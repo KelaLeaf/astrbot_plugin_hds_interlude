@@ -205,6 +205,7 @@ class AstrbotBridge:
             user_profile=conf_story.get("user_profile", ""),
             relationship=conf_story.get("relationship", ""),
             world=conf_story.get("world", ""),
+            extra_setting=conf_story.get("extra_setting", ""),
             style=conf_story.get("style", setting_default_style := "现实主义日常叙事，情绪克制，关系变化缓慢而具体。"),
             timezone=conf_story.get("timezone", "Asia/Shanghai"),
         )
@@ -410,6 +411,7 @@ class AstrbotBridge:
                     character_profile=profile,
                     user_profile=conf_story.get("user_profile", ""),
                     relationship=conf_story.get("relationship", ""),
+                    extra_setting=conf_story.get("extra_setting", ""),
                     timezone=conf_story.get("timezone", "Asia/Shanghai"),
                 ),
                 created_at=datetime.now(_UTC),

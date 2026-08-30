@@ -101,6 +101,8 @@ def _build_messages(ctx: NarrativeContext, prompts: dict, locale_style: str) -> 
         lines.append(f"Supporting cast: {setting.supporting_cast}")
     if setting.location:
         lines.append(f"Location: {setting.location}")
+    if setting.extra_setting:
+        lines.append(f"Extra setting: {setting.extra_setting}")
     lines.append(f"Story style: {setting.style}")
 
     if ctx.continuity:
