@@ -5,6 +5,7 @@ short_desc: 时间感知的持续叙事聊天框架 AstrBot 移植版。
 version: v0.1.0
 repo: https://github.com/KelaLeaf/astrbot_plugin_hds_interlude
 author: KelaLeaf
+license: AGPL-3.0
 astrbot_version: ">=4.16,<5"
 tags: ["narrative", "roleplay", "time-aware", "memory"]
 support_platforms: ["aiocqhttp", "qq_official", "telegram", "wecom", "lark", "dingtalk", "discord", "slack", "kook", "voicechat", "satori", "misskey"]
