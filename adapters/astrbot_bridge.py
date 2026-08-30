@@ -367,21 +367,20 @@ class AstrbotBridge:
     def import_persona(self, *, persona_id: str, system_prompt: str) -> dict:
         """把某个 AstrBot 人格的 system_prompt 解析/填充进插件 story 配置。
 
-        启发式：从 "你是XX" 提取角色名，其余设作角色设定（保留原 prompt 保证不丢信息）。
-        已有打开剧本则覆盖其 setting；没有则新建。返回填充概览。
+        角色名优先取 persona_id（AstrBot 人格标识，通常是角色名，如「凌梦」）；
+        persona_id 为空时才用正则从「你是XX」猜测。整个 system_prompt 保留为角色设定。
+        已有打开剧本则覆盖其设定；没有则新建。返回填充概览。
         """
         text = (system_prompt or "").strip()
-        name = persona_id or "Imported"
+        name = (persona_id or "").strip() or "Imported"
         profile = text
 
-        # 从提示词里提取"你是XXX"作为角色名；负向前瞻排除"一个/一位/一名/你们的"这类量词短语，
-        # 避免把"你是一个助手"里的"一个助手"误当名字。
-        import re
-        m = re.search(r"你是\s*((?:(?!一个|一位|一名|你们的)[\u4e00-\u9fa5A-Za-z0-9])+)", text)
-        if m:
-            candidate = m.group(1).strip()
-            if candidate:
-                name = candidate
+        # 仅当 persona_id 为空时，才用正则从"你是XX"猜测角色名
+        if not (persona_id or "").strip():
+            import re
+            m = re.search(r"你是\s*((?:(?!一个|一位|一名|你们的)[\u4e00-\u9fa5A-Za-z0-9])+)", text)
+            if m and m.group(1).strip():
+                name = m.group(1).strip()
 
         if self._story and self._story.status.value == "active":
             story = self._story

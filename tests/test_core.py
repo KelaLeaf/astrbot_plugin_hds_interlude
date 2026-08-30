@@ -166,31 +166,44 @@ class TestCompact(unittest.TestCase):
 
 
 class TestImportPersona(unittest.TestCase):
-    def test_import_persona_sets_story(self):
-        """从人格 prompt 提取角色名并填充 story。"""
+    def test_import_persona_uses_persona_id_as_name(self):
+        """角色名优先取 persona_id（如「凌梦」），整个 prompt 作为角色设定。"""
         _bridge_mod = importlib.import_module(f"{_PLUGIN_DIR}.adapters.astrbot_bridge")
         AstrbotBridge = _bridge_mod.AstrbotBridge
 
         d = tempfile.mkdtemp()
         bridge = AstrbotBridge(d, {})
         info = bridge.import_persona(
-            persona_id="cat",
+            persona_id="凌梦",
             system_prompt="你是凌梦，一只温柔的白猫娘，傲娇又粘人。生活在现代都市。",
         )
+        # persona_id 优先，不被"你是XXX"抢走（旧 bug：曾解析成"一只猫娘"）
         self.assertEqual(info["character_name"], "凌梦")
-        self.assertIsNotNone(bridge._story)
         self.assertEqual(bridge._story.setting.character_name, "凌梦")
         self.assertIn("凌梦", bridge._story.setting.character_profile)
 
-    def test_import_persona_without_name_uses_id(self):
+    def test_import_persona_falls_back_to_regex_when_no_id(self):
+        """persona_id 为空时，才用正则从"你是XX"猜测角色名。"""
         _bridge_mod = importlib.import_module(f"{_PLUGIN_DIR}.adapters.astrbot_bridge")
         AstrbotBridge = _bridge_mod.AstrbotBridge
 
         d = tempfile.mkdtemp()
         bridge = AstrbotBridge(d, {})
-        info = bridge.import_persona(persona_id="default", system_prompt="你是一个助手。")
-        self.assertEqual(info["character_name"], "default")  # 未匹配"你是XX"则回退 persona_id
-        self.assertEqual(bridge._story.setting.character_name, "default")
+        info = bridge.import_persona(persona_id="", system_prompt="你是凌梦，一只可爱的猫娘。")
+        self.assertEqual(info["character_name"], "凌梦")
+        self.assertEqual(bridge._story.setting.character_name, "凌梦")
+
+    def test_import_persona_no_match_uses_fallback(self):
+        """persona_id 为空且无"你是XX"时回退到占位名。"""
+        _bridge_mod = importlib.import_module(f"{_PLUGIN_DIR}.adapters.astrbot_bridge")
+        AstrbotBridge = _bridge_mod.AstrbotBridge
+
+        d = tempfile.mkdtemp()
+        bridge = AstrbotBridge(d, {})
+        info = bridge.import_persona(persona_id="", system_prompt="你是一个助手。")
+        # "你是一个助手"的量词短语被排除，回退占位名
+        self.assertNotEqual(info["character_name"], "一个助手")
+        self.assertEqual(bridge._story.setting.character_name, "Imported")
 
 
 if __name__ == "__main__":
