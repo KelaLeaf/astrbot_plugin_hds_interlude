@@ -202,6 +202,8 @@ class AstrbotBridge:
         setting = StorySetting(
             character_name=conf_story.get("character_name", "Unnamed character"),
             character_profile=conf_story.get("character_profile", ""),
+            user_profile=conf_story.get("user_profile", ""),
+            relationship=conf_story.get("relationship", ""),
             world=conf_story.get("world", ""),
             style=conf_story.get("style", setting_default_style := "现实主义日常叙事，情绪克制，关系变化缓慢而具体。"),
             timezone=conf_story.get("timezone", "Asia/Shanghai"),
@@ -221,7 +223,11 @@ class AstrbotBridge:
 
     def get_participant(self, person_id: str, story: InterludeStory, display_name: str = "") -> InterludeParticipant:
         if person_id in self._participants:
-            return self._participants[person_id]
+            p = self._participants[person_id]
+            if display_name and p.display_name != display_name:
+                p.display_name = display_name
+                self._persist()
+            return p
         p = InterludeParticipant(
             id=person_id, story_id=story.id, user_id=person_id,
             person_id=person_id, display_name=display_name or person_id,
@@ -272,6 +278,7 @@ class AstrbotBridge:
         channel_id: str,
         content: str,
         *,
+        sender_name: str = "",
         get_provider_callable=None,
     ) -> tuple[Optional[str], NarrativeDecision, bool]:
         """处理一条用户私聊消息。
@@ -283,7 +290,7 @@ class AstrbotBridge:
             return "尚未创建主剧本：请先在插件配置中开启自动创建，或手动触发启动。", \
                 NarrativeDecision(decided=NarrativeDecisionKind.remain_silent, reason="no story"), True
 
-        participant = self.get_participant(user_id, story)
+        participant = self.get_participant(user_id, story, display_name=sender_name)
         now = datetime.now(_UTC).isoformat()
         self.append_entry(story, ScriptEntryKind.user_event, content, participant_id=user_id)
 
@@ -395,12 +402,15 @@ class AstrbotBridge:
             st.character_name = name
             st.character_profile = profile
         else:
+            conf_story = self.conf.get("story", {})
             story = InterludeStory(
                 id="hds-main",
                 setting=StorySetting(
                     character_name=name,
                     character_profile=profile,
-                    timezone=self.conf.get("story", {}).get("timezone", "Asia/Shanghai"),
+                    user_profile=conf_story.get("user_profile", ""),
+                    relationship=conf_story.get("relationship", ""),
+                    timezone=conf_story.get("timezone", "Asia/Shanghai"),
                 ),
                 created_at=datetime.now(_UTC),
                 updated_at=datetime.now(_UTC),

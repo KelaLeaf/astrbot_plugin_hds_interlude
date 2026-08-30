@@ -139,9 +139,11 @@ class HDSInterludePlugin(Star):
         platform = event.get_platform_name()
         self_id = str(event.get_self_id())
         channel_id = str(event.get_session_id())
+        sender_name = str(event.get_sender_name() or "")
 
         reply, decision, consumed = await self.bridge.handle_user_message(
             platform, self_id, user_id, channel_id, text,
+            sender_name=sender_name,
             get_provider_callable=self._build_astrobot_call(event),
         )
         if not consumed:
