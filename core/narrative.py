@@ -38,6 +38,33 @@ def kind_value(kind) -> str:
     return str(kind)
 
 
+# AstrBot 平台 ID → 人类可读名
+_PLATFORM_NAMES = {
+    "aiocqhttp": "QQ（OneBot/NapCat）",
+    "qqofficial": "QQ（官方）",
+    "qq_official": "QQ（官方）",
+    "telegram": "Telegram",
+    "wecom": "企业微信",
+    "lark": "飞书",
+    "dingtalk": "钉钉",
+    "discord": "Discord",
+    "slack": "Slack",
+    "kook": "KOOK",
+    "voicechat": "语音聊天",
+    "weixin_official_account": "微信公众号",
+    "wechat": "微信",
+    "satori": "Satori",
+    "misskey": "Misskey",
+}
+
+
+def platform_name_human(platform_id: str) -> str:
+    """把平台 ID 映射为人类可读名；未知则原样返回。"""
+    if not platform_id:
+        return "未知"
+    return _PLATFORM_NAMES.get(platform_id, platform_id)
+
+
 # 主叙事使用的结构输出协议（JSON）。
 _NARRATIVE_SCHEMA_INSTRUCTION = (
     "You are the continuity engine of a persistent, character-centered life script. "
@@ -111,6 +138,10 @@ def _build_messages(ctx: NarrativeContext, prompts: dict, locale_style: str) -> 
             lines.append(f"与主角的关系: {p.relationship}")
         if p.profile:
             lines.append(f"对端资料: {p.profile}")
+
+    # 消息来源平台：告诉模型这是 QQ/微信/Telegram/Kook 等哪个平台
+    platform = getattr(ctx.story, "platform", "") or ""
+    lines.append(f"消息平台: {platform_name_human(platform)}")
 
     if ctx.participant and ctx.participant.state.open_threads:
         lines.append("Open threads: " + "; ".join(ctx.participant.state.open_threads))

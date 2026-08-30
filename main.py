@@ -117,11 +117,10 @@ class HDSInterludePlugin(Star):
             logger.warn(f"hds-interlude: get conversation tools failed: {err}")
             return None
 
-    # ---- 普通私聊文本（OneBot/NapCat）----
+    # ---- 普通私聊文本（多平台：QQ/微信/Telegram/Kook 等）----
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_private_message(self, event: AstrMessageEvent):
-        """捕获 OneBot/NapCat 私聊文本，进入 HDSI 叙事。"""
+        """捕获任意平台私聊文本，进入 HDSI 叙事。"""
         text = (event.message_str or "").strip()
         if not text:
             return
