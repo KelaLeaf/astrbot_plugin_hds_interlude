@@ -100,10 +100,17 @@ class AstrbotBridge:
             key = p.get("person_id") or p.get("id") or p.get("user_id")
             if key:
                 self._participants[key] = self._build_participant(p)
-        self._entries = [
-            ScriptEntry(**{k: v for k, v in e.items() if k in set(ScriptEntry.__dataclass_fields__)})
-            for e in (self.store.load(_ENTRIES_FILE) or [])
-        ]
+        self._entries = []
+        for e in (self.store.load(_ENTRIES_FILE) or []):
+            # 恢复 kind 为枚举（JSON 存的是字符串，如 "user"/"script"）
+            if "kind" in e and isinstance(e["kind"], str):
+                try:
+                    e["kind"] = ScriptEntryKind(e["kind"])
+                except ValueError:
+                    e["kind"] = ScriptEntryKind.user_event
+            self._entries.append(ScriptEntry(
+                **{k: v for k, v in e.items() if k in set(ScriptEntry.__dataclass_fields__)}
+            ))
         self._facts = self.store.load(_FACTS_FILE) or []
 
     def _build_story(self, raw: dict) -> Optional[InterludeStory]:
