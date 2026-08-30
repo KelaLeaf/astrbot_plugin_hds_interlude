@@ -67,20 +67,27 @@ class HDSInterludePlugin(Star):
             return getattr(llm_resp, "completion_text", "") or ""
         return call
 
-    # ---- 普通私聊文本 ----
+    # ---- 普通私聊文本（OneBot/NapCat）----
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_private_message(self, event: AstrMessageEvent):
-        """捕获私聊文本，进入 HDSI 叙事。"""
+        """捕获 OneBot/NapCat 私聊文本，进入 HDSI 叙事。"""
         text = (event.message_str or "").strip()
         if not text:
             return
-        # 管理命令跳过的简单实现：hdsi.* 前缀
+        # 管理命令跳过：hdsi.* 前缀
         if text.startswith("hdsi.") or text.startswith("interlude."):
+            return
+
+        # 可选白名单：只在配置了 allowed_user_ids 且非空时启用。
+        allowed = self.config.get("runtime", {}).get("allowed_user_ids") or []
+        user_id = str(event.get_sender_id())
+        if allowed and user_id not in allowed:
+            logger.info(f"hds-interlude: 拒绝未授权用户 {user_id}")
             return
 
         platform = event.get_platform_name()
         self_id = str(event.self_id)
-        user_id = str(event.get_sender_id())
         channel_id = str(event.session_id)
 
         reply, decision, consumed = await self.bridge.handle_user_message(
@@ -92,7 +99,7 @@ class HDSInterludePlugin(Star):
         if reply:
             yield event.plain_result(reply)
         else:
-            # 沉默决策：也吞掉消息，不让它落入其他处理器
+            # 沉默决策：吞掉消息，不让它落入其他处理器
             yield event.plain_result("")
 
     # ---- 管理命令 ----
