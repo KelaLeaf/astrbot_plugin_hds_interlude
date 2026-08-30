@@ -8,11 +8,8 @@ HDS Interlude 是一个面向 **AstrBot** 一对一与多参与者场景的持�
 
 ## 文档导航
 
-- 插件安装与配置：见本文件下方 [安装](#安装) 与 [配置](#配置)
-- 架构总览：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- 移植决策与注意事项：[docs/PORTING_NOTES.md](docs/PORTING_NOTES.md)
-- 跟进上游更新：[docs/UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md)
-- 上游 Koishi 原版文档：见 [MomoiCore/hds-interlude](https://gitee.com/MomoiCore/hds-interlude)
+- 上游 Koishi 原版文档：见 [MomoiCore/hds-interlude](https://gitee.com/MomoiCore/hds-interlude)（含架构、配置、指令等完整说明）
+- 本移植版侧重于：持续生活剧本、主叙事写作、时间感知、长期事实记忆
 
 ## 它解决什么问题
 
@@ -67,11 +64,12 @@ HDSI 按用途分层组织信息，让每次请求获得恰当的连续性，同
 
 ## 安装
 
-本插件为 AstrBot 插件，需放入 AstrBot 的插件目录后于后台启用：
+本插件为 AstrBot 插件，可直接从 GitHub 仓库安装：
 
-1. 把 `astrbot_plugin_hds_interlude` 文件夹放入 AstrBot 的插件目录。
-2. 在 AstrBot 后台安装依赖：`requirements.txt` 含 `httpx`、`pyyaml`。
-3. 重启 AstrBot，进入插件配置页填写模型与剧本起点。
+- **AstrBot 后台** → 插件 → 从 GitHub 安装，填入仓库地址 `https://github.com/KelaLeaf/astrbot_plugin_hds_interlude`。
+- 或手动把本仓库文件放入 AstrBot 的插件目录 `data/plugins/astrbot_plugin_hds_interlude/`。
+
+依赖：`requirements.txt` 含 `httpx`、`pyyaml`（AstrBot 安装时通常会自动满足或提示安装）。安装后进入插件配置页填写模型与剧本起点。
 
 ## 配置
 
@@ -117,7 +115,6 @@ HDSI 按用途分层组织信息，让每次请求获得恰当的连续性，同
 ## 开发与验证
 
 ```bash
-cd plugin
 python -m tests.test_core   # 核心单元测试（12 项，不依赖 AstrBot SDK）
 ```
 
