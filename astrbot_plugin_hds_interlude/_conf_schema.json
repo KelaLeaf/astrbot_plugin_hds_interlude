@@ -105,6 +105,13 @@
           "description": "无主剧本时是否自动启动。关闭后需手动触发。",
           "default": false
         },
+        "allowed_user_ids": {
+          "type": "array",
+          "title": "允许互动的用户 ID 白名单",
+          "description": "留空表示允许所有 OneBot/NapCat 私聊用户；填入后仅这些 ID 会被处理。对应上游的 OneBot 用户白名单。",
+          "items": { "type": "string" },
+          "default": []
+        },
         "context_entry_limit": {
           "type": "integer",
           "title": "上下文条目数",

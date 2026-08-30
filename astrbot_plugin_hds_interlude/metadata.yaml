@@ -7,4 +7,4 @@ repo: https://github.com/KelaLeaf/astrbot_plugin_hds_interlude
 author: KelaLeaf
 astrbot_version: ">=4.16,<5"
 tags: ["narrative", "roleplay", "time-aware", "memory"]
-support_platforms: ["qq", "wechat", "telegram", "webchat"]
+support_platforms: ["aiocqhttp", "qq_official"]
