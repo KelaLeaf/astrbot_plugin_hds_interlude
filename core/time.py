@@ -78,6 +78,8 @@ def story_local_time_context(value: datetime, timezone: str) -> dict:
         "date": parts["date"],
         "time": parts["time"],
         "hour": hour,
+        "weekday": parts["weekday"],
+        "offset": parts["offset"],
         "period": period,
         "periodZh": _PERIOD_ZH[period],
         "daylightExpectation": daylight,
