@@ -102,18 +102,15 @@ def _build_messages(ctx: NarrativeContext, prompts: dict, locale_style: str) -> 
         for fact in ctx.facts[:20]:
             lines.append(f"- {fact.content}")
 
-    # 当前对话对端身份：让模型知道"正在和谁说话、与主角什么关系"
-    rel = setting.relationship or "未知"
+    # 当前对话对端身份：自动用发送者名片告诉模型"在跟谁说话"
     if ctx.participant is not None:
         p = ctx.participant
         who = p.display_name or p.user_id or "对方"
+        lines.append(f"当前对端: {who}")
         if p.relationship:
-            rel = p.relationship
-        lines.append(f"当前对端: {who}。（与主角的关系: {rel}）")
+            lines.append(f"与主角的关系: {p.relationship}")
         if p.profile:
             lines.append(f"对端资料: {p.profile}")
-    elif setting.user_profile:
-        lines.append(f"当前对端: {setting.user_profile or '对方'}。（与主角的关系: {rel}）")
 
     if ctx.participant and ctx.participant.state.open_threads:
         lines.append("Open threads: " + "; ".join(ctx.participant.state.open_threads))
