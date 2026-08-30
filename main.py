@@ -23,11 +23,16 @@ class HDSInterludePlugin(Star):
         self._apply_persona_if_set()
 
     def _apply_persona_if_set(self) -> None:
-        """配置页选了 persona_id 时，启动即把该 AstrBot 人格导入为角色设定。"""
+        """配置页选了 persona_id（在 story 组）时，启动即把该 AstrBot 人格导入为角色设定。"""
         persona_id = None
         try:
             if isinstance(self.config, dict):
-                persona_id = self.config.get("persona_id")
+                # persona_id 现位于 story 子组；兼容旧顶层读取
+                story = self.config.get("story", {})
+                if isinstance(story, dict):
+                    persona_id = story.get("persona_id") or self.config.get("persona_id")
+                else:
+                    persona_id = self.config.get("persona_id")
         except Exception as err:  # noqa: BLE001
             logger.warn(f"hds-interlude: read persona_id failed: {err}")
         if not persona_id:
