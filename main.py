@@ -62,13 +62,34 @@ class HDSInterludePlugin(Star):
                     prompt_parts.append(f"{m.role}: {m.content}")
             prompt = "\n\n".join(prompt_parts)
 
+            # 可选：让叙事模型感知 AstrBot 会话工具（含 MCP/知识库/网页搜索）。
+            # 默认关闭，避免破坏结构化 JSON 叙事。开启后模型可声明调用外部工具。
+            tools = None
+            if self.config.get("runtime", {}).get("narrative_tools", False):
+                tools = self._get_conversation_tools(umo)
+            kwargs = {}
+            if tools is not None:
+                kwargs["tools"] = tools
+
             llm_resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=prompt,
                 system_prompt=system_prompt,
+                **kwargs,
             )
             return getattr(llm_resp, "completion_text", "") or ""
         return call
+
+    def _get_conversation_tools(self, umo: str | None = None):
+        """尝试获取 AstrBot 会话可用工具集；API 不可用则返回 None（不崩溃）。"""
+        try:
+            runner = self.context.get_using_agent_runner(umo=umo) if umo else self.context.get_using_agent_runner()
+            if runner is not None and hasattr(runner, "tool_manager"):
+                return getattr(runner, "tool_manager")
+            return None
+        except Exception as err:  # noqa: BLE001
+            logger.warn(f"hds-interlude: get conversation tools failed: {err}")
+            return None
 
     # ---- 普通私聊文本（OneBot/NapCat）----
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
@@ -125,6 +146,42 @@ class HDSInterludePlugin(Star):
         yield event.plain_result(
             f"主剧本：{c}\n叙事轮次：{updates}\n剧本条目：{entries}\n长期事实：{facts}"
         )
+
+    @filter.command("hdsi.import_persona <persona_id>")
+    async def hdsi_import_persona(self, event: AstrMessageEvent, persona_id: str):
+        """把一个 AstrBot 人格一键导入为本插件的角色设定。"""
+        try:
+            pm = self.context.persona_manager
+            persona = pm.get_persona(persona_id)
+        except Exception as err:  # noqa: BLE001
+            yield event.plain_result(f"读取人格失败：{err}")
+            return
+
+        system_prompt = getattr(persona, "system_prompt", "") or ""
+        info = self.bridge.import_persona(
+            persona_id=persona_id,
+            system_prompt=system_prompt,
+        )
+        yield event.plain_result(
+            f"已导入人格「{persona_id}」：角色名「{info['character_name']}」，"
+            f"设定 {info['profile_length']} 字。重启/触发叙事后生效。"
+        )
+
+    @filter.command("hdsi.personas")
+    async def hdsi_personas(self, event: AstrMessageEvent):
+        """列出 AstrBot 可导入的人格。"""
+        try:
+            pm = self.context.persona_manager
+            personas = pm.get_all_personas()
+        except Exception as err:  # noqa: BLE001
+            yield event.plain_result(f"读取人格列表失败：{err}")
+            return
+        lines = [f"共 {len(personas)} 个人格："]
+        for p in personas:
+            pid = getattr(p, "persona_id", None) or getattr(p, "id", "")
+            name = getattr(p, "name", "") or getattr(p, "id", "")
+            lines.append(f"- {pid}（{name}）")
+        yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         """插件卸载时清理。"""
