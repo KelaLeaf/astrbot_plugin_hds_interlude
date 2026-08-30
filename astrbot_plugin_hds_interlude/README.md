@@ -43,9 +43,7 @@ HDS Interlude（幕间系统）的 AstrBot 移植版。聊天在幕前发生，�
 
 ## 隐私说明
 
-- 插件本身不带任何密钥，模型 API Key 都从 AstrBot 的配置（`_conf_schema.json`）里读，或者直接复用 AstrBot 默认模型。
-- 数据都存本地：剧本、参与者、长期事实放在 `data/plugin_data/astrbot_plugin_hds_interlude/`。
-- 除了你配的那个模型接口，插件不会去连别的地方。
+插件里没有写死的密钥，模型的 key 都是你在 AstrBot 配置里填的，或者直接用它的默认模型。剧本、参与者、记忆这些数据也都只存在本地 `data/plugin_data/astrbot_plugin_hds_interlude/` 里，除了你填的那个模型接口，它不会主动连别的地方。
 
 ## 目录
 
