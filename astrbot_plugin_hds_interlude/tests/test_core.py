@@ -1,11 +1,13 @@
 """core 独立单元测试（不依赖 AstrBot SDK）。
 
-运行方式（从插件根目录）：
-    python -m tests.test_core
+运行方式（从任意插件目录的父目录）：
+    python -m <插件目录名>.tests.test_core
 
 这些测试只验证叙事核心逻辑本身，可在任何 Python 环境（含 cnb 构建机）运行。
+包名与目录名解耦：这里按插件目录的实际名字动态 import，不硬编码。
 """
 
+import importlib
 import os
 import sys
 import tempfile
@@ -15,14 +17,27 @@ import unittest
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _REPO_ROOT)
 
-from astrbot_plugin_hds_interlude.core import narrative, time as htime  # noqa: E402
-from astrbot_plugin_hds_interlude.core.types import (  # noqa: E402
+# 自动解析插件目录名（即 Python 包名）
+_PLUGIN_DIR = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_core_mod = importlib.import_module(f"{_PLUGIN_DIR}.core")
+narrative = _core_mod.narrative
+htime = _core_mod.time
+_types = importlib.import_module(f"{_PLUGIN_DIR}.core.types")
+(
     ContinuitySnapshot,
     NarrativeDecision,
     NarrativeDecisionKind,
     ScriptEntryKind,
     SettingOverlay,
     StorySetting,
+) = (
+    _types.ContinuitySnapshot,
+    _types.NarrativeDecision,
+    _types.NarrativeDecisionKind,
+    _types.ScriptEntryKind,
+    _types.SettingOverlay,
+    _types.StorySetting,
 )
 
 
@@ -94,7 +109,8 @@ class TestContinuitySnapshot(unittest.TestCase):
 
 class TestBridgeStore(unittest.TestCase):
     def test_json_store_persistence(self):
-        from astrbot_plugin_hds_interlude.adapters.astrbot_bridge import AstrbotBridge
+        _bridge_mod = importlib.import_module(f"{_PLUGIN_DIR}.adapters.astrbot_bridge")
+        AstrbotBridge = _bridge_mod.AstrbotBridge
 
         d = tempfile.mkdtemp()
         conf = {
