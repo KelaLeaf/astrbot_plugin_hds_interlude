@@ -160,12 +160,22 @@ async def chat_completion_json(
     *,
     astrobot_call: Optional[AstrBotCallable] = None,
 ) -> tuple[Optional[dict], Optional[str]]:
-    """请求 JSON object 响应并解析。返回 (data, error)。"""
+    """请求 JSON object 响应并解析。返回 (data, error)。
+
+    先尝试带 response_format=json_object；若模型不支持（如低配 Ollama 模型会导致 500），
+    回落为不带，靠 prompt 指示 + 宽松提取。避免低配模型因 json mode 崩溃。
+    """
     result = await chat_completion(
         messages, config,
         response_format={"type": "json_object"},
         astrobot_call=astrobot_call,
     )
+    if not result.ok:
+        # 回落：不带 response_format，让模型自然输出 JSON 文本
+        result = await chat_completion(
+            messages, config,
+            astrobot_call=astrobot_call,
+        )
     if not result.ok:
         return None, result.error
     data = extract_json_object(result.content)
