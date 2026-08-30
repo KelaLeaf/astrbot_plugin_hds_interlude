@@ -133,5 +133,37 @@ class TestBridgeStore(unittest.TestCase):
         self.assertEqual(bridge2._entries[0].content, "hi")
 
 
+class TestCompact(unittest.TestCase):
+    def test_below_threshold_skips_llm(self):
+        """条目数未达阈值时直接返回，不触发 LLM（用会抛异常的 call 验证）。"""
+        _bridge_mod = importlib.import_module(f"{_PLUGIN_DIR}.adapters.astrbot_bridge")
+        _model = importlib.import_module(f"{_PLUGIN_DIR}.core.model")
+        AstrbotBridge = _bridge_mod.AstrbotBridge
+        ModelConfig = _model.ModelConfig
+
+        d = tempfile.mkdtemp()
+        bridge = AstrbotBridge(d, {"runtime": {"compact_threshold": 18}})
+        story = bridge.ensure_story("qq", "self", "u", "c")
+        # auto_create 未开则手动注入一个 story 到 bridge
+        if story is None:
+            _types = importlib.import_module(f"{_PLUGIN_DIR}.core.types")
+            story = _types.InterludeStory(id="hds-main", platform="qq", user_id="u")
+            bridge._story = story
+        # 只加 5 条，低于阈值
+        for i in range(5):
+            bridge.append_entry(story, ScriptEntryKind.user_event, f"msg {i}")
+
+        async def _bomb_call(*_a, **_k):
+            raise AssertionError("不应触发 LLM 调用")
+
+        import asyncio
+        asyncio.run(
+            bridge.maybe_compact(story, ModelConfig(), threshold_entries=18, astrobot_call=_bomb_call)
+        )
+        # 未压缩：快照保持 None
+        self.assertIsNone(story.state.continuity_snapshot)
+        self.assertEqual(len(bridge._facts), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
