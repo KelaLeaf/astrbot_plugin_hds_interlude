@@ -113,6 +113,12 @@
         "hint": "超过则压缩旧场景、提炼长期事实",
         "default": 18
       },
+      "narrative_tools": {
+        "type": "bool",
+        "description": "叙事模型感知会话工具",
+        "hint": "开启后角色可调用 AstrBot 工具/MCP；可能影响 JSON 输出，默认关",
+        "default": false
+      },
       "min_delayed_reply_seconds": {
         "type": "int",
         "description": "最短延迟回复（秒）",
