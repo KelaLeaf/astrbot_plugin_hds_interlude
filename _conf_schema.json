@@ -1,11 +1,4 @@
 {
-  "persona_id": {
-    "type": "string",
-    "description": "导入的 AstrBot 人格",
-    "hint": "选择后插件启动时自动将人格填充为角色设定",
-    "_special": "select_persona",
-    "default": ""
-  },
   "model": {
     "type": "object",
     "description": "主叙事模型连接。留空则用 AstrBot 默认模型。",
@@ -54,26 +47,38 @@
     "type": "object",
     "description": "剧本起点",
     "items": {
+      "persona_id": {
+        "type": "string",
+        "description": "导入的 AstrBot 人格",
+        "hint": "选中后自动作为角色名与角色设定（下方手动项随之隐藏）",
+        "_special": "select_persona",
+        "default": ""
+      },
       "character_name": {
         "type": "string",
         "description": "主角名",
+        "hint": "未选人格时填写",
+        "condition": {"persona_id": ""},
         "default": "Unnamed character"
       },
       "character_profile": {
         "type": "text",
         "description": "角色设定",
         "hint": "背景、性格、说话方式",
+        "condition": {"persona_id": ""},
         "default": ""
       },
       "world": {
         "type": "text",
         "description": "世界设定",
         "hint": "时代、地点、规则",
+        "condition": {"persona_id": ""},
         "default": ""
       },
       "style": {
         "type": "text",
         "description": "叙事文风",
+        "condition": {"persona_id": ""},
         "default": "现实主义日常叙事，情绪克制，关系变化缓慢而具体。"
       },
       "timezone": {
