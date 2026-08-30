@@ -1,4 +1,11 @@
 {
+  "persona_id": {
+    "type": "string",
+    "description": "导入的 AstrBot 人格",
+    "hint": "选择后插件启动时自动将人格填充为角色设定",
+    "_special": "select_persona",
+    "default": ""
+  },
   "model": {
     "type": "object",
     "description": "主叙事模型连接。留空则用 AstrBot 默认模型。",
