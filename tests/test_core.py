@@ -165,5 +165,33 @@ class TestCompact(unittest.TestCase):
         self.assertEqual(len(bridge._facts), 0)
 
 
+class TestImportPersona(unittest.TestCase):
+    def test_import_persona_sets_story(self):
+        """从人格 prompt 提取角色名并填充 story。"""
+        _bridge_mod = importlib.import_module(f"{_PLUGIN_DIR}.adapters.astrbot_bridge")
+        AstrbotBridge = _bridge_mod.AstrbotBridge
+
+        d = tempfile.mkdtemp()
+        bridge = AstrbotBridge(d, {})
+        info = bridge.import_persona(
+            persona_id="cat",
+            system_prompt="你是凌梦，一只温柔的白猫娘，傲娇又粘人。生活在现代都市。",
+        )
+        self.assertEqual(info["character_name"], "凌梦")
+        self.assertIsNotNone(bridge._story)
+        self.assertEqual(bridge._story.setting.character_name, "凌梦")
+        self.assertIn("凌梦", bridge._story.setting.character_profile)
+
+    def test_import_persona_without_name_uses_id(self):
+        _bridge_mod = importlib.import_module(f"{_PLUGIN_DIR}.adapters.astrbot_bridge")
+        AstrbotBridge = _bridge_mod.AstrbotBridge
+
+        d = tempfile.mkdtemp()
+        bridge = AstrbotBridge(d, {})
+        info = bridge.import_persona(persona_id="default", system_prompt="你是一个助手。")
+        self.assertEqual(info["character_name"], "default")  # 未匹配"你是XX"则回退 persona_id
+        self.assertEqual(bridge._story.setting.character_name, "default")
+
+
 if __name__ == "__main__":
     unittest.main()
