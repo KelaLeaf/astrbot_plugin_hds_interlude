@@ -362,3 +362,46 @@ class AstrbotBridge:
                     self._facts.append({"content": c, "created_at": now})
                 if len(self._facts) > 200:
                     self._facts = self._facts[-200:]
+
+    # ---- 一键导入人格 ----
+    def import_persona(self, *, persona_id: str, system_prompt: str) -> dict:
+        """把某个 AstrBot 人格的 system_prompt 解析/填充进插件 story 配置。
+
+        启发式：从 "你是XX" 提取角色名，其余设作角色设定（保留原 prompt 保证不丢信息）。
+        已有打开剧本则覆盖其 setting；没有则新建。返回填充概览。
+        """
+        text = (system_prompt or "").strip()
+        name = persona_id or "Imported"
+        profile = text
+
+        # 从提示词里提取"你是XXX"作为角色名；负向前瞻排除"一个/一位/一名/你们的"这类量词短语，
+        # 避免把"你是一个助手"里的"一个助手"误当名字。
+        import re
+        m = re.search(r"你是\s*((?:(?!一个|一位|一名|你们的)[\u4e00-\u9fa5A-Za-z0-9])+)", text)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate:
+                name = candidate
+
+        if self._story and self._story.status.value == "active":
+            story = self._story
+            st = story.setting
+            st.character_name = name
+            st.character_profile = profile
+        else:
+            story = InterludeStory(
+                id="hds-main",
+                setting=StorySetting(
+                    character_name=name,
+                    character_profile=profile,
+                    timezone=self.conf.get("story", {}).get("timezone", "Asia/Shanghai"),
+                ),
+                created_at=datetime.now(_UTC),
+                updated_at=datetime.now(_UTC),
+            )
+            self._story = story
+            self._participants.clear()
+
+        story.updated_at = datetime.now(_UTC)
+        self._persist()
+        return {"persona_id": persona_id, "character_name": name, "profile_length": len(profile)}
