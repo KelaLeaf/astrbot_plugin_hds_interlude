@@ -107,6 +107,12 @@
         "description": "长期事实数量",
         "default": 20
       },
+      "compact_threshold": {
+        "type": "int",
+        "description": "触发记忆压缩的条目数",
+        "hint": "超过则压缩旧场景、提炼长期事实",
+        "default": 18
+      },
       "min_delayed_reply_seconds": {
         "type": "int",
         "description": "最短延迟回复（秒）",

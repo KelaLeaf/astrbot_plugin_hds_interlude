@@ -13,9 +13,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
+from ..core import memory as hmemory
 from ..core import time as htime
 from ..core.model import ChatMessage, ModelConfig
 from ..core.types import (
+    ContinuitySnapshot,
     InterludeParticipant,
     InterludeStory,
     NarrativeContext,
@@ -316,5 +318,47 @@ class AstrbotBridge:
             self.append_entry(story, ScriptEntryKind.character_message, decision.visible_reply, participant_id=user_id)
 
         story.state.narrative_update_count += 1
+        await self.maybe_compact(
+            story, cfg,
+            threshold_entries=int(self.conf.get("runtime", {}).get("compact_threshold", 18)),
+            astrobot_call=get_provider_callable,
+        )
         self._persist()
         return decision.visible_reply or None, decision, True
+
+    # ---- 记忆压缩接线 ----
+    async def maybe_compact(
+        self,
+        story: InterludeStory,
+        cfg: ModelConfig,
+        *,
+        threshold_entries: int = 18,
+        astrobot_call=None,
+    ) -> None:
+        """剧本条目过多时，把已完成场景压缩为连续性快照，并提取长期事实。"""
+        # 只压缩已完结的用户事件与剧本段落（排除最近几条活跃条目）
+        entries_with_stamp = [
+            (e.created_at or "", e.content)
+            for e in self._entries[:-8]
+            if e.kind in (ScriptEntryKind.user_event, ScriptEntryKind.script, ScriptEntryKind.character_message)
+        ]
+        if len(entries_with_stamp) < threshold_entries:
+            return
+
+        # 压缩连续性快照
+        snap = await hmemory.compact_scene(entries_with_stamp, cfg, astrobot_call=astrobot_call)
+        if snap is not None:
+            story.state.continuity_snapshot = snap
+            story.state.last_continuity_update_at = datetime.now(_UTC).isoformat()
+
+        # 提取长期事实（增量并入，去重）
+        new_facts = await hmemory.extract_facts(entries_with_stamp, cfg, astrobot_call=astrobot_call)
+        if new_facts:
+            existing = {f["content"] for f in self._facts}
+            added = [c for c in new_facts if c not in existing]
+            if added:
+                now = datetime.now(_UTC).isoformat()
+                for c in added:
+                    self._facts.append({"content": c, "created_at": now})
+                if len(self._facts) > 200:
+                    self._facts = self._facts[-200:]
