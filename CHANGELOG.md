@@ -19,8 +19,13 @@
 
 - 叙事 JSON 请求兼容低配模型：`response_format=json_object` 在部分 Ollama 模型上导致 500，失败时回落为普通请求 + 宽松提取。
 - `_data_dir` 用固定插件名替代 `self.name`（Star 基类无 name 属性），修复插件加载 AttributeError。
+- 对端身份注入：prompt 里加"当前对端: X"（自动用发送者名片），解决角色把主人当陌生号码回"不认识"。
+- 平台注入：prompt 里加"消息平台: QQ/Telegram/KOOK..."（`platform_name_human` 映射），并去掉单一 AIOCQHTTP 限制，多平台监听私聊。
+- 剧本条目 `kind` 从 JSON 读回变字符串导致 `'str' object has no attribute 'value'`：`bridge._load` 恢复枚举 + `narrative.kind_value()` 兜底。
+- 时间上下文补 `weekday`/`offset` 键，修复 `KeyError: 'weekday'`。
+- `on_private_message` 用 `get_self_id()`/`get_session_id()` 等 getter，修复 `AiocqhttpMessageEvent` 的 AttributeError。
 
-> 已用本地 AstrBot + Ollama `huihui_ai/qwen2.5-vl-abliterated` 实测：主叙事成功返回结构化决策（凌梦人格回复「吃过了，主人。」）。
+> 已用本地 AstrBot + Ollama `huihui_ai/qwen2.5-vl-abliterated` 实测：主叙事成功返回结构化决策（"吃过了，主人。"）；注入"当前对端: 主人Kela（我的主人）"后模型回"在，主人。"；平台注入验证 QQ/Telegram/KOOK。
 
 ## 待发布
 
