@@ -2,26 +2,17 @@
 
 > 聊天在幕前发生，生活在幕间继续。
 
-HDS Interlude 是一个面向 **AstrBot** 的持续叙事聊天框架（Koishi 原版的 AstrBot 移植版）。它让用户消息、角色的沉默、延迟回复、主动联系和自动推进，都成为同一段生活剧本中自然可见的部分，并由一次主叙事写作连贯地决定。
+HDS Interlude 是一个面向 **AstrBot** 一对一与多参与者场景的持续叙事聊天框架。它让用户消息、角色的沉默、延迟回复、主动联系和自动推进，都成为同一段生活剧本中自然可见的部分，并由一次主叙事写作连贯地决定。
 
-当前版本：`v0.1.0`（测试版）。定位为**上游核心叙事子集的移植**：持续生活剧本、主叙事写作、时间感知、长期事实记忆。
-
-| 项目 | 当前信息 |
-| --- | --- |
-| 插件名 | `astrbot_plugin_hds_interlude` |
-| 版本 | `v0.1.0` |
-| AstrBot | `>= 4.16` |
-| 支持平台 | `aiocqhttp` |
-| 上游 | [HDS Interlude (Koishi)](https://gitee.com/MomoiCore/hds-interlude) |
-| 发布 | [KelaLeaf/astrbot_plugin_hds_interlude](https://github.com/KelaLeaf/astrbot_plugin_hds_interlude) |
+当前版本：`v0.1.0`（测试版）。本仓库是上游 Koishi 原版 [hds-interlude](https://gitee.com/MomoiCore/hds-interlude)（`0.1.4-beta3-enhanced`）的 **AstrBot 移植版**，当前聚焦核心叙事子集：持续生活剧本、主叙事写作、时间感知、长期事实记忆。
 
 ## 文档导航
 
-- 安装与配置：本文件
+- 插件安装与配置：见本文件下方 [安装](#安装) 与 [配置](#配置)
 - 架构总览：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - 移植决策与注意事项：[docs/PORTING_NOTES.md](docs/PORTING_NOTES.md)
 - 跟进上游更新：[docs/UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md)
-- 上游原版文档：见本仓库 `upstream/` 目录（只读快照）
+- 上游 Koishi 原版文档：见 [MomoiCore/hds-interlude](https://gitee.com/MomoiCore/hds-interlude)
 
 ## 它解决什么问题
 
@@ -37,9 +28,13 @@ HDSI 以主角为中心维护持续剧情状态：角色拥有日程、关系、
 
 ### 活跃场景是短期连续性的来源
 
-每次主叙事写作都会读取当前活跃场景中最近发生的真实条目：用户事件、已成功投递的角色消息、剧本段落与必要的场景摘要。它保留原始对话的语义、说话顺序和时间信息，同时通过字符预算控制上下文规模。
+每次主叙事写作都会读取当前活跃场景中最近发生的真实条目：用户 / 群聊事件、已成功投递的角色消息、剧本段落与必要的场景摘要。它保留原始对话的语义、说话顺序和时间信息，同时通过字符预算控制上下文规模。
 
-### 一次消息如何变成剧情
+### 固定阶段，连续生活
+
+HDSI 不以时间间隔切换写作尺度，而是按当前事件进入四种明确阶段：用户消息、对话后续、到期意图与独立生活推进。每一轮都从故事游标补写已经经过的时间，并以当前本地时间结束；调度间隔只决定何时唤醒写作，不会预设剧情的密度、情绪或篇幅。
+
+## 一次消息如何变成剧情
 
 ```text
 用户发送消息 / 图片
@@ -72,38 +67,59 @@ HDSI 按用途分层组织信息，让每次请求获得恰当的连续性，同
 
 ## 安装
 
-1. 把 `astrbot_plugin_hds_interlude` 放入 AstrBot 的插件目录。
+本插件为 AstrBot 插件，需放入 AstrBot 的插件目录后于后台启用：
+
+1. 把 `astrbot_plugin_hds_interlude` 文件夹放入 AstrBot 的插件目录。
 2. 在 AstrBot 后台安装依赖：`requirements.txt` 含 `httpx`、`pyyaml`。
 3. 重启 AstrBot，进入插件配置页填写模型与剧本起点。
 
 ## 配置
 
-见 `_conf_schema.json`。核心项：
+配置项见 `_conf_schema.json`（AstrBot 插件配置页会读取）。核心项：
 
 - **模型**：`enabled` 勾选后使用独立 OpenAI 兼容连接；否则走 AstrBot 默认模型。
 - **剧本起点**：主角姓名、角色设定、世界设定、叙事风格、时区。
 - **运行时**：私聊拦截开关、自动创建开关、上下文条目数、长期事实数。
+- **OneBot 白名单**：`runtime.allowed_user_ids`，留空放行所有 OneBot 用户，填入后仅处理列出的用户 ID。
 
-## 使用
+建议配置顺序：先填基础设定与模型，再配置平台与运行时，最后按需调整叙事节奏。
 
-私聊直接发消息即进入叙事。管理命令：`/hdsi.status` 查看当前主剧本状态。
+## 常用管理员指令
 
-## 隐私
+以下指令使用 `hdsi` 主命令（移植版风格，区别于上游的 `interlude`）：
 
-- 密钥不写死，从 AstrBot 配置里读。
-- 数据只存本地，不对外上报。
-- 除配置的模型接口外，不请求其他接口。
+| 指令 | 作用 |
+| --- | --- |
+| `hdsi.status` | 查看当前主剧本、角色、叙事轮次与记忆状态。 |
 
-## 本移植版 vs 上游
+## 平台支持与现状
 
-本仓库是**核心叙事子集**，下列上游能力**尚未移植**（如实标注，非缺陷）：
+本移植版当前**已适配**：
 
-- OneBot / NapCat 账号白名单与群聊管控
+- **OneBot / NapCat（QQ）**：通过 `@filter.platform_adapter_type(AIOCQHTTP)` 处理私聊文本；支持可选用户白名单。
+
+**尚未移植**（见下方 `本移植版 vs 上游`）：
+
+- OneBot 群聊白名单与群消息进叙事
 - 主体行动窗口（Agency Window）
 - 情绪偏移追踪（Alter System）
 - 图片视觉、QQ 语音转写、网页观察
 - 完整记忆分层（Overlay / Perspective / 剧情余波）
 - 后台自动生活推进（基础已具备）
+
+## 使用边界
+
+- HDSI 依赖模型的写作与结构化输出能力。较小或不稳定的模型更容易出现格式失败、过度重复或关系跳跃。
+- 自动推进基于已记录状态补写角色生活，适合叙事陪伴与角色互动；医疗、紧急救助、法律及其他高风险场景应使用相应的专业服务。
+- 主动联系需要显式开启，并始终受白名单、参与者资料、意愿阈值与单轮数量限制。
+- 数据仅存本地，不对外上报；模型密钥走 AstrBot 配置，不硬编码在源码。
+
+## 开发与验证
+
+```bash
+cd plugin
+python -m tests.test_core   # 核心单元测试（12 项，不依赖 AstrBot SDK）
+```
 
 ## 许可证
 
