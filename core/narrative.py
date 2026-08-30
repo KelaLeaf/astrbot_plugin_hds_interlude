@@ -28,6 +28,16 @@ from .types import (
 
 _UTC = timezone.utc
 
+
+def kind_value(kind) -> str:
+    """返回枚举/字符串 kind 的字符串值。兼容从 JSON 反序列化后 kind 为字符串的情况。"""
+    if isinstance(kind, str):
+        return kind
+    if hasattr(kind, "value"):
+        return str(kind.value)
+    return str(kind)
+
+
 # 主叙事使用的结构输出协议（JSON）。
 _NARRATIVE_SCHEMA_INSTRUCTION = (
     "You are the continuity engine of a persistent, character-centered life script. "
@@ -98,13 +108,13 @@ def _build_messages(ctx: NarrativeContext, prompts: dict, locale_style: str) -> 
     if ctx.recent_entries:
         lines.append("Recent script entries:")
         for entry in ctx.recent_entries[-30:]:
-            sender = entry.participant_id or entry.kind.value
+            sender = entry.participant_id or kind_value(entry.kind)
             lines.append(f"[{entry.created_at or ''}] {sender}: {entry.content}")
 
     # 当前事件
     if ctx.current_intent:
         intent = ctx.current_intent
-        lines.append(f"Current event ({intent.kind.value}): {intent.content}")
+        lines.append(f"Current event ({kind_value(intent.kind)}): {intent.content}")
 
     user_text = "\n".join(lines)
     return [
