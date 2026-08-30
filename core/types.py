@@ -37,6 +37,7 @@ class StorySetting:
     world: str = ""
     supporting_cast: str = ""
     location: str = ""
+    extra_setting: str = ""          # 其它设定补充：自由文本，主叙事时注入
     style: str = "现实主义日常叙事，情绪克制，关系变化缓慢而具体。"
     timezone: str = "Asia/Shanghai"
 

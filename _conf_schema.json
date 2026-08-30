@@ -75,6 +75,12 @@
         "condition": {"persona_id": ""},
         "default": ""
       },
+      "extra_setting": {
+        "type": "text",
+        "description": "其它设定补充",
+        "hint": "额外的人格/世界观/背景等自由文本，主叙事时注入",
+        "default": ""
+      },
       "style": {
         "type": "text",
         "description": "叙事文风",
