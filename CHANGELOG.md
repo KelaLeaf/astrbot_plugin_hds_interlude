@@ -15,6 +15,13 @@
 
 未移植（见 README「本移植版 vs 上游」）：群聊、Agency Window、Alter System、图片视觉、QQ 语音转写、网页观察、完整记忆分层、后台自动生活推进。
 
+## 实测修复
+
+- 叙事 JSON 请求兼容低配模型：`response_format=json_object` 在部分 Ollama 模型上导致 500，失败时回落为普通请求 + 宽松提取。
+- `_data_dir` 用固定插件名替代 `self.name`（Star 基类无 name 属性），修复插件加载 AttributeError。
+
+> 已用本地 AstrBot + Ollama `huihui_ai/qwen2.5-vl-abliterated` 实测：主叙事成功返回结构化决策（凌梦人格回复「吃过了，主人。」）。
+
 ## 待发布
 
 - 后台自动生活推进（角色在用户不说话时也持续生活）。
