@@ -81,18 +81,6 @@
         "condition": {"persona_id": ""},
         "default": "现实主义日常叙事，情绪克制，关系变化缓慢而具体。"
       },
-      "user_profile": {
-        "type": "text",
-        "description": "当前对端称呼",
-        "hint": "例: 主人Kela；填写后角色会认得当前对话方",
-        "default": ""
-      },
-      "relationship": {
-        "type": "text",
-        "description": "与对端关系",
-        "hint": "例: 我的主人，我会对他言听计从",
-        "default": ""
-      },
       "timezone": {
         "type": "string",
         "description": "时区",
