@@ -1,159 +1,131 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "HDS Interlude Config",
-  "type": "object",
-  "properties": {
-    "model": {
-      "type": "object",
-      "title": "模型",
-      "description": "OpenAI 兼容主叙事模型连接。若留空则使用 AstrBot 的默认 LLM 配置。",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "title": "启用独立模型连接",
-          "description": "勾选后使用下方 endpoint/apiKey/model，否则走 AstrBot 默认 LLM Provider。",
-          "default": false
-        },
-        "endpoint": {
-          "type": "string",
-          "title": "Chat Completions 地址",
-          "description": "完整地址，例如 https://api.openai.com/v1/chat/completions",
-          "default": ""
-        },
-        "api_key": {
-          "type": "string",
-          "title": "API Key",
-          "description": "模型鉴权密钥。",
-          "default": ""
-        },
-        "model": {
-          "type": "string",
-          "title": "模型名",
-          "description": "服务商实际模型名，例如 gpt-4o-mini。",
-          "default": ""
-        },
-        "temperature": {
-          "type": "number",
-          "title": "采样温度",
-          "default": 0.8,
-          "minimum": 0,
-          "maximum": 2
-        },
-        "max_tokens": {
-          "type": "integer",
-          "title": "最大输出 token",
-          "default": 4096,
-          "minimum": 0,
-          "maximum": 100000
-        },
-        "timeout_seconds": {
-          "type": "integer",
-          "title": "请求超时（秒）",
-          "default": 60
-        }
+  "model": {
+    "type": "object",
+    "description": "OpenAI 兼容主叙事模型连接。若留空则使用 AstrBot 的默认 LLM 配置。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用独立模型连接：勾选后使用下方 endpoint/apiKey/model，否则走 AstrBot 默认 LLM Provider。",
+        "default": false
+      },
+      "endpoint": {
+        "type": "string",
+        "description": "Chat Completions 完整地址，例如 https://api.openai.com/v1/chat/completions。",
+        "default": ""
+      },
+      "api_key": {
+        "type": "string",
+        "description": "模型鉴权密钥。",
+        "default": ""
+      },
+      "model": {
+        "type": "string",
+        "description": "服务商实际模型名，例如 gpt-4o-mini。",
+        "default": ""
+      },
+      "temperature": {
+        "type": "float",
+        "description": "采样温度。",
+        "default": 0.8,
+        "slider": {"min": 0, "max": 2, "step": 0.1}
+      },
+      "max_tokens": {
+        "type": "int",
+        "description": "最大输出 token。",
+        "default": 4096
+      },
+      "timeout_seconds": {
+        "type": "int",
+        "description": "请求超时（秒）。",
+        "default": 60
       }
-    },
-    "story": {
-      "type": "object",
-      "title": "剧本起点",
-      "description": "主角、世界、默认关系、地点、时区和叙事风格。",
-      "properties": {
-        "character_name": {
-          "type": "string",
-          "title": "主角名称",
-          "default": "Unnamed character"
-        },
-        "character_profile": {
-          "type": "string",
-          "title": "角色设定",
-          "description": "主角的背景、性格、日程和说话方式。",
-          "default": ""
-        },
-        "world": {
-          "type": "string",
-          "title": "世界设定",
-          "description": "故事时代、地点和现实规则。",
-          "default": ""
-        },
-        "style": {
-          "type": "string",
-          "title": "叙事风格",
-          "description": "该主剧本的文风。",
-          "default": "现实主义日常叙事，情绪克制，关系变化缓慢而具体。"
-        },
-        "timezone": {
-          "type": "string",
-          "title": "时区",
-          "description": "用于自动推进、休息窗口和延迟时间解析的 IANA 时区。",
-          "default": "Asia/Shanghai"
-        }
+    }
+  },
+  "story": {
+    "type": "object",
+    "description": "剧本起点：主角、世界、默认关系、地点、时区和叙事风格。",
+    "items": {
+      "character_name": {
+        "type": "string",
+        "description": "主角名称。",
+        "default": "Unnamed character"
+      },
+      "character_profile": {
+        "type": "text",
+        "description": "主角的背景、性格、日程和说话方式。",
+        "default": ""
+      },
+      "world": {
+        "type": "text",
+        "description": "故事时代、地点和现实规则。",
+        "default": ""
+      },
+      "style": {
+        "type": "text",
+        "description": "该主剧本的文风。",
+        "default": "现实主义日常叙事，情绪克制，关系变化缓慢而具体。"
+      },
+      "timezone": {
+        "type": "string",
+        "description": "用于自动推进、休息窗口和延迟时间解析的 IANA 时区。",
+        "default": "Asia/Shanghai"
       }
-    },
-    "runtime": {
-      "type": "object",
-      "title": "对话与时间",
-      "description": "消息合并、回复投递、失败重试和自动生活推进。",
-      "properties": {
-        "capture_direct_messages": {
-          "type": "boolean",
-          "title": "拦截私聊文本",
-          "default": true
-        },
-        "auto_create": {
-          "type": "boolean",
-          "title": "自动创建主剧本",
-          "description": "无主剧本时是否自动启动。关闭后需手动触发。",
-          "default": false
-        },
-        "allowed_user_ids": {
-          "type": "array",
-          "title": "允许互动的用户 ID 白名单",
-          "description": "留空表示允许所有 OneBot/NapCat 私聊用户；填入后仅这些 ID 会被处理。对应上游的 OneBot 用户白名单。",
-          "items": { "type": "string" },
-          "default": []
-        },
-        "context_entry_limit": {
-          "type": "integer",
-          "title": "上下文条目数",
-          "description": "主模型读取的最近剧本条目数。",
-          "default": 30,
-          "minimum": 1,
-          "maximum": 200
-        },
-        "memory_limit": {
-          "type": "integer",
-          "title": "长期事实数量",
-          "default": 20,
-          "minimum": 1,
-          "maximum": 200
-        },
-        "min_delayed_reply_seconds": {
-          "type": "integer",
-          "title": "最短延迟回复（秒）",
-          "default": 10
-        },
-        "max_delayed_reply_minutes": {
-          "type": "integer",
-          "title": "最长延迟回复（分钟）",
-          "default": 1440
-        }
+    }
+  },
+  "runtime": {
+    "type": "object",
+    "description": "对话与时间：消息合并、回复投递、失败重试和自动生活推进。",
+    "items": {
+      "capture_direct_messages": {
+        "type": "bool",
+        "description": "拦截私聊文本。",
+        "default": true
+      },
+      "auto_create": {
+        "type": "bool",
+        "description": "无主剧本时是否自动启动。关闭后需手动触发。",
+        "default": false
+      },
+      "allowed_user_ids": {
+        "type": "list",
+        "description": "OneBot 用户 ID 白名单：留空放行所有，填入后仅处理列出的 ID。对应上游的 OneBot 用户白名单。",
+        "default": []
+      },
+      "context_entry_limit": {
+        "type": "int",
+        "description": "主模型读取的最近剧本条目数。",
+        "default": 30
+      },
+      "memory_limit": {
+        "type": "int",
+        "description": "主模型读取的长期事实数量。",
+        "default": 20
+      },
+      "min_delayed_reply_seconds": {
+        "type": "int",
+        "description": "最短延迟回复（秒）。",
+        "default": 10
+      },
+      "max_delayed_reply_minutes": {
+        "type": "int",
+        "description": "最长延迟回复（分钟）。",
+        "default": 1440
       }
-    },
-    "prompts": {
-      "type": "object",
-      "title": "提示词",
-      "description": "可覆盖的叙事/文风指令。",
-      "properties": {
-        "main_prompt": {
-          "type": "string",
-          "title": "主叙事行为指令",
-          "default": "Continue the character-centered life script with grounded actions, motives, relationships, and ordinary time passing."
-        },
-        "style_prompt": {
-          "type": "string",
-          "title": "全局叙事文风",
-          "default": "Use restrained, realistic prose with concrete daily details, natural pauses, and no forced drama."
-        }
+    }
+  },
+  "prompts": {
+    "type": "object",
+    "description": "可覆盖的叙事/文风指令。",
+    "items": {
+      "main_prompt": {
+        "type": "text",
+        "description": "主叙事行为指令。",
+        "default": "Continue the character-centered life script with grounded actions, motives, relationships, and ordinary time passing."
+      },
+      "style_prompt": {
+        "type": "text",
+        "description": "全局叙事文风。",
+        "default": "Use restrained, realistic prose with concrete daily details, natural pauses, and no forced drama."
       }
     }
   }
