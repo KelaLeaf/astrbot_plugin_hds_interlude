@@ -20,23 +20,44 @@ class HDSInterludePlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self.bridge = AstrbotBridge(self._data_dir(), self.config)
+        self._apply_persona_if_set()
+
+    def _apply_persona_if_set(self) -> None:
+        """配置页选了 persona_id 时，启动即把该 AstrBot 人格导入为角色设定。"""
+        persona_id = None
+        try:
+            if isinstance(self.config, dict):
+                persona_id = self.config.get("persona_id")
+        except Exception as err:  # noqa: BLE001
+            logger.warn(f"hds-interlude: read persona_id failed: {err}")
+        if not persona_id:
+            return
+        try:
+            pm = self.context.persona_manager
+            persona = pm.get_persona(persona_id)
+            system_prompt = getattr(persona, "system_prompt", "") or ""
+            info = self.bridge.import_persona(persona_id=str(persona_id), system_prompt=system_prompt)
+            logger.info(f"hds-interlude: 已从配置导入人格「{persona_id}」→ 角色「{info['character_name']}」")
+        except Exception as err:  # noqa: BLE001
+            logger.warn(f"hds-interlude: apply persona '{persona_id}' failed: {err}")
 
     def _data_dir(self) -> str:
         """插件专属数据目录：data/plugin_data/astrbot_plugin_hds_interlude/"""
+        plugin_name = "astrbot_plugin_hds_interlude"
         try:
             from pathlib import Path
 
             from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
             # get_astrbot_data_path() 返回 str，需转 Path 才能用 / 拼接
-            path = Path(get_astrbot_data_path()) / "plugin_data" / self.name
+            path = Path(get_astrbot_data_path()) / "plugin_data" / plugin_name
             path.mkdir(parents=True, exist_ok=True)
             return str(path)
         except Exception as err:  # noqa: BLE001
             logger.warn(f"hds-interlude: cannot resolve data dir, fallback to ./data: {err}")
             import os
 
-            path = os.path.join("data", "plugin_data", self.name)
+            path = os.path.join("data", "plugin_data", plugin_name)
             os.makedirs(path, exist_ok=True)
             return path
 
