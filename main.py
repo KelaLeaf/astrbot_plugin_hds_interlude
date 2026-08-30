@@ -24,9 +24,12 @@ class HDSInterludePlugin(Star):
     def _data_dir(self) -> str:
         """插件专属数据目录：data/plugin_data/astrbot_plugin_hds_interlude/"""
         try:
+            from pathlib import Path
+
             from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-            path = get_astrbot_data_path() / "plugin_data" / self.name
+            # get_astrbot_data_path() 返回 str，需转 Path 才能用 / 拼接
+            path = Path(get_astrbot_data_path()) / "plugin_data" / self.name
             path.mkdir(parents=True, exist_ok=True)
             return str(path)
         except Exception as err:  # noqa: BLE001
