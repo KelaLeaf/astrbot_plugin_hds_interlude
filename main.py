@@ -137,8 +137,8 @@ class HDSInterludePlugin(Star):
             return
 
         platform = event.get_platform_name()
-        self_id = str(event.self_id)
-        channel_id = str(event.session_id)
+        self_id = str(event.get_self_id())
+        channel_id = str(event.get_session_id())
 
         reply, decision, consumed = await self.bridge.handle_user_message(
             platform, self_id, user_id, channel_id, text,
