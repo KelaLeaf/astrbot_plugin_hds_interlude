@@ -41,12 +41,11 @@ HDS Interlude（幕间系统）的 AstrBot 移植版。聊天在幕前发生，�
 
 - `/hdsi.status`：查看当前主剧本状态。
 
-## 隐私与安全
+## 隐私说明
 
-- **不收集任何密钥或个人信息。** 模型 API Key 等敏感信息通过 AstrBot 的插件配置（`_conf_schema.json`）注入，
-  或直接复用 AstrBot 默认 LLM Provider，**绝不硬编码在源码中**，也不会上传到任何远端。
-- 插件只在本地读写：剧本、参与者、长期事实保存在插件数据目录 `data/plugin_data/astrbot_plugin_hds_interlude/`。
-- 不调用任何外部服务，除了你所配置的模型端点。
+- 插件本身不带任何密钥，模型 API Key 都从 AstrBot 的配置（`_conf_schema.json`）里读，或者直接复用 AstrBot 默认模型。
+- 数据都存本地：剧本、参与者、长期事实放在 `data/plugin_data/astrbot_plugin_hds_interlude/`。
+- 除了你配的那个模型接口，插件不会去连别的地方。
 
 ## 目录
 
