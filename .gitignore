@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时数据
+data/
+*.log
+
+# 平台
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,10 @@
+name: astrbot_plugin_hds_interlude
+display_name: HDS Interlude
+desc: 时间感知的持续叙事聊天框架 AstrBot 移植版。让角色拥有日程、关系、待办、情绪与未完成事件，用户消息作为一项事件参与角色当下的判断与生活。
+short_desc: 时间感知的持续叙事聊天框架 AstrBot 移植版。
+version: v0.1.0
+repo: https://gitee.com/MomoiCore/hds-interlude
+author: Kela
+astrbot_version: ">=4.16,<5"
+tags: ["narrative", "roleplay", "time-aware", "memory"]
+support_platforms: ["qq", "wechat", "telegram", "webchat"]
