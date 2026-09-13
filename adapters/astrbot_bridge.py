@@ -1088,22 +1088,25 @@ class AstrbotHttpClient:
         headers: Optional[dict[str, str]] = None,
         body: Any = None,
         timeout: Optional[int] = None,
+        task: Optional[str] = None,
     ) -> Any:
         payload = body if isinstance(body, dict) else {}
-        # 优先级：**插件自己在 `model_center.providers` 里配了 endpoint 就用它**。
+        # 优先级（从高到低）：
         #
-        # 上游本来就是「每类任务一条自己的 provider」（main / compaction / timeline /
-        # alter / embedding / stickers / vision），任务级路由与连接级参数
-        # （temperature / max_tokens / response_format / extra_body / 思考开关）全都挂在
-        # 那条连接上。无条件改道 AstrBot Provider 会让 `model_center` 里的全部配置静默
-        # 失效——实测过：插件指向桩服务、日志也显示用桩的模型名，请求却仍打到 AstrBot
-        # 的 Ollama 上。
-        #
-        # 只有插件没给出可用 endpoint 时（url 为空/非 http），才回落到 AstrBot Provider，
-        # 保留「不想单独填 key，直接复用 AstrBot 里配好的模型」这条便利路径。
+        # 1. **该任务在 `model_center.task_models` 里指名了 AstrBot Provider** → 用它。
+        #    这是用户针对单个任务做出的明确选择，比连接行的用途勾选更具体。
+        # 2. **插件自己在 `model_center.providers` 里配了 endpoint** → 直连它。
+        #    上游本来就是「每类任务一条自己的 provider」（main / compaction / timeline /
+        #    alter / embedding / stickers / vision），任务级路由与连接级参数
+        #    （temperature / max_tokens / response_format / extra_body / 思考开关）全都挂在
+        #    那条连接上。无条件改道 AstrBot Provider 会让这些配置静默失效——实测过：
+        #    插件指向桩服务、日志也显示用桩的模型名，请求却仍打到 AstrBot 的 Ollama 上。
+        # 3. 两者都没有 → 回落到 AstrBot 的默认 Provider，保留「不想单独填 key，
+        #    直接复用 AstrBot 里配好的模型」这条便利路径。
+        bound = self.bridge.task_model_id(task)
         explicit_endpoint = isinstance(url, str) and url.strip().lower().startswith(('http://', 'https://'))
-        if 'messages' in payload and not explicit_endpoint:
-            routed = await self._chat(payload, timeout)
+        if 'messages' in payload and (bound or not explicit_endpoint):
+            routed = await self._chat(payload, timeout, task=task, provider_id=bound)
             if routed is not None:
                 return routed
         if 'input' in payload and ('model' in payload or 'dimensions' in payload) and not explicit_endpoint:
@@ -1118,14 +1121,48 @@ class AstrbotHttpClient:
         headers: Optional[dict[str, str]] = None,
         body: Any = None,
         timeout: Optional[int] = None,
+        task: Optional[str] = None,
     ) -> AsyncIterator[str]:
-        """流式请求不接管（见类文档）；直接回落 `HttpxHttpClient`。"""
+        """流式请求：**该任务指名了 AstrBot Provider 时**退化成"单块流"。
+
+        AstrBot 的 `llm_generate` 是整段返回的，没有增量通道。但调用方
+        （`request_openai_compatible_streaming`）本身就有兜底：收不到 SSE 增量时
+        会把累积到的原文当普通 JSON 解析一次。所以这里发一次**非流式**请求、把整个
+        响应体当唯一一块吐出去——模型仍然是用户指名的那一个，只是失去"首泡加速"，
+        而不是打到一个完全不相干的 endpoint 上（更不是拿空 URL 去撞 httpx）。
+        """
+        if self.bridge.task_model_id(task):
+            return self._single_chunk_stream(url, headers, body, timeout, task)
         return self._fallback.iterate_sse(url, headers, body, timeout)
+
+    async def _single_chunk_stream(
+        self,
+        url: str,
+        headers: Optional[dict[str, str]],
+        body: Any,
+        timeout: Optional[int],
+        task: Optional[str],
+    ) -> AsyncIterator[str]:
+        """把一次非流式路由结果包装成"只有一个块"的流。"""
+        payload = body if isinstance(body, dict) else {}
+        routed = await self.post_json(url, headers, payload, timeout, task=task)
+        yield json.dumps(routed, ensure_ascii=False)
 
     # ---- chat ----
 
-    async def _chat(self, payload: dict[str, Any], timeout: Optional[int]) -> Optional[dict[str, Any]]:
-        provider_id = await self.bridge.resolve_chat_provider_id()
+    async def _chat(
+        self,
+        payload: dict[str, Any],
+        timeout: Optional[int],
+        task: Optional[str] = None,
+        provider_id: str = '',
+    ) -> Optional[dict[str, Any]]:
+        # 该任务指名了 AstrBot Provider 就用它（比会话默认模型更具体）；
+        # 留空 / 没配过才回落到会话当前模型。
+        if not provider_id:
+            provider_id = self.bridge.task_model_id(task)
+        if not provider_id:
+            provider_id = await self.bridge.resolve_chat_provider_id()
         if not provider_id:
             log_fallback('debug', 'AstrBot 未解析到聊天 Provider：回落到直连 endpoint')
             return None
@@ -1169,8 +1206,19 @@ class AstrbotHttpClient:
                 conversation.append('assistant: %s' % text)
             else:
                 conversation.append(text)
-        if image_urls or audio_urls:
-            self._warn_unsupported_modalities(provider_id, image_urls, audio_urls)
+        # 语音：配了转写模型就转成文字并进 prompt（主模型不必支持音频）
+        if audio_urls:
+            transcript = await self._transcribe(audio_urls)
+            if transcript:
+                conversation.append(transcript)
+                audio_urls = []
+        # 图片：`vision.mode = native` 时主模型自己看；sidecar 模式下图片本来就不该
+        # 出现在主叙事请求里（core 已经换成侧端观察），所以这里只在 native 时报能力。
+        if image_urls and not self.bridge.vision_mode_native():
+            image_urls = []
+        image_urls, audio_urls = self._filter_unsupported_modalities(
+            provider_id, image_urls, audio_urls, task,
+        )
         params: dict[str, Any] = {}
         if payload.get('temperature') is not None:
             params['temperature'] = payload['temperature']
@@ -1217,44 +1265,95 @@ class AstrbotHttpClient:
             },
         }
 
-    def _warn_unsupported_modalities(
+    def _known_modalities(self, provider_id: str) -> Optional[set[str]]:
+        """读该 Provider 声明的模态；**没声明返回 `None`**（区别于"声明了但为空"）。
+
+        `None` 表示"不知道"，调用方必须保持原行为。只有拿到确切声明时才做取舍——
+        没填 `modalities` 的网关多的是，拿"没声明"当"不支持"是帮倒忙。
+        """
+        provider = self.bridge.provider_by_id(provider_id)
+        declared = self.bridge.provider_modalities(provider)
+        return declared or None
+
+    def _filter_unsupported_modalities(
         self,
         provider_id: str,
         image_urls: list[str],
         audio_urls: list[str],
-    ) -> None:
-        """AstrBot Provider 声明不支持该模态时**提醒一次**（不阻断，仍照常送出去）。
+        task: Optional[str],
+    ) -> tuple[list[str], list[str]]:
+        """按 Provider 声明的模态**丢弃确定送不进去的内容**，并说明原因。
 
-        AstrBot 的 Provider 配置里有 `modalities`（`text` / `image` / `audio` / `tool_use`）。
-        用户勾了 `vision.mode = native` 却把连接留空（走 AstrBot Provider），而那个模型
-        只声明了 `text` 时，图片会被服务端忽略——模型看到的只有文字。这种"静默失明"
-        必须让人知道，所以按 provider 去重警告一次。**不主动丢弃**：有的网关没填
-        `modalities` 但实际能吃图，拦下来才是帮倒忙。
+        为什么不是"照常发出去让服务端报错"：AstrBot 的 `Provider.text_chat` 文档写明
+        「如果模型不支持图片输入，将会抛出错误」——真发过去是**整轮失败**，比丢掉图片
+        严重得多。既然 Provider 自己声明了能力，就按声明处理，并把这件事说出来。
+
+        语音有更好的出路：`model_center.audio.provider_id` 指定了语音转写模型时，
+        先转文字再进主模型（见 `_transcribe`），所以这里只处理**没配转写**的情况。
         """
-        needed = []
-        if image_urls:
-            needed.append('image')
-        if audio_urls:
-            needed.append('audio')
-        key = (provider_id, tuple(needed))
+        declared = self._known_modalities(provider_id)
+        if declared is None:
+            return image_urls, audio_urls
+
+        dropped: list[str] = []
+        if image_urls and 'image' not in declared:
+            dropped.append('image')
+            image_urls = []
+        if audio_urls and 'audio' not in declared:
+            dropped.append('audio')
+            audio_urls = []
+        if not dropped:
+            return image_urls, audio_urls
+
+        key = (provider_id, tuple(dropped), task or '')
         if key in self._modality_warned:
-            return
-        provider = self.bridge.provider_by_id(provider_id)
-        declared = self.bridge.provider_modalities(provider)
-        if not declared:
-            return  # 没声明就别猜
-        missing = [item for item in needed if item not in declared]
-        if not missing:
-            return
+            return image_urls, audio_urls
         self._modality_warned.add(key)
-        log_fallback(
-            'warn',
-            'AstrBot Provider %s 只声明了 %s，本轮带上了 %s：如果模型其实不支持，'
-            '请改用 model_center 里自带的视觉 / 音频连接，或把该 Provider 的 modalities 补全',
-            provider_id,
-            '/'.join(sorted(declared)) or '(空)',
-            '/'.join(missing),
-        )
+        # 主叙事缺图片能力时用与 `hdsi_status` 一致的措辞，便于用户对上号
+        if 'image' in dropped and (task in (None, 'main')):
+            log_fallback(
+                'warn',
+                '当前主模型未声明图片能力，图片会被忽略（部分服务商会直接报错），'
+                '建议改用 sidecar；Provider=%s 已声明=%s',
+                provider_id,
+                '/'.join(sorted(declared)),
+            )
+        else:
+            log_fallback(
+                'warn',
+                'AstrBot Provider %s 只声明了 %s，本轮丢掉了 %s：请改名为支持该模态的'
+                '模型，或把该 Provider 的 modalities 补全',
+                provider_id,
+                '/'.join(sorted(declared)),
+                '/'.join(dropped),
+            )
+        return image_urls, audio_urls
+
+    async def _transcribe(self, audio_urls: list[str]) -> Optional[str]:
+        """用指定的语音转写模型把音频变成文字；没配 / 失败返回 `None`。
+
+        `model_center.audio.provider_id`（`_special: select_provider_stt`）指名
+        AstrBot 的 STT Provider。转写成功就把文字并进 prompt——这样**主模型根本不需要
+        支持音频**，也呼应了上游"语音只是用户消息的一种载体"的语义。
+        """
+        provider_id = self.bridge.task_model_id('audio')
+        if not provider_id or not audio_urls:
+            return None
+        provider = self.bridge.provider_by_id(provider_id)
+        get_text = getattr(provider, 'get_text', None)
+        if not callable(get_text):
+            log_fallback('warn', '语音转写模型 %s 不可用；语音将交给主模型', provider_id)
+            return None
+        transcripts: list[str] = []
+        for url in audio_urls:
+            try:
+                text = await get_text(url)
+            except Exception as error:  # noqa: BLE001 - 转写失败不该毁掉整轮
+                log_fallback('warn', '语音转写失败（%s）；语音将交给主模型：%s', provider_id, error)
+                return None
+            transcripts.append(_text(text).strip())
+        joined = '\n'.join(item for item in transcripts if item)
+        return joined or None
 
     # ---- embedding ----
 
@@ -1552,6 +1651,10 @@ class AstrbotBridge:
         #: 配置导入导出要用它写回磁盘；只有它不可用时才退化为直接写 JSON 文件。
         self._live_config: Any = config
         self.logger = logger
+        #: 最近一次解析到的 AstrBot 聊天 / Embedding Provider id，供 `hdsi_status`
+        #: 报「主模型能力」用（能力自检需要知道到底是哪个模型在服务）。
+        self._resolved_chat_provider_id = ''
+        self._resolved_embedding_provider_id = ''
         self.db = Database(database_path(self.data_dir))
         self.transport = AstrbotTransport(self)
         self.http_client = AstrbotHttpClient(self)
@@ -1724,6 +1827,125 @@ class AstrbotBridge:
                     return []
         return []
 
+    # ------------------------------------------------------------------ #
+    # 按任务指定 AstrBot 模型（`model_center.task_models`）
+    # ------------------------------------------------------------------ #
+
+    #: 任务键 → 「该任务的模型来源」在配置里的路径（`(分组, 子键…)`）。
+    #:
+    #: 这一项与上游的连接行是**并列**的：连接行回答"这条连接给哪些任务用"，
+    #: 这里回答"这个任务固定用 AstrBot 的哪个模型"。留空即回落到连接行 → 会话默认，
+    #: 与历史行为完全一致。
+    TASK_MODEL_PATHS: dict[str, tuple[str, ...]] = {
+        'main': ('model', 'main_provider_id'),
+        'compaction': ('model', 'compaction_provider_id'),
+        'alter': ('model', 'alter_provider_id'),
+        'vision': ('model', 'vision', 'provider_id'),
+        'audio': ('model', 'audio', 'provider_id'),
+        'embedding': ('model', 'embedding', 'provider_id'),
+        'stickers': ('stickers', 'provider_id'),
+    }
+
+    def task_model_id(self, task: Optional[str]) -> str:
+        """读「该任务用哪个 AstrBot 模型」。留空 → `''`（沿用默认 Provider）。
+
+        为什么要有这一层：上游每类任务绑一条自己的 OpenAI 兼容连接，而 AstrBot
+        把这些连接统一管在自己的 Provider 列表里。用户想让某个任务复用 AstrBot
+        里配好的模型时，就在这一项里**指名**该 Provider；留空则回落到
+        `resolve_chat_provider_id()`（会话当前模型），与历史行为完全一致。
+        """
+        if not task:
+            return ''
+        path = self.TASK_MODEL_PATHS.get(task)
+        if not path:
+            return ''
+        node: Any = self.section(path[0])
+        for step in path[1:]:
+            if not isinstance(node, dict):
+                return ''
+            node = node.get(step)
+        return node.strip() if isinstance(node, str) and node.strip() else ''
+
+    def task_provider_modalities(self, task: Optional[str]) -> set[str]:
+        """该任务指名的 AstrBot Provider 声明的模态（没指名 / 拿不到 → 空集合）。"""
+        provider_id = self.task_model_id(task)
+        if not provider_id:
+            return set()
+        return self.provider_modalities(self.provider_by_id(provider_id))
+
+    def vision_mode_native(self) -> bool:
+        """`model_center.vision.mode` 是不是 `native`（默认就是 native）。"""
+        vision = self.section('model').get('vision')
+        if not isinstance(vision, dict):
+            return True
+        mode = vision.get('mode')
+        return (mode if isinstance(mode, str) else 'native').strip().lower() != 'sidecar'
+
+    def image_capability_note(self) -> str:
+        """主叙事当前能不能吃图片；不能时返回一句给人看的话，否则空串。
+
+        `hdsi_status` 与启动日志都用它。只在**确定**不支持时说话：Provider 没声明
+        `modalities` 时返回空串——猜出来的结论只会误导人。
+        """
+        provider_id = self.task_model_id('main') or self._resolved_chat_provider_id
+        if not provider_id:
+            return ''
+        declared = self.provider_modalities(self.provider_by_id(provider_id))
+        if not declared or 'image' in declared:
+            return ''
+        return (
+            '当前主模型未声明图片能力，图片会被忽略（部分服务商会直接报错），'
+            '建议改用 sidecar'
+        )
+
+    def any_provider_loaded(self) -> bool:
+        """AstrBot 的 Provider 管理器是否已经装好模型（启动自检等它用）。
+
+        AstrBot 4.28 的启动顺序是**插件先、模型后**：`initialize()` 里 `inst_map`
+        还是空的。等这里是 `True` 再去查 Provider 的 `modalities`，才不会既拿不到
+        结果、又触发宿主那条 "Provider … was not found" 的误导性警告。
+        """
+        for name in ('get_all_providers', 'get_all_embedding_providers'):
+            getter = getattr(self.context, name, None)
+            if not callable(getter):
+                continue
+            try:
+                if list(getter() or []):
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    async def log_model_capabilities(self) -> None:
+        """启动时解析一次模型、把能力结论写进日志（见 `main.HDSInterludePlugin.initialize`）。
+
+        - 能力结论走 `warn`，**只在确定不支持时说话**，默认就能在日志里看到；
+        - 「每个任务用的是哪个模型」走 `info`。注意 `log_fallback` 不读用户的日志等级
+          配置（它没有实例上下文），而 sink 把 `info` 映射到 debug，所以这一份摘要
+          要在插件日志等级调到 DEBUG 时才可见——这是刻意的，免得正常运行时刷屏。
+        """
+        if not self.task_model_id('main') and not self._resolved_chat_provider_id:
+            await self.resolve_chat_provider_id()
+        for task in ('main', 'compaction', 'alter', 'vision', 'stickers', 'embedding', 'audio'):
+            bound = self.task_model_id(task)
+            if bound:
+                log_fallback('info', '模型来源：%s → AstrBot Provider %s', task, bound)
+        for note in (self.image_capability_note(), self.audio_capability_note()):
+            if note:
+                log_fallback('warn', '%s', note)
+
+    def audio_capability_note(self) -> str:
+        """主叙事当前能不能吃音频；不能时返回一句给人看的话，否则空串。"""
+        if self.task_model_id('audio'):
+            return ''  # 已指定语音转写模型，音频不进主模型
+        provider_id = self.task_model_id('main') or self._resolved_chat_provider_id
+        if not provider_id:
+            return ''
+        declared = self.provider_modalities(self.provider_by_id(provider_id))
+        if not declared or 'audio' in declared:
+            return ''
+        return '当前主模型未声明音频能力，语音会被忽略，建议在「语音 / 音频理解」里指定语音转写模型'
+
     async def resolve_chat_provider_id(self) -> str:
         """解析当前会话的 AstrBot 聊天 Provider id。
 
@@ -1737,7 +1959,9 @@ class AstrbotBridge:
                 if inspect.isawaitable(provider_id):
                     provider_id = await provider_id
                 if provider_id:
-                    return _text(provider_id)
+                    resolved = _text(provider_id)
+                    self._resolved_chat_provider_id = resolved
+                    return resolved
             except Exception:  # noqa: BLE001 - 会话没有绑定模型是正常情况
                 pass
         fallback = getattr(self.context, 'get_using_provider', None)
@@ -1751,7 +1975,9 @@ class AstrbotBridge:
             meta = getattr(provider, 'meta', None)
             if callable(meta):
                 try:
-                    return _text(getattr(meta(), 'id', ''))
+                    resolved = _text(getattr(meta(), 'id', ''))
+                    self._resolved_chat_provider_id = resolved
+                    return resolved
                 except Exception:  # pragma: no cover
                     return ''
         return ''
@@ -1794,6 +2020,9 @@ class AstrbotBridge:
         （`Context.get_all_embedding_providers()`，`Provider.get_embedding` /
         `get_embeddings`），跟聊天 Provider 不是一回事；先找专用 Embedding
         Provider，找不到再退回当前会话的 Provider（它可能也支持向量）。
+
+        用户在「Embedding 模型」里指名了 Provider 时优先用它（指名了一个不存在的
+        id 会记一条 warning 再回落，**绝不因此让检索整体失效**）。
         """
         getter = getattr(self.context, 'get_all_embedding_providers', None)
         if callable(getter):
@@ -1802,7 +2031,11 @@ class AstrbotBridge:
             except Exception:  # noqa: BLE001
                 providers = []
             if providers:
-                return providers[0]
+                chosen = self._pick_embedding_provider(providers)
+                self._resolved_embedding_provider_id = (
+                    self._embedding_provider_ids([chosen]) or ['']
+                )[0]
+                return chosen
         fallback = getattr(self.context, 'get_using_provider', None)
         if not callable(fallback):
             return None
@@ -1811,6 +2044,44 @@ class AstrbotBridge:
         except Exception:  # noqa: BLE001
             return None
         return provider
+
+    def _pick_embedding_provider(self, providers: list[Any]) -> Any:
+        """按「Embedding 模型」配置挑一个 Embedding Provider。
+
+        留空 → 列表第一个（保持历史行为）。指名了 id → 精确匹配；匹配不到就
+        warning + 回落第一个，而不是抛错。
+        """
+        wanted = self.task_model_id('embedding')
+        if not wanted:
+            return providers[0]
+        for provider in providers:
+            meta = getattr(provider, 'meta', None)
+            if not callable(meta):
+                continue
+            try:
+                if _text(getattr(meta(), 'id', '')) == wanted:
+                    return provider
+            except Exception:  # noqa: BLE001
+                continue
+        log_fallback(
+            'warn',
+            'Embedding 模型指名的 Provider %s 不存在（可用的：%s）；本轮回落到第一个',
+            wanted,
+            ', '.join(self._embedding_provider_ids(providers)) or '无',
+        )
+        return providers[0]
+
+    @staticmethod
+    def _embedding_provider_ids(providers: list[Any]) -> list[str]:
+        ids = []
+        for provider in providers:
+            meta = getattr(provider, 'meta', None)
+            if callable(meta):
+                try:
+                    ids.append(_text(getattr(meta(), 'id', '')))
+                except Exception:  # noqa: BLE001
+                    continue
+        return [item for item in ids if item]
 
     # ------------------------------------------------------------------ #
     # 投递坐标

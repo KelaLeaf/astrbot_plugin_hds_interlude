@@ -462,6 +462,20 @@ class ChatRequestOverrides(TypedDict, total=False):
 # ========== 传输层 ==========
 
 
+#: `_side_task_json` 的中文任务名 → `model_routing` 的任务键。
+#:
+#: 宿主适配层据此判断"这个旁路任务该用哪个 AstrBot 模型"。上游的 `timeline` /
+#: 日程预排 / Overlay 整理都跟随 `compaction` 的连接（`isAssignedTo` 里没有独立
+#: 开关），所以这里统一映射到 `compaction`。
+SIDE_TASK_ROUTES: dict[str, str] = {
+    '压缩': 'compaction',
+    '时间导演': 'compaction',
+    '日程预排': 'compaction',
+    'Overlay 整理': 'compaction',
+    'Alter 分析': 'alter',
+}
+
+
 class HttpClient(Protocol):
     """本移植版的 HTTP 传输协议（替代上游的 `ctx.http` / 全局 `fetch`）。
 
@@ -479,8 +493,16 @@ class HttpClient(Protocol):
         headers: Optional[dict[str, str]] = None,
         body: Any = None,
         timeout: Optional[int] = None,
+        task: Optional[str] = None,
     ) -> Any:
-        """POST 一个 JSON 请求体，返回解析后的响应对象。"""
+        """POST 一个 JSON 请求体，返回解析后的响应对象。
+
+        `task` 是**本移植版新增**的路由提示（`main` / `compaction` / `alter` /
+        `embedding` / `stickers` / `vision`）：宿主适配层可以据此把该任务改派到
+        AstrBot 里配好的模型。上游没有这个概念（Koishi 侧每类任务固定用自己的
+        provider 连接），所以它只是**可选**参数：普通 HTTP 传输实现直接忽略，
+        `url` 仍然是权威目标。见 `docs/PORTING_NOTES.md` 的「模型来源」一节。
+        """
         ...
 
     def iterate_sse(
@@ -489,8 +511,9 @@ class HttpClient(Protocol):
         headers: Optional[dict[str, str]] = None,
         body: Any = None,
         timeout: Optional[int] = None,
+        task: Optional[str] = None,
     ) -> AsyncIterator[str]:
-        """POST 一个 JSON 请求体，按块产出解码后的响应文本。"""
+        """POST 一个 JSON 请求体，按块产出解码后的响应文本（`task` 同 `post_json`）。"""
         ...
 
 
@@ -556,8 +579,12 @@ class HttpxHttpClient:
         headers: Optional[dict[str, str]] = None,
         body: Any = None,
         timeout: Optional[int] = None,
+        task: Optional[str] = None,
     ) -> Any:
-        """POST 一个 JSON 请求体；非 2xx 抛 `HttpStatusError`。"""
+        """POST 一个 JSON 请求体；非 2xx 抛 `HttpStatusError`。
+
+        `task` 只是给宿主适配层的路由提示，直连传输按 `url` 走，忽略它。
+        """
         client = self._ensure_client()
         response = await client.post(
             url, headers=headers or {}, content=self._encode(body), timeout=self._timeout(timeout),
@@ -581,6 +608,7 @@ class HttpxHttpClient:
         headers: Optional[dict[str, str]] = None,
         body: Any = None,
         timeout: Optional[int] = None,
+        task: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """流式 POST；按块产出解码后的文本（与 `TextDecoder` 的 `{stream: true}` 等价）。"""
         return self._stream(url, headers, body, timeout)
@@ -767,7 +795,9 @@ class OpenAICompatibleEmbedder:
         if _is_number(dimensions) and dimensions > 0:
             body['dimensions'] = dimensions
         headers = _json_headers(provider)
-        response = await self.http.post_json(endpoint, headers, body, _get(embedding, 'timeout'))
+        response = await self.http.post_json(
+            endpoint, headers, body, _get(embedding, 'timeout'), task='embedding',
+        )
         vector = _get(_first(_get(response, 'data')), 'embedding')
         if not isinstance(vector, list) or not vector:
             raise RuntimeError('Embedding provider returned an invalid vector.')
@@ -1037,7 +1067,7 @@ class OpenAICompatibleNarrator:
                 'stream': True,
                 'thinking': {'type': 'enabled'},
                 'reasoning_effort': _or(provider.get('reasoning_effort'), 'high'),
-            }, headers, on_stream_text if streaming_early_reply else None, collect, self.http)
+            }, headers, on_stream_text if streaming_early_reply else None, collect, self.http, task='main')
         elif streaming_early_reply:
             text = await request_openai_compatible_streaming(
                 provider.get('endpoint'),
@@ -1047,6 +1077,7 @@ class OpenAICompatibleNarrator:
                 on_stream_text,
                 collect,
                 self.http,
+                task='main',
             )
         else:
             response = await self.http.post_json(
@@ -1054,6 +1085,7 @@ class OpenAICompatibleNarrator:
                 {**headers},
                 with_deepseek_thinking(provider, request_body),
                 _coalesce(overrides.get('timeout'), provider.get('timeout')),
+                task='main',
             )
             collect(_get(response, 'usage'))
             text = extract_chat_text(response)
@@ -1131,6 +1163,7 @@ class OpenAICompatibleNarrator:
                 return parse(text)
             response = await self.http.post_json(
                 provider.get('endpoint'), headers, with_deepseek_thinking(provider, body), timeout,
+                task=SIDE_TASK_ROUTES.get(task, 'compaction'),
             )
             collect(_get(response, 'usage'))
             last_error: Exception = RuntimeError('No textual response field found.')
@@ -1509,6 +1542,7 @@ class OpenAICompatibleNarrator:
         try:
             response = await self.http.post_json(
                 provider.get('endpoint'), headers, with_deepseek_thinking(provider, request_body), provider.get('timeout'),
+                task='stickers',
             )
             collect(_get(response, 'usage'))
             text = extract_chat_text(response)
@@ -1592,6 +1626,7 @@ class OpenAICompatibleNarrator:
                             provider.get('endpoint'), headers,
                             with_deepseek_thinking(provider, {**request_body, 'stream': False}),
                             provider.get('timeout'),
+                            task='vision',
                         )
                         self._collect_usage(usages, '侧端识图', provider, provider.get('model'), _get(response, 'usage'))
                         text = extract_chat_text(response).strip()[:3_000]
@@ -1770,6 +1805,7 @@ async def request_zhipu_streaming(
     on_text: Optional[Callable[[str], Awaitable[None]]] = None,
     collect_usage: Optional[Callable[[Any], None]] = None,
     http: Any = None,
+    task: Optional[str] = None,
 ) -> str:
     """智谱官方通道的流式请求（上游 `requestZhipuStreaming`）。
 
@@ -1780,7 +1816,7 @@ async def request_zhipu_streaming(
     """
     client = resolve_http(http)
     loop = asyncio.get_running_loop()
-    stream = client.iterate_sse(endpoint, headers, body, None).__aiter__()
+    stream = client.iterate_sse(endpoint, headers, body, None, task=task).__aiter__()
     received_visible_token = False
     first_token_timed_out = False
     deadline = loop.time() + ZHIPU_FIRST_VISIBLE_TOKEN_TIMEOUT / 1000
@@ -1838,6 +1874,7 @@ async def request_openai_compatible_streaming(
     on_text: Optional[Callable[[str], Awaitable[None]]] = None,
     collect_usage: Optional[Callable[[Any], None]] = None,
     http: Any = None,
+    task: Optional[str] = None,
 ) -> str:
     """普通 OpenAI 兼容端点的实验性 SSE 通道（上游 `requestOpenAICompatibleStreaming`）。
 
@@ -1850,7 +1887,7 @@ async def request_openai_compatible_streaming(
     limit_ms = max(1_000, timeout if _is_number(timeout) else 1_000)
     deadline = loop.time() + limit_ms / 1000
     timed_out = False
-    stream = client.iterate_sse(endpoint, headers, body, timeout).__aiter__()
+    stream = client.iterate_sse(endpoint, headers, body, timeout, task=task).__aiter__()
     pending = ''
     content = ''
     raw = ''
