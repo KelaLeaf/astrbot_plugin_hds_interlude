@@ -1226,20 +1226,22 @@ class AssemblyTests(unittest.TestCase):
         """
         import subprocess
         import sys
-        from pathlib import Path
 
-        repo_root = Path(__file__).resolve().parents[2]
+        from . import PACKAGE_NAME, REPO_ROOT
+
+        # 两种仓库布局都能跑：本地工作区包名是 `plugin`（cwd=仓库根），
+        # 发布仓里仓库根**就是**插件根，包名是仓库目录名（PEP 420 命名空间包）。
         program = (
             'import sys, importlib\n'
-            'importlib.import_module("plugin.core.service")\n'
-            'importlib.import_module("plugin.core.narrator")\n'
+            f'importlib.import_module({PACKAGE_NAME + ".core.service"!r})\n'
+            f'importlib.import_module({PACKAGE_NAME + ".core.narrator"!r})\n'
             'leaked = sorted(m for m in sys.modules\n'
             '                if m == "astrbot" or m.startswith("astrbot."))\n'
             'print("LEAKED:" + ",".join(leaked))\n'
         )
         proc = subprocess.run(
             [sys.executable, '-c', program],
-            cwd=str(repo_root), capture_output=True, text=True,
+            cwd=REPO_ROOT, capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         marker = [line for line in proc.stdout.splitlines() if line.startswith('LEAKED:')]
