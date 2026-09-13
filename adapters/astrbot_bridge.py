@@ -1399,6 +1399,30 @@ def _local_apply_section_aliases(raw: Any) -> dict[str, Any]:
     return source
 
 
+def _deep_merge(base: Any, incoming: Any) -> Any:
+    """把 `incoming` **显式写出的键**叠到 `base` 上（字典递归，其余整体替换）。
+
+    `incoming` 里没出现的键一律保持 `base` 的值——这就是配置导入「合并而不是替换」
+    那条硬要求的实现本体。列表整体替换（provider / 群规则这类列表没法逐项合并）。
+    """
+    if isinstance(base, dict) and isinstance(incoming, dict):
+        result = dict(base)
+        for key, value in incoming.items():
+            result[key] = _deep_merge(result[key], value) if key in result else value
+        return result
+    return incoming
+
+
+def explicit_config(raw: Any) -> dict[str, Any]:
+    """只取用户**显式写出**的配置：统一分组名与键名，**不补默认值**。
+
+    与 `normalize_bridge_config` 的区别就在"不补默认值"——导入时必须知道文件里
+    到底写了什么，否则补出来的默认值会盖掉磁盘上用户改过的值（例如手写片段只写
+    `characterName`，补默认值会让 `timezone` 被默认值顶掉）。
+    """
+    return _fallback_normalize_config(_local_apply_section_aliases(raw))
+
+
 def normalize_bridge_config(raw: Any) -> dict[str, Any]:
     """把 AstrBot 配置归一成 `core/service` 认得的 snake_case 结构。
 
@@ -1965,15 +1989,29 @@ class AstrbotBridge:
             note=note,
         )
 
+    def _merge_import(self, incoming: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """算导入的**实际写盘目标**与变更概览。
+
+        返回 `(current, target, diff)`。关键是 `target` 才是"导入之后配置长什么样"，
+        预览与报告都必须拿它跟 `current` 比——拿文件原文比会把磁盘上"文件里没提到
+        的键"全报成 `removed`，用户会以为导入会清空配置（实际不会）。
+        """
+        from ..core.config_io import diff_config  # noqa: PLC0415
+
+        current = normalize_bridge_config(self.raw_config())
+        # 只叠用户**显式写出**的键：补过默认值的副本会把磁盘上的用户值顶掉
+        target = normalize_bridge_config(_deep_merge(current, explicit_config(incoming)))
+        return current, target, diff_config(current, target)
+
     def preview_config_import(self, payload: Any) -> dict[str, Any]:
-        """只解析与比较，**不写盘**——给导入前的 y/n 确认用。"""
-        from ..core.config_io import diff_config, parse_import  # noqa: PLC0415
+        """只解析与比较，**不写盘**——给导入前的确认用。"""
+        from ..core.config_io import parse_import  # noqa: PLC0415
 
         parsed = parse_import(payload)
-        merged = normalize_bridge_config(parsed['config'])
-        current = normalize_bridge_config(self.raw_config())
-        parsed['diff'] = diff_config(current, merged)
-        parsed['section_count'] = len(merged)
+        _current, _target, diff = self._merge_import(parsed['config'])
+        parsed['diff'] = diff
+        # 分组数报告**文件里显式写的**分组数，不是补完默认值后的分组数
+        parsed['section_count'] = len(explicit_config(parsed['config']))
         return parsed
 
     async def import_config(self, payload: Any) -> dict[str, Any]:
@@ -1983,7 +2021,7 @@ class AstrbotBridge:
         归一化走 `core.service.config.normalize_config`（分组别名 + 默认值补全），
         迁移链走 `core.config_io.migrate_config`；两者都不丢未知键。
         """
-        from ..core.config_io import ConfigImportError, diff_config, parse_import  # noqa: PLC0415
+        from ..core.config_io import ConfigImportError, parse_import  # noqa: PLC0415
         from ..core.service.config import to_schema_shape  # noqa: PLC0415
 
         try:
@@ -1991,21 +2029,14 @@ class AstrbotBridge:
         except ConfigImportError:
             raise
         incoming = parsed['config']
-        current_raw = self.raw_config()
-        merged = normalize_bridge_config(incoming)      # camel→snake + 别名 + 默认值
-        current_normalized = normalize_bridge_config(current_raw)
-        diff = diff_config(current_normalized, merged)
+        _current, target, diff = self._merge_import(incoming)
 
-        # 合并写入：以**磁盘上现有的配置**为底，叠加归一化后的新值。
-        # 这样用户没在导出文件里出现的键不会被清掉，AstrBot 自己维护的私有键也留住。
-        target = normalize_bridge_config(current_raw)
-        target.update(merged)
         # 落盘必须是 **schema 形状**（`model_center` / `qq_access`）：AstrBot 的配置页
         # 按 `_conf_schema.json` 渲染，写成上游名会让用户在配置页看到"全是默认值"。
         saved_via = await self._save_config(to_schema_shape(target))
 
         # 让运行中的服务立刻用上新配置，不必重启
-        self.config = normalize_bridge_config(target)
+        self.config = target
         try:
             self.service.config = self.config
         except Exception:  # noqa: BLE001 - 服务未就绪时忽略

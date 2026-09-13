@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "HDS Interlude"
+  },
+  "pages": {
+    "config-backup": {
+      "title": "配置备份",
+      "description": "导出或导入 HDS Interlude 的插件配置（只含配置，不含剧情数据）。"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "HDS Interlude"
+  },
+  "pages": {
+    "config-backup": {
+      "title": "Config backup",
+      "description": "Export or import the HDS Interlude plugin configuration (settings only, no story data)."
+    }
+  }
+}

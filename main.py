@@ -39,19 +39,13 @@ from astrbot.api.star import Context, Star
 from .adapters.astrbot_bridge import (
     AstrbotBridge,
     COMMAND_WORD_RE,
+    PLUGIN_NAME,
     build_bridge,
     endpoint_for_event,
     session_view,
 )
 
-__all__ = [
-    'COMMANDS',
-    'COMMAND_HANDLERS',
-    'HDSInterludePlugin',
-    'LOCAL_EXTENSION_COMMANDS',
-    'MANAGEMENT_COMMANDS',
-    'UPSTREAM_COMMAND_COUNT',
-]
+__all__ = ['COMMANDS', 'COMMAND_HANDLERS', 'HDSInterludePlugin', 'MANAGEMENT_COMMANDS']
 
 
 # =========================================================================== #
@@ -158,30 +152,10 @@ COMMANDS: tuple[CommandSpec, ...] = (
         'interlude.purge.range', 'hdsi_purge_range', 'hdsi_purge_range', 'admin',
         'hdsi_purge_range <开始> <结束>',
     ),
-    # 本移植版新增（上游 Koishi 没有）：配置的导出与导入。
-    CommandSpec(
-        'interlude.config.export', 'hdsi_config_export', 'hdsi_config_export', 'admin',
-        'hdsi_config_export',
-    ),
-    CommandSpec(
-        'interlude.config.import', 'hdsi_config_import', 'hdsi_config_import', 'admin',
-        'hdsi_config_import [JSON]',
-    ),
 )
 
 #: AstrBot 命令名 → 处理器方法名。
 COMMAND_HANDLERS: dict[str, str] = {spec.command: spec.handler for spec in COMMANDS}
-
-#: 本移植版**新增**的命令（上游 Koishi 的 `registerCommands()` 里没有）。
-#: 上游对齐性的断言用 `len(COMMANDS) - len(LOCAL_EXTENSION_COMMANDS) == 32` 表达，
-#: 这样将来再加本地命令不会把"上游 32 条都在"的性质测丢。
-LOCAL_EXTENSION_COMMANDS: frozenset[str] = frozenset({
-    'hdsi_config_export',
-    'hdsi_config_import',
-})
-
-#: 上游 `interlude.*` 命令条数（`upstream/src/index.ts` 的 `registerCommands()`）。
-UPSTREAM_COMMAND_COUNT = 32
 
 #: 盲区模式下需要从 `star_handlers_registry` 摘除的 handler 方法名。
 MANAGEMENT_COMMANDS: frozenset[str] = frozenset(COMMAND_HANDLERS.values())
@@ -199,47 +173,38 @@ CONFIRMATION_TIMEOUT_SECONDS = 60
 CONFIRMATION_YES_RE = re.compile(r'^(?:y|yes)$', re.IGNORECASE)
 
 
-def _read_file_component(component: Any) -> Optional[str]:
-    """尽力从一个消息组件里读出文本内容（配置导入用）。
+async def _page_import_payload() -> Optional[str]:
+    """从插件页请求里取配置文本。
 
-    只认 AstrBot 的 `File` 段（鸭子类型：同时有 `name` 与 `file_`），这样图片/语音
-    这些同样带 `file` 属性的段不会被误当成配置。优先读本地路径，其次读
-    `base64://` / `file://` / `http(s)` URL。任何一步失败都返回 `None`——
-    导入命令自己会给"没找到配置内容"的提示，不需要抛。
+    优先级：**multipart 上传的文件**（`file` / `config` 字段）→ JSON body 里的
+    `payload`（文本）或 `config`（对象）。取不到返回 `None`，由调用方给出提示。
     """
-    import base64 as _base64  # noqa: PLC0415
-    import urllib.request  # noqa: PLC0415
+    from astrbot.api.web import request  # noqa: PLC0415 - 宿主 API，测试里用桩
 
-    if not (hasattr(component, 'name') and hasattr(component, 'file_')):
-        return None
-    candidates = [getattr(component, 'file', None), getattr(component, 'url', None)]
     try:
-        for candidate in candidates:
-            if not isinstance(candidate, str) or not candidate:
-                continue
-            if os.path.isfile(candidate):
-                with open(candidate, encoding='utf-8-sig') as handle:
-                    return handle.read()
-            if candidate.startswith('base64://'):
-                return _base64.b64decode(candidate[len('base64://'):]).decode('utf-8-sig')
-            if candidate.startswith('file://'):
-                with open(candidate[len('file://'):], encoding='utf-8-sig') as handle:
-                    return handle.read()
-            if candidate.startswith(('http://', 'https://')):
-                with urllib.request.urlopen(candidate, timeout=15) as response:  # noqa: S310
-                    return response.read().decode('utf-8-sig')
-    except Exception:  # noqa: BLE001 - 读不到就当没有附件
-        return None
-    return None
+        files = await request.files()
+    except Exception:  # noqa: BLE001 - 不是 multipart
+        files = None
+    if files:
+        upload = files.get('file') or files.get('config')
+        if upload is not None:
+            try:
+                data = await upload.read()
+            except Exception:  # noqa: BLE001
+                data = None
+            if data:
+                return data.decode('utf-8-sig', errors='replace')
 
-#: 上游 `requireManager` 失败文案（三种写法与上游逐字一致）。
-NO_MANAGER = '当前 QQ 没有共享主剧本的管理权限。'
-NO_MANAGER_DETAIL = (
-    '当前 QQ 没有共享主剧本的管理权限。'
-    '请在 Console 的 sharedStory.managerAccounts 中添加此 QQ，或留空允许所有获授权账号。'
-)
-NO_ADMIN = '无权限：当前账号不是 HDSI 管理员。'
-CANCELLED = '操作已取消。'
+    try:
+        body = await request.json(default=None)
+    except Exception:  # noqa: BLE001
+        body = None
+    if isinstance(body, dict):
+        if isinstance(body.get('payload'), str):
+            return body['payload']
+        if isinstance(body.get('config'), dict):
+            return json.dumps(body['config'], ensure_ascii=False)
+    return None
 
 
 def _pick(value: Any, camel: str, snake: Optional[str] = None) -> Any:
@@ -347,6 +312,7 @@ class HDSInterludePlugin(Star):
         super().__init__(context, config)
         self.config: dict = config or {}
         self.bridge: AstrbotBridge = build_bridge(context, self.config, logger)
+        self._register_config_page_apis(context)
         #: 盲区模式（上游 `blindMode.enabled`，兼容旧键 `blackBox.enabled`）。
         self.blind_mode: bool = self.bridge.blind_mode_enabled
         #: 被摘除的管理命令方法名（盲区模式下非空）。
@@ -361,6 +327,112 @@ class HDSInterludePlugin(Star):
             )
         else:
             logger.info('hds-interlude：插件加载开始')
+
+    # ------------------------------------------------------------------ #
+    # 配置备份页（WebUI 插件页面 `pages/config-backup/`）
+    # ------------------------------------------------------------------ #
+
+    def _register_config_page_apis(self, context: Context) -> None:
+        """注册「配置备份」页面用的三个 Web API。
+
+        **为什么不做成聊天命令**：配置的导入导出是配置界面的事，跟聊天无关。
+        AstrBot 的内置配置页由 `_conf_schema.json` 驱动、插不进自定义按钮，官方给的
+        扩展点是**插件页面**（`pages/<名>/index.html` + `window.AstrBotPluginPage`
+        bridge，明确支持文件上传下载与自定义交互），所以这里注册页面要调的后端接口，
+        配套页面放在 `plugin/pages/config-backup/`。
+        """
+        specs = (
+            (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
+             '导出 HDS Interlude 配置'),
+            (f'/{PLUGIN_NAME}/config-import-preview', self.page_config_import_preview, ['POST'],
+             '配置导入预览'),
+            (f'/{PLUGIN_NAME}/config-import-apply', self.page_config_import_apply, ['POST'],
+             '应用配置导入'),
+        )
+        for route, handler, methods, desc in specs:
+            try:
+                context.register_web_api(route, handler, methods, desc)
+            except Exception as error:  # noqa: BLE001 - 宿主版本漂移时别拖垮插件加载
+                logger.warning('hds-interlude：注册配置页 API %s 失败：%s' % (route, error))
+
+    async def page_config_export(self):
+        """下载当前配置（带格式信封，AstrBot 会按 `filename` 触发下载）。"""
+        from astrbot.api.web import error_response, file_response
+
+        from .adapters.astrbot_bridge import _plugin_version
+        from .core.config_io import export_filename
+
+        try:
+            envelope = self.bridge.export_config()
+        except Exception as error:  # noqa: BLE001
+            return error_response('导出失败：%s' % error, status_code=500)
+
+        filename = export_filename(_plugin_version())
+        path = os.path.join(self.bridge.data_dir, 'exports', filename)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump(envelope, handle, ensure_ascii=False, indent=2)
+        except OSError as error:
+            return error_response('导出失败：无法写入 %s（%s）' % (path, error), status_code=500)
+        return file_response(path, filename=filename, content_type='application/json')
+
+    async def page_config_import_preview(self):
+        """解析上传的配置并返回变更预览（**不写盘**）。"""
+        from astrbot.api.web import error_response, json_response
+
+        from .core.config_io import ConfigImportError
+
+        payload = await _page_import_payload()
+        if payload is None:
+            return error_response('没有收到配置文件，请选择一个由本插件导出的 JSON 文件。')
+        try:
+            preview = self.bridge.preview_config_import(payload)
+        except ConfigImportError as error:
+            return error_response(str(error))
+        return json_response({
+            'report': {
+                'format_version': preview.get('format_version'),
+                'source': preview.get('source'),
+                'section_count': preview.get('section_count'),
+                'diff': preview.get('diff'),
+                'notes': preview.get('notes'),
+                'warnings': preview.get('warnings'),
+            },
+            # 回给前端、确认时原样送回：服务端不留 pending，无状态最省心
+            'payload': payload,
+        })
+
+    async def page_config_import_apply(self):
+        """应用导入（前端把预览时拿到的 payload 原样送回）。"""
+        from astrbot.api.web import error_response, json_response, request
+
+        from .core.config_io import ConfigImportError
+
+        payload = None
+        try:
+            body = await request.json(default=None)
+        except Exception:  # noqa: BLE001
+            body = None
+        if isinstance(body, dict) and isinstance(body.get('payload'), str):
+            payload = body['payload']
+        if payload is None:
+            payload = await _page_import_payload()
+        if payload is None:
+            return error_response('没有收到要导入的配置。')
+
+        try:
+            report = await self.bridge.import_config(payload)
+        except ConfigImportError as error:
+            return error_response(str(error))
+        except Exception as error:  # noqa: BLE001
+            return error_response('导入失败：%s' % error, status_code=500)
+        return json_response({
+            'saved_via': report.get('saved_via'),
+            'config_path': report.get('config_path'),
+            'format_version': report.get('format_version'),
+            'diff': report.get('diff'),
+        })
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -1376,156 +1448,3 @@ class HDSInterludePlugin(Star):
             '已删除 %s 至 %s 范围内的剧本和关联记忆；Canon 与参与者身份未删除。'
             % (self.bridge.iso_time(from_value), self.bridge.iso_time(to_value))
         )
-
-    # ------------------------------------------------------------------ #
-    # 配置导出 / 导入（本移植版新增，上游 Koishi 没有）
-    # ------------------------------------------------------------------ #
-
-    @filter.command('hdsi_config_export')
-    async def hdsi_config_export(self, event: AstrMessageEvent):
-        """管理员：把当前插件配置导出成一个 JSON 文件（同时落盘到插件数据目录）。
-
-        导出的是**用户实际存下来的那份配置**（原样，不做归一化），文件里带
-        `format` / `formatVersion` / 插件与上游版本，所以以后升级插件也能导回来。
-        """
-        if self.blind_mode:
-            return
-        session = await self._prepare(event)
-        if not self._is_manager(session):
-            yield event.plain_result(NO_MANAGER)
-            return
-
-        from .adapters.astrbot_bridge import _plugin_version  # noqa: PLC0415
-        from .core.config_io import export_filename  # noqa: PLC0415
-
-        envelope = self.bridge.export_config()
-        directory = os.path.join(self.bridge.data_dir, 'exports')
-        os.makedirs(directory, exist_ok=True)
-        filename = export_filename(_plugin_version())
-        path = os.path.join(directory, filename)
-        try:
-            with open(path, 'w', encoding='utf-8') as handle:
-                json.dump(envelope, handle, ensure_ascii=False, indent=2)
-        except OSError as error:
-            yield event.plain_result('导出失败：无法写入 %s（%s）' % (path, error))
-            return
-
-        sections = envelope.get('sections') or []
-        summary = '\n'.join([
-            '配置已导出。',
-            '插件版本：%s' % envelope.get('pluginVersion') or '-',
-            '上游版本：%s' % (envelope.get('upstreamVersion') or '-'),
-            '分组：%d 个（%s）' % (len(sections), '、'.join(sections[:6]) + ('…' if len(sections) > 6 else '')),
-            '文件：%s' % path,
-            '提示：这份文件不含剧情数据，只含配置；以后升级插件后仍可用 hdsi_config_import 导回来。',
-        ])
-        try:
-            from astrbot.api.message_components import File, Plain  # noqa: PLC0415
-
-            yield event.chain_result([Plain(summary), File(name=filename, file=path)])
-        except Exception:  # noqa: BLE001 - 平台不支持文件段时只发文本，路径已经给出
-            yield event.plain_result(summary)
-
-    @filter.command('hdsi_config_import')
-    async def hdsi_config_import(self, event: AstrMessageEvent):
-        """管理员：导入一份配置；支持引用一份导出的文件，或直接在命令后粘贴 JSON。
-
-        兼容性（**硬要求**）：带信封的新文件、早期版本没有信封的裸配置、手写的片段、
-        甚至更新版本插件导出的文件都能导入；未知键原样保留，缺失键补默认值。
-        """
-        if self.blind_mode:
-            return
-        session = await self._prepare(event)
-        if not self._is_manager(session):
-            yield event.plain_result(NO_MANAGER)
-            return
-
-        from .core.config_io import ConfigImportError  # noqa: PLC0415
-
-        payload = self._config_import_payload(event)
-        if payload is None:
-            yield event.plain_result(
-                '没找到配置内容。用法：\n'
-                '1) 引用（回复）一份 hdsi_config_export 导出的文件后发送 hdsi_config_import；\n'
-                '2) 或把 JSON 直接贴在命令后面：hdsi_config_import {"runtime":{"auto_create":true}}'
-            )
-            return
-
-        try:
-            preview = self.bridge.preview_config_import(payload)
-        except ConfigImportError as error:
-            yield event.plain_result('导入失败：%s' % error)
-            return
-
-        diff = preview.get('diff') or {}
-        lines = [
-            '配置导入预览',
-            '文件格式：v%s（%s）' % (preview.get('format_version'), preview.get('source')),
-            '分组数：%s' % preview.get('section_count'),
-            '变更：修改 %d 项，新增 %d 项，删除 %d 项'
-            % (len(diff.get('changed') or []), len(diff.get('added') or []), len(diff.get('removed') or [])),
-        ]
-        changed = list(diff.get('changed') or [])
-        if changed:
-            lines.append('将被覆盖：%s' % '、'.join(changed[:8]) + ('…' if len(changed) > 8 else ''))
-        for note in (preview.get('notes') or [])[:3]:
-            lines.append('说明：%s' % note)
-        for warning in (preview.get('warnings') or [])[:3]:
-            lines.append('注意：%s' % warning)
-        if not await self._ask_confirmation(event, '\n'.join(lines) + '\n确认导入吗？(y/n)'):
-            yield event.plain_result(CANCELLED)
-            return
-
-        try:
-            report = await self.bridge.import_config(payload)
-        except ConfigImportError as error:
-            yield event.plain_result('导入失败：%s' % error)
-            return
-        except Exception as error:  # noqa: BLE001 - 写盘失败等
-            yield event.plain_result('导入失败：%s' % error)
-            return
-
-        final = report.get('diff') or {}
-        yield event.plain_result('\n'.join([
-            '配置已导入并生效。',
-            '写入方式：%s' % report.get('saved_via'),
-            '配置文件：%s' % report.get('config_path'),
-            '本次修改 %d 项、新增 %d 项（未出现在文件里的项保持原值）。'
-            % (len(final.get('changed') or []), len(final.get('added') or [])),
-        ]))
-
-    def _config_import_payload(self, event: AstrMessageEvent) -> Optional[str]:
-        """按优先级找导入内容：命令后的内联 JSON → 本消息附件 → 被引用消息的附件。
-
-        内联 JSON 取的是**命令词之后的原始文本**（只切掉命令词），不做按空格重新拼接——
-        否则 JSON 字符串值里的连续空格会被压掉。
-        """
-        raw = _text(event.get_message_str()).strip()
-        parts = raw.split(None, 1)
-        if len(parts) > 1:
-            inline = parts[1].strip()
-            # 附件消息的正文里也会带上文件名，只有看着像 JSON 才当内联内容
-            if inline.startswith(('{', '[')):
-                return inline
-        for components in self._attachment_groups(event):
-            for component in components:
-                content = _read_file_component(component)
-                if content:
-                    return content
-        return None
-
-    @staticmethod
-    def _attachment_groups(event: AstrMessageEvent) -> list[list[Any]]:
-        """本消息的组件列表 + 它引用（回复）的那条消息的组件列表。"""
-        groups: list[list[Any]] = []
-        try:
-            current = list(event.get_messages() or [])
-        except Exception:  # noqa: BLE001
-            current = []
-        if current:
-            groups.append(current)
-        for component in current:
-            chain = getattr(component, 'chain', None)
-            if isinstance(chain, (list, tuple)) and chain:
-                groups.append(list(chain))
-        return groups
