@@ -71,6 +71,7 @@ from .model_routing import (
     ModelTask,
     effective_main_model_id,
     provider_key,
+    provider_reachable,
     resolve_model_routing,
 )
 from .script.continuation import prose_reuse_observation
@@ -860,7 +861,7 @@ class OpenAICompatibleNarrator:
         target_model = _get(route.get('target'), 'model')
         enabled = [
             provider for provider in (route.get('providers') or [])
-            if _truthy(provider.get('enabled')) and _truthy(provider.get('endpoint'))
+            if _truthy(provider.get('enabled')) and provider_reachable(provider)
             and (not require_model or _truthy(provider.get('model')) or _truthy(target_model))
         ]
         now = dt_ms(utc_now())
