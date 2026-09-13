@@ -863,6 +863,18 @@ def _parse_commands_doc():
 
 
 class CommandTableTests(unittest.TestCase):
+    """命令表与 `docs/COMMANDS.md` 的双向对账。
+
+    这是**工作区一致性检查**：`docs/` 只存在于开发工作区与 CNB 工作仓
+    （仓库根 = 插件根 + docs + upstream）；GitHub 发布仓里仓库根**就是**插件根、
+    不带 docs/，因此文件缺失时整体跳过而不是报失败。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not os.path.isfile(COMMANDS_DOC):
+            raise unittest.SkipTest('发布仓不含 docs/（工作区一致性检查）')
+
     def test_doc_exists(self):
         self.assertTrue(os.path.isfile(COMMANDS_DOC), 'docs/COMMANDS.md 必须存在')
 

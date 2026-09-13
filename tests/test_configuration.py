@@ -937,10 +937,16 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
 
 class ReleaseConsistencyTest(unittest.TestCase):
-    """上游 `test/release-consistency.test.ts` 的等价移植。"""
+    """上游 `test/release-consistency.test.ts` 的等价移植。
+
+    其中几条要读 `docs/`、`upstream/` —— 那是**工作区级**材料，只在开发工作区与
+    CNB 工作仓里存在；GitHub 发布仓（仓库根 = 插件根）不带它们，故缺失时整体跳过。
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
+        if not os.path.isdir(os.path.join(REPO_ROOT, 'docs')):
+            raise unittest.SkipTest('发布仓不含 docs/ 与 upstream/（工作区一致性检查）')
         cls.meta_version = load_meta_version()
 
     def test_metadata_version_matches_the_runtime_meta_constant(self):
