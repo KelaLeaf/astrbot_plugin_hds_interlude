@@ -2,124 +2,238 @@
 
 > 聊天在幕前发生，生活在幕间继续。
 
-HDS Interlude 是一个面向 **AstrBot** 一对一与多参与者场景的持续叙事聊天框架。它让用户消息、角色的沉默、延迟回复、主动联系和自动推进，都成为同一段生活剧本中自然可见的部分，并由一次主叙事写作连贯地决定。
+HDS Interlude 是一个给 **AstrBot** 用的持续叙事聊天插件（上游 Koishi 版的完整移植）。装上以后，你的角色不再"收到一条消息就回一条"，而是**一直在过自己的日子**——你发过去的消息只是这段时间里发生的一件事，她可能马上看见，也可能没看见、不想回、正忙着、晚点再回。
 
-当前版本：`v0.1.0`（测试版）。本仓库是上游 Koishi 原版 [hds-interlude](https://gitee.com/MomoiCore/hds-interlude)（`0.1.4-beta3-enhanced`）的 **AstrBot 移植版**，当前聚焦核心叙事子集：持续生活剧本、主叙事写作、时间感知、长期事实记忆。
+当前版本 `v1.0.0`，对应上游 `1.0.1-beta6-rebuild`。
 
-## 文档导航
-
-- 上游 Koishi 原版文档：见 [MomoiCore/hds-interlude](https://gitee.com/MomoiCore/hds-interlude)（含架构、配置、指令等完整说明）
-- 本移植版侧重于：持续生活剧本、主叙事写作、时间感知、长期事实记忆
-
-## 它解决什么问题
-
-HDSI 以主角为中心维护持续剧情状态：角色拥有日程、关系、待办、情绪、配角和未完成事件；用户消息作为进入这段现实的一项事件，参与角色当下的判断与后续生活。
-
-这套框架让角色从既有生活出发，自然决定何时看见消息、是否愿意回复、如何回应，以及这件事会给后续生活留下怎样的影响。
-
-## 核心结构
-
-### 一个主剧本，多位参与者
-
-一个机器人账号维护一个 Canonical Story（主剧本）。多个已授权用户可以进入同一主剧本，但每位参与者保留独立的资料、初始关系、关系演化和近期互动状态。
-
-### 活跃场景是短期连续性的来源
-
-每次主叙事写作都会读取当前活跃场景中最近发生的真实条目：用户 / 群聊事件、已成功投递的角色消息、剧本段落与必要的场景摘要。它保留原始对话的语义、说话顺序和时间信息，同时通过字符预算控制上下文规模。
-
-### 固定阶段，连续生活
-
-HDSI 不以时间间隔切换写作尺度，而是按当前事件进入四种明确阶段：用户消息、对话后续、到期意图与独立生活推进。每一轮都从故事游标补写已经经过的时间，并以当前本地时间结束；调度间隔只决定何时唤醒写作，不会预设剧情的密度、情绪或篇幅。
-
-## 一次消息如何变成剧情
-
-```text
-用户发送消息 / 图片
-        ↓
-短时合并（连续消息合成同一轮）
-        ↓
-读取活跃场景、当前状态、关系、记忆与待办
-        ↓
-主叙事模型一次写作：补写已发生时间 + 处理当前事件 + 决定可见行为
-        ↓
-保存剧本、记忆候选、关系变化与未来意图
-        ↓
-按即时 / 延迟 / 不回复投递角色消息
-```
-
-主模型在一次调用里完成"补写故事、判断是否回复、写出回复"。结构化输出给出：**可见回复**（角色真正发出的那句话，可为空即沉默）、**剧本补写**（角色生活的推进）、**意图**（延迟回复、提醒、主动联系或后续处理计划）。
-
-## 记忆与设定演化
-
-HDSI 按用途分层组织信息，让每次请求获得恰当的连续性，同时保持上下文的清晰与节制。
-
-| 层级 | 用途 |
+| | |
 | --- | --- |
-| Canon | 初始角色、世界、配角与参与者关系，是剧情起点。 |
-| 活跃场景 | 当前连续剧情的原始条目与摘要，是短期连贯性的主要依据。 |
-| 长期事实 | 承诺、重要事件、稳定世界事实和未解决事项。 |
-| 意图 | 延迟回复、提醒、主动联系或后续处理计划。 |
+| 插件名 | `astrbot_plugin_hds_interlude` |
+| 版本 | `v1.0.0` |
+| AstrBot | `>=4.16,<5` |
+| 依赖 | `httpx`、`pyyaml` |
+| 上游 | [HDS Interlude（Koishi）](https://gitee.com/MomoiCore/hds-interlude) |
+| 发布 | [KelaLeaf/astrbot_plugin_hds_interlude](https://github.com/KelaLeaf/astrbot_plugin_hds_interlude) |
+| 许可 | AGPL-3.0 |
 
-（本移植版当前覆盖 Canon、活跃场景、长期事实、意图；上游的 Overlay / Perspective / 剧情余波等更细层级列为后续。）
+## 它和普通角色扮演插件有什么不同
+
+普通角色扮演插件的模型是「输入一条，输出一条」。HDSI 的模型是**一段连续的生活**：
+
+- **时间是真的**。故事有自己的时区、本地时间、星期和日照；每次写作都知道"现在是周四下午四点，天还亮着"。你昨晚说的事、三天前答应的回信，都在正确的时间位置上。
+- **你的消息只是一件事**。它进入角色的当下，参与判断，但不主宰一切。她可以看了不回，可以只回一个"嗯"，可以说"在忙，晚点说"，也可以隔半小时才想起来。
+- **沉默也是剧情**。没回不是出错，是一个被记录下来的决定；剧本里写着她那会儿在干什么。
+- **投递有账本**。每条真的发出去的话都带 `commitId` / `eventId`，按气泡、贴图、原生表情逐段回写 `pending / delivered / partial / failed / cancelled`。"她说过"和"她想过但没说"是两件事，不会混。
+- **记忆分层**。原始剧本 → 场景/弧摘要 → 长期事实 → Overlay 设定演化 → Perspective 人格外壳 → 剧情余波。事实还带证据：她是**亲眼看到**、听人转述，还是自己猜的。
+- **日程是活的**。Schedule Preplan 在后台维护近期计划，主叙事只读未来约半天，而且不会把计划当成已经发生的事实。
+- **Alter 情绪天气**。每轮记录一个 -5..+5 的氛围偏移，累积过阈值就让侧端模型写一句氛围描述，注入后续提示词；同向强化、反向消退、太淡就自动清掉。角色不会聊久了就只剩一种腔调。
+- **Agency 行动窗口**。她主动找你之前，先看日程负荷、有没有隐私、设备顺不顺手。忙或者不方便的时候，不是"不发"，而是过一阵子带着新的生活重新判断。
+- **群聊意愿层**。群里普通消息先过一个纯算法的意愿分（衰减、边际递减、阈值概率），觉得值得才叫主模型；@ 她永远直接通过。
+
+一句话：**它演的是一个人的生活，不是一次问答。**
 
 ## 安装
 
-本插件为 AstrBot 插件，可直接从 GitHub 仓库安装：
+### 插件市场
 
-- **AstrBot 后台** → 插件 → 从 GitHub 安装，填入仓库地址 `https://github.com/KelaLeaf/astrbot_plugin_hds_interlude`。
-- 或手动把本仓库文件放入 AstrBot 的插件目录 `data/plugins/astrbot_plugin_hds_interlude/`。
+AstrBot 后台 → 插件市场 → 搜 `hds_interlude` → 安装 → 重启。
 
-依赖：`requirements.txt` 含 `httpx`、`pyyaml`（AstrBot 安装时通常会自动满足或提示安装）。安装后进入插件配置页填写模型与剧本起点。
+### 从 GitHub 装
 
-## 配置
+后台 → 插件管理 → 从链接安装，填仓库根地址：
 
-配置项见 `_conf_schema.json`（AstrBot 插件配置页会读取）。核心项：
-
-- **模型**：`enabled` 勾选后使用独立 OpenAI 兼容连接；否则走 AstrBot 默认模型。
-- **剧本起点**：主角姓名、角色设定、世界设定、叙事风格、时区；**其它设定补充** `extra_setting` 可填额外人格/世界观细节，主叙事时注入。
-- **运行时**：私聊拦截开关、自动创建开关、上下文条目数、长期事实数。
-- **OneBot 白名单**：`runtime.allowed_user_ids`，留空放行所有 OneBot 用户，填入后仅处理列出的用户 ID。
-
-> 关于人格：可在「剧本起点」顶部选一个 AstrBot 人格（`persona_id`）一键导入为角色名/角色设定（导入后下方手动项隐藏，以人格为准）；也可直接手填角色设定。**AstrBot 自带的人格（persona）配置对本插件不生效**，请在本插件配置页内选择。未选人格时，主角名/角色设定/世界/文风可手动填写，`extra_setting` 可补充额外细节。
-
-建议配置顺序：先填基础设定与模型，再配置平台与运行时，最后按需调整叙事节奏。
-
-## 常用管理员指令
-
-以下指令使用 `hdsi` 主命令（移植版风格，区别于上游的 `interlude`）：
-
-| 指令 | 作用 |
-| --- | --- |
-| `hdsi.status` | 查看当前主剧本、角色、叙事轮次与记忆状态。 |
-
-## 平台支持与现状
-
-本移植版当前**已适配**：
-
-- **OneBot / NapCat（QQ）**：通过 `@filter.platform_adapter_type(AIOCQHTTP)` 处理私聊文本；支持可选用户白名单。
-
-**尚未移植**（见下方 `本移植版 vs 上游`）：
-
-- OneBot 群聊白名单与群消息进叙事
-- 主体行动窗口（Agency Window）
-- 情绪偏移追踪（Alter System）
-- 图片视觉、QQ 语音转写、网页观察
-- 完整记忆分层（Overlay / Perspective / 剧情余波）
-- 后台自动生活推进（基础已具备）
-
-## 使用边界
-
-- HDSI 依赖模型的写作与结构化输出能力。较小或不稳定的模型更容易出现格式失败、过度重复或关系跳跃。
-- 自动推进基于已记录状态补写角色生活，适合叙事陪伴与角色互动；医疗、紧急救助、法律及其他高风险场景应使用相应的专业服务。
-- 主动联系需要显式开启，并始终受白名单、参与者资料、意愿阈值与单轮数量限制。
-- 数据仅存本地，不对外上报；模型密钥走 AstrBot 配置，不硬编码在源码。
-
-## 开发与验证
-
-```bash
-python -m tests.test_core   # 核心单元测试（12 项，不依赖 AstrBot SDK）
+```text
+https://github.com/KelaLeaf/astrbot_plugin_hds_interlude
 ```
 
-## 许可证
+**不要**填 `.../tree/main/xxx` 之类带子目录的地址——这个仓库的根目录**就是**插件目录，`metadata.yaml` 就在根上。
 
-AGPL-3.0（与上游一致）。
+手动装也一样：把 `plugin/` 里的东西整个放进 AstrBot 的 `data/plugins/astrbot_plugin_hds_interlude/`，再装依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+依赖只有 `httpx` 和 `pyyaml`，都是 AstrBot 环境里本来就有的东西。图片缩放/动图抽帧需要 `Pillow`，**可选**：没装就透传原图，不会报错。
+
+## 快速开始
+
+1. **配模型**：进插件配置页 → **模型中心** → 加一条 OpenAI 兼容连接，填 `endpoint`（要完整的 Chat Completions 地址，比如 `https://api.deepseek.com/v1/chat/completions`）、`api_key`、`model`，然后勾上"用于主叙事"。想让不同任务用不同模型（压缩、Alter、Embedding、识图、表情描述），再加几条各勾各的用途。
+2. **配故事**：**故事档案** → 填主角名、角色设定、世界设定、时区。偷懒的办法是 `persona_id` 那里选一个 AstrBot 人格直接导入，角色名和设定自动带过来；还想补世界观就用"其它设定补充"。
+3. **说第一句话**。私聊机器人即可。默认不会自动建故事，去 **QQ 接入** 里把白名单用户加好，或者干脆打开 `runtime` 的 `auto_create` 让它第一次私聊时自己建。
+4. **看状态**：`/hdsi_doctor` 体检，`/hdsi_status` 看运行状态，`/hdsi_context` 看当前场景和关系态势。想盯得更细就把 `logging` 的 `level` 调成 `debug`。
+
+故事跑起来之后什么都不用管。后台每 5 分钟扫一遍：补写生活、兑现到期意图、压缩旧场景、审查日程、整理 Overlay。
+
+## 配置概览
+
+配置页一共 22 个分组。**前三组配完就能跑**，剩下的按需要开。
+
+### 先配这三组
+
+| 分组 | 干什么 |
+| --- | --- |
+| **故事档案** `story_defaults` | 主角、视角、世界、配角、默认关系、地点、文风、时区；也可以直接选一个 AstrBot 人格导入。 |
+| **模型中心** `model_center` | 模型连接池 + 任务级路由（主叙事/压缩/时间线/Alter/Embedding/表情/识图），以及主叙事参数、failover、Embedding、后台压缩。 |
+| **QQ 接入** `qq_access` | 机器人账号、私聊用户白名单（含每人背景与初始关系）、群聊白名单（含群用途、角色定位、触发方式）、语音转写。 |
+
+### 结构与节奏
+
+| 分组 | 干什么 |
+| --- | --- |
+| **共享主剧本** `shared_story` | 多个用户进同一份主剧本，各自的资料、关系与近期状态独立；跨账号联系与管理员。 |
+| **运行时** `runtime` | 消息合并、打字节奏、失败重试、上下文条数、延迟回复、自动生活推进与休息时段。 |
+| **Urge 弹性推进** `urge` | 用真实消息热度决定下次推进什么时候发生，取代固定间隔（默认关闭）。 |
+| **日程预排** `schedule_preplan` | 后台维护近期日程结构，以及 stable / contextual / granular 三种变化颗粒度。 |
+| **时间导演** `timeline_director` | 自动回合里的相对时间账本与降级保护。 |
+| **Agency 行动窗口** `agency` | 主动联系前的日程负荷、隐私、设备三类容量条件。 |
+
+### 表达
+
+| 分组 | 干什么 |
+| --- | --- |
+| **聊天动作** `chat_actions` | 引用回复、贴反应、QQ 原生小表情，以及最低表达意愿。 |
+| **本地表情包** `stickers` | 扫描本地素材目录，用视觉模型生成描述，主模型按语境挑图。 |
+
+### 内在
+
+| 分组 | 干什么 |
+| --- | --- |
+| **记忆与连续性** `memory` | 压缩触发、事实召回权重、剧情余波、以及设定演化（Overlay）的置信度与冷却门槛。 |
+| **Alter 情绪** `alter_system` | 氛围偏移的阈值、权重增减、强度上限与侧端分析参数。 |
+
+### 提示词、扩展与维护
+
+| 分组 | 干什么 |
+| --- | --- |
+| **提示词** `prompts` | 主叙事写作指令、结构化输出补充规则、长期固定约束、全局文风。 |
+| **网页观察** `browser` | 只读浏览：时机、搜索模板、域名黑白名单、并发与超时、正文长度上限。 |
+| **盲区模式** `blind_mode` | 沉浸运行：屏蔽全部管理命令，日志只留周期心跳。 |
+| **日志** `logging` | 级别、信息密度、布局配色、颜文字，以及是否输出剧本/消息内容预览。 |
+
+剩下五个分组（`chat_rhythm`、`black_box`、`shared_story_compat`、`runtime_compat`、`model_compat`）是**旧配置兼容位**，默认折叠，正常用不到。
+
+每个字段的类型、默认值、含义与上游出处都在 `docs/CONFIG_MAP.md` 里逐条列出。
+
+## 命令
+
+AstrBot 的命令名不能带点，所以上游的 `interlude.memory.facts` 在这里叫 `hdsi_memory_facts`，调用时加前缀：`/hdsi_memory_facts`。上游那套 `interlude.*` 写法也照样能被识别（不会被当成聊天内容），从 Koishi 迁过来的用户不会踩坑。
+
+**完整 32 条对照表在 `docs/COMMANDS.md`。** 常用的这些：
+
+**看看状态**
+
+| 命令 | 作用 |
+| --- | --- |
+| `/hdsi_doctor` | 体检：档案、白名单、时区、主模型是否就绪。 |
+| `/hdsi_status` | 故事状态、运行游标、主动消息、行动窗口。 |
+| `/hdsi_context` | 活动场景、关系态势、剧本引子与长期连续性。 |
+| `/hdsi_timeline [条数]` | 最近原始剧本条目，默认 10、最多 30。 |
+| `/hdsi_schedule` | 日程覆盖范围与未来约半天的计划。 |
+
+**管理故事**
+
+| 命令 | 作用 |
+| --- | --- |
+| `/hdsi_story_start` | 从配置档案启动第一份故事（会问 y/n）。 |
+| `/hdsi_pause` / `/hdsi_resume` | 暂停 / 恢复自动推进、延迟处理与主动处理。 |
+| `/hdsi_advance` | 立刻把剧本补写到当前真实时间。 |
+| `/hdsi_setup <JSON>` | 改当前故事的基础设定。 |
+| `/hdsi_schedule_refresh` | 重新审查日程，旧计划留作稳定参考。 |
+
+**记忆与设定演化**
+
+| 命令 | 作用 |
+| --- | --- |
+| `/hdsi_memory [条数]` | 当前账号相关的记忆摘要。 |
+| `/hdsi_memory_facts` / `/hdsi_memory_add` / `/hdsi_memory_forget` | 列长期事实、手工加一条、把某条标记失效（不物理删除）。 |
+| `/hdsi_memory_intents` / `/hdsi_memory_cancel` | 看等待中的延迟回复、提醒、承诺与剧情余波，或取消一条。 |
+| `/hdsi_memory_patches` / `/hdsi_memory_reject` | 看 / 拒绝尚未应用的设定演化提案。 |
+| `/hdsi_overlay_status` / `/hdsi_overlay_compact` / `/hdsi_overlay_clear <部分>` | 看、压缩、清除指定部分的设定 overlay。 |
+| `/hdsi_compact` | 整理场景、事实、状态提案，并顺带做 overlay 维护。 |
+| `/hdsi_script [条数]` / `/hdsi_script_note <内容>` | 看跨参与者的原始剧本，或写一条带来源标记的人工注记。 |
+
+**危险操作**（都会先问 y/n，60 秒不回视为取消）
+
+| 命令 | 作用 |
+| --- | --- |
+| `/hdsi_timeline_rebase` | 从当前真实时间重建推进时间线，保留历史剧本。 |
+| `/hdsi_database_clear` | 清空 HDSI 自有 SQLite 表。 |
+| `/hdsi_purge_range <开始> <结束>` | 删除时间范围内的剧本与关联记忆，ISO-8601。 |
+| `/hdsi_purge_platform <平台>` | 清空并归档某个平台的全部故事。 |
+| `/hdsi_purge_all` | 彻底重置所有平台的剧本、记忆与 Canon。 |
+
+权限分两档：`member` 只要在白名单里就能用，`admin` 需要 `shared_story.manager_accounts`；这个列表留空时，白名单里的用户都算管理员。
+
+## 与上游的差异
+
+上游是 Koishi 的 TypeScript 插件，这里是 AstrBot 的 Python 插件。能逐字搬的全搬了（包括命令返回的中文文案），搬不了的都是**显式降级分支**，不留占位。
+
+| 项目 | 上游（Koishi） | 本移植版 |
+| --- | --- | --- |
+| 宿主 | Koishi + OneBot / NapCat | AstrBot（主流平台都行，见 `metadata.yaml`） |
+| 安装 | npm 包 / tgz | AstrBot 插件市场，或从仓库根安装 |
+| 配置 | Koishi Console Schema | 插件配置页 `_conf_schema.json`，22 组，键名 snake_case |
+| 命令 | `interlude.story.start` | `hdsi_story_start`（32 条，语义与文案不变） |
+| 数据 | Koishi ORM | 自带 SQLite，13 张表，**列名与上游逐字一致**（camelCase） |
+| 出站投递 | 直接调 `session.bot` | 统一收敛到 `Transport` 协议，做不到的走 `transport-unavailable` 降级 |
+| 网页观察 | Puppeteer 服务 | 走 `Transport` 的 `search_web` / `visit_web`，由适配层提供 |
+| 图像处理 | Puppeteer + sharp | `PIL`；没装就透传原图（可选依赖） |
+| 桌面桥 | 与 Koishi 进程 `process.send` | 可选 HTTP 桥（`HDSI_DESKTOP_BRIDGE=1` 才启用） |
+| 人格 | 上游 Console 手填 | 多一个 `story_defaults.persona_id`，可直接导入 AstrBot 人格 |
+| 群表态 / 原生表情 | Satori 原生接口 | 平台不支持时返回失败，由调用方走既有的投递失败分支 |
+
+几个已知的、刻意的行为差异（原因写在 `docs/PORTING_NOTES.md`）：网页观察落库前不传 `id`（自增主键不会被 `0` 占住）；范围查询退化成"取足够行 + Python 侧过滤"，遇到不支持的算子**显式抛错**而不是静默返回偏窄结果；`interlude_schedule_preplan` 换主键是 no-op（只能删旧行插新行）；群规则 `enabled` 缺省视为启用。
+
+> 上游 README 里提到的 npm 安装、Koishi Console、Puppeteer、`interlude.*` 命令名都不适用于本移植版；上面这张表就是换算关系。
+
+## 常见问题
+
+**模型返回的不是合法 JSON**
+
+先看 `logging.level=debug` 下的原始响应。两个方向：把该连接（或 `model_center.main_response_format`）改成 `prompt-only`，让插件用宽松提取去捞 JSON；或者换个模型——结构化输出能力直接决定这个插件能不能用，小模型经常输出一段中文分析而不是协议要求的对象。沙箱里想验管线本身，可以用 `scripts/sandbox_stub_model.py` 起一个"永远回合法决策"的桩服务，把插件的问题和模型的问题分开。
+
+**`response_format=json_object` 在部分 Ollama 上会让请求崩**
+
+有些 Ollama 版本/模型组合一收到 `json_object` 就 500，从日志上看是 runner 崩掉而不是模型答错。把该连接的 `response_format` 改成 `prompt-only` 即可。插件本身也有回落：带 `json_object` 失败后会用普通请求重发一次，再宽松提取 JSON，但源头改掉更干净。
+
+**插件完全不回复**
+
+按这个顺序排：
+
+1. `logging.level=debug`，看有没有收到事件、有没有调模型。
+2. `qq_access.enabled` 是不是没开，或者白名单是空的——**空白名单 = 私聊入口关闭**，这是刻意的默认值。
+3. 故事建了没有：`/hdsi_status`。没有就先 `/hdsi_story_start`，或者打开 `runtime.auto_create`。
+4. 模型连接：`endpoint` 必须是**完整的 Chat Completions 地址**（`.../v1/chat/completions`），只填 base URL 会 404。
+5. 是不是 `blind_mode.enabled=true` 了——那会屏蔽全部管理命令，日志也收束成心跳。回配置页关掉再重载。
+
+**为什么不回答我，明明看到了**
+
+这是功能，不是 bug。看 `/hdsi_script` 就知道她那轮在干什么——剧本里那条"没回"的记录和她真发出去的话是同一份账本里的两件事。真想让她开口，给个具体由头比连发几条更管用。
+
+**她回得太快 / 太慢**
+
+`runtime` 的 `typing_base_delay_seconds`、`typing_characters_per_second`、`typing_max_delay_seconds` 控制拆分气泡之间的模拟打字时间，`typing_jitter_ratio`（默认 `0.3`）给它加随机浮动，填 `0` 就是固定延迟。自动推进的节奏在 `auto_advance_interval_minutes`、`conversation_follow_up_minutes` 和 `rest_windows` 里。
+
+**想让她安静一点**
+
+`runtime.allow_proactive_messages` 默认就是关的；真要开，`proactive_willingness_threshold` 决定多愿意才主动找你，`agency` 管的是"现在方不方便"。群聊那边用 `response_mode` 和每群的 `willingness` 控制。
+
+## 隐私
+
+- 密钥只存在 AstrBot 配置里，插件不写死、不外传。
+- 数据落在本地 SQLite，除了你配的模型接口和 `browser` 里允许的域名，不发任何其它请求。
+- `logging` 的剧本/消息内容预览默认关闭。
+
+## 文档
+
+- 逐字段配置对照：`docs/CONFIG_MAP.md`
+- 命令全表：`docs/COMMANDS.md`
+- 移植决策、刻意的行为差异与实测修复：`docs/PORTING_NOTES.md`
+- 架构总览：`docs/ARCHITECTURE.md`
+- 跟进上游更新：`docs/UPSTREAM_SYNC.md`
+- 版本记录：`CHANGELOG.md`
+
+## 许可
+
+AGPL-3.0，与上游一致。
