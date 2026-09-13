@@ -800,8 +800,14 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertEqual(missing, [], f"未覆盖的上游字段：{missing}")
 
     #: 上游没有、本移植版新增的字段（AstrBot 生态接入）。
+    #:
+    #: 只登记**分组内可见的键**（嵌套分组的子项由 `test_deep_sections_are_complete`
+    #: 那一类用例单独盯）。`vision.provider_id` / `audio.provider_id` /
+    #: `embedding.provider_id` 也属本移植版新增，但它们在嵌套分组里，不计入本表。
     LOCAL_ONLY_FIELDS = {
         "story_defaults": {"persona_id", "extra_setting"},
+        "model_center": {"main_provider_id", "compaction_provider_id", "alter_provider_id"},
+        "stickers": {"provider_id"},
     }
 
     def test_upstream_field_count_matches(self):

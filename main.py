@@ -169,6 +169,9 @@ OVERLAY_TARGETS = ('character', 'perspective', 'relationship', 'world', 'all')
 #: 上游 `askConfirmation` 的等待时长（60 秒）。
 CONFIRMATION_TIMEOUT_SECONDS = 60
 
+#: 启动自检等待 Provider 管理器就绪的上限秒数（AstrBot 4.28 里插件先于模型加载）。
+CAPABILITY_CHECK_WAIT_SECONDS = 45
+
 #: 上游 `askConfirmation` 的肯定回答正则：`/^(?:y|yes)$/i`。
 CONFIRMATION_YES_RE = re.compile(r'^(?:y|yes)$', re.IGNORECASE)
 
@@ -319,6 +322,8 @@ class HDSInterludePlugin(Star):
         self.suppressed_commands: tuple[str, ...] = ()
         #: 等待 y/n 确认的回调（key = `unified_msg_origin`）。
         self._confirmations: dict[str, asyncio.Future] = {}
+        #: 启动自检的后台任务（`initialize()` 里创建，`terminate()` 里取消）。
+        self._capability_task: asyncio.Task | None = None
         if self.blind_mode:
             self.suppressed_commands = self._suppress_management_commands()
             logger.info(
@@ -327,6 +332,36 @@ class HDSInterludePlugin(Star):
             )
         else:
             logger.info('hds-interlude：插件加载开始')
+
+    async def initialize(self) -> None:
+        """AstrBot 的异步初始化钩子：起一个**延后的模型能力自检**。
+
+        为什么是"延后"：**AstrBot 4.28 里插件先于模型加载**——`initialize()` 跑的时候
+        `provider_manager` 还是空的（实测：`context.get_provider_by_id()` 返回 `None`
+        并打一条 "Provider … was not found" 宿主警告，模型要再过约 0.5 秒才装上）。
+        所以这里只登记一个后台任务，等 Provider 就绪后再自检；顺带也避免了那条
+        误导性的宿主警告。
+
+        自检要解决的问题：用户配了 `vision.mode = native`（默认）却选了一个只声明
+        `text` 的主模型时，图片会静默失效。结论会进日志，`hdsi_status` 里也带同一句话。
+        """
+        try:
+            self._capability_task = asyncio.create_task(self._self_check_model_capabilities())
+        except RuntimeError:  # pragma: no cover - 没有运行中的事件循环（测试/极旧宿主）
+            self._capability_task = None
+
+    async def _self_check_model_capabilities(self) -> None:
+        """等 Provider 管理器就绪，再做一次能力自检（失败绝不影响插件运行）。"""
+        try:
+            for _ in range(CAPABILITY_CHECK_WAIT_SECONDS):
+                if self.bridge.any_provider_loaded():
+                    break
+                await asyncio.sleep(1)
+            await self.bridge.log_model_capabilities()
+        except asyncio.CancelledError:  # pragma: no cover - 关插件时正常取消
+            raise
+        except Exception as error:  # noqa: BLE001 - 自检失败绝不能挡住插件启动
+            logger.warning('hds-interlude：模型能力自检失败：%s' % error)
 
     # ------------------------------------------------------------------ #
     # 配置备份页（WebUI 插件页面 `pages/config-backup/`）
@@ -441,6 +476,9 @@ class HDSInterludePlugin(Star):
     async def terminate(self) -> None:
         """优雅关闭：停后台任务、关 HTTP 客户端与数据库。"""
         self._confirmations.clear()
+        task = getattr(self, '_capability_task', None)
+        if task is not None and not task.done():
+            task.cancel()
         try:
             await self.bridge.shutdown()
         except Exception as error:  # noqa: BLE001 - 卸载路径绝不抛回宿主
@@ -729,6 +767,10 @@ class HDSInterludePlugin(Star):
             yield event.plain_result(story)
             return
         service = self.bridge.service
+        # 能力自检需要知道「到底是哪个模型在服务」：会话默认模型是异步解析的，
+        # 这里补解析一次，`hdsi_status` 才能在第一次对话之前就给出结论。
+        if not self.bridge.task_model_id('main') and not self.bridge._resolved_chat_provider_id:
+            await self.bridge.resolve_chat_provider_id()
         participants = await service.participants(_pick(story, 'id'))
         state = _pick(story, 'state') or {}
         agency_enabled = self.bridge.config_flag('agency', 'enabled', default=True) is not False
@@ -739,6 +781,14 @@ class HDSInterludePlugin(Star):
             '故事状态：%s' % _pick(story, 'status'),
             '已写到：%s' % self.bridge.iso_time(_pick(story, 'cursorAt', 'cursor_at')),
             '主模型连接：%s' % self.bridge.main_provider_label(),
+            *[
+                '模型能力：%s' % note
+                for note in (
+                    self.bridge.image_capability_note(),
+                    self.bridge.audio_capability_note(),
+                )
+                if note
+            ],
             '允许主动可见消息：%s' % (
                 '开启' if self.bridge.config_flag(
                     'runtime', 'allow_proactive_messages', 'allowProactiveMessages', default=False,

@@ -130,8 +130,10 @@ class FakeHttpClient:
         self.posts: list[dict] = []
         self.opened_streams: list[dict] = []
 
-    async def post_json(self, url, headers=None, body=None, timeout=None):
-        self.posts.append({'url': url, 'headers': headers, 'body': body, 'timeout': timeout})
+    async def post_json(self, url, headers=None, body=None, timeout=None, task=None):
+        self.posts.append({
+            'url': url, 'headers': headers, 'body': body, 'timeout': timeout, 'task': task,
+        })
         if not self._responses:
             raise AssertionError('测试替身没有准备更多的 post_json 响应。')
         item = self._responses.pop(0)
@@ -139,8 +141,10 @@ class FakeHttpClient:
             raise item
         return item
 
-    def iterate_sse(self, url, headers=None, body=None, timeout=None):
-        self.opened_streams.append({'url': url, 'headers': headers, 'body': body, 'timeout': timeout})
+    def iterate_sse(self, url, headers=None, body=None, timeout=None, task=None):
+        self.opened_streams.append({
+            'url': url, 'headers': headers, 'body': body, 'timeout': timeout, 'task': task,
+        })
         item = self._streams.pop(0) if self._streams else []
         return FakeStream(item)
 

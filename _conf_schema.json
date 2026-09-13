@@ -98,6 +98,13 @@
             "description": "启用图片理解",
             "default": false
           },
+          "provider_id": {
+            "type": "string",
+            "default": "",
+            "_special": "select_provider",
+            "description": "图片解析模型",
+            "hint": "选择支持视觉能力的模型；留空则使用默认 Provider。识图方式为「独立视觉连接」时由它识图；「原生多模态」时图片直接交给主叙事模型，本项不生效。"
+          },
           "mode": {
             "type": "string",
             "description": "识图方式：原生多模态或独立视觉连接",
@@ -140,6 +147,13 @@
             "description": "启用语音原生理解",
             "default": false,
             "hint": "要求主模型支持音频输入；QQ 语音先转码为原生音频直传，不做文本转写"
+          },
+          "provider_id": {
+            "type": "string",
+            "default": "",
+            "_special": "select_provider_stt",
+            "description": "语音转写模型",
+            "hint": "用 AstrBot 的语音转文字模型把语音转成文本再交给主叙事；留空则把语音原样交给主模型（要求主模型支持音频）。"
           },
           "out_format": {
             "type": "string",
@@ -374,6 +388,27 @@
           }
         ]
       },
+      "main_provider_id": {
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "description": "主叙事模型",
+        "hint": "从 AstrBot 已配置的模型中选一个承担主叙事；留空则使用默认 Provider（连接行里勾了「用于主叙事」的那条，都没有时用当前会话模型）。"
+      },
+      "compaction_provider_id": {
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "description": "压缩与总结模型",
+        "hint": "后台压缩、事实提取、时间导演与日程预排共用；留空则使用默认 Provider。结构化输出建议选支持 JSON 模式的模型。"
+      },
+      "alter_provider_id": {
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "description": "Alter 分析模型",
+        "hint": "用于情绪氛围的低频侧端分析；留空则使用默认 Provider。"
+      },
       "main_temperature": {
         "type": "float",
         "description": "主叙事采样温度",
@@ -493,6 +528,12 @@
             "description": "启用长期事实语义检索",
             "default": false,
             "hint": "模型由连接行的「用于 Embedding」开关选择"
+          },
+          "provider_id": {
+            "type": "string",
+            "default": "",
+            "description": "Embedding 模型",
+            "hint": "填 AstrBot 里 Embedding Provider 的 ID；留空时用第一个 Embedding Provider，一个都没有才回落到连接行勾了「用于 Embedding」的连接。"
           },
           "semantic_history": {
             "type": "bool",
@@ -1382,6 +1423,13 @@
         "type": "bool",
         "description": "启用本地表情包库",
         "default": false
+      },
+      "provider_id": {
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "description": "表情包描述模型",
+        "hint": "需要视觉能力；留空则使用默认 Provider。"
       },
       "directory": {
         "type": "string",

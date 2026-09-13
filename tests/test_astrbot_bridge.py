@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -1716,14 +1717,26 @@ class _RecordingContext:
 
 
 class _RecordingBridge:
-    def __init__(self, context):
+    """只实现 `AstrbotHttpClient` 会用到的那几个 bridge 方法。"""
+
+    def __init__(self, context, task_models=None, vision_mode='native'):
         self.context = context
         self._current_umo = 'aiocqhttp:FriendMessage:1'
+        self.task_models = dict(task_models or {})
+        self.vision_mode = vision_mode
 
     async def resolve_chat_provider_id(self):
         return self.context.provider_id
 
+    def task_model_id(self, task):
+        return self.task_models.get(task or '', '')
+
+    def vision_mode_native(self):
+        return self.vision_mode != 'sidecar'
+
     def provider_by_id(self, provider_id):
+        if not provider_id:
+            return None
         return self.context.get_provider_by_id(provider_id)
 
     def provider_modalities(self, provider):
@@ -1732,10 +1745,10 @@ class _RecordingBridge:
         return {str(item).lower() for item in values} if isinstance(values, list) else set()
 
 
-def _make_client(context):
+def _make_client(context, task_models=None, vision_mode='native'):
     """绕开 `__init__` 直接装配一个只走 chat 路由的 `AstrbotHttpClient`。"""
     client = bridge_module.AstrbotHttpClient.__new__(bridge_module.AstrbotHttpClient)
-    client.bridge = _RecordingBridge(context)
+    client.bridge = _RecordingBridge(context, task_models=task_models, vision_mode=vision_mode)
     client._fallback = None
     client._modality_warned = set()
     return client
@@ -1756,19 +1769,20 @@ def _multimodal_payload():
         'max_tokens': 64,
     }
 
-
 class AstrBotProviderRoutingTests(unittest.TestCase):
-    """`model_center.providers[].endpoint` 留空时改道 AstrBot Provider 的那条路。
+    """`model_center` 没填 endpoint / 指名了 AstrBot Provider 时的那条路。
 
     这是「不想单独填 Key，直接复用 AstrBot 里配好的模型」的便利路径。上游整套任务级
-    路由与连接参数都挂在插件自己的连接上，所以这条路必须**保真**：多模态内容尤其
-    不能被静默丢掉。
+    路由与连接参数都挂在插件自己的连接上，所以这条路必须**保真**：多模态内容不能被
+    静默丢掉，任务级指派也要真的生效。
     """
 
-    def _run(self, client, payload):
+    def _run(self, client, payload, task=None):
         import asyncio
 
-        return asyncio.run(client._chat(payload, None))
+        return asyncio.run(client._chat(payload, None, task=task))
+
+    # ---- 多模态转交 ----
 
     def test_images_and_audio_are_forwarded_not_dropped(self):
         """多模态分段必须转交 `image_urls` / `audio_urls`，不能只留文本。
@@ -1807,31 +1821,170 @@ class AstrBotProviderRoutingTests(unittest.TestCase):
         ]})
         self.assertEqual(context.calls[0]['prompt'], '在吗\n\nassistant: 在的\n\n好')
 
-    def test_provider_that_declares_no_image_still_gets_the_image(self):
-        """没声明 `image` 时**不拦**：没填 `modalities` 的网关多的是，拦下来是帮倒忙。"""
-        context = _RecordingContext(modalities=['text'])
+    def test_undeclared_modalities_still_receive_the_image(self):
+        """Provider **没填** `modalities` 时照常送图——没声明的网关多的是，拦下来是帮倒忙。"""
+        context = _RecordingContext(modalities=None)
         self._run(_make_client(context), _multimodal_payload())
         self.assertEqual(context.calls[0]['image_urls'], ['data:image/png;base64,AAAA'])
+        self.assertEqual(context.calls[0]['audio_urls'], ['data:audio/mp3;base64,QUJD'])
 
-    def test_modality_mismatch_warns_once_per_provider(self):
-        """模态不匹配只警告一次，别每轮刷屏。"""
+    def test_declared_text_only_drops_the_image_and_explains(self):
+        """Provider **明确声明**只有 text 时丢掉图片，并用与 `hdsi_status` 一致的说法说明。
+
+        AstrBot 的 `text_chat` 文档写明「模型不支持图片输入会抛错」——真发过去是整轮
+        失败，比丢图严重得多。既然 Provider 自己声明了能力，就按声明处理并说出来。
+        """
+        context = _RecordingContext(modalities=['text'])
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            self._run(_make_client(context), _multimodal_payload())
+        call = context.calls[0]
+        self.assertNotIn('image_urls', call)
+        self.assertNotIn('audio_urls', call)
+        warnings = [item for item in logged.call_args_list if item.args and item.args[0] == 'warn']
+        self.assertEqual(len(warnings), 1, '丢内容必须留下一条警告')
+        self.assertIn('图片会被忽略', warnings[0].args[1])
+
+    def test_declared_image_only_still_gets_the_image(self):
+        context = _RecordingContext(modalities=['text', 'image'])
+        self._run(_make_client(context), _multimodal_payload())
+        self.assertEqual(context.calls[0]['image_urls'], ['data:image/png;base64,AAAA'])
+        self.assertNotIn('audio_urls', context.calls[0])
+
+    def test_modality_warning_is_deduplicated_per_provider(self):
+        """同一个 provider 同一个模态只警告一次，别每轮刷屏。"""
         context = _RecordingContext(modalities=['text'])
         client = _make_client(context)
         with mock.patch.object(bridge_module, 'log_fallback') as logged:
             self._run(client, _multimodal_payload())
             self._run(client, _multimodal_payload())
-        warnings = [call for call in logged.call_args_list if call.args and call.args[0] == 'warn']
-        self.assertEqual(len(warnings), 1, '同一个 provider 只该警告一次')
-        self.assertIn('image', warnings[0].args[4])
-
-    def test_unset_modalities_produces_no_warning(self):
-        """Provider 没填 `modalities` 就什么都不说——猜出来的结论会误导人。"""
-        context = _RecordingContext(modalities=None)
-        with mock.patch.object(bridge_module, 'log_fallback') as logged:
-            self._run(_make_client(context), _multimodal_payload())
         self.assertEqual(
-            [call for call in logged.call_args_list if call.args and call.args[0] == 'warn'], [],
+            len([item for item in logged.call_args_list if item.args and item.args[0] == 'warn']), 1,
         )
+
+    def test_sidecar_mode_never_sends_images_to_the_main_model(self):
+        """`vision.mode = sidecar` 时图片不该出现在主叙事请求里（识图交给侧端连接）。"""
+        context = _RecordingContext(modalities=['text', 'image'])
+        client = _make_client(context, vision_mode='sidecar')
+        self._run(client, _multimodal_payload())
+        self.assertNotIn('image_urls', context.calls[0])
+
+    # ---- 按任务指名 AstrBot Provider ----
+
+    def test_bound_task_uses_the_named_provider(self):
+        """`task_models.main` 指名了 Provider 时，主叙事必须走它。"""
+        context = _RecordingContext(provider_id='session-default', modalities=['text'])
+        context.provider = _FakeProvider('named-provider', ['text'])
+        client = _make_client(context, task_models={'main': 'named-provider'})
+        self._run(client, {'model': 'x', 'messages': [{'role': 'user', 'content': '你好'}]}, task='main')
+        self.assertEqual(context.calls[0]['chat_provider_id'], 'named-provider')
+
+    def test_unbound_task_falls_back_to_the_session_provider(self):
+        context = _RecordingContext(provider_id='session-default', modalities=['text'])
+        self._run(_make_client(context), {'model': 'x', 'messages': [{'role': 'user', 'content': '你好'}]}, task='main')
+        self.assertEqual(context.calls[0]['chat_provider_id'], 'session-default')
+
+    def test_binding_overrides_a_filled_endpoint(self):
+        """指名比连接行的 endpoint 更具体，所以填了 endpoint 也照样走指名的那条。
+
+        早期实现只看「url 是不是 http」：连接行填了 endpoint 就直连，用户的指名被
+        静默忽略。指名是针对**单个任务**的明确选择，优先级最高。
+        """
+        context = _RecordingContext(provider_id='session-default', modalities=['text'])
+        context.provider = _FakeProvider('named-provider', ['text'])
+        client = _make_client(context, task_models={'vision': 'named-provider'})
+        routed = asyncio.run(client.post_json(
+            'https://api.example.com/v1/chat/completions', {}, {'model': 'x', 'messages': []},
+            None, task='vision',
+        ))
+        self.assertEqual(routed['model'], 'named-provider')
+        self.assertEqual(context.calls[0]['chat_provider_id'], 'named-provider')
+
+    def test_unknown_task_has_no_binding(self):
+        """没被指名的任务不能误用别的任务的绑定。"""
+        context = _RecordingContext(provider_id='session-default', modalities=['text'])
+        client = _make_client(context, task_models={'vision': 'named-provider'})
+        self.assertEqual(client.bridge.task_model_id('compaction'), '')
+        self._run(client, {'model': 'x', 'messages': [{'role': 'user', 'content': 'hi'}]}, task='compaction')
+        self.assertEqual(context.calls[0]['chat_provider_id'], 'session-default')
+
+    # ---- 语音转写 ----
+
+    def test_audio_is_transcribed_when_an_stt_provider_is_named(self):
+        """指定了语音转写模型：音频不进主模型，转成文字并进 prompt。"""
+        context = _RecordingContext(provider_id='main-provider', modalities=['text'])
+
+        class _Stt:
+            def __init__(self):
+                self.urls = []
+
+            async def get_text(self, url):
+                self.urls.append(url)
+                return '今天天气不错'
+
+        stt = _Stt()
+        client = _make_client(context, task_models={'audio': 'whisper-local'})
+        client.bridge.provider_by_id = lambda provider_id: stt  # type: ignore[method-assign]
+        self._run(client, {'model': 'x', 'messages': [{'role': 'user', 'content': [
+            {'type': 'text', 'text': '听一下'},
+            {'type': 'input_audio', 'input_audio': {'data': 'QUJD', 'format': 'mp3'}},
+        ]}]}, task='main')
+        self.assertEqual(stt.urls, ['data:audio/mp3;base64,QUJD'])
+        self.assertNotIn('audio_urls', context.calls[0])
+        self.assertIn('今天天气不错', context.calls[0]['prompt'])
+
+    def test_transcription_failure_falls_back_to_native_audio(self):
+        """转写失败不能毁掉整轮：回落到把音频交给主模型。"""
+        context = _RecordingContext(provider_id='main-provider', modalities=['text', 'audio'])
+
+        class _BrokenStt:
+            async def get_text(self, url):  # noqa: ARG002
+                raise RuntimeError('模型没起来')
+
+        client = _make_client(context, task_models={'audio': 'whisper-local'})
+        client.bridge.provider_by_id = lambda provider_id: _BrokenStt()  # type: ignore[method-assign]
+        self._run(client, {'model': 'x', 'messages': [{'role': 'user', 'content': [
+            {'type': 'input_audio', 'input_audio': {'data': 'QUJD', 'format': 'mp3'}},
+        ]}]}, task='main')
+        self.assertEqual(context.calls[0]['audio_urls'], ['data:audio/mp3;base64,QUJD'])
+
+    # ---- 流式降级 ----
+
+    def test_streaming_degrades_to_a_single_chunk_for_a_bound_task(self):
+        """指名了 AstrBot Provider 的任务没有增量通道：整段响应当唯一一块吐出去。
+
+        调用方（`request_openai_compatible_streaming`）本身就有「网关只回普通 JSON」
+        的兜底，所以这样既能保住用户指名的模型，又不会拿空 URL 去撞 httpx。
+        """
+        context = _RecordingContext(provider_id='session-default', modalities=['text'])
+        context.provider = _FakeProvider('named-provider', ['text'])
+        client = _make_client(context, task_models={'main': 'named-provider'})
+
+        async def collect():
+            return [chunk async for chunk in client.iterate_sse('', {}, {'model': 'x', 'messages': []}, None, task='main')]
+
+        chunks = asyncio.run(collect())
+        self.assertEqual(len(chunks), 1, '应该只有一块')
+        parsed = json.loads(chunks[0])
+        self.assertEqual(parsed['choices'][0]['message']['content'], '模型回复')
+
+    def test_unbound_streaming_still_falls_back_to_direct_http(self):
+        client = _make_client(_RecordingContext(modalities=['text']))
+
+        class _Fallback:
+            def iterate_sse(self, url, headers=None, body=None, timeout=None):  # noqa: ARG002
+                async def gen():
+                    yield 'direct'
+
+                return gen()
+
+        client._fallback = _Fallback()
+
+        async def collect():
+            return [chunk async for chunk in client.iterate_sse('https://x/v1', {}, {}, None, task='main')]
+
+        self.assertEqual(asyncio.run(collect()), ['direct'])
+
+    # ---- 参数与容错 ----
 
     def test_sampling_params_are_dropped_on_type_error(self):
         """有的 Provider 不收采样参数：抛 TypeError 后去掉重试一次。"""
@@ -1847,7 +2000,7 @@ class AstrBotProviderRoutingTests(unittest.TestCase):
         self.assertNotIn('temperature', context.calls[1])
 
     def test_provider_lookup_failure_is_not_fatal(self):
-        """拿不到 Provider 对象（宿主版本差异）时照常发请求，只是没有模态提示。"""
+        """拿不到 Provider 对象（宿主版本差异）时照常发请求，只是没有模态判断。"""
         context = _RecordingContext(modalities=['text'])
         client = _make_client(context)
         client.bridge.provider_by_id = lambda provider_id: None  # type: ignore[method-assign]
@@ -1867,6 +2020,178 @@ class AstrBotProviderRoutingTests(unittest.TestCase):
             {'type': 'input_audio', 'input_audio': {'data': 'data:audio/ogg;base64,QUJD', 'format': 'mp3'}},
         ]}]})
         self.assertEqual(context.calls[0]['audio_urls'], ['data:audio/ogg;base64,QUJD'])
+
+
+class TaskModelConfigTests(unittest.TestCase):
+    """`model_center.task_models` 的读取与能力说明（走真实 `AstrbotBridge`）。"""
+
+    def setUp(self):
+        self.bridge = _make_bridge({
+            'model_center': {
+                'main_provider_id': '',
+                'vision': {'mode': 'native', 'provider_id': 'vision-model'},
+                'audio': {'provider_id': 'stt-model'},
+            },
+        })
+        # 模拟"已经解析过一次会话默认模型"（`hdsi_status` 在真实运行里总是先解析过）
+        self.bridge._resolved_chat_provider_id = 'session-default'
+
+    def test_task_model_id_reads_the_named_provider(self):
+        self.assertEqual(self.bridge.task_model_id('vision'), 'vision-model')
+        self.assertEqual(self.bridge.task_model_id('audio'), 'stt-model')
+
+    def test_blank_and_unknown_tasks_resolve_to_empty(self):
+        """留空 = 使用默认 Provider；没配过的任务不能误用别人的绑定。"""
+        self.assertEqual(self.bridge.task_model_id('main'), '')
+        self.assertEqual(self.bridge.task_model_id('compaction'), '')
+        self.assertEqual(self.bridge.task_model_id(None), '')
+
+    def test_task_model_id_tolerates_a_missing_section(self):
+        """老配置里没有 `task_models` 分组时不能抛异常（向后兼容）。"""
+        bridge = _make_bridge({'model': {}})
+        self.assertEqual(bridge.task_model_id('vision'), '')
+
+    def test_vision_mode_defaults_to_native(self):
+        self.assertTrue(self.bridge.vision_mode_native())
+        self.assertFalse(_make_bridge({'model': {'vision': {'mode': 'sidecar'}}}).vision_mode_native())
+
+    def test_image_capability_note_is_silent_when_modalities_are_unset(self):
+        """Provider 没声明 `modalities` 时什么都不说——猜出来的结论会误导人。"""
+        self.bridge.provider_by_id = lambda provider_id: _FakeProvider(provider_id, None)  # type: ignore[method-assign]
+        self.assertEqual(self.bridge.image_capability_note(), '')
+
+    def test_image_capability_note_names_the_problem_when_image_is_missing(self):
+        self.bridge.provider_by_id = lambda provider_id: _FakeProvider(provider_id, ['text'])  # type: ignore[method-assign]
+        note = self.bridge.image_capability_note()
+        self.assertIn('当前主模型未声明图片能力', note)
+        self.assertIn('建议改用 sidecar', note)
+
+    def test_image_capability_note_is_empty_when_image_is_declared(self):
+        self.bridge.provider_by_id = lambda provider_id: _FakeProvider(provider_id, ['text', 'image'])  # type: ignore[method-assign]
+        self.assertEqual(self.bridge.image_capability_note(), '')
+
+    def test_image_capability_note_respects_the_main_binding(self):
+        """绑定了主模型就按绑定的那个看，不再看会话默认 Provider。"""
+        bridge = _make_bridge({'model': {'task_models': {'main': 'bound-main'}}})
+        bridge._resolved_chat_provider_id = 'session-default'
+        bridge.provider_by_id = lambda provider_id: _FakeProvider(provider_id, ['text'])  # type: ignore[method-assign]
+        self.assertIn('当前主模型未声明图片能力', bridge.image_capability_note())
+
+
+class ModelCapabilitySelfCheckTests(unittest.TestCase):
+    """启动自检 + `hdsi_status` 的能力提示。"""
+
+    def _bridge_with(self, provider_id, modalities, task_models=None):
+        bridge = _make_bridge({'model_center': dict(task_models or {})})
+        bridge._resolved_chat_provider_id = provider_id
+        bridge.provider_by_id = (  # type: ignore[method-assign]
+            lambda pid: _FakeProvider(pid, modalities)
+        )
+        return bridge
+
+    def test_startup_logs_the_binding_and_the_missing_capability(self):
+        bridge = self._bridge_with('main-provider', ['text'], {'main_provider_id': 'bound-main'})
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            asyncio.run(bridge.log_model_capabilities())
+        messages = [item.args[1] % tuple(item.args[2:]) for item in logged.call_args_list if item.args]
+        self.assertTrue(any('main → AstrBot Provider bound-main' in item for item in messages), messages)
+        self.assertTrue(any('当前主模型未声明图片能力' in item for item in messages), messages)
+
+    def test_startup_is_silent_when_nothing_is_bound_and_modalities_are_declared(self):
+        bridge = self._bridge_with('main-provider', ['text', 'image', 'audio'])
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            asyncio.run(bridge.log_model_capabilities())
+        self.assertEqual(
+            [item for item in logged.call_args_list if item.args and item.args[0] == 'warn'], [],
+        )
+
+    def test_status_line_reports_the_missing_capability(self):
+        """`hdsi_status` 要能在第一次对话之前就说明白，而不是等用户发图没反应。"""
+        context = FakeContext()
+        plugin = _make_plugin(context=context)
+        plugin.bridge._resolved_chat_provider_id = 'main-provider'
+        plugin.bridge.provider_by_id = (  # type: ignore[method-assign]
+            lambda pid: _FakeProvider(pid, ['text'])
+        )
+        self.assertIn('当前主模型未声明图片能力', plugin.bridge.image_capability_note())
+
+    def test_status_line_is_absent_when_capability_is_fine(self):
+        context = FakeContext()
+        plugin = _make_plugin(context=context)
+        plugin.bridge._resolved_chat_provider_id = 'main-provider'
+        plugin.bridge.provider_by_id = (  # type: ignore[method-assign]
+            lambda pid: _FakeProvider(pid, ['text', 'image', 'audio'])
+        )
+        self.assertEqual(plugin.bridge.image_capability_note(), '')
+        self.assertEqual(plugin.bridge.audio_capability_note(), '')
+
+    def test_audio_note_is_suppressed_when_a_transcriber_is_named(self):
+        bridge = self._bridge_with('main-provider', ['text'], {'audio': {'provider_id': 'stt'}})
+        self.assertEqual(bridge.audio_capability_note(), '')
+
+    def test_any_provider_loaded_tracks_the_host_manager(self):
+        """启动自检靠它判断"模型装好了没"。"""
+        context = FakeContext()
+        plugin = _make_plugin(context=context)
+        self.assertFalse(plugin.bridge.any_provider_loaded())
+
+        class _WithProviders:
+            def get_all_providers(self):
+                return [_FakeProvider('p1', ['text'])]
+
+        plugin.bridge.context = _WithProviders()
+        self.assertTrue(plugin.bridge.any_provider_loaded())
+
+    def test_initialize_schedules_a_deferred_check_and_terminate_cancels_it(self):
+        """AstrBot 4.28 里插件先于模型加载，所以自检必须延后、且不能漏掉取消。"""
+        plugin = _make_plugin()
+
+        async def scenario():
+            await plugin.initialize()
+            task = plugin._capability_task
+            assert task is not None, '必须登记后台自检任务'
+            self.assertFalse(task.done())
+            await plugin.terminate()
+            try:
+                await asyncio.wait_for(task, timeout=1)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            return task.done()
+
+        self.assertTrue(asyncio.run(scenario()), 'terminate() 之后自检任务必须收尾')
+
+    def test_deferred_check_gives_up_after_the_wait_budget(self):
+        """Provider 一直不就绪时也要收敛（不能变成永不结束的轮询）。"""
+        context = FakeContext()
+        plugin = _make_plugin(context=context)
+        calls = []
+
+        async def fake_log():
+            calls.append(1)
+
+        plugin.bridge.any_provider_loaded = lambda: False  # type: ignore[method-assign]
+        plugin.bridge.log_model_capabilities = fake_log  # type: ignore[method-assign]
+        original = main_module.CAPABILITY_CHECK_WAIT_SECONDS
+        main_module.CAPABILITY_CHECK_WAIT_SECONDS = 2
+        try:
+            with mock.patch.object(main_module.asyncio, 'sleep', _async_return(None)):
+                asyncio.run(plugin._self_check_model_capabilities())
+        finally:
+            main_module.CAPABILITY_CHECK_WAIT_SECONDS = original
+        self.assertEqual(len(calls), 1, '放弃等待后仍要做一次结论')
+
+    def test_initialize_never_raises_even_if_the_host_explodes(self):
+        """自检失败绝不能挡住插件启动。"""
+        context = FakeContext()
+        plugin = _make_plugin(context=context)
+
+        async def boom():
+            raise RuntimeError('宿主接口变了')
+
+        plugin.bridge.any_provider_loaded = lambda: True  # type: ignore[method-assign]
+        plugin.bridge.log_model_capabilities = boom  # type: ignore[method-assign]
+        asyncio.run(plugin.initialize())
+        asyncio.run(plugin._self_check_model_capabilities())
 
 
 if __name__ == '__main__':
