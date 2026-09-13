@@ -106,7 +106,9 @@ __all__ = [
     'normalize_config',
     'CONFIG_DEFAULTS',
     'CONFIG_SECTION_ALIASES',
+    'CONFIG_SECTION_ALIASES_REVERSE',
     'apply_section_aliases',
+    'to_schema_shape',
     'snapshot_defaults',
     'resolve_blind_mode_config',
     'resolve_black_box_config',
@@ -1019,6 +1021,31 @@ CONFIG_SECTION_ALIASES: dict[str, str] = {
     'model_center': 'model',
     'qq_access': 'onebot',
 }
+
+#: 反向：上游名 → schema 名。**持久化**时用（见 `to_schema_shape`）。
+CONFIG_SECTION_ALIASES_REVERSE: dict[str, str] = {
+    upstream: schema for schema, upstream in CONFIG_SECTION_ALIASES.items()
+}
+
+
+def to_schema_shape(config: Any) -> dict[str, Any]:
+    """把内部（上游分组名）配置转回 `_conf_schema.json` 的分组名，**写盘用**。
+
+    为什么必须转：AstrBot 的插件配置页是按 `_conf_schema.json` 渲染的。如果落盘的是
+    上游分组名（`model` / `onebot`），配置页读不到 `model_center` / `qq_access`
+    就会显示默认值——用户会以为"导入把配置弄丢了"（实际上 core 还能读，但观感是灾难）。
+
+    读取侧**不需要**反向处理：`normalize_config` 会在加载时用
+    `apply_section_aliases` 把 schema 名补成上游名，所以写 schema 形状是安全的。
+
+    只转这两个已知别名；其余键原样保留（含未知键）。
+    """
+    if not isinstance(config, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, value in config.items():
+        out[CONFIG_SECTION_ALIASES_REVERSE.get(key, key)] = value
+    return out
 
 
 def _to_snake_key(key: str) -> str:

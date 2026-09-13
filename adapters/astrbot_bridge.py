@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -142,6 +143,23 @@ def database_path(data_dir: Optional[str] = None) -> str:
     base = Path(data_dir) if data_dir else Path(plugin_data_dir())
     base.mkdir(parents=True, exist_ok=True)
     return str(base / 'hdsi.sqlite3')
+
+
+def _plugin_version() -> str:
+    """本插件自身版本（`metadata.yaml` 的 `version`）。
+
+    读不到就回落 `core/meta.py` 的**上游版本**常量——导出的信封里这个字段只是给人看的，
+    不值得为它抛异常。
+    """
+    from ..core.meta import HDS_INTERLUDE_VERSION  # noqa: PLC0415
+
+    path = Path(__file__).resolve().parent.parent / 'metadata.yaml'
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError:
+        return HDS_INTERLUDE_VERSION
+    match = re.search(r'^version:\s*(\S+)\s*$', text, re.MULTILINE)
+    return match.group(1) if match else HDS_INTERLUDE_VERSION
 
 
 # =========================================================================== #
@@ -1424,6 +1442,9 @@ class AstrbotBridge:
         self.data_dir = data_dir or plugin_data_dir()
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
         self.config = normalize_bridge_config(config)
+        #: 保存原样的配置对象引用（AstrBot 的 `AstrBotConfig`，带 `save_config`）。
+        #: 配置导入导出要用它写回磁盘；只有它不可用时才退化为直接写 JSON 文件。
+        self._live_config: Any = config
         self.logger = logger
         self.db = Database(database_path(self.data_dir))
         self.transport = AstrbotTransport(self)
@@ -1901,6 +1922,132 @@ class AstrbotBridge:
             if value is not None:
                 return bool(value)
         return False
+
+    # ------------------------------------------------------------------ #
+    # 配置导入 / 导出
+    # ------------------------------------------------------------------ #
+
+    def config_file_path(self) -> str:
+        """AstrBot 存放本插件配置的位置：`<astrbot_data>/config/<插件名>_config.json`。"""
+        return str(Path(get_astrbot_data_path()) / 'config' / f'{PLUGIN_NAME}_config.json')
+
+    def raw_config(self) -> dict[str, Any]:
+        """导出用的**原样**配置。
+
+        优先读磁盘上的配置文件——那是用户实际存下来的东西（含我们不认识的键），
+        比内存里归一化后的 `self.config` 更忠实；读不到才回落到内存副本。
+        """
+        path = self.config_file_path()
+        try:
+            with open(path, encoding='utf-8-sig') as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                return data
+        except (OSError, ValueError):
+            pass
+        live = self._live_config
+        if isinstance(live, dict):
+            return {k: v for k, v in live.items()}
+        try:
+            return {k: v for k, v in dict(live).items()}
+        except Exception:  # noqa: BLE001 - 拿不到就退回归一化后的副本
+            return self.config
+
+    def export_config(self, *, note: str | None = None) -> dict[str, Any]:
+        """打包一份可长期保存的导出信封（格式与兼容契约见 `core/config_io.py`）。"""
+        from ..core.config_io import build_export  # noqa: PLC0415
+        from ..core.meta import HDS_INTERLUDE_VERSION  # noqa: PLC0415
+
+        return build_export(
+            self.raw_config(),
+            plugin_version=_plugin_version(),
+            upstream_version=HDS_INTERLUDE_VERSION,
+            note=note,
+        )
+
+    def preview_config_import(self, payload: Any) -> dict[str, Any]:
+        """只解析与比较，**不写盘**——给导入前的 y/n 确认用。"""
+        from ..core.config_io import diff_config, parse_import  # noqa: PLC0415
+
+        parsed = parse_import(payload)
+        merged = normalize_bridge_config(parsed['config'])
+        current = normalize_bridge_config(self.raw_config())
+        parsed['diff'] = diff_config(current, merged)
+        parsed['section_count'] = len(merged)
+        return parsed
+
+    async def import_config(self, payload: Any) -> dict[str, Any]:
+        """解析并按当前格式落库一份导入配置，返回给用户看的报告。
+
+        流程：**解析 → 归一化/补默认 → 与当前配置逐键比较 → 写回**。
+        归一化走 `core.service.config.normalize_config`（分组别名 + 默认值补全），
+        迁移链走 `core.config_io.migrate_config`；两者都不丢未知键。
+        """
+        from ..core.config_io import ConfigImportError, diff_config, parse_import  # noqa: PLC0415
+        from ..core.service.config import to_schema_shape  # noqa: PLC0415
+
+        try:
+            parsed = parse_import(payload)
+        except ConfigImportError:
+            raise
+        incoming = parsed['config']
+        current_raw = self.raw_config()
+        merged = normalize_bridge_config(incoming)      # camel→snake + 别名 + 默认值
+        current_normalized = normalize_bridge_config(current_raw)
+        diff = diff_config(current_normalized, merged)
+
+        # 合并写入：以**磁盘上现有的配置**为底，叠加归一化后的新值。
+        # 这样用户没在导出文件里出现的键不会被清掉，AstrBot 自己维护的私有键也留住。
+        target = normalize_bridge_config(current_raw)
+        target.update(merged)
+        # 落盘必须是 **schema 形状**（`model_center` / `qq_access`）：AstrBot 的配置页
+        # 按 `_conf_schema.json` 渲染，写成上游名会让用户在配置页看到"全是默认值"。
+        saved_via = await self._save_config(to_schema_shape(target))
+
+        # 让运行中的服务立刻用上新配置，不必重启
+        self.config = normalize_bridge_config(target)
+        try:
+            self.service.config = self.config
+        except Exception:  # noqa: BLE001 - 服务未就绪时忽略
+            pass
+
+        return {
+            'format_version': parsed['format_version'],
+            'source': parsed['source'],
+            'envelope': parsed['envelope'],
+            'notes': parsed['notes'],
+            'warnings': parsed['warnings'],
+            'diff': diff,
+            'saved_via': saved_via,
+            'config_path': self.config_file_path(),
+        }
+
+    async def _save_config(self, config: dict[str, Any]) -> str:
+        """写回配置。优先用 AstrBot 的 `save_config`（会通知运行时），失败则直接写文件。"""
+        live = self._live_config
+        save = getattr(live, 'save_config_async', None)
+        if callable(save):
+            try:
+                await save(config)
+                return 'astrbot-config-api'
+            except Exception as error:  # noqa: BLE001 - 回落文件写入
+                log_fallback('warn', 'AstrBot 配置保存失败，改用直接写文件：%s', error)
+        save = getattr(live, 'save_config', None)
+        if callable(save):
+            try:
+                save(config)
+                return 'astrbot-config-api'
+            except Exception as error:  # noqa: BLE001
+                log_fallback('warn', 'AstrBot 配置保存失败，改用直接写文件：%s', error)
+        path = self.config_file_path()
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('\ufeff')          # AstrBot 配置文件带 BOM
+                json.dump(config, handle, ensure_ascii=False, indent=2)
+            return 'config-file'
+        except OSError as error:
+            raise RuntimeError(f'配置写入失败：{error}') from error
 
     def _has_voice(self, session: SessionView) -> bool:
         """上游 `extractSessionVoiceCount(session)` 的等价判定。"""
