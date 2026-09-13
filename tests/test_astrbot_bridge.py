@@ -198,6 +198,45 @@ class FakeHandlerRegistry:
         self.handlers = [item for item in self.handlers if item is not handler]
 
 
+class _FakeWebResponse:
+    """`json_response` / `file_response` / `error_response` 的桩。"""
+
+    def __init__(self, payload=None, status_code=200, path=None, filename=None):
+        self.payload = payload
+        self.status_code = status_code
+        self.path = path
+        self.filename = filename
+
+
+class _FakeUpload:
+    def __init__(self, filename, data):
+        self.filename = filename
+        self._data = data
+
+    async def read(self, size=-1):  # noqa: ARG002
+        return self._data
+
+
+class _FakeMultiDict(dict):
+    def getlist(self, key):
+        value = self.get(key)
+        return [] if value is None else [value]
+
+
+class _FakeWebRequest:
+    """插件页请求的桩：`files()` / `json()` 由各用例按需设置。"""
+
+    def __init__(self, uploads=None, body=None):
+        self.uploads = _FakeMultiDict(uploads or {})
+        self.body = body
+
+    async def files(self):
+        return self.uploads
+
+    async def json(self, default=None):
+        return self.body if self.body is not None else default
+
+
 def _install_astrbot_stub():
     """把最小 AstrBot 桩装进 `sys.modules`（幂等）。"""
     if 'astrbot' in sys.modules and getattr(sys.modules['astrbot'], '_hdsi_stub', False):
@@ -273,6 +312,44 @@ def _install_astrbot_stub():
 
     core_cfg = module('astrbot.core.config')
     core_cfg.AstrBotConfig = dict
+
+    # 插件页 Web API（`page_config_*` 用懒加载导入 `astrbot.api.web`）
+    web_module = module('astrbot.api.web')
+    web_module.PluginRequest = _FakeWebRequest
+    web_module.PluginUploadFile = _FakeUpload
+    web_module._hdsi_fake_request = None
+
+    def _json_response(data=None, *, status_code=200, headers=None):  # noqa: ARG001
+        return _FakeWebResponse(payload=data, status_code=status_code)
+
+    def _error_response(message, *, status_code=400, data=None, headers=None):  # noqa: ARG001
+        return _FakeWebResponse(
+            payload={'status': 'error', 'message': message}, status_code=status_code,
+        )
+
+    def _file_response(path, *, filename=None, content_type=None, headers=None):  # noqa: ARG001
+        return _FakeWebResponse(path=str(path), filename=filename)
+
+    web_module.json_response = _json_response
+    web_module.error_response = _error_response
+    web_module.file_response = _file_response
+
+    class _RequestProxy:
+        """对应 AstrBot 的 `request` 代理：读当前用例装进来的桩。"""
+
+        def _current(self):
+            current = web_module._hdsi_fake_request
+            if current is None:
+                raise RuntimeError('没有安装请求桩')
+            return current
+
+        async def files(self):
+            return await self._current().files()
+
+        async def json(self, default=None):
+            return await self._current().json(default=default)
+
+    web_module.request = _RequestProxy()
 
     core.message = core_message
     core.star = core_star
@@ -431,6 +508,14 @@ class FakeContext:
         self.persona_manager = FakePersonaManager()
         self.platform_manager = FakePlatformManager()
         self.sent: list[tuple[str, object]] = []
+        #: `register_web_api` 的记录：(route, handler, methods, desc)
+        self.web_apis: list[tuple[str, object, list, str]] = []
+        self.web_api_error: Exception | None = None
+
+    def register_web_api(self, route, view_handler, methods, desc):  # noqa: ARG002
+        if self.web_api_error is not None:
+            raise self.web_api_error
+        self.web_apis.append((route, view_handler, list(methods), desc))
 
     async def send_message(self, umo, chain):
         self.sent.append((umo, chain))
@@ -490,6 +575,18 @@ def _make_plugin(config=None, context=None):
         plugin = main_module.HDSInterludePlugin(context or FakeContext(), config or {})
     plugin.bridge.db = fake_db
     return plugin
+
+
+def _install_web_request(uploads=None, body=None):
+    """把插件页请求桩装进 `astrbot.api.web`，返回还原回调。"""
+    web = sys.modules['astrbot.api.web']
+    previous = web._hdsi_fake_request
+    web._hdsi_fake_request = _FakeWebRequest(uploads=uploads, body=body)
+
+    def restore():
+        web._hdsi_fake_request = previous
+
+    return restore
 
 
 def _async_return(value):
@@ -907,20 +1004,10 @@ class CommandTableTests(unittest.TestCase):
                 self.assertEqual(getattr(handler, '__astrbot_command__', None), spec.command)
 
     def test_command_count_matches_upstream_index(self):
-        # 上游 `registerCommands` 注册 32 条命令（`upstream/command.md` 的指令总览表）；
-        # 本移植版另外新增了配置导出/导入 2 条，所以断言写成"上游那 32 条一条不少"。
-        self.assertEqual(
-            len(main_module.COMMANDS),
-            main_module.UPSTREAM_COMMAND_COUNT + len(main_module.LOCAL_EXTENSION_COMMANDS),
-        )
-        self.assertEqual(len(set(main_module.COMMAND_HANDLERS)), len(main_module.COMMANDS))
-        # 本移植版新增的那几条确实不在上游命令清单里
-        upstream_names = {spec.upstream for spec in main_module.COMMANDS}
-        self.assertTrue(main_module.LOCAL_EXTENSION_COMMANDS <= set(main_module.COMMAND_HANDLERS))
-        for name in main_module.LOCAL_EXTENSION_COMMANDS:
-            spec = next(s for s in main_module.COMMANDS if s.command == name)
-            self.assertTrue(spec.upstream.startswith('interlude.'))
-            self.assertIn(spec.upstream, upstream_names)
+        # 上游 `registerCommands` 注册 32 条命令（`upstream/command.md` 的指令总览表）。
+        # 配置导出/导入**不占命令**——它是 WebUI 插件页面（`pages/config-backup/`）。
+        self.assertEqual(len(main_module.COMMANDS), 32)
+        self.assertEqual(len(set(main_module.COMMAND_HANDLERS)), 32)
 
     def test_permissions_match_upstream_roles(self):
         admin = {spec.command for spec in main_module.COMMANDS if spec.permission == 'admin'}
@@ -1077,11 +1164,9 @@ class BlindModeTests(unittest.TestCase):
         plugin, registry = self._plugin(False)
         self.assertFalse(plugin.blind_mode)
         self.assertEqual(plugin.suppressed_commands, ())
-        expected = main_module.UPSTREAM_COMMAND_COUNT + len(main_module.LOCAL_EXTENSION_COMMANDS)
-        self.assertEqual(len(plugin.active_commands()), expected)
+        self.assertEqual(len(plugin.active_commands()), 32)
         self.assertEqual(
-            len(registry.get_handlers_by_module_name(main_module.HDSInterludePlugin.__module__)),
-            expected + 1,  # +1 是私聊监听 on_private_message
+            len(registry.get_handlers_by_module_name(main_module.HDSInterludePlugin.__module__)), 33,
         )
 
 
@@ -1242,6 +1327,80 @@ class ConfigTransferTests(unittest.TestCase):
         self.assertIn('runtime.auto_create', preview['diff']['changed'])
         self.assertEqual(self._read_disk(), {'runtime': {'auto_create': False}}, '预览不应写盘')
 
+    def test_preview_does_not_report_disk_only_keys_as_removed(self):
+        """导入是合并：文件里没提到的键不会被删，预览就不能把它们报成 removed。
+
+        早期实现拿"文件归一化后的副本"跟磁盘比，结果是手写片段一来就报几百项
+        `removed`，用户以为要清空配置——纯粹是自己吓自己。
+        """
+        self._write_disk({
+            'story_defaults': {'character_name': '凌梦', 'timezone': 'Asia/Tokyo'},
+            '我的扩展': {'保留我': True},
+        })
+        preview = self.bridge.preview_config_import({'storyDefaults': {'characterName': '凌梦改'}})
+        self.assertEqual(preview['diff']['removed'], [], '合并导入永远不会 remove')
+        self.assertIn('story_defaults.character_name', preview['diff']['changed'])
+        self.assertNotIn('我的扩展.保留我', preview['diff']['changed'], '未知键不在文件里，不该被动')
+        self.assertEqual(preview['diff']['same'] > 0, True, '未受影响的键应计入 same')
+
+    def test_preview_counts_only_the_sections_the_file_actually_has(self):
+        """`section_count` 报文件里显式写的分组数，不是补完默认值之后的数量。"""
+        self._write_disk({})
+        preview = self.bridge.preview_config_import({'storyDefaults': {'characterName': '凌梦'}})
+        self.assertEqual(preview['section_count'], 1)
+        self.assertEqual(preview['source'], 'bare')
+
+    def test_hand_written_snippet_does_not_clobber_unspecified_keys(self):
+        """补默认值不能盖掉磁盘上用户改过的值。
+
+        手写片段只写 `characterName` 时，`normalize_config` 会给 `story_defaults`
+        的每个键补默认值；如果直接拿这份带默认值的副本覆盖，用户的 `timezone`
+        就被默认值顶掉了。所以合并只能叠"文件里显式写出的键"。
+        """
+        import asyncio
+
+        self._write_disk({
+            'story_defaults': {'character_name': '凌梦', 'timezone': 'Asia/Tokyo'},
+            '我的扩展': {'保留我': True},
+        })
+        bridge = _make_bridge({})
+        bridge._live_config = None
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+
+        asyncio.run(bridge.import_config({'storyDefaults': {'characterName': '凌梦改'}}))
+        written = self._read_disk()
+        self.assertEqual(written['story_defaults']['character_name'], '凌梦改')
+        self.assertEqual(written['story_defaults']['timezone'], 'Asia/Tokyo', '没写的键必须保持原值')
+        self.assertEqual(written['我的扩展'], {'保留我': True}, '未知键原样保留')
+
+    def test_nested_merge_keeps_sibling_keys_the_file_omits(self):
+        """深层合并：同一个分组里，文件只写 A，磁盘上的 B 不能被顺手清掉。"""
+        import asyncio
+
+        self._write_disk({'model_center': {'main_model_id': 'keep', 'temperature': 0.9}})
+        bridge = _make_bridge({})
+        bridge._live_config = None
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+
+        asyncio.run(bridge.import_config({'model_center': {'main_model_id': 'new'}}))
+        written = self._read_disk()
+        self.assertEqual(written['model_center']['main_model_id'], 'new')
+        self.assertEqual(written['model_center']['temperature'], 0.9)
+
+    def test_import_report_diff_matches_what_actually_changed(self):
+        """报告里的 diff 必须是"磁盘 → 写盘后"的真实差异。"""
+        import asyncio
+
+        self._write_disk({'story_defaults': {'character_name': '凌梦', 'timezone': 'Asia/Tokyo'}})
+        bridge = _make_bridge({})
+        bridge._live_config = None
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+
+        report = asyncio.run(bridge.import_config({'storyDefaults': {'characterName': '凌梦改'}}))
+        self.assertEqual(report['diff']['removed'], [])
+        self.assertEqual(report['diff']['changed'], ['story_defaults.character_name'])
+        self.assertEqual(self._read_disk()['story_defaults']['character_name'], '凌梦改')
+
     def test_import_writes_through_the_astrbot_config_api(self):
         saved = {}
 
@@ -1321,45 +1480,201 @@ class ConfigTransferTests(unittest.TestCase):
             asyncio.run(bridge.import_config('{"a":'))
 
 
-class ConfigImportPayloadTests(unittest.TestCase):
-    """`main.py` 从消息里取导入内容的优先级。"""
+# =========================================================================== #
+# 5. 插件页「配置备份」（WebUI 页面，不是聊天命令）
+# =========================================================================== #
+
+class ConfigPageRegistrationTests(unittest.TestCase):
+    """`pages/config-backup/` 要调的三个 Web API。
+
+    AstrBot 的内置配置页由 `_conf_schema.json` 驱动、插不进自定义按钮，官方扩展点是
+    **插件页面**（`pages/<名>/index.html` + `window.AstrBotPluginPage` bridge，明确支持
+    文件上传与下载）。所以导出/导入注册成页面后端接口，而**不是**聊天命令。
+    """
+
+    def test_no_chat_commands_were_added_for_config_transfer(self):
+        """配置导入导出不该出现在聊天命令表里。"""
+        commands = {spec.command for spec in main_module.COMMANDS}
+        for name in commands:
+            self.assertNotIn('config_export', name)
+            self.assertNotIn('config_import', name)
+        self.assertEqual(len(main_module.COMMANDS), 32, '上游 32 条命令不应被配置功能污染')
+
+    def test_three_routes_are_registered_under_the_plugin_prefix(self):
+        context = FakeContext()
+        _make_plugin(context=context)
+        routes = [route for route, _h, _m, _d in context.web_apis]
+        self.assertEqual(routes, [
+            f'/{main_module.PLUGIN_NAME}/config-export',
+            f'/{main_module.PLUGIN_NAME}/config-import-preview',
+            f'/{main_module.PLUGIN_NAME}/config-import-apply',
+        ])
+        # 路由必须以插件名开头：AstrBot 按 `/<plugin_name>/...` 分发
+        for route in routes:
+            self.assertTrue(route.startswith('/%s/' % main_module.PLUGIN_NAME))
+
+    def test_methods_and_handlers_match_the_page_calls(self):
+        context = FakeContext()
+        plugin = _make_plugin(context=context)
+        seen = {route: (handler, methods) for route, handler, methods, _d in context.web_apis}
+        export = seen[f'/{main_module.PLUGIN_NAME}/config-export']
+        self.assertEqual(export[1], ['GET'])
+        self.assertEqual(export[0], plugin.page_config_export)
+        for suffix in ('config-import-preview', 'config-import-apply'):
+            handler, methods = seen[f'/{main_module.PLUGIN_NAME}/{suffix}']
+            self.assertEqual(methods, ['POST'])
+            self.assertIsNotNone(handler)
+
+    def test_every_registration_carries_a_description(self):
+        context = FakeContext()
+        _make_plugin(context=context)
+        for _route, _handler, _methods, desc in context.web_apis:
+            self.assertTrue(desc and isinstance(desc, str))
+
+    def test_host_without_web_api_support_still_loads_the_plugin(self):
+        """老宿主没有 `register_web_api` 时只警告，不拖垮插件加载。"""
+        context = FakeContext()
+        context.web_api_error = AttributeError('register_web_api')
+        plugin = _make_plugin(context=context)  # 不应抛异常
+        self.assertEqual(context.web_apis, [])
+        self.assertTrue(hasattr(plugin, 'page_config_export'))
+
+
+class ConfigPageAssetTests(unittest.TestCase):
+    """页面文件本身：AstrBot 只托管插件目录下的 `pages/<名>/`。"""
+
+    PAGE_DIR = os.path.join(PLUGIN_ROOT, 'pages', 'config-backup')
+
+    def _read(self, name):
+        with open(os.path.join(self.PAGE_DIR, name), encoding='utf-8') as handle:
+            return handle.read()
+
+    def test_page_directory_has_the_four_required_files(self):
+        for name in ('index.html', 'app.js', 'style.css', '_page.json'):
+            self.assertTrue(os.path.isfile(os.path.join(self.PAGE_DIR, name)), name)
+
+    def test_index_uses_the_bridge_sdk_and_relative_assets(self):
+        html = self._read('index.html')
+        self.assertIn('AstrBotPluginPage', html)
+        self.assertIn('bridge-sdk.js', html)
+        # 相对路径！绝对 `/app.js` 在插件页里会因为路径前缀不同而 404
+        self.assertIn('./app.js', html)
+        self.assertIn('./style.css', html)
+        self.assertNotIn('src="/app.js"', html)
+
+    def test_page_metadata_points_at_the_i18n_key(self):
+        meta = json.loads(self._read('_page.json'))
+        self.assertEqual(meta['title']['i18n_key'], 'pages.config-backup.title')
+
+    def test_page_i18n_keys_exist_in_both_locales(self):
+        """键名必须是 `title` / `description`。
+
+        AstrBot 的插件详情页按 `pages.<页名>.title` 与 `pages.<页名>.description`
+        取文案（见 dashboard 的 `pluginI18n` 助手）；写成 `desc` 会静默回落成
+        组件自带的英文占位串 "Plugin Page entry"。
+        """
+        for locale in ('zh-CN', 'en-US'):
+            path = os.path.join(PLUGIN_ROOT, '.astrbot-plugin', 'i18n', f'{locale}.json')
+            with open(path, encoding='utf-8') as handle:
+                data = json.load(handle)
+            pages = data.get('pages', {}).get('config-backup', {})
+            self.assertTrue(pages.get('title'), locale)
+            self.assertTrue(pages.get('description'), locale)
+            self.assertNotIn('desc', pages, '宿主只认 description')
+
+    def test_page_metadata_i18n_keys_match_the_host_convention(self):
+        meta = json.loads(self._read('_page.json'))
+        self.assertEqual(meta['title']['i18n_key'], 'pages.config-backup.title')
+        self.assertEqual(meta['description']['i18n_key'], 'pages.config-backup.description')
+
+    def test_page_calls_the_three_registered_endpoints(self):
+        source = self._read('app.js')
+        for endpoint in ('config-export', 'config-import-preview', 'config-import-apply'):
+            self.assertIn(endpoint, source)
+        self.assertIn('bridge.download', source)
+        self.assertIn('bridge.upload', source)
+
+
+class ConfigPageHandlerTests(unittest.TestCase):
+    """三个处理函数的返回值形状（页面按这些字段渲染）。"""
 
     def setUp(self):
-        self.plugin = _make_plugin({})
-        self.plugin.bridge.iso_time = lambda value: 'T'  # type: ignore[method-assign]
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self._tmp.name, 'astrbot_plugin_hds_interlude_config.json')
+        self.plugin = _make_plugin()
+        self.plugin.bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+        self.plugin.bridge.data_dir = self._tmp.name
+        self.addCleanup(_install_web_request())
 
-    def test_inline_json_keeps_internal_spacing(self):
-        event = FakeMessageEvent(message='hdsi_config_import {"a": "凌  梦"}')
-        payload = self.plugin._config_import_payload(event)
-        self.assertEqual(payload, '{"a": "凌  梦"}')
+    def _write_disk(self, data):
+        with open(self.path, 'w', encoding='utf-8') as handle:
+            handle.write('\ufeff' + json.dumps(data, ensure_ascii=False))
 
-    def test_attached_file_is_read(self):
-        path = os.path.join(tempfile.mkdtemp(), 'conf.json')
-        with open(path, 'w', encoding='utf-8') as handle:
-            handle.write('{"runtime": {"auto_create": true}}')
-        event = FakeMessageEvent(
-            message='hdsi_config_import',
-            components=[File(name='conf.json', file_=path)],
+    def _read_disk(self):
+        with open(self.path, encoding='utf-8-sig') as handle:
+            return json.load(handle)
+
+    def _run(self, coro):
+        import asyncio
+
+        return asyncio.run(coro)
+
+    def test_export_writes_a_file_and_returns_a_download(self):
+        self._write_disk({'story_defaults': {'character_name': '凌梦'}})
+        response = self._run(self.plugin.page_config_export())
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.filename.startswith('hdsi-config-'))
+        self.assertTrue(response.filename.endswith('.json'))
+        self.assertTrue(os.path.isfile(response.path), '导出文件要真的落盘才算下载成功')
+        with open(response.path, encoding='utf-8') as handle:
+            envelope = json.load(handle)
+        self.assertEqual(envelope['config']['story_defaults']['character_name'], '凌梦')
+        self.assertEqual(
+            os.path.dirname(response.path), os.path.join(self._tmp.name, 'exports'),
         )
-        self.assertEqual(self.plugin._config_import_payload(event), '{"runtime": {"auto_create": true}}')
 
-    def test_replied_file_is_read(self):
-        path = os.path.join(tempfile.mkdtemp(), 'conf.json')
-        with open(path, 'w', encoding='utf-8') as handle:
-            handle.write('{"a": 1}')
-        event = FakeMessageEvent(
-            message='hdsi_config_import',
-            components=[Reply(id='m-0', chain=[File(name='conf.json', file_=path)])],
-        )
-        self.assertEqual(self.plugin._config_import_payload(event), '{"a": 1}')
+    def test_preview_returns_the_diff_and_echoes_the_payload_back(self):
+        import asyncio
 
-    def test_images_are_not_mistaken_for_config_files(self):
-        event = FakeMessageEvent(message='hdsi_config_import', components=[Image(file='/tmp/x.png')])
-        self.assertIsNone(self.plugin._config_import_payload(event))
+        self._write_disk({'runtime': {'auto_create': False}})
+        raw = json.dumps({'runtime': {'auto_create': True}})
+        self.addCleanup(_install_web_request(uploads={'file': _FakeUpload('cfg.json', raw.encode())}))
+        response = self._run(self.plugin.page_config_import_preview())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('runtime.auto_create', response.payload['report']['diff']['changed'])
+        # 服务端不留 pending：预览把原文回给前端，apply 时原样送回
+        self.assertEqual(json.loads(response.payload['payload']), {'runtime': {'auto_create': True}})
+        self.assertEqual(self._read_disk(), {'runtime': {'auto_create': False}}, '预览不写盘')
 
-    def test_missing_payload_returns_none(self):
-        event = FakeMessageEvent(message='hdsi_config_import')
-        self.assertIsNone(self.plugin._config_import_payload(event))
+    def test_preview_without_a_file_returns_a_readable_error(self):
+        response = self._run(self.plugin.page_config_import_preview())
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('没有收到配置文件', response.payload['message'])
+
+    def test_apply_writes_the_config_and_reports_how(self):
+        import asyncio
+
+        self._write_disk({'runtime': {'auto_create': False}})
+        self.plugin.bridge._live_config = None  # 走写文件那条降级路径
+        body = {'payload': json.dumps({'runtime': {'auto_create': True}})}
+        self.addCleanup(_install_web_request(body=body))
+        response = self._run(self.plugin.page_config_import_apply())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.payload['saved_via'], 'config-file')
+        self.assertTrue(self._read_disk()['runtime']['auto_create'])
+
+    def test_apply_rejects_a_payload_that_is_not_json(self):
+        self._write_disk({})
+        self.addCleanup(_install_web_request(body={'payload': '{"runtime":'}))
+        response = self._run(self.plugin.page_config_import_apply())
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('message', response.payload)
+
+    def test_apply_without_anything_returns_a_readable_error(self):
+        response = self._run(self.plugin.page_config_import_apply())
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('没有收到要导入的配置', response.payload['message'])
 
 
 if __name__ == '__main__':
