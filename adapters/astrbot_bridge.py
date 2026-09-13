@@ -1075,6 +1075,8 @@ class AstrbotHttpClient:
     def __init__(self, bridge: 'AstrbotBridge', fallback: Any = None) -> None:
         self.bridge = bridge
         self._fallback = fallback if fallback is not None else HttpxHttpClient()
+        #: 已经警告过的「模态不匹配」(provider_id, 需要的模态)，避免每轮刷屏
+        self._modality_warned: set[tuple[str, tuple[str, ...]]] = set()
 
     @property
     def context(self) -> Context:
@@ -1129,17 +1131,37 @@ class AstrbotHttpClient:
             return None
         system_parts: list[str] = []
         conversation: list[str] = []
+        image_urls: list[str] = []
+        audio_urls: list[str] = []
         for message in payload.get('messages') or []:
             if not isinstance(message, dict):
                 continue
             role = _text(message.get('role') or 'user')
             content = message.get('content')
             if isinstance(content, list):
-                content = ' '.join(
-                    _text(part.get('text')) for part in content if isinstance(part, dict)
-                )
+                # 多模态回合的 content 是分段数组（text / image_url / input_audio）。
+                # **不能只取 text**：原图上文一旦被丢掉，模型看到的就是"用户在说看这张图"
+                # 却没有任何图——静默失明比报错难查得多。AstrBot 的 `llm_generate` 原生
+                # 支持 `image_urls` / `audio_urls`，这里原样转交。
+                parts: list[str] = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    kind = _text(part.get('type'))
+                    if kind == 'image_url':
+                        url = part.get('image_url')
+                        url = url.get('url') if isinstance(url, dict) else url
+                        if _text(url):
+                            image_urls.append(_text(url))
+                    elif kind == 'input_audio':
+                        audio = part.get('input_audio')
+                        if isinstance(audio, dict) and _text(audio.get('data')):
+                            audio_urls.append(_audio_data_uri(audio))
+                    else:
+                        parts.append(_text(part.get('text')))
+                content = ' '.join(parts)
             text = _text(content)
-            if not text:
+            if not text and not (image_urls or audio_urls):
                 continue
             if role == 'system':
                 system_parts.append(text)
@@ -1147,6 +1169,8 @@ class AstrbotHttpClient:
                 conversation.append('assistant: %s' % text)
             else:
                 conversation.append(text)
+        if image_urls or audio_urls:
+            self._warn_unsupported_modalities(provider_id, image_urls, audio_urls)
         params: dict[str, Any] = {}
         if payload.get('temperature') is not None:
             params['temperature'] = payload['temperature']
@@ -1154,6 +1178,10 @@ class AstrbotHttpClient:
             params['top_p'] = payload['top_p']
         if payload.get('max_tokens') is not None:
             params['max_tokens'] = payload['max_tokens']
+        if image_urls:
+            params['image_urls'] = image_urls
+        if audio_urls:
+            params['audio_urls'] = audio_urls
         try:
             response = await self.context.llm_generate(
                 chat_provider_id=provider_id,
@@ -1162,7 +1190,7 @@ class AstrbotHttpClient:
                 **params,
             )
         except TypeError:
-            # 某些 Provider 不接受采样参数：去掉后重试一次。
+            # 某些 Provider 不接受采样参数 / 多模态参数：去掉后重试一次。
             try:
                 response = await self.context.llm_generate(
                     chat_provider_id=provider_id,
@@ -1188,6 +1216,45 @@ class AstrbotHttpClient:
                 'total_tokens': _usage_field(usage, 'total_tokens'),
             },
         }
+
+    def _warn_unsupported_modalities(
+        self,
+        provider_id: str,
+        image_urls: list[str],
+        audio_urls: list[str],
+    ) -> None:
+        """AstrBot Provider 声明不支持该模态时**提醒一次**（不阻断，仍照常送出去）。
+
+        AstrBot 的 Provider 配置里有 `modalities`（`text` / `image` / `audio` / `tool_use`）。
+        用户勾了 `vision.mode = native` 却把连接留空（走 AstrBot Provider），而那个模型
+        只声明了 `text` 时，图片会被服务端忽略——模型看到的只有文字。这种"静默失明"
+        必须让人知道，所以按 provider 去重警告一次。**不主动丢弃**：有的网关没填
+        `modalities` 但实际能吃图，拦下来才是帮倒忙。
+        """
+        needed = []
+        if image_urls:
+            needed.append('image')
+        if audio_urls:
+            needed.append('audio')
+        key = (provider_id, tuple(needed))
+        if key in self._modality_warned:
+            return
+        provider = self.bridge.provider_by_id(provider_id)
+        declared = self.bridge.provider_modalities(provider)
+        if not declared:
+            return  # 没声明就别猜
+        missing = [item for item in needed if item not in declared]
+        if not missing:
+            return
+        self._modality_warned.add(key)
+        log_fallback(
+            'warn',
+            'AstrBot Provider %s 只声明了 %s，本轮带上了 %s：如果模型其实不支持，'
+            '请改用 model_center 里自带的视觉 / 音频连接，或把该 Provider 的 modalities 补全',
+            provider_id,
+            '/'.join(sorted(declared)) or '(空)',
+            '/'.join(missing),
+        )
 
     # ---- embedding ----
 
@@ -1234,6 +1301,21 @@ class AstrbotHttpClient:
             'model': payload.get('model') or 'astrbot-embedding',
             'data': [{'object': 'embedding', 'index': index, 'embedding': vector} for index, vector in enumerate(vectors)],
         }
+
+
+def _audio_data_uri(audio: dict[str, Any]) -> str:
+    """`input_audio` 分段 → data URI，喂给 AstrBot 的 `audio_urls`。
+
+    OpenAI 的音频输入是 `{'data': <base64>, 'format': 'mp3'}`；AstrBot 的
+    `llm_generate(audio_urls=[...])` 收的是 URL 或本地路径，所以这里拼成 data URI。
+    """
+    data = _text(audio.get('data'))
+    if not data:
+        return ''
+    if data.startswith('data:'):
+        return data
+    fmt = _text(audio.get('format')).lower().lstrip('.') or 'wav'
+    return 'data:audio/%s;base64,%s' % (fmt, data)
 
 
 def _usage_field(usage: Any, *names: str) -> int:
@@ -1673,6 +1755,37 @@ class AstrbotBridge:
                 except Exception:  # pragma: no cover
                     return ''
         return ''
+
+    def provider_by_id(self, provider_id: str) -> Any:
+        """按 id 取 AstrBot Provider 实例（拿不到返回 `None`）。
+
+        只用于读它的元信息（`modalities`）；请求本身仍然交给 `context.llm_generate`，
+        不去碰 Provider 的私有调用方式。
+        """
+        if not provider_id:
+            return None
+        getter = getattr(self.context, 'get_provider_by_id', None)
+        if not callable(getter):
+            return None
+        try:
+            provider = getter(_text(provider_id))
+            if inspect.isawaitable(provider):
+                return None  # 这个宿主版本是协程：读元信息不值得再开一次 await 路径
+            return provider
+        except Exception:  # noqa: BLE001
+            return None
+
+    def provider_modalities(self, provider: Any) -> set[str]:
+        """Provider 声明的模态集合（`text` / `image` / `audio` / `tool_use`）。
+
+        AstrBot 把它放在 `provider.provider_config['modalities']`。**读不到就返回空集合**
+        ——空集合表示"没声明"，调用方不该据此判断模型不支持（不填的网关多的是）。
+        """
+        config = getattr(provider, 'provider_config', None)
+        values = config.get('modalities') if isinstance(config, dict) else None
+        if not isinstance(values, (list, tuple, set)):
+            return set()
+        return {_text(item).lower() for item in values if _text(item)}
 
     def embedding_provider(self) -> Any:
         """取用于 Embedding 的 AstrBot Provider（没有就返回 `None` → 回落直连）。

@@ -1677,5 +1677,197 @@ class ConfigPageHandlerTests(unittest.TestCase):
         self.assertIn('没有收到要导入的配置', response.payload['message'])
 
 
+# =========================================================================== #
+# 6. 走 AstrBot Provider 的那条路（model_center 没填 endpoint 时的降级路径）
+# =========================================================================== #
+
+class _FakeProvider:
+    def __init__(self, provider_id='prov-1', modalities=None):
+        self.provider_config = {'id': provider_id}
+        if modalities is not None:
+            self.provider_config['modalities'] = modalities
+
+
+class _RecordingContext:
+    """记下 `llm_generate` 收到了什么；`error` 非空时逐次抛出。"""
+
+    def __init__(self, provider_id='prov-1', modalities=None, errors=None):
+        self.provider_id = provider_id
+        self.provider = _FakeProvider(provider_id, modalities)
+        self.errors = list(errors or [])
+        self.calls: list[dict] = []
+
+    async def get_current_chat_provider_id(self, umo):  # noqa: ARG002
+        return self.provider_id
+
+    def get_provider_by_id(self, provider_id):  # noqa: ARG002
+        return self.provider
+
+    async def llm_generate(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.errors:
+            raise self.errors.pop(0)
+
+        class _Response:
+            completion_text = '模型回复'
+            usage = {'prompt_tokens': 3, 'completion_tokens': 5}
+
+        return _Response()
+
+
+class _RecordingBridge:
+    def __init__(self, context):
+        self.context = context
+        self._current_umo = 'aiocqhttp:FriendMessage:1'
+
+    async def resolve_chat_provider_id(self):
+        return self.context.provider_id
+
+    def provider_by_id(self, provider_id):
+        return self.context.get_provider_by_id(provider_id)
+
+    def provider_modalities(self, provider):
+        config = getattr(provider, 'provider_config', None) or {}
+        values = config.get('modalities')
+        return {str(item).lower() for item in values} if isinstance(values, list) else set()
+
+
+def _make_client(context):
+    """绕开 `__init__` 直接装配一个只走 chat 路由的 `AstrbotHttpClient`。"""
+    client = bridge_module.AstrbotHttpClient.__new__(bridge_module.AstrbotHttpClient)
+    client.bridge = _RecordingBridge(context)
+    client._fallback = None
+    client._modality_warned = set()
+    return client
+
+
+def _multimodal_payload():
+    return {
+        'model': 'x',
+        'messages': [
+            {'role': 'system', 'content': '你是主角'},
+            {'role': 'user', 'content': [
+                {'type': 'text', 'text': '看看这张图'},
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AAAA', 'detail': 'auto'}},
+                {'type': 'input_audio', 'input_audio': {'data': 'QUJD', 'format': 'mp3'}},
+            ]},
+        ],
+        'temperature': 0.8,
+        'max_tokens': 64,
+    }
+
+
+class AstrBotProviderRoutingTests(unittest.TestCase):
+    """`model_center.providers[].endpoint` 留空时改道 AstrBot Provider 的那条路。
+
+    这是「不想单独填 Key，直接复用 AstrBot 里配好的模型」的便利路径。上游整套任务级
+    路由与连接参数都挂在插件自己的连接上，所以这条路必须**保真**：多模态内容尤其
+    不能被静默丢掉。
+    """
+
+    def _run(self, client, payload):
+        import asyncio
+
+        return asyncio.run(client._chat(payload, None))
+
+    def test_images_and_audio_are_forwarded_not_dropped(self):
+        """多模态分段必须转交 `image_urls` / `audio_urls`，不能只留文本。
+
+        早期实现把 content 数组 `join` 成文本，原图与语音直接消失——模型看到的是
+        「看看这张图」却没有任何图，是静默失明。AstrBot 的 `llm_generate` 原生支持
+        这两个参数，没有理由不转交。
+        """
+        context = _RecordingContext(modalities=['text', 'image', 'audio'])
+        self._run(_make_client(context), _multimodal_payload())
+        self.assertEqual(len(context.calls), 1)
+        call = context.calls[0]
+        self.assertEqual(call['image_urls'], ['data:image/png;base64,AAAA'])
+        self.assertEqual(call['audio_urls'], ['data:audio/mp3;base64,QUJD'])
+        self.assertEqual(call['prompt'], '看看这张图')
+        self.assertEqual(call['system_prompt'], '你是主角')
+        self.assertEqual(call['temperature'], 0.8)
+        self.assertEqual(call['max_tokens'], 64)
+
+    def test_text_only_payload_does_not_send_multimodal_keys(self):
+        """纯文本回合不能凭空多出 `image_urls` / `audio_urls`。"""
+        context = _RecordingContext(modalities=['text'])
+        self._run(_make_client(context), {'model': 'x', 'messages': [{'role': 'user', 'content': '你好'}]})
+        call = context.calls[0]
+        self.assertNotIn('image_urls', call)
+        self.assertNotIn('audio_urls', call)
+        self.assertEqual(call['prompt'], '你好')
+
+    def test_assistant_turns_keep_their_role_marker(self):
+        """多轮历史里 assistant 的发言仍带 `assistant: ` 前缀（沿用上游拼法）。"""
+        context = _RecordingContext(modalities=['text'])
+        self._run(_make_client(context), {'model': 'x', 'messages': [
+            {'role': 'user', 'content': '在吗'},
+            {'role': 'assistant', 'content': '在的'},
+            {'role': 'user', 'content': '好'},
+        ]})
+        self.assertEqual(context.calls[0]['prompt'], '在吗\n\nassistant: 在的\n\n好')
+
+    def test_provider_that_declares_no_image_still_gets_the_image(self):
+        """没声明 `image` 时**不拦**：没填 `modalities` 的网关多的是，拦下来是帮倒忙。"""
+        context = _RecordingContext(modalities=['text'])
+        self._run(_make_client(context), _multimodal_payload())
+        self.assertEqual(context.calls[0]['image_urls'], ['data:image/png;base64,AAAA'])
+
+    def test_modality_mismatch_warns_once_per_provider(self):
+        """模态不匹配只警告一次，别每轮刷屏。"""
+        context = _RecordingContext(modalities=['text'])
+        client = _make_client(context)
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            self._run(client, _multimodal_payload())
+            self._run(client, _multimodal_payload())
+        warnings = [call for call in logged.call_args_list if call.args and call.args[0] == 'warn']
+        self.assertEqual(len(warnings), 1, '同一个 provider 只该警告一次')
+        self.assertIn('image', warnings[0].args[4])
+
+    def test_unset_modalities_produces_no_warning(self):
+        """Provider 没填 `modalities` 就什么都不说——猜出来的结论会误导人。"""
+        context = _RecordingContext(modalities=None)
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            self._run(_make_client(context), _multimodal_payload())
+        self.assertEqual(
+            [call for call in logged.call_args_list if call.args and call.args[0] == 'warn'], [],
+        )
+
+    def test_sampling_params_are_dropped_on_type_error(self):
+        """有的 Provider 不收采样参数：抛 TypeError 后去掉重试一次。"""
+        context = _RecordingContext(
+            modalities=['text'],
+            errors=[TypeError('unexpected keyword argument'), RuntimeError('还是失败')],
+        )
+        self.assertIsNone(self._run(_make_client(context), {
+            'model': 'x', 'messages': [{'role': 'user', 'content': '你好'}], 'temperature': 0.8,
+        }))
+        self.assertEqual(len(context.calls), 2, '应该重试一次')
+        self.assertIn('temperature', context.calls[0])
+        self.assertNotIn('temperature', context.calls[1])
+
+    def test_provider_lookup_failure_is_not_fatal(self):
+        """拿不到 Provider 对象（宿主版本差异）时照常发请求，只是没有模态提示。"""
+        context = _RecordingContext(modalities=['text'])
+        client = _make_client(context)
+        client.bridge.provider_by_id = lambda provider_id: None  # type: ignore[method-assign]
+        self._run(client, _multimodal_payload())
+        self.assertEqual(context.calls[0]['image_urls'], ['data:image/png;base64,AAAA'])
+
+    def test_audio_without_format_falls_back_to_wav(self):
+        context = _RecordingContext(modalities=['audio'])
+        self._run(_make_client(context), {'model': 'x', 'messages': [{'role': 'user', 'content': [
+            {'type': 'input_audio', 'input_audio': {'data': 'QUJD'}},
+        ]}]})
+        self.assertEqual(context.calls[0]['audio_urls'], ['data:audio/wav;base64,QUJD'])
+
+    def test_data_uri_input_is_passed_through_unchanged(self):
+        context = _RecordingContext(modalities=['audio'])
+        self._run(_make_client(context), {'model': 'x', 'messages': [{'role': 'user', 'content': [
+            {'type': 'input_audio', 'input_audio': {'data': 'data:audio/ogg;base64,QUJD', 'format': 'mp3'}},
+        ]}]})
+        self.assertEqual(context.calls[0]['audio_urls'], ['data:audio/ogg;base64,QUJD'])
+
+
 if __name__ == '__main__':
     unittest.main()
