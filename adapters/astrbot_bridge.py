@@ -1402,6 +1402,16 @@ class AstrbotHttpClient:
         }
 
 
+#: 合成连接行的 id 前缀。合成行只活在给 core 的配置副本里（见
+#: `AstrbotBridge.routing_config`），不会写进用户的配置文件。
+ROUTING_ROW_PREFIX = 'hdsi-astrbot-'
+
+
+def is_routing_row(provider: Any) -> bool:
+    """判断一条连接行是不是本移植版合成的（防止重复注入）。"""
+    return isinstance(provider, dict) and _text(provider.get('id')).startswith(ROUTING_ROW_PREFIX)
+
+
 def _audio_data_uri(audio: dict[str, Any]) -> str:
     """`input_audio` 分段 → data URI，喂给 AstrBot 的 `audio_urls`。
 
@@ -1666,7 +1676,9 @@ class AstrbotBridge:
             logger=_AstrbotLoggerAdapter(logger) if logger is not None else None,
             base_dir=self.data_dir,
         )
-        self.service = InterludeService(self.interlude_context, self.config, self.db, self.transport)
+        self.service = InterludeService(
+            self.interlude_context, self.routing_config(), self.db, self.transport,
+        )
         self._started = False
         self._start_lock = asyncio.Lock()
         self._capture: Optional[_TurnCapture] = None
@@ -1865,6 +1877,74 @@ class AstrbotBridge:
                 return ''
             node = node.get(step)
         return node.strip() if isinstance(node, str) and node.strip() else ''
+
+    def _binding_row(self, task: str, provider_id: str) -> dict[str, Any]:
+        """为「指名了 AstrBot 模型」的任务合成一条连接行（**只给 core 看的副本**）。
+
+        为什么必须合成：core 的候选筛选（`resolve_route` / `selectRouteProviders`）
+        以上游的方式只看 `endpoint`——连接行不填地址就被判成 `unavailable`，
+        请求根本走不到传输层。可是"只用宿主的模型"这条路本来就不该填地址。
+        所以给 core 的配置副本里补一条**声明了 `transport_target`** 的行：
+        core 只判断它非空（见 `model_routing.provider_reachable`），
+        真正的目标是哪个模型由传输层按 `task` 决定。
+
+        合成行**只存在于内存副本里**：`self.config` 仍是干净配置，导出 / 落盘、
+        `section()` 读取走的都是它，所以用户不会在配置文件里看到这些假行。
+        """
+        return {
+            'id': '{}{}'.format(ROUTING_ROW_PREFIX, task),
+            'label': 'AstrBot · %s' % provider_id,
+            'enabled': True,
+            'mode': 'openai-compatible',
+            'endpoint': '',
+            'transport_target': 'astrbot:%s' % provider_id,
+            'api_key': '',
+            # `model` 必须非空，否则 core 的候选筛选同样会跳过这一行。
+            'model': self.provider_model_name(provider_id) or provider_id,
+            'use_for_main': task == 'main',
+            'use_for_compaction': task == 'compaction',
+            'use_for_alter': task == 'alter',
+            'use_for_vision': task == 'vision',
+            'use_for_stickers': task == 'stickers',
+            'use_for_embedding': task == 'embedding',
+        }
+
+    def routing_config(self, config: Any = None) -> dict[str, Any]:
+        """给 `InterludeService` 用的配置副本：补上指名的任务用合成连接行。
+
+        没有指名任何任务时**原样返回**同一个对象（零开销、也保证老配置的行为
+        逐字不变）。
+        """
+        base = self.config if config is None else config
+        if not isinstance(base, dict):
+            return base if isinstance(base, dict) else {}
+        rows = []
+        for task in ('main', 'compaction', 'alter', 'vision', 'stickers', 'embedding'):
+            provider_id = self.task_model_id(task)
+            if provider_id:
+                rows.append(self._binding_row(task, provider_id))
+        if not rows:
+            return base
+        result = dict(base)
+        for name in ('model', 'model_center'):
+            section = result.get(name)
+            if not isinstance(section, dict) or not isinstance(section.get('providers'), list):
+                continue
+            existing = [item for item in section['providers'] if not is_routing_row(item)]
+            section = dict(section)
+            # 指名的排在最前：它是用户针对这个任务的明确选择，其余连接作为 failover
+            section['providers'] = rows + existing
+            result[name] = section
+        return result
+
+    def provider_model_name(self, provider_id: str) -> str:
+        """读 AstrBot Provider 配置里的模型名（拿不到返回空串）。"""
+        provider = self.provider_by_id(provider_id)
+        config = getattr(provider, 'provider_config', None)
+        if isinstance(config, dict):
+            return _text(config.get('model'))
+        model = getattr(provider, 'model', None)
+        return _text(model) if isinstance(model, str) else ''
 
     def task_provider_modalities(self, task: Optional[str]) -> set[str]:
         """该任务指名的 AstrBot Provider 声明的模态（没指名 / 拿不到 → 空集合）。"""
@@ -2422,7 +2502,7 @@ class AstrbotBridge:
         # 让运行中的服务立刻用上新配置，不必重启
         self.config = target
         try:
-            self.service.config = self.config
+            self.service.config = self.routing_config()
         except Exception:  # noqa: BLE001 - 服务未就绪时忽略
             pass
 

@@ -57,6 +57,7 @@ __all__ = [
     'configured_providers',
     'uses_remote_providers',
     'provider_key',
+    'provider_reachable',
     'is_assigned_to',
     'format_model_routing',
 ]
@@ -216,6 +217,21 @@ def provider_key(provider: ProviderConfig) -> str:
     ))
 
 
+def provider_reachable(provider: ProviderConfig) -> bool:
+    """这条连接行当前有没有可用的请求目标。
+
+    上游只看 http(s) `endpoint`。本移植版多认一条：连接行可以声明
+    `transport_target`——它的目标由**传输层**解析（例如"这个任务用宿主自己管理的
+    某个模型"），此时插件侧本来就不需要、也不该填地址。core 只判断真值，
+    不关心那个字符串是什么；把它塞进去的是适配层。
+
+    没有这条的话，"不填连接、只用宿主的模型"会在 core 就被判成 unavailable
+    （`No enabled OpenAI-compatible provider is available.`），传输层的回退路径
+    永远走不到。
+    """
+    return bool(_truthy(provider.get('endpoint')) or _truthy(provider.get('transport_target')))
+
+
 def is_assigned_to(provider: ProviderConfig, task: str) -> bool:
     """上游 `isAssignedTo()`：这条连接是否被显式指派给该任务。
 
@@ -271,7 +287,7 @@ def resolve_route(
     """上游 `resolveRoute()`：显式指派 → 指定连接/模型 → 历史兜底。"""
     assigned = [
         provider for provider in providers
-        if _truthy(provider.get('enabled')) and _truthy(provider.get('endpoint')) and _truthy(provider.get('model'))
+        if _truthy(provider.get('enabled')) and provider_reachable(provider) and _truthy(provider.get('model'))
         and is_assigned_to(provider, task)
     ]
     if assigned:
@@ -282,7 +298,7 @@ def resolve_route(
 
     targeted = [
         provider for provider in providers
-        if _truthy(provider.get('enabled')) and _truthy(provider.get('endpoint'))
+        if _truthy(provider.get('enabled')) and provider_reachable(provider)
         and (provider.get('id') == target.get('provider_id') or provider_key(provider) == target.get('provider_id'))
     ] if _truthy(target.get('provider_id')) else []
     targeted_usable = [
@@ -301,7 +317,7 @@ def resolve_route(
     # 显式的任务指派仍然是首选。
     fallback = [
         provider for provider in providers
-        if _truthy(provider.get('enabled')) and _truthy(provider.get('endpoint'))
+        if _truthy(provider.get('enabled')) and provider_reachable(provider)
         and (not require_chat_model or _truthy(provider.get('model')))
         and not is_exclusively_non_chat(provider)
     ]
@@ -323,7 +339,7 @@ def resolve_assigned_only_route(task: str, providers: list[ProviderConfig]) -> R
     """
     assigned = [
         provider for provider in providers
-        if _truthy(provider.get('enabled')) and _truthy(provider.get('endpoint')) and _truthy(provider.get('model'))
+        if _truthy(provider.get('enabled')) and provider_reachable(provider) and _truthy(provider.get('model'))
         and is_assigned_to(provider, task)
     ]
     return {
@@ -389,6 +405,8 @@ def normalize_provider(provider: ProviderConfig) -> ProviderConfig:
         'response_format': _coalesce(provider.get('response_format'), 'json-object'),
         'extra_headers': _coalesce(provider.get('extra_headers'), ''),
         'extra_body': _coalesce(provider.get('extra_body'), ''),
+        # 由适配层塞入的不透明句柄：非空表示"目标由传输层解析"，见 provider_reachable()
+        'transport_target': _coalesce(provider.get('transport_target'), ''),
         'zhipu_official': zhipu_official,
         'reasoning_effort': _coalesce(provider.get('reasoning_effort'), 'high'),
         'deepseek_official': deepseek_official,

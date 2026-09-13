@@ -2078,6 +2078,89 @@ class TaskModelConfigTests(unittest.TestCase):
         self.assertIn('当前主模型未声明图片能力', bridge.image_capability_note())
 
 
+class RoutingRowInjectionTests(unittest.TestCase):
+    """指名了 AstrBot 模型时，给 core 的配置副本里要补一条合成连接行。
+
+    没有这条的话，core 的候选筛选（只认 `endpoint`）会把"不填连接、只用宿主模型"
+    的连接行判成 `unavailable`，`decide()` 直接抛
+    `No enabled OpenAI-compatible provider is available.` —— 传输层的回退路径
+    永远走不到。这个 bug 在真机复现过。
+    """
+
+    def _bridge(self, config):
+        return _make_bridge(config)
+
+    def test_binding_row_is_only_visible_to_the_core_copy(self):
+        bridge = self._bridge({
+            'model_center': {
+                'main_provider_id': 'ollama',
+                'providers': [{'label': 'Primary model', 'enabled': True, 'endpoint': '', 'model': ''}],
+            },
+        })
+        routing = bridge.routing_config()
+        rows = routing['model']['providers']
+        self.assertTrue(bridge_module.is_routing_row(rows[0]), '合成行必须排在最前')
+        self.assertEqual(rows[0]['use_for_main'], True)
+        self.assertTrue(rows[0]['transport_target'])
+        # **用户那份配置不能被污染**（否则会被导出 / 落盘）
+        clean = bridge.section('model')['providers']
+        self.assertFalse(any(bridge_module.is_routing_row(item) for item in clean))
+
+    def test_no_binding_returns_the_same_object(self):
+        """没指名任何任务时零开销、行为逐字不变。"""
+        bridge = self._bridge({'model_center': {'providers': []}})
+        self.assertIs(bridge.routing_config(), bridge.config)
+
+    def test_injection_is_idempotent(self):
+        """重复调用不能堆出多条合成行。"""
+        bridge = self._bridge({'model_center': {'main_provider_id': 'ollama', 'providers': []}})
+        once = bridge.routing_config()
+        twice = bridge.routing_config(once)
+        self.assertEqual(len(twice['model']['providers']), 1)
+
+    def test_bound_task_becomes_available_in_core_routing(self):
+        """这条断言是 bug 的护栏：core 必须认为主叙事可用。"""
+        from plugin.core.model_routing import resolve_model_routing
+
+        bridge = self._bridge({
+            'model_center': {
+                'main_provider_id': 'ollama',
+                'providers': [{'label': 'Primary model', 'enabled': True, 'endpoint': '', 'model': ''}],
+            },
+        })
+        routing = resolve_model_routing(bridge.routing_config()['model'])
+        self.assertTrue(routing['main']['available'], routing['main']['reason'])
+        self.assertEqual(routing['main']['reason'], 'assigned-provider')
+
+    def test_without_a_binding_an_empty_connection_stays_unavailable(self):
+        """反向断言：空连接行不能因为这次改动就变成"可用"。"""
+        from plugin.core.model_routing import resolve_model_routing
+
+        bridge = self._bridge({
+            'model_center': {'providers': [{'label': 'x', 'enabled': True, 'endpoint': '', 'model': ''}]},
+        })
+        routing = resolve_model_routing(bridge.routing_config()['model'])
+        self.assertFalse(routing['main']['available'])
+
+    def test_each_task_gets_its_own_row(self):
+        bridge = self._bridge({
+            'model_center': {
+                'main_provider_id': 'p-main',
+                'vision': {'provider_id': 'p-vision'},
+                'audio': {'provider_id': 'p-stt'},
+                'providers': [],
+            },
+        })
+        rows = bridge.routing_config()['model']['providers']
+        by_task = {item['id'].replace(bridge_module.ROUTING_ROW_PREFIX, ''): item for item in rows}
+        self.assertEqual(set(by_task), {'main', 'vision'})
+        self.assertTrue(by_task['main']['use_for_main'])
+        self.assertFalse(by_task['main']['use_for_vision'])
+        self.assertTrue(by_task['vision']['use_for_vision'])
+        # audio 是侧端转写用的，不是一条 chat 候选，不该出现在这里
+        self.assertNotIn('audio', by_task)
+
+
 class ModelCapabilitySelfCheckTests(unittest.TestCase):
     """启动自检 + `hdsi_status` 的能力提示。"""
 
