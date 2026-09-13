@@ -24,8 +24,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -905,9 +907,20 @@ class CommandTableTests(unittest.TestCase):
                 self.assertEqual(getattr(handler, '__astrbot_command__', None), spec.command)
 
     def test_command_count_matches_upstream_index(self):
-        # 上游 `registerCommands` 注册 32 条命令（`upstream/command.md` 的指令总览表）。
-        self.assertEqual(len(main_module.COMMANDS), 32)
-        self.assertEqual(len(set(main_module.COMMAND_HANDLERS)), 32)
+        # 上游 `registerCommands` 注册 32 条命令（`upstream/command.md` 的指令总览表）；
+        # 本移植版另外新增了配置导出/导入 2 条，所以断言写成"上游那 32 条一条不少"。
+        self.assertEqual(
+            len(main_module.COMMANDS),
+            main_module.UPSTREAM_COMMAND_COUNT + len(main_module.LOCAL_EXTENSION_COMMANDS),
+        )
+        self.assertEqual(len(set(main_module.COMMAND_HANDLERS)), len(main_module.COMMANDS))
+        # 本移植版新增的那几条确实不在上游命令清单里
+        upstream_names = {spec.upstream for spec in main_module.COMMANDS}
+        self.assertTrue(main_module.LOCAL_EXTENSION_COMMANDS <= set(main_module.COMMAND_HANDLERS))
+        for name in main_module.LOCAL_EXTENSION_COMMANDS:
+            spec = next(s for s in main_module.COMMANDS if s.command == name)
+            self.assertTrue(spec.upstream.startswith('interlude.'))
+            self.assertIn(spec.upstream, upstream_names)
 
     def test_permissions_match_upstream_roles(self):
         admin = {spec.command for spec in main_module.COMMANDS if spec.permission == 'admin'}
@@ -1064,9 +1077,11 @@ class BlindModeTests(unittest.TestCase):
         plugin, registry = self._plugin(False)
         self.assertFalse(plugin.blind_mode)
         self.assertEqual(plugin.suppressed_commands, ())
-        self.assertEqual(len(plugin.active_commands()), 32)
+        expected = main_module.UPSTREAM_COMMAND_COUNT + len(main_module.LOCAL_EXTENSION_COMMANDS)
+        self.assertEqual(len(plugin.active_commands()), expected)
         self.assertEqual(
-            len(registry.get_handlers_by_module_name(main_module.HDSInterludePlugin.__module__)), 33,
+            len(registry.get_handlers_by_module_name(main_module.HDSInterludePlugin.__module__)),
+            expected + 1,  # +1 是私聊监听 on_private_message
         )
 
 
@@ -1175,6 +1190,176 @@ class BridgeIntegrationTests(unittest.TestCase):
         group_endpoint = bridge_module.endpoint_for_event(group_event)
         bridge.remember_event(group_event, session_view(group_event, group_endpoint), group_endpoint)
         self.assertEqual(bridge.group_umo('30003'), 'aiocqhttp:GroupMessage:30003')
+
+
+class ConfigTransferTests(unittest.TestCase):
+    """配置导出 / 导入（本移植版新增）与它的**向后兼容**契约。
+
+    这里测的是适配层行为：读的是磁盘上那份原样配置、写回走 AstrBot 的 `save_config`、
+    拿不到 live config 时退化为直接写文件。信封格式与迁移链在
+    `plugin/tests/test_config_io.py` 里单独测。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self._tmp.name, 'astrbot_plugin_hds_interlude_config.json')
+        self.bridge = _make_bridge({'runtime': {'auto_create': False}})
+        # 用临时文件代替真实的 `data/config/<插件>_config.json`
+        self.bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+
+    def _write_disk(self, data):
+        with open(self.path, 'w', encoding='utf-8') as handle:
+            handle.write('\ufeff' + json.dumps(data, ensure_ascii=False))
+
+    def _read_disk(self):
+        with open(self.path, encoding='utf-8-sig') as handle:
+            return json.load(handle)
+
+    def test_export_wraps_the_on_disk_config_not_the_normalized_copy(self):
+        self._write_disk({'model_center': {'main_model_id': 'x'}, '我的扩展': {'a': 1}})
+        envelope = self.bridge.export_config()
+        self.assertEqual(envelope['config']['model_center'], {'main_model_id': 'x'})
+        self.assertEqual(envelope['config']['我的扩展'], {'a': 1}, '导出必须保留未知键')
+        self.assertEqual(envelope['sections'], ['model_center', '我的扩展'])
+        self.assertEqual(envelope['formatVersion'], 1)
+
+    def test_export_falls_back_to_memory_when_no_file(self):
+        bridge = _make_bridge({'runtime': {'auto_create': True}})
+        bridge.config_file_path = lambda: os.path.join(self._tmp.name, 'missing.json')  # type: ignore[method-assign]
+        envelope = bridge.export_config()
+        self.assertIn('runtime', envelope['config'])
+
+    def test_export_carries_an_upstream_version_and_a_note(self):
+        self._write_disk({})
+        envelope = self.bridge.export_config(note='回归测试')
+        self.assertTrue(envelope.get('upstreamVersion'))
+        self.assertEqual(envelope.get('note'), '回归测试')
+
+    def test_preview_does_not_write_anything(self):
+        self._write_disk({'runtime': {'auto_create': False}})
+        preview = self.bridge.preview_config_import({'runtime': {'auto_create': True}})
+        self.assertIn('runtime.auto_create', preview['diff']['changed'])
+        self.assertEqual(self._read_disk(), {'runtime': {'auto_create': False}}, '预览不应写盘')
+
+    def test_import_writes_through_the_astrbot_config_api(self):
+        saved = {}
+
+        class _LiveConfig(dict):
+            def save_config(self, replace_config=None, **kwargs):
+                saved.update(replace_config or {})
+
+        bridge = _make_bridge({})
+        bridge._live_config = _LiveConfig()
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+        self._write_disk({'runtime': {'auto_create': False}})
+        import asyncio
+
+        report = asyncio.run(bridge.import_config({'runtime': {'auto_create': True}}))
+        self.assertEqual(report['saved_via'], 'astrbot-config-api')
+        self.assertTrue(saved.get('runtime', {}).get('auto_create'))
+
+    def test_import_falls_back_to_writing_the_file(self):
+        bridge = _make_bridge({})
+        bridge._live_config = None
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+        self._write_disk({'runtime': {'auto_create': False}, 'keep_me': {'v': 1}})
+        import asyncio
+
+        report = asyncio.run(bridge.import_config({'runtime': {'auto_create': True}}))
+        self.assertEqual(report['saved_via'], 'config-file')
+        written = self._read_disk()
+        self.assertTrue(written['runtime']['auto_create'])
+        self.assertEqual(written['keep_me'], {'v': 1}, '文件里没出现的键不能被清掉')
+
+    def test_legacy_bare_config_imports_and_is_reported_as_v0(self):
+        self._write_disk({})
+        bridge = _make_bridge({})
+        bridge._live_config = None
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+        import asyncio
+
+        report = asyncio.run(bridge.import_config({
+            'storyDefaults': {'characterName': '凌梦'},   # 上游 Koala Console 时代的分组名
+        }))
+        self.assertEqual(report['format_version'], 0)
+        self.assertEqual(report['source'], 'bare')
+        written = self._read_disk()
+        # 归一化后落到 snake_case 分组，并补齐默认值
+        self.assertEqual(written['story_defaults']['character_name'], '凌梦')
+        self.assertIn('model_center', written)
+
+    def test_round_trip_export_then_import_keeps_everything(self):
+        original = {
+            'story_defaults': {'character_name': '凌梦', 'timezone': 'Asia/Shanghai'},
+            'model_center': {'providers': [{'label': '主叙事', 'model': 'x'}]},
+            '我的扩展': {'v': 1},
+        }
+        self._write_disk(original)
+        envelope = self.bridge.export_config()
+
+        bridge = _make_bridge({})
+        bridge._live_config = None
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+        self._write_disk({})
+        import asyncio
+
+        asyncio.run(bridge.import_config(envelope))
+        written = self._read_disk()
+        self.assertEqual(written['story_defaults']['character_name'], '凌梦')
+        self.assertEqual(written['model_center']['providers'][0]['model'], 'x')
+        self.assertEqual(written['我的扩展'], {'v': 1})
+
+    def test_import_rejects_broken_json_with_a_readable_message(self):
+        bridge = _make_bridge({})
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+        import asyncio
+
+        from plugin.core.config_io import ConfigImportError
+
+        with self.assertRaises(ConfigImportError):
+            asyncio.run(bridge.import_config('{"a":'))
+
+
+class ConfigImportPayloadTests(unittest.TestCase):
+    """`main.py` 从消息里取导入内容的优先级。"""
+
+    def setUp(self):
+        self.plugin = _make_plugin({})
+        self.plugin.bridge.iso_time = lambda value: 'T'  # type: ignore[method-assign]
+
+    def test_inline_json_keeps_internal_spacing(self):
+        event = FakeMessageEvent(message='hdsi_config_import {"a": "凌  梦"}')
+        payload = self.plugin._config_import_payload(event)
+        self.assertEqual(payload, '{"a": "凌  梦"}')
+
+    def test_attached_file_is_read(self):
+        path = os.path.join(tempfile.mkdtemp(), 'conf.json')
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write('{"runtime": {"auto_create": true}}')
+        event = FakeMessageEvent(
+            message='hdsi_config_import',
+            components=[File(name='conf.json', file_=path)],
+        )
+        self.assertEqual(self.plugin._config_import_payload(event), '{"runtime": {"auto_create": true}}')
+
+    def test_replied_file_is_read(self):
+        path = os.path.join(tempfile.mkdtemp(), 'conf.json')
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write('{"a": 1}')
+        event = FakeMessageEvent(
+            message='hdsi_config_import',
+            components=[Reply(id='m-0', chain=[File(name='conf.json', file_=path)])],
+        )
+        self.assertEqual(self.plugin._config_import_payload(event), '{"a": 1}')
+
+    def test_images_are_not_mistaken_for_config_files(self):
+        event = FakeMessageEvent(message='hdsi_config_import', components=[Image(file='/tmp/x.png')])
+        self.assertIsNone(self.plugin._config_import_payload(event))
+
+    def test_missing_payload_returns_none(self):
+        event = FakeMessageEvent(message='hdsi_config_import')
+        self.assertIsNone(self.plugin._config_import_payload(event))
 
 
 if __name__ == '__main__':
