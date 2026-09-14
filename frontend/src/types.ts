@@ -61,6 +61,7 @@ export interface ConnectionRow {
   prices: { input: number; output: number; cached: number }
   response_format: string
   temperature: number | null
+  top_p: number | null
   max_tokens: number | null
   timeout: number | null
 }
@@ -208,4 +209,82 @@ export interface ImportPreview {
     warnings: string[]
   }
   payload: string
+}
+
+
+export interface AlterPayload {
+  story: StoryBrief | null
+  state: {
+    value: number
+    weight: number
+    direction: number
+    updated_at: string
+    last_attempt_at: string
+    offset: { direction: string; description: string; intensity: number; generated_at: string } | null
+  } | null
+  history: Array<{
+    turn: number
+    phase: string
+    alter: number
+    alter_value: number
+    timestamp: string
+    participant_id: string
+  }>
+  pending: Array<{ participant_id: string; value: number; last_attempt_at: string }>
+  config: Record<string, unknown>
+}
+
+export interface AgencyPayload {
+  story: StoryBrief | null
+  window: {
+    activity_load: string
+    privacy: string
+    device_access: string
+    next_opportunity_at: string
+    valid_until: string
+    basis: string
+    source_entry_ids: number[]
+    updated_at: string
+  } | null
+  plan: {
+    revision: number
+    timezone: string
+    valid_from: string
+    valid_through: string
+    last_reviewed: string
+    review_reason: string
+    regimes: unknown[]
+    exceptions: unknown[]
+    materialized_days: unknown[]
+    updated_at: string
+  } | null
+  config: Record<string, unknown>
+}
+
+export interface DeliverySegment {
+  index: number
+  kind: string
+  status: string
+  attempts: number
+  error: string
+}
+
+export interface DeliveryAction {
+  entry_id: number
+  occurred_at: string
+  commit_id: string
+  event_id: string
+  status: string
+  target: string
+  attempts: number
+  updated_at: string
+  segments: DeliverySegment[]
+  done: number
+}
+
+export interface DeliveryPayload {
+  story: StoryBrief | null
+  actions: DeliveryAction[]
+  totals: Record<string, number>
+  scanned: number
 }

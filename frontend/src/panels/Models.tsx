@@ -1,13 +1,19 @@
+import { useState } from 'preact/hooks'
+import { apiPost } from '../bridge'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { ModelsPayload } from '../types'
-import { Badge, Empty, ErrorNote, Grid, Icon, KeyValue, Loading, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
+import { Badge, Button, Empty, ErrorNote, Grid, KeyValue, Loading, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
+import { ConnectionEditor } from '../components/ConnectionEditor'
 
 function fmt(value: number | null | undefined, unit = '') {
   return value === null || value === undefined ? '—' : `${value}${unit}`
 }
 
 export function Models({ storyId, refreshKey }: PanelProps) {
+  const [editing, setEditing] = useState<number | 'new' | null>(null)
+  const [notice, setNotice] = useState('')
+  const [failure, setFailure] = useState('')
   const { data, error, loading, reload } = useQuery<ModelsPayload>(
     'console/models',
     { story_id: storyId },
@@ -17,6 +23,19 @@ export function Models({ storyId, refreshKey }: PanelProps) {
   if (error) return <ErrorNote text={error} onRetry={reload} />
   if (loading && !data) return <Loading />
   if (!data) return <Empty text="没有拿到数据" />
+
+  async function remove(index: number, label: string) {
+    if (!window.confirm(`确定删除连接「${label || '#' + index}」吗？此操作会立即写进插件配置。`)) return
+    setFailure('')
+    try {
+      const result = await apiPost<{ changed: string }>('console/connections-delete', { index })
+      setNotice(result.changed)
+      if (editing === index) setEditing(null)
+      reload()
+    } catch (problem) {
+      setFailure(problem instanceof Error ? problem.message : String(problem))
+    }
+  }
 
   const { tasks, connections, astrbot_providers, main, embedding, vision, audio, failover, usage } = data
   const bound = Object.entries(data.task_models).filter(([, item]) => item.astrbot_provider)
@@ -64,33 +83,82 @@ export function Models({ storyId, refreshKey }: PanelProps) {
       </Panel>
 
       <Grid cols={2}>
-        <Panel title={`模型连接池（${connections.length}）`} icon="link">
-          {connections.length === 0 ? (
+        <Panel
+          title={`模型连接池（${connections.length}）`}
+          icon="link"
+          actions={
+            <Button icon="config" onClick={() => setEditing(editing === 'new' ? null : 'new')}>
+              新增连接
+            </Button>
+          }
+        >
+          {notice && <div class="mb-3"><Note tone="ok">{notice}</Note></div>}
+          {failure && (
+            <div class="mb-3">
+              <ErrorNote text={failure} onRetry={() => setFailure('')} />
+            </div>
+          )}
+
+          {editing === 'new' && (
+            <div class="mb-3">
+              <ConnectionEditor
+                index={null}
+                row={null}
+                onCancel={() => setEditing(null)}
+                onDone={(message) => {
+                  setNotice(message)
+                  setEditing(null)
+                  reload()
+                }}
+              />
+            </div>
+          )}
+
+          {connections.length === 0 && editing !== 'new' ? (
             <Empty text="连接池是空的。只用了 AstrBot 的模型时这是正常的。" icon="link" />
           ) : (
             <div class="flex flex-col gap-3">
-              {connections.map((row, index) => (
-                <div key={index} class="rounded-lg border border-line px-3 py-2">
-                  <div class="flex items-center gap-2">
-                    <span class="text-xs font-medium">{row.label || '(未命名)'}</span>
-                    {row.enabled ? <Badge tone="ok">启用</Badge> : <Badge tone="warn">停用</Badge>}
-                    <Badge>{row.mode}</Badge>
-                    <span class="ml-auto text-[11px] text-muted">{row.model || '模型未填'}</span>
+              {connections.map((row, index) =>
+                editing === index ? (
+                  <ConnectionEditor
+                    key={index}
+                    index={index}
+                    row={row}
+                    onCancel={() => setEditing(null)}
+                    onDone={(message) => {
+                      setNotice(message)
+                      setEditing(null)
+                      reload()
+                    }}
+                  />
+                ) : (
+                  <div key={index} class="rounded-lg border border-line px-3 py-2">
+                    <div class="flex items-center gap-2">
+                      <span class="text-xs font-medium">{row.label || '(未命名)'}</span>
+                      {row.enabled ? <Badge tone="ok">启用</Badge> : <Badge tone="warn">停用</Badge>}
+                      <Badge>{row.mode}</Badge>
+                      {row.has_key && <Badge tone="accent">有密钥</Badge>}
+                      <span class="ml-auto text-[11px] text-muted">{row.model || '模型未填'}</span>
+                      <Button icon="config" onClick={() => setEditing(index)}>编辑</Button>
+                      <Button variant="danger" icon="close" onClick={() => void remove(index, row.label)}>
+                        删除
+                      </Button>
+                    </div>
+                    <div class="mt-2">
+                      <KeyValue
+                        rows={[
+                          ['地址', row.endpoint ? <span class="font-mono text-[11px]">{row.endpoint}</span> : <span class="text-warn">留空（走 AstrBot）</span>],
+                          ['密钥', row.has_key ? '已配置（不回显）' : '未配置'],
+                          ['用途', row.tasks.length ? row.tasks.join('、') : '未勾选'],
+                          ['输出格式', row.response_format || '—'],
+                          ['采样', `${fmt(row.temperature)} / ${fmt(row.top_p)} / ${fmt(row.max_tokens, ' tokens')}`],
+                          ['单价', row.prices.input || row.prices.output ? `入 ${row.prices.input} / 出 ${row.prices.output}` : '未配置'],
+                        ]}
+                      />
+                    </div>
                   </div>
-                  <div class="mt-2">
-                    <KeyValue
-                      rows={[
-                        ['地址', row.endpoint ? <span class="font-mono text-[11px]">{row.endpoint}</span> : <span class="text-warn">留空（走 AstrBot）</span>],
-                        ['密钥', row.has_key ? '已填' : '未填'],
-                        ['用途', row.tasks.length ? row.tasks.join('、') : '未勾选'],
-                        ['输出格式', row.response_format || '—'],
-                        ['采样', `${fmt(row.temperature)} / top_p — / ${fmt(row.max_tokens, ' tokens')}`],
-                        ['单价', row.prices.input || row.prices.output ? `入 ${row.prices.input} / 出 ${row.prices.output}` : '未配置'],
-                      ]}
-                    />
-                  </div>
-                </div>
-              ))}
+                ),
+              )}
             </div>
           )}
         </Panel>

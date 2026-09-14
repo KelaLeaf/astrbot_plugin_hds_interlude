@@ -3,7 +3,7 @@ import { useState } from 'preact/hooks'
 import { downloadFile, uploadFile, apiPost } from '../bridge'
 import type { PanelProps } from '../main'
 import type { ImportPreview } from '../types'
-import { Badge, Button, Empty, ErrorNote, Grid, Icon, Note, Panel, Stack, Stat } from '../components/ui'
+import { Badge, Button, Empty, ErrorNote, FilePicker, Grid, Icon, Note, Panel, Stack, Stat } from '../components/ui'
 
 interface ApplyResult {
   saved_via: string
@@ -106,17 +106,13 @@ export function Config({ refreshKey }: PanelProps) {
           <p class="mb-3 text-xs text-muted">
             先选文件、看清会改哪些项，再确认导入。导入是「合并」：文件里没写的设置保持原值，不认识的键原样保留。
           </p>
-          <div class="flex items-center gap-3">
-            <input
-              type="file"
-              accept=".json,application/json"
-              class="text-xs"
-              onChange={(event) => {
-                const file = (event.currentTarget as HTMLInputElement).files?.[0]
-                if (file) void doPreview(file)
-              }}
-            />
-            <span class="text-[11px] text-muted">{importing || fileName}</span>
+          <FilePicker
+            onPick={(file) => void doPreview(file)}
+            disabled={Boolean(importing) && importing !== '正在解析…'}
+            hint="只接受本插件导出的 JSON"
+          />
+          <div class="mt-2 text-[11px] text-muted">
+            {importing || (fileName ? `已选择：${fileName}` : '还没有选择文件')}
           </div>
         </Panel>
       </Grid>

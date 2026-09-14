@@ -114,7 +114,7 @@ export function Memory({ storyId, refreshKey }: PanelProps) {
       </Panel>
 
       <Grid cols={2}>
-        <Panel title="记忆条目（压缩产物）" icon="document">
+        <Panel title="记忆条目（压缩产物）" icon="logs">
           <Table
             columns={[
               { key: 'category', title: '类别', render: (row) => <Badge>{row.category || '—'}</Badge> },

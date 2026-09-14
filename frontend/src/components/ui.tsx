@@ -6,6 +6,7 @@
  * 组件只做「排版 + 语义色」，不带状态机、不引外部依赖；样式全走 Tailwind 工具类
  * 与 `style.css` 里的语义色板。
  */
+import { useRef, useState } from 'preact/hooks'
 import type { ComponentChildren } from 'preact'
 import { Icon, type IconName } from './Icon'
 
@@ -112,6 +113,169 @@ export function Button({
       {icon && <Icon name={icon} class="h-3.5 w-3.5" />}
       {children}
     </button>
+  )
+}
+
+/** 开关：控制台里所有布尔设置都用它（受控，禁用态会变灰）。 */
+export function Switch({
+  checked,
+  onChange,
+  disabled,
+  label,
+}: {
+  checked: boolean
+  onChange: (next: boolean) => void
+  disabled?: boolean
+  label?: string
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      class={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition disabled:cursor-not-allowed disabled:opacity-50 ${
+        checked ? 'border-accent bg-accent' : 'border-line bg-raised'
+      }`}
+    >
+      <span
+        class={`absolute h-3.5 w-3.5 rounded-full bg-panel shadow transition-all ${
+          checked ? 'left-[1.15rem]' : 'left-[0.15rem]'
+        }`}
+      />
+    </button>
+  )
+}
+
+/** 受控文本框：连接池编辑表单里用。 */
+export function Field({
+  label,
+  hint,
+  children,
+  class: className = '',
+}: {
+  label: string
+  hint?: string
+  children: ComponentChildren
+  class?: string
+}) {
+  return (
+    <label class={`flex flex-col gap-1 ${className}`}>
+      <span class="text-[11px] font-medium text-muted">{label}</span>
+      {children}
+      {hint && <span class="text-[11px] text-muted">{hint}</span>}
+    </label>
+  )
+}
+
+/** 统一样式的输入控件。用原生元素，样式靠 Tailwind——不引表单库。 */
+export function Input({
+  value,
+  onInput,
+  type = 'text',
+  placeholder,
+  disabled,
+}: {
+  value: string | number
+  onInput: (next: string) => void
+  type?: 'text' | 'number' | 'password'
+  placeholder?: string
+  disabled?: boolean
+}) {
+  return (
+    <input
+      type={type}
+      value={value}
+      placeholder={placeholder}
+      disabled={disabled}
+      onInput={(event) => onInput((event.currentTarget as HTMLInputElement).value)}
+      class="w-full rounded-lg border border-line bg-panel px-2 py-1.5 text-xs outline-none transition focus:border-accent disabled:opacity-50"
+    />
+  )
+}
+
+export function Select({
+  value,
+  onChange,
+  options,
+}: {
+  value: string
+  onChange: (next: string) => void
+  options: Array<{ value: string; label: string }>
+}) {
+  return (
+    <select
+      value={value}
+      onChange={(event) => onChange((event.currentTarget as HTMLSelectElement).value)}
+      class="w-full rounded-lg border border-line bg-panel px-2 py-1.5 text-xs outline-none focus:border-accent"
+    >
+      {options.map((option) => (
+        <option key={option.value} value={option.value}>
+          {option.label}
+        </option>
+      ))}
+    </select>
+  )
+}
+
+/**
+ * 文件选择：**不要**直接用 `<input type="file">`——浏览器原生控件跟整套 UI 格格不入
+ * （实测用户第一眼就发现了）。这里把它藏起来，外面套一个能点、能拖的方块。
+ */
+export function FilePicker({
+  onPick,
+  accept = '.json,application/json',
+  disabled,
+  hint,
+}: {
+  onPick: (file: File) => void
+  accept?: string
+  disabled?: boolean
+  hint?: string
+}) {
+  const [over, setOver] = useState(false)
+  const input = useRef<HTMLInputElement>(null)
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => !disabled && input.current?.click()}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') input.current?.click()
+      }}
+      onDragOver={(event) => {
+        event.preventDefault()
+        if (!disabled) setOver(true)
+      }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(event) => {
+        event.preventDefault()
+        setOver(false)
+        const file = event.dataTransfer?.files?.[0]
+        if (file && !disabled) onPick(file)
+      }}
+      class={`flex cursor-pointer flex-col items-center gap-1 rounded-xl border-2 border-dashed px-4 py-6 text-center transition ${
+        over ? 'border-accent bg-accent/5' : 'border-line hover:border-accent/60'
+      } ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
+    >
+      <Icon name="upload" class="h-5 w-5 text-muted" />
+      <span class="text-xs">点击选择文件，或拖到这里</span>
+      {hint && <span class="text-[11px] text-muted">{hint}</span>}
+      <input
+        ref={input}
+        type="file"
+        accept={accept}
+        class="hidden"
+        onChange={(event) => {
+          const file = (event.currentTarget as HTMLInputElement).files?.[0]
+          if (file) onPick(file)
+          // 同一个文件连选两次也要能触发 change
+          ;(event.currentTarget as HTMLInputElement).value = ''
+        }}
+      />
+    </div>
   )
 }
 
