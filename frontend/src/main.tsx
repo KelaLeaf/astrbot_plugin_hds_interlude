@@ -18,14 +18,23 @@ import { Memory } from './panels/Memory'
 import { Database } from './panels/Database'
 import { Logs } from './panels/Logs'
 import { Config } from './panels/Config'
+import { Alter } from './panels/Alter'
+import { Agency } from './panels/Agency'
+import { Delivery } from './panels/Delivery'
 
-type PanelKey = 'overview' | 'models' | 'script' | 'memory' | 'database' | 'logs' | 'config'
+type PanelKey =
+  | 'overview' | 'models' | 'script' | 'memory'
+  | 'alter' | 'agency' | 'delivery'
+  | 'database' | 'logs' | 'config'
 
 const NAV: Array<{ key: PanelKey; icon: IconName; label: string; fallback: string }> = [
   { key: 'overview', icon: 'overview', label: '总览', fallback: '总览' },
   { key: 'models', icon: 'models', label: '模型', fallback: '模型' },
   { key: 'script', icon: 'script', label: '剧本', fallback: '剧本' },
   { key: 'memory', icon: 'memory', label: '记忆', fallback: '记忆' },
+  { key: 'alter', icon: 'star', label: '情绪', fallback: '情绪' },
+  { key: 'agency', icon: 'compass', label: '日程', fallback: '日程' },
+  { key: 'delivery', icon: 'link', label: '投递', fallback: '投递' },
   { key: 'database', icon: 'database', label: '数据库', fallback: '数据库' },
   { key: 'logs', icon: 'logs', label: '日志', fallback: '日志' },
   { key: 'config', icon: 'config', label: '配置', fallback: '配置' },
@@ -133,6 +142,12 @@ function App() {
             <Script {...props} />
           ) : panel === 'memory' ? (
             <Memory {...props} />
+          ) : panel === 'alter' ? (
+            <Alter {...props} />
+          ) : panel === 'agency' ? (
+            <Agency {...props} />
+          ) : panel === 'delivery' ? (
+            <Delivery {...props} />
           ) : panel === 'database' ? (
             <Database {...props} />
           ) : panel === 'logs' ? (

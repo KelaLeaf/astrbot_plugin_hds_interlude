@@ -404,6 +404,19 @@ class HDSInterludePlugin(Star):
              '控制台：数据库概览'),
             (f'/{PLUGIN_NAME}/console/logs', self.page_console_logs, ['GET'],
              '控制台：运行日志'),
+            (f'/{PLUGIN_NAME}/console/alter', self.page_console_alter, ['GET'],
+             '控制台：Alter 情绪'),
+            (f'/{PLUGIN_NAME}/console/agency', self.page_console_agency, ['GET'],
+             '控制台：Agency 与日程'),
+            (f'/{PLUGIN_NAME}/console/delivery', self.page_console_delivery, ['GET'],
+             '控制台：投递账本'),
+            # 写操作（控制台里唯一会改状态的两处，都是白名单）
+            (f'/{PLUGIN_NAME}/console/flags', self.page_console_set_flag, ['POST'],
+             '控制台：切换运行开关'),
+            (f'/{PLUGIN_NAME}/console/connections', self.page_console_save_connection, ['POST'],
+             '控制台：新增 / 修改模型连接'),
+            (f'/{PLUGIN_NAME}/console/connections-delete', self.page_console_delete_connection, ['POST'],
+             '控制台：删除模型连接'),
             # 配置备份（原 config-backup 页并入控制台）
             (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
              '导出 HDS Interlude 配置'),
@@ -441,6 +454,57 @@ class HDSInterludePlugin(Star):
         return await self._console_json(lambda api, q: api.logs(
             _to_int(q('limit'), 200), q('level'),
         ))
+
+    async def page_console_alter(self):
+        return await self._console_json(lambda api, q: api.alter(q('story_id')))
+
+    async def page_console_agency(self):
+        return await self._console_json(lambda api, q: api.agency(q('story_id')))
+
+    async def page_console_delivery(self):
+        return await self._console_json(lambda api, q: api.delivery(
+            q('story_id'), _to_int(q('limit'), 300), q('status'),
+        ))
+
+    # ---- 控制台的写操作 ---- #
+
+    async def page_console_set_flag(self):
+        return await self._console_write(lambda api, body: api.set_flag(
+            body.get('name'), body.get('value'),
+        ))
+
+    async def page_console_save_connection(self):
+        return await self._console_write(lambda api, body: api.save_connection(body))
+
+    async def page_console_delete_connection(self):
+        return await self._console_write(lambda api, body: api.delete_connection(body.get('index')))
+
+    async def _console_write(self, action):
+        """跑一个控制台写操作。
+
+        跟读接口的区别：用户能直接看到失败原因（比如"地址格式不对"），所以
+        `ConsoleError` 映射成 400 + 原文案；其它异常仍是 500 + 泛化文案。
+        每次成功的写操作都记一条 warn 日志——控制台改了用户的配置，得留下痕迹。
+        """
+        from astrbot.api.web import error_response, json_response, request
+
+        from .adapters.console_api import ConsoleError
+
+        try:
+            body = await request.json(default=None)
+        except Exception:  # noqa: BLE001 - 不是 JSON 就当空对象
+            body = None
+        if not isinstance(body, dict):
+            return error_response('请求体必须是 JSON 对象', status_code=400)
+        try:
+            payload = await action(self._console, body)
+        except ConsoleError as error:
+            return error_response(str(error), status_code=400)
+        except Exception as error:  # noqa: BLE001
+            logger.warning('hds-interlude：控制台写操作失败：%s' % error)
+            return error_response('操作失败：%s' % error, status_code=500)
+        logger.warning('hds-interlude：控制台修改了配置：%s' % payload.get('changed', '?'))
+        return json_response(payload)
 
     async def _console_json(self, loader):
         """跑一个控制台取数函数并把结果包成 JSON 响应。

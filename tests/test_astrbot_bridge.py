@@ -1512,6 +1512,12 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/memory',
             f'/{main_module.PLUGIN_NAME}/console/database',
             f'/{main_module.PLUGIN_NAME}/console/logs',
+            f'/{main_module.PLUGIN_NAME}/console/alter',
+            f'/{main_module.PLUGIN_NAME}/console/agency',
+            f'/{main_module.PLUGIN_NAME}/console/delivery',
+            f'/{main_module.PLUGIN_NAME}/console/flags',
+            f'/{main_module.PLUGIN_NAME}/console/connections',
+            f'/{main_module.PLUGIN_NAME}/console/connections-delete',
             f'/{main_module.PLUGIN_NAME}/config-export',
             f'/{main_module.PLUGIN_NAME}/config-import-preview',
             f'/{main_module.PLUGIN_NAME}/config-import-apply',
@@ -1532,10 +1538,21 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             self.assertEqual(methods, ['POST'])
             self.assertIsNotNone(handler)
         # 控制台的只读面板一律 GET（页面用 bridge.apiGet 拉数据）
-        for panel in ('overview', 'models', 'script', 'memory', 'database', 'logs'):
+        for panel in ('overview', 'models', 'script', 'memory', 'database', 'logs',
+                      'alter', 'agency', 'delivery'):
             handler, methods = seen[f'/{main_module.PLUGIN_NAME}/console/{panel}']
             self.assertEqual(methods, ['GET'], panel)
             self.assertIsNotNone(handler, panel)
+        # 写操作一律 POST，且**只有这三个**——控制台不是配置编辑器
+        writer = [
+            route for route, _h, methods, _d in context.web_apis
+            if route.startswith(f'/{main_module.PLUGIN_NAME}/console/') and 'GET' not in methods
+        ]
+        self.assertEqual(writer, [
+            f'/{main_module.PLUGIN_NAME}/console/flags',
+            f'/{main_module.PLUGIN_NAME}/console/connections',
+            f'/{main_module.PLUGIN_NAME}/console/connections-delete',
+        ])
 
     def test_every_registration_carries_a_description(self):
         context = FakeContext()

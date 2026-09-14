@@ -2610,6 +2610,38 @@ class AstrbotBridge:
         except OSError as error:
             raise RuntimeError(f'配置写入失败：{error}') from error
 
+    async def save_raw_config(self, config: dict[str, Any]) -> str:
+        """把一份**原样配置**写回磁盘，并让运行中的服务立刻生效。
+
+        控制台改开关 / 连接池走这里，跟配置导入共用同一条写回路径（`to_schema_shape`
+        → `_save_config`），保证三件事一致：BOM、schema 分组名、AstrBot 的配置变更通知。
+
+        **生效用的是刚写下去的这份，而不是回头再读一遍磁盘**：宿主的 `save_config`
+        是同步写、但将来未必；而且连续两次写（比如"加一条再删一条"）时，回读可能拿到
+        还没落盘的旧值。写什么就生效什么，最省心。
+        """
+        from ..core.service.config import to_schema_shape  # noqa: PLC0415
+
+        saved_via = await self._save_config(to_schema_shape(config))
+        self.apply_config(config)
+        return saved_via
+
+    def apply_config(self, config: dict[str, Any]) -> None:
+        """把一份配置装进内存并交给服务（不落盘）。
+
+        `self.config` 始终是干净配置（不含 `routing_config()` 合成的连接行），
+        交给服务的是补过合成行的副本——与 `__init__` 保持一致。
+        """
+        self.config = normalize_bridge_config(config)
+        try:
+            self.service.config = self.routing_config()
+        except Exception:  # noqa: BLE001 - 服务未就绪时忽略
+            pass
+
+    def reload_config(self) -> None:
+        """按**当前磁盘上的配置**重建内存副本，并交给服务。"""
+        self.apply_config(self.raw_config())
+
     def _has_voice(self, session: SessionView) -> bool:
         """上游 `extractSessionVoiceCount(session)` 的等价判定。"""
         from ..core.service.helpers import extract_session_voice_count  # noqa: PLC0415
