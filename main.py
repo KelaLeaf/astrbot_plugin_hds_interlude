@@ -44,6 +44,7 @@ from .adapters.astrbot_bridge import (
     endpoint_for_event,
     session_view,
 )
+from .adapters.console_api import ConsoleApi
 
 __all__ = ['COMMANDS', 'COMMAND_HANDLERS', 'HDSInterludePlugin', 'MANAGEMENT_COMMANDS']
 
@@ -174,6 +175,14 @@ CAPABILITY_CHECK_WAIT_SECONDS = 45
 
 #: 上游 `askConfirmation` 的肯定回答正则：`/^(?:y|yes)$/i`。
 CONFIRMATION_YES_RE = re.compile(r'^(?:y|yes)$', re.IGNORECASE)
+
+
+def _to_int(value: Any, default: int) -> int:
+    """查询参数转 int（拿不到/格式不对就用默认值，别让一个坏参数把面板打挂）。"""
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
 
 
 async def _page_import_payload() -> Optional[str]:
@@ -315,6 +324,8 @@ class HDSInterludePlugin(Star):
         super().__init__(context, config)
         self.config: dict = config or {}
         self.bridge: AstrbotBridge = build_bridge(context, self.config, logger)
+        #: 控制台（WebUI 插件页面）的取数入口；逻辑在 `adapters/console_api.py`。
+        self._console = ConsoleApi(self.bridge)
         self._register_config_page_apis(context)
         #: 盲区模式（上游 `blindMode.enabled`，兼容旧键 `blackBox.enabled`）。
         self.blind_mode: bool = self.bridge.blind_mode_enabled
@@ -368,15 +379,32 @@ class HDSInterludePlugin(Star):
     # ------------------------------------------------------------------ #
 
     def _register_config_page_apis(self, context: Context) -> None:
-        """注册「配置备份」页面用的三个 Web API。
+        """注册插件控制台页面（`pages/console/`）用的 Web API。
 
-        **为什么不做成聊天命令**：配置的导入导出是配置界面的事，跟聊天无关。
+        **为什么不做成聊天命令**：这些是配置 / 观测界面的事，跟聊天无关。
         AstrBot 的内置配置页由 `_conf_schema.json` 驱动、插不进自定义按钮，官方给的
         扩展点是**插件页面**（`pages/<名>/index.html` + `window.AstrBotPluginPage`
         bridge，明确支持文件上传下载与自定义交互），所以这里注册页面要调的后端接口，
-        配套页面放在 `plugin/pages/config-backup/`。
+        配套页面（Vite + Preact 构建产物）放在 `plugin/pages/console/`。
+
+        取数逻辑在 `adapters/console_api.py`；这里只做路由注册与响应包装，
+        免得 `main.py` 继续膨胀。
         """
         specs = (
+            # 控制台各面板（全部 GET，只读）
+            (f'/{PLUGIN_NAME}/console/overview', self.page_console_overview, ['GET'],
+             '控制台：总览'),
+            (f'/{PLUGIN_NAME}/console/models', self.page_console_models, ['GET'],
+             '控制台：模型与用量'),
+            (f'/{PLUGIN_NAME}/console/script', self.page_console_script, ['GET'],
+             '控制台：剧本条目'),
+            (f'/{PLUGIN_NAME}/console/memory', self.page_console_memory, ['GET'],
+             '控制台：记忆与事实'),
+            (f'/{PLUGIN_NAME}/console/database', self.page_console_database, ['GET'],
+             '控制台：数据库概览'),
+            (f'/{PLUGIN_NAME}/console/logs', self.page_console_logs, ['GET'],
+             '控制台：运行日志'),
+            # 配置备份（原 config-backup 页并入控制台）
             (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
              '导出 HDS Interlude 配置'),
             (f'/{PLUGIN_NAME}/config-import-preview', self.page_config_import_preview, ['POST'],
@@ -388,7 +416,52 @@ class HDSInterludePlugin(Star):
             try:
                 context.register_web_api(route, handler, methods, desc)
             except Exception as error:  # noqa: BLE001 - 宿主版本漂移时别拖垮插件加载
-                logger.warning('hds-interlude：注册配置页 API %s 失败：%s' % (route, error))
+                logger.warning('hds-interlude：注册控制台 API %s 失败：%s' % (route, error))
+
+    # ---- 控制台各面板（薄包装：取数在 adapters/console_api.py） ---- #
+
+    async def page_console_overview(self):
+        return await self._console_json(lambda api, q: api.overview(q('story_id')))
+
+    async def page_console_models(self):
+        return await self._console_json(lambda api, q: api.models(q('story_id')))
+
+    async def page_console_script(self):
+        return await self._console_json(lambda api, q: api.script(
+            q('story_id'), _to_int(q('limit'), 60), _to_int(q('offset'), 0),
+        ))
+
+    async def page_console_memory(self):
+        return await self._console_json(lambda api, q: api.memory(q('story_id')))
+
+    async def page_console_database(self):
+        return await self._console_json(lambda api, q: api.database())
+
+    async def page_console_logs(self):
+        return await self._console_json(lambda api, q: api.logs(
+            _to_int(q('limit'), 200), q('level'),
+        ))
+
+    async def _console_json(self, loader):
+        """跑一个控制台取数函数并把结果包成 JSON 响应。
+
+        单个面板出错不该让整页打不开，所以这里把异常转成 500 + 可读文案；
+        前端会把它显示在对应面板里。
+        """
+        from astrbot.api.web import error_response, json_response, request
+
+        def query(name: str) -> str:
+            try:
+                value = request.query.get(name, '')
+            except Exception:  # noqa: BLE001 - 取不到查询参数就当空
+                return ''
+            return str(value) if value is not None else ''
+
+        try:
+            return json_response(await loader(self._console, query))
+        except Exception as error:  # noqa: BLE001
+            logger.warning('hds-interlude：控制台取数失败：%s' % error)
+            return error_response('控制台取数失败：%s' % error, status_code=500)
 
     async def page_config_export(self):
         """下载当前配置（带格式信封，AstrBot 会按 `filename` 触发下载）。"""
