@@ -40,6 +40,18 @@
   http `endpoint`，会把留空的连接判成不可用；现在由适配层给 core 补一条声明了
   `transport_target` 的合成行，core 不因此认识 AstrBot）。
 
+**新增插件控制台**（WebUI 插件页面 `pages/console/`，取代原来的「配置备份」页）。
+
+- 七个面板：**总览**（故事、参与者、开关、模型路由、能力提示）、**模型**（任务→模型来源、
+  连接池、AstrBot 模型与能力声明、用量）、**剧本**（条目时间线、场景、弧）、
+  **记忆**（长期事实、压缩记忆、承诺意图、设定演化候选、参与者）、**数据库**（13 张表行数）、
+  **运行日志**（内存环形缓冲，可筛选、可自动刷新）、**配置**（导出 / 导入，功能与原来一致）。
+- 后端在 `plugin/adapters/console_api.py`：只读、不返回任何密钥（endpoint 会去掉 query），
+  每个面板在"没有剧本 / 没建表 / 没配模型"时都返回空壳而不是报错。
+- 前端源码在 `plugin/frontend/`（Vite + Preact + Tailwind v4），**构建产物提交进仓库**，
+  用户安装时不需要 Node。运行时依赖只有 Preact 一个，gzip 约 25KB JS + 4KB CSS。
+- 图标取自 [Game-Icon-Pack](https://github.com/Nieobie/Game-Icon-Pack)（CC0），只挑了 30 个内联进产物。
+
 ## v1.0.0
 
 **全量移植上游 `1.0.1-beta6-rebuild`（v2 剧本内核）**。v0.1.0 的"核心叙事子集"被整体替换：这一版把上游 Koishi 插件从配置、数据层、提示词到投递账本逐模块搬到了 AstrBot 上。

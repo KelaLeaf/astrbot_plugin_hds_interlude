@@ -50,6 +50,7 @@ import inspect
 import json
 import os
 import re
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable, Optional
@@ -1108,12 +1109,47 @@ class AstrbotHttpClient:
         if 'messages' in payload and (bound or not explicit_endpoint):
             routed = await self._chat(payload, timeout, task=task, provider_id=bound)
             if routed is not None:
+                self._record_usage(task, routed)
                 return routed
         if 'input' in payload and ('model' in payload or 'dimensions' in payload) and not explicit_endpoint:
             routed = await self._embedding(payload)
             if routed is not None:
                 return routed
-        return await self._fallback.post_json(url, headers, body, timeout)
+        response = await self._fallback.post_json(url, headers, body, timeout)
+        self._record_usage(task, response)
+        return response
+
+    def _record_usage(self, task: Optional[str], response: Any) -> None:
+        """把响应里的 `usage` 记进控制台的内存环形缓冲（**只做展示，不参与计费**）。
+
+        放在传输层是有意的：无论请求走的是 AstrBot Provider 还是插件自己的连接，
+        都会经过 `post_json`，所以这一处就能覆盖两条路。真正给用户看的 token 用量
+        与费用仍由 core 的 `report_token_usage` 负责；这里只是让 WebUI 有个"刚刚花了多少"
+        的即时视图，重启即清空。
+
+        拿不到 usage（很多网关不报）就什么都不记，不编造数据。
+        """
+        if not isinstance(response, dict):
+            return
+        usage = response.get('usage')
+        if not isinstance(usage, dict):
+            return
+        prompt = _usage_field(usage, 'prompt_tokens', 'input_tokens')
+        completion = _usage_field(usage, 'completion_tokens', 'output_tokens')
+        total = _usage_field(usage, 'total_tokens') or (prompt + completion)
+        if not (prompt or completion or total):
+            return
+        try:
+            self.bridge.usage_records.append({
+                'at': _now_iso(),
+                'task': task or '',
+                'model': _text(response.get('model')),
+                'prompt_tokens': prompt,
+                'completion_tokens': completion,
+                'total_tokens': total,
+            })
+        except Exception:  # pragma: no cover - 记账失败不能影响请求
+            pass
 
     def iterate_sse(
         self,
@@ -1402,6 +1438,23 @@ class AstrbotHttpClient:
         }
 
 
+def _now_iso() -> str:
+    """控制台时间戳（UTC ISO8601，与 core 的 `iso()` 一致）。"""
+    try:
+        return iso_time_value(utc_now())
+    except Exception:  # pragma: no cover
+        return ''
+
+
+#: 剥掉分层日志里的 ANSI 色码（WebUI 渲染不了 256 色转义序列）。
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+#: 控制台的环形缓冲长度（日志条数 / 用量条数）。
+CONSOLE_LOG_BUFFER = 600
+CONSOLE_USAGE_BUFFER = 400
+
+
 #: 合成连接行的 id 前缀。合成行只活在给 core 的配置副本里（见
 #: `AstrbotBridge.routing_config`），不会写进用户的配置文件。
 ROUTING_ROW_PREFIX = 'hdsi-astrbot-'
@@ -1665,6 +1718,10 @@ class AstrbotBridge:
         #: 报「主模型能力」用（能力自检需要知道到底是哪个模型在服务）。
         self._resolved_chat_provider_id = ''
         self._resolved_embedding_provider_id = ''
+        #: 控制台用的**内存**环形缓冲：最近若干条分层日志与 token 用量。
+        #: 不落盘、不增加任何依赖，重启即清空——它只是给 WebUI 看一眼"刚刚发生了什么"。
+        self.log_buffer: deque[dict[str, Any]] = deque(maxlen=CONSOLE_LOG_BUFFER)
+        self.usage_records: deque[dict[str, Any]] = deque(maxlen=CONSOLE_USAGE_BUFFER)
         self.db = Database(database_path(self.data_dir))
         self.transport = AstrbotTransport(self)
         self.http_client = AstrbotHttpClient(self)
@@ -1811,6 +1868,15 @@ class AstrbotBridge:
             return
 
         def sink(level: str, text: str) -> None:
+            # 先留一份给控制台（纯内存，失败不影响日志本身）。
+            # **要剥掉 ANSI 色码**：core 的分层日志带 256 色转义序列，AstrBot 的控制台
+            # 能渲染，但 WebUI 里会显示成一堆 `\u001b[38;5;222m`。
+            try:
+                self.log_buffer.append({
+                    'at': _now_iso(), 'level': level, 'text': _ANSI_RE.sub('', text),
+                })
+            except Exception:  # pragma: no cover
+                pass
             writer = getattr(target, 'debug' if level in ('debug', 'info') else 'warning', None)
             if level == 'error':
                 writer = getattr(target, 'error', writer)

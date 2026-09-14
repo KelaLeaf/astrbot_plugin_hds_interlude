@@ -1501,11 +1501,17 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             self.assertNotIn('config_import', name)
         self.assertEqual(len(main_module.COMMANDS), 32, '上游 32 条命令不应被配置功能污染')
 
-    def test_three_routes_are_registered_under_the_plugin_prefix(self):
+    def test_every_route_is_registered_under_the_plugin_prefix(self):
         context = FakeContext()
         _make_plugin(context=context)
         routes = [route for route, _h, _m, _d in context.web_apis]
         self.assertEqual(routes, [
+            f'/{main_module.PLUGIN_NAME}/console/overview',
+            f'/{main_module.PLUGIN_NAME}/console/models',
+            f'/{main_module.PLUGIN_NAME}/console/script',
+            f'/{main_module.PLUGIN_NAME}/console/memory',
+            f'/{main_module.PLUGIN_NAME}/console/database',
+            f'/{main_module.PLUGIN_NAME}/console/logs',
             f'/{main_module.PLUGIN_NAME}/config-export',
             f'/{main_module.PLUGIN_NAME}/config-import-preview',
             f'/{main_module.PLUGIN_NAME}/config-import-apply',
@@ -1525,6 +1531,11 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             handler, methods = seen[f'/{main_module.PLUGIN_NAME}/{suffix}']
             self.assertEqual(methods, ['POST'])
             self.assertIsNotNone(handler)
+        # 控制台的只读面板一律 GET（页面用 bridge.apiGet 拉数据）
+        for panel in ('overview', 'models', 'script', 'memory', 'database', 'logs'):
+            handler, methods = seen[f'/{main_module.PLUGIN_NAME}/console/{panel}']
+            self.assertEqual(methods, ['GET'], panel)
+            self.assertIsNotNone(handler, panel)
 
     def test_every_registration_carries_a_description(self):
         context = FakeContext()
@@ -1542,62 +1553,73 @@ class ConfigPageRegistrationTests(unittest.TestCase):
 
 
 class ConfigPageAssetTests(unittest.TestCase):
-    """页面文件本身：AstrBot 只托管插件目录下的 `pages/<名>/`。"""
+    """控制台页面文件本身：AstrBot 只托管插件目录下的 `pages/<名>/`。
 
-    PAGE_DIR = os.path.join(PLUGIN_ROOT, 'pages', 'config-backup')
+    页面是 **Vite 构建产物**（源码在 `plugin/frontend/`），所以这里断言的是
+    「构建出来的东西符合宿主的要求」，而不是手写文件的内容。
+    """
+
+    PAGE_DIR = os.path.join(PLUGIN_ROOT, 'pages', 'console')
 
     def _read(self, name):
         with open(os.path.join(self.PAGE_DIR, name), encoding='utf-8') as handle:
             return handle.read()
 
-    def test_page_directory_has_the_four_required_files(self):
-        for name in ('index.html', 'app.js', 'style.css', '_page.json'):
+    def test_page_directory_exists_with_entry_and_metadata(self):
+        for name in ('index.html', '_page.json'):
             self.assertTrue(os.path.isfile(os.path.join(self.PAGE_DIR, name)), name)
+        self.assertTrue(os.path.isdir(os.path.join(self.PAGE_DIR, 'assets')), 'assets/')
 
-    def test_index_uses_the_bridge_sdk_and_relative_assets(self):
+    def test_built_assets_are_relative_so_the_host_can_rewrite_them(self):
+        """构建产物必须是相对路径。
+
+        `base: './'` 是硬要求：宿主只重写**相对**资源地址，产物里出现绝对的
+        `/assets/...` 会被当成外部链接跳过，整页 404。这条在真机上踩过。
+        """
         html = self._read('index.html')
-        self.assertIn('AstrBotPluginPage', html)
-        self.assertIn('bridge-sdk.js', html)
-        # 相对路径！绝对 `/app.js` 在插件页里会因为路径前缀不同而 404
-        self.assertIn('./app.js', html)
-        self.assertIn('./style.css', html)
-        self.assertNotIn('src="/app.js"', html)
+        self.assertIn('src="./assets/', html)
+        self.assertIn('href="./assets/', html)
+        self.assertNotIn('src="/assets/', html)
+        self.assertNotIn('href="/assets/', html)
+
+    def test_index_declares_the_bridge_sdk_before_the_app(self):
+        html = self._read('index.html')
+        self.assertIn('/api/plugin/page/bridge-sdk.js', html)
+        self.assertIn('id="app"', html)
 
     def test_page_metadata_points_at_the_i18n_key(self):
         meta = json.loads(self._read('_page.json'))
-        self.assertEqual(meta['title']['i18n_key'], 'pages.config-backup.title')
+        self.assertEqual(meta['title']['i18n_key'], 'pages.console.title')
+        self.assertEqual(meta['description']['i18n_key'], 'pages.console.description')
 
     def test_page_i18n_keys_exist_in_both_locales(self):
-        """键名必须是 `title` / `description`。
-
-        AstrBot 的插件详情页按 `pages.<页名>.title` 与 `pages.<页名>.description`
-        取文案（见 dashboard 的 `pluginI18n` 助手）；写成 `desc` 会静默回落成
-        组件自带的英文占位串 "Plugin Page entry"。
-        """
+        """键名必须是 `title` / `description`（写成 `desc` 会静默回落成英文占位串）。"""
         for locale in ('zh-CN', 'en-US'):
             path = os.path.join(PLUGIN_ROOT, '.astrbot-plugin', 'i18n', f'{locale}.json')
             with open(path, encoding='utf-8') as handle:
                 data = json.load(handle)
-            pages = data.get('pages', {}).get('config-backup', {})
-            self.assertTrue(pages.get('title'), locale)
-            self.assertTrue(pages.get('description'), locale)
-            self.assertNotIn('desc', pages, '宿主只认 description')
+            page = data.get('pages', {}).get('console', {})
+            self.assertTrue(page.get('title'), locale)
+            self.assertTrue(page.get('description'), locale)
+            self.assertNotIn('desc', page, '宿主只认 description')
+            for key in ('overview', 'models', 'script', 'memory', 'database', 'logs', 'config'):
+                self.assertTrue(page.get('nav', {}).get(key), f'{locale}.nav.{key}')
 
-    def test_page_metadata_i18n_keys_match_the_host_convention(self):
-        meta = json.loads(self._read('_page.json'))
-        self.assertEqual(meta['title']['i18n_key'], 'pages.config-backup.title')
-        self.assertEqual(meta['description']['i18n_key'], 'pages.config-backup.description')
+    def test_console_bundle_stays_small(self):
+        """体积护栏：控制台是随插件分发的静态资源，别让它悄悄膨胀。
 
-    def test_page_calls_the_three_registered_endpoints(self):
-        source = self._read('app.js')
-        for endpoint in ('config-export', 'config-import-preview', 'config-import-apply'):
-            self.assertIn(endpoint, source)
-        self.assertIn('bridge.download', source)
-        self.assertIn('bridge.upload', source)
+        当前约 25KB JS + 4KB CSS（gzip）。阈值给到 120KB，超过就说明引入了一个
+        不小的依赖，应该先讨论再合并（对照：HeroUI + React 版实测 193KB gzip）。
+        """
+        assets = os.path.join(self.PAGE_DIR, 'assets')
+        total = 0
+        for name in os.listdir(assets):
+            total += os.path.getsize(os.path.join(assets, name))
+        self.assertLess(total, 400 * 1024, f'控制台资源合计 {total} 字节，太大了')
 
 
 class ConfigPageHandlerTests(unittest.TestCase):
-    """三个处理函数的返回值形状（页面按这些字段渲染）。"""
+    """配置导入导出处理函数的返回值形状（控制台「配置」面板按这些字段渲染）。"""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

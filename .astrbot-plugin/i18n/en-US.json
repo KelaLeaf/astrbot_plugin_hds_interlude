@@ -3,9 +3,18 @@
     "display_name": "HDS Interlude"
   },
   "pages": {
-    "config-backup": {
-      "title": "Config backup",
-      "description": "Export or import the HDS Interlude plugin configuration (settings only, no story data)."
+    "console": {
+      "title": "Interlude console",
+      "description": "Inspect story, models, script and memory; export or import the plugin configuration.",
+      "nav": {
+        "overview": "Overview",
+        "models": "Models",
+        "script": "Script",
+        "memory": "Memory",
+        "database": "Database",
+        "logs": "Logs",
+        "config": "Config"
+      }
     }
   }
 }

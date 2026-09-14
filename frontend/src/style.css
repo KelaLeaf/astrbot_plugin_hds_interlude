@@ -1,0 +1,105 @@
+@import 'tailwindcss';
+
+/*
+ * 让 `dark:` 跟随宿主注入的 `data-theme`，而不是系统偏好——AstrBot 的插件页
+ * bridge 会在 iframe 的 <html> 上设 `data-theme="dark" | "light"`，
+ * 这是唯一权威的来源（用户在控制台里切主题，页面要跟着变）。
+ */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+
+/*
+ * 语义色板：浅色/深色两套值挂在 CSS 变量上，再用 `@theme inline` 暴露给
+ * Tailwind 的工具类（`bg-panel` / `text-muted` / `border-line` …）。
+ * 这样整套配色只在这里改一处，组件里不出现裸色值。
+ */
+:root {
+  --app-bg: oklch(0.975 0.003 250);
+  --app-panel: oklch(1 0 0);
+  --app-raised: oklch(0.985 0.002 250);
+  --app-fg: oklch(0.24 0.02 260);
+  --app-muted: oklch(0.56 0.02 260);
+  --app-line: oklch(0.9 0.008 260);
+  --app-accent: oklch(0.58 0.19 265);
+  --app-accent-fg: oklch(0.99 0 0);
+  --app-ok: oklch(0.62 0.15 155);
+  --app-warn: oklch(0.72 0.15 75);
+  --app-danger: oklch(0.6 0.2 25);
+  --app-code-bg: oklch(0.96 0.004 260);
+}
+
+[data-theme='dark'] {
+  --app-bg: oklch(0.19 0.012 265);
+  --app-panel: oklch(0.235 0.014 265);
+  --app-raised: oklch(0.27 0.015 265);
+  --app-fg: oklch(0.93 0.008 260);
+  --app-muted: oklch(0.68 0.015 260);
+  --app-line: oklch(0.33 0.015 265);
+  --app-accent: oklch(0.68 0.16 265);
+  --app-accent-fg: oklch(0.16 0.02 265);
+  --app-ok: oklch(0.72 0.14 155);
+  --app-warn: oklch(0.8 0.14 75);
+  --app-danger: oklch(0.7 0.17 25);
+  --app-code-bg: oklch(0.17 0.012 265);
+}
+
+@theme inline {
+  --color-bg: var(--app-bg);
+  --color-panel: var(--app-panel);
+  --color-raised: var(--app-raised);
+  --color-fg: var(--app-fg);
+  --color-muted: var(--app-muted);
+  --color-line: var(--app-line);
+  --color-accent: var(--app-accent);
+  --color-accent-fg: var(--app-accent-fg);
+  --color-ok: var(--app-ok);
+  --color-warn: var(--app-warn);
+  --color-danger: var(--app-danger);
+  --color-code: var(--app-code-bg);
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei',
+    'Noto Sans SC', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--app-bg);
+  color: var(--app-fg);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 滚动条也跟主题走，免得深色下露出系统白条 */
+* {
+  scrollbar-color: var(--app-line) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--app-line);
+  border-radius: 9999px;
+}
+
+/* 长文本（剧本正文、日志）统一走这个，避免各处重复写 */
+.prose-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.7;
+}
+
+@keyframes hdsi-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: hdsi-spin 0.9s linear infinite;
+}
