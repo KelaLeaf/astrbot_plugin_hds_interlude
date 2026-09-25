@@ -425,6 +425,10 @@ class HDSInterludePlugin(Star):
              '控制台：写入一个配置项'),
             (f'/{PLUGIN_NAME}/console/participants', self.page_console_participants, ['GET'],
              '控制台：已知参与者（白名单一键填入）'),
+            (f'/{PLUGIN_NAME}/console/stories', self.page_console_stories, ['GET'],
+             '控制台：剧本清单（含归档）'),
+            (f'/{PLUGIN_NAME}/console/story-merge', self.page_console_story_merge, ['POST'],
+             '控制台：把旧剧本并入共享主剧本'),
             # 配置备份（原 config-backup 页并入控制台）
             (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
              '导出 HDS Interlude 配置'),
@@ -499,6 +503,14 @@ class HDSInterludePlugin(Star):
 
     async def page_console_participants(self):
         return await self._console_json(lambda api, q: api.participants(q('story_id')))
+
+    async def page_console_stories(self):
+        return await self._console_json(lambda api, q: api.stories())
+
+    async def page_console_story_merge(self):
+        return await self._console_write(lambda api, body: api.merge_story(
+            body.get('source_story_id'), body.get('target_story_id'),
+        ))
 
     async def _console_write(self, action):
         """跑一个控制台写操作。

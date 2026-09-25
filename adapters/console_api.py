@@ -1186,6 +1186,86 @@ class ConsoleApi:
             'scene': _text((state.get('currentScene') or {}).get('hook')) if isinstance(state.get('currentScene'), dict) else '',
         }
 
+    async def stories(self, limit: int = 30) -> dict[str, Any]:
+        """剧本清单（控制台顶栏的「剧本」切换器用）。
+
+        **为什么要有这个接口**：共享主剧本（上游 `sharedStoryConfig.enabled` 硬编码 true）
+        下同一个角色只有一部活动剧本，但库里可能还有若干旧剧本（旧 beta 的"每 QQ 一部"
+        遗留、以及被单剧本守卫归档的）。面板默认只显示"最近更新的那一部"，所以新用户
+        一发消息，界面就跳到新剧本，让人以为"前面的剧本没了"。这里把库里的剧本全列出来
+        （含 `archived`），供切换查看。
+        """
+        database = self.bridge.db
+        size = max(1, min(50, _int(limit, 30)))
+        rows = _safe_all(database, 'interlude_story', order='updatedAt DESC', limit=size)
+        stories: list[dict[str, Any]] = []
+        for row in rows:
+            brief = self._story_brief(row)
+            story_id = brief['id']
+            brief['entries'] = _safe_count(database, 'interlude_script_entry', {'storyId': story_id})
+            brief['participants'] = _safe_count(database, 'interlude_participant', {'storyId': story_id})
+            brief['shared'] = story_id.startswith('character:')
+            stories.append(brief)
+        return {'stories': stories, 'canonical': await self._canonical_story_id(stories)}
+
+    async def merge_story(self, source_story_id: Any, target_story_id: Any = '') -> dict[str, Any]:
+        """把一部旧剧本并入共享主剧本（控制台「并入主剧本」）。
+
+        上游只在"该账号回来时那条旧分支还 active"时惰性合并，而单剧本守卫会在任何人
+        发消息时先把其余 active 剧本归档（归档后不再合并）——所以升级到共享主剧本时，
+        先被归档的那部剧本的内容会留在库里但不进主剧本。这个入口把用户选中的剧本
+        显式并进去（条目 / 记忆 / 事实 / 场景 / 弧线等一起搬）。
+        """
+        service = getattr(self.bridge, 'service', None)
+        if service is None or not callable(getattr(service, 'merge_story_into_canonical', None)):
+            raise ConsoleError('插件服务尚未就绪，稍后再试')
+        source = _text(source_story_id)
+        if not source:
+            raise ConsoleError('请选择要并入的剧本')
+        target = _text(target_story_id)
+        if not target:
+            target = await self._canonical_story_id()
+        if not target:
+            raise ConsoleError('找不到共享主剧本，请先让角色说一句话再试')
+        if target == source:
+            raise ConsoleError('这就是当前主剧本，不需要并入')
+        try:
+            result = await service.merge_story_into_canonical(source, target)
+        except LookupError as error:
+            raise ConsoleError('剧本不存在或已被清理：%s' % error) from error
+        except ValueError as error:
+            raise ConsoleError('不能并入这部剧本：%s' % error) from error
+        payload = await self.stories()
+        payload['merged'] = {
+            'source': source,
+            'target': target,
+            'participant': _text((result or {}).get('participant_id')),
+            'moved': _int((result or {}).get('moved')),
+        }
+        payload['changed'] = 'story-merge %s → %s' % (source, target)
+        return payload
+
+    async def _canonical_story_id(self, stories: Optional[list[dict[str, Any]]] = None) -> str:
+        """当前共享主剧本 id：优先 `character:…`，其次库里最新的 active 剧本。"""
+        rows = stories
+        if rows is None:
+            service = getattr(self.bridge, 'service', None)
+            finder = getattr(service, 'canonical_story_id', None)
+            if callable(finder):
+                try:
+                    found = _text(await finder())
+                except Exception:  # noqa: BLE001 - 取不到就回落到直接查库
+                    found = ''
+                if found:
+                    return found
+            rows = [self._story_brief(item) for item in _safe_all(
+                self.bridge.db, 'interlude_story', order='updatedAt DESC', limit=50,
+            )]
+        for row in rows:
+            if row.get('shared') or _text(row.get('id')).startswith('character:'):
+                return _text(row.get('id'))
+        return _text(rows[0].get('id')) if rows else ''
+
     def _flags(self) -> dict[str, Any]:
         bridge = self.bridge
         return {

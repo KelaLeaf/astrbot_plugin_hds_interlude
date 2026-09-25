@@ -1563,6 +1563,8 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/config',
             f'/{main_module.PLUGIN_NAME}/console/config-set',
             f'/{main_module.PLUGIN_NAME}/console/participants',
+            f'/{main_module.PLUGIN_NAME}/console/stories',
+            f'/{main_module.PLUGIN_NAME}/console/story-merge',
             f'/{main_module.PLUGIN_NAME}/config-export',
             f'/{main_module.PLUGIN_NAME}/config-import-preview',
             f'/{main_module.PLUGIN_NAME}/config-import-apply',
@@ -1600,6 +1602,7 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/connections',
             f'/{main_module.PLUGIN_NAME}/console/connections-delete',
             f'/{main_module.PLUGIN_NAME}/console/config-set',
+            f'/{main_module.PLUGIN_NAME}/console/story-merge',
         ])
 
     def test_every_registration_carries_a_description(self):

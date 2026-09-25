@@ -485,6 +485,52 @@ class ConsoleApiTests(unittest.TestCase):
         for coro in (self.api.alter(), self.api.agency(), self.api.delivery()):
             json.dumps(_run(coro), ensure_ascii=False)
 
+    # ---- 剧本清单与「并入主剧本」 ----
+
+    def _story_row(self, story_id: str, *, status: str = 'active', updated: str = '2026-01-02T00:00:00Z',
+                   character: str = '凌梦', entries: int = 0) -> None:
+        self.bridge.db.upsert('interlude_story', {
+            'id': story_id, 'platform': 'qq', 'selfId': '20000', 'status': status,
+            'setting': json.dumps({'character': {'name': character}, 'timezone': 'Asia/Shanghai'}),
+            'state': json.dumps({}), 'cursorAt': updated, 'createdAt': '2026-01-01T00:00:00Z',
+            'updatedAt': updated,
+        })
+        for index in range(entries):
+            self.bridge.db.insert('interlude_script_entry', {
+                'storyId': story_id, 'kind': 'script', 'actor': 'narrator',
+                'content': '第 %d 段' % index, 'occurredAt': updated, 'metadata': json.dumps({}),
+                'createdAt': updated,
+            })
+
+    def test_stories_lists_every_story_including_archived(self):
+        """用户报过「新的人发消息前面的剧本就没了」——清单必须把归档的也列出来。"""
+        self._story_row('character:qq:20000', entries=3, updated='2026-01-03T00:00:00Z')
+        self._story_row('qq:20000:10001', status='archived', entries=5, updated='2026-01-01T00:00:00Z')
+        payload = _run(self.api.stories())
+        ids = [item['id'] for item in payload['stories']]
+        self.assertEqual(ids, ['character:qq:20000', 'qq:20000:10001'])
+        self.assertEqual(payload['canonical'], 'character:qq:20000')
+        shared, old = payload['stories']
+        self.assertTrue(shared['shared'])
+        self.assertEqual(shared['entries'], 3)
+        self.assertFalse(old['shared'])
+        self.assertEqual(old['status'], 'archived')
+        self.assertEqual(old['entries'], 5)
+
+    def test_stories_without_a_shared_story_falls_back_to_the_newest(self):
+        self._story_row('qq:20000:10001', entries=1)
+        payload = _run(self.api.stories())
+        self.assertEqual(payload['canonical'], 'qq:20000:10001')
+
+    def test_merge_story_reports_a_clear_error_without_a_service(self):
+        self._story_row('qq:20000:10001')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.merge_story('qq:20000:10001'))
+
+    def test_merge_story_requires_a_source(self):
+        with self.assertRaises(ConsoleError):
+            _run(self.api.merge_story(''))
+
     # ---- 容错 ----
 
     def test_endpoints_survive_a_broken_database(self):

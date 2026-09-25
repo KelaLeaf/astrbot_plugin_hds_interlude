@@ -13,6 +13,21 @@ export interface StoryBrief {
   scene: string
 }
 
+/** `GET console/stories`：库里的全部剧本（含归档），供顶栏切换器使用。 */
+export interface StoryListItem extends StoryBrief {
+  entries: number
+  participants: number
+  shared: boolean
+}
+
+export interface StoryListPayload {
+  stories: StoryListItem[]
+  canonical: string
+  /** 仅「并入主剧本」的响应里出现。 */
+  merged?: { source: string; target: string; participant: string; moved: number }
+  changed?: string
+}
+
 export interface RoutingRow {
   task: string
   label: string

@@ -83,6 +83,7 @@ from ..types import empty_participant_state, empty_story_setting
 from ..urge import resolve_urge_config
 from .base import ServiceBase, legacy_story_id_for, normalize_account_id, pick, story_id_for_character
 from .config import COMPACTION_RETRY_BACKOFF, SCHEDULE_PREPLAN_RETRY_BACKOFF
+from .session import SessionView
 from .helpers import (
     _random_integer,
     active_rest_window,
@@ -96,6 +97,11 @@ from .helpers import (
 )
 
 __all__ = ['ServiceChunk7']
+
+
+def _text_value(value: Any) -> str:
+    """`str` 化并去空白（`None` → 空串）。"""
+    return ('' if value is None else str(value)).strip()
 
 #: 上游 `Time.minute`。
 MINUTE_MS = 60_000
@@ -834,6 +840,106 @@ class ServiceChunk7(ServiceBase):
             }, now, pick(participant, 'id'),
         )
         await self.ensure_continuity(story, now)
+
+    async def merge_story_into_canonical(
+        self, source_story_id: Any, target_story_id: Any = '',
+    ) -> dict[str, Any]:
+        """把一部剧本并入共享主剧本（**本移植版扩展**，控制台「并入主剧本」用）。
+
+        为什么需要它：上游的惰性合并（`migrateLegacyBranchIntoShared`）只处理
+        "这个账号回来时**还 active** 的那条旧分支"，而单剧本守卫 `getCanonicalStory`
+        在**任何人**发消息时就会把其余 active 剧本归档，归档后那条分支再也不会被合并
+        ——于是从"每个 QQ 一部剧本"升级到共享主剧本时，先被归档的那部剧本虽然
+        内容还在库里（条目、记忆、事实一条不少），却不会自己走进主剧本。
+        控制台用这个入口把用户选中的剧本显式并进去。
+
+        语义与 `migrate_legacy_branch_into_shared` 一致：搬 `storyId`（分支表同时改挂
+        到迁移出来的那条关系分支上）、源剧本转 `archived`、追加一条
+        `legacy-branch-merged` 系统条目。返回搬运统计。上游没有这个入口，属于
+        「控制台专属能力」，因此不改动 `findStory` 的任何行为。
+        """
+        source_id = _text_value(source_story_id)
+        target_id = _text_value(target_story_id)
+        source_rows = await self.db_get('interlude_story', {'id': source_id})  # type: ignore[attr-defined]
+        source = source_rows[0] if source_rows else None
+        if not source:
+            raise LookupError('source-story-not-found')
+        if not target_id:
+            target_id = await self.canonical_story_id()
+        if not target_id:
+            raise LookupError('target-story-not-found')
+        if target_id == source_id:
+            raise ValueError('same-story')
+        target_rows = await self.db_get('interlude_story', {'id': target_id})  # type: ignore[attr-defined]
+        target = target_rows[0] if target_rows else None
+        if not target:
+            raise LookupError('target-story-not-found')
+        # 目标必须是**活动**剧本：往归档剧本里搬内容等于把内容搬进死档案。
+        # 不要求目标已经是 `character:…`——升级后还没人说过话时，canonical 仍是旧的
+        # 按账号剧本，它会在这部剧本的下一条消息里被 `migrateLegacyStory` 迁移成共享
+        # 剧本，那时并进来的内容跟着一起走，最终结果一致。
+        if _text_value(pick(target, 'status')) != 'active':
+            raise ValueError('target-not-active')
+
+        now = self.now()  # type: ignore[attr-defined]
+        # ⚠️ 必须是真 `SessionView`（或任何实现 `__getitem__` 双读的视图）：
+        # service 层的 `pick()` **只认 dict 与 `__getitem__`**，不读对象属性——
+        # 自造一个只有属性的小对象会让 `pick(session, 'userId', 'user_id')` 全返回
+        # None，参与者 id 直接变成 `None:None:None`（实测踩过）。
+        session = SessionView(
+            platform=pick(source, 'platform'),
+            self_id=pick(source, 'selfId', 'self_id') or '',
+            user_id=pick(source, 'userId', 'user_id') or '',
+            channel_id=pick(source, 'channelId', 'channel_id') or '',
+        )
+        participant = await self.ensure_participant(target, session, now)  # type: ignore[attr-defined]
+        participant_id = pick(participant, 'id')
+        moved = 0
+        for table in _LEGACY_ACCOUNT_TABLES:
+            rows = await self.db_get(table, {'storyId': source_id}, {'limit': 100_000})  # type: ignore[attr-defined]
+            moved += len(rows)
+            await self.db_set(  # type: ignore[attr-defined]
+                table, {'storyId': source_id},
+                {'storyId': target_id, 'participantId': participant_id},
+            )
+        for table in _LEGACY_MIGRATION_TABLES:
+            if table in _LEGACY_ACCOUNT_TABLES:
+                continue
+            rows = await self.db_get(table, {'storyId': source_id}, {'limit': 100_000})  # type: ignore[attr-defined]
+            moved += len(rows)
+            await self.db_set(table, {'storyId': source_id}, {'storyId': target_id})  # type: ignore[attr-defined]
+        await self.db_set(  # type: ignore[attr-defined]
+            'interlude_story', {'id': source_id}, {'status': 'archived', 'updatedAt': now},
+        )
+        await self.append_entry(  # type: ignore[attr-defined]
+            target_id, {
+                'kind': 'legacy-branch-merged', 'actor': 'system',
+                'content': 'Earlier account-specific history for %s was merged into the shared story.'
+                           % pick(participant, 'displayName', 'display_name'),
+                'occurredAt': iso(now), 'metadata': {'legacyStoryId': source_id},
+            }, now, participant_id,
+        )
+        await self.ensure_continuity(target, now)
+        return {
+            'source': source_id,
+            'target': target_id,
+            'participant_id': participant_id,
+            'moved': moved,
+        }
+
+    async def canonical_story_id(self) -> str:
+        """当前共享主剧本的 id（`character:…`），没有就返回空串。
+
+        单剧本守卫保证"同时只有一部 active 剧本"，但升级后第一次有人说话之前也可能
+        出现多部 active（旧库遗留），此时按 `updatedAt` 取最新的一部。
+        """
+        rows = await self.db_get(  # type: ignore[attr-defined]
+            'interlude_story', {'status': 'active'}, {'sort': {'updatedAt': 'DESC'}, 'limit': 50},
+        )
+        for row in rows:
+            if str(pick(row, 'id')).startswith('character:'):
+                return str(pick(row, 'id'))
+        return str(pick(rows[0], 'id')) if rows else ''
 
     # ------------------------------------------------------------------ #
     # 连续性（`src/service.ts:5840-5864`）

@@ -1168,7 +1168,10 @@ class CanManageSessionTests(ServiceTestCase):
         ))
         self.assertTrue(service.can_manage_session(SessionView(platform='onebot', self_id='1', user_id='2')))
         self.assertFalse(service.can_manage_session(SessionView(platform='onebot', self_id='1', user_id='3')))
-        self.assertIn('2', service.shared_story_config.get('managerAccounts') or [])
+        self.assertIn('2', service.shared_story_config.get('manager_accounts') or [])
+        # `resolve_shared_story_config` 输出 snake_case；`enabled` 恒为真（上游硬编码，
+        # 写进配置的 `enabled: False` 会被丢弃）。
+        self.assertIs(service.shared_story_config.get('enabled'), True)
 
     def test_blank_manager_entries_are_ignored(self) -> None:
         service = self.make_service(onebot_config(

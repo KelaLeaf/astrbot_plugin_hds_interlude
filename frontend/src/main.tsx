@@ -8,9 +8,12 @@
 import { render } from 'preact'
 import { useEffect, useState } from 'preact/hooks'
 import './style.css'
-import { bootstrap, onContext, translate, type BridgeContext } from './bridge'
+import { apiPost, bootstrap, onContext, translate, type BridgeContext } from './bridge'
+import { useQuery } from './query'
 import { Icon, type IconName } from './components/Icon'
-import { Button } from './components/ui'
+import { Button, Select } from './components/ui'
+import { canMergeStory, storyLabel } from './story-label'
+import type { StoryListPayload } from './types'
 import { Overview } from './panels/Overview'
 import { Models } from './panels/Models'
 import { Script } from './panels/Script'
@@ -56,6 +59,45 @@ function App() {
   const [ready, setReady] = useState(false)
   const [fatal, setFatal] = useState('')
   const [refreshKey, setRefreshKey] = useState(0)
+  const [merging, setMerging] = useState(false)
+  const [mergeError, setMergeError] = useState('')
+  // 顶栏的剧本切换器：库里的全部剧本（含归档）。面板默认显示"最近更新的那一部"，
+  // 没有这个入口时，新用户一发消息界面就跳走，看起来像"前面的剧本没了"。
+  const storyList = useQuery<StoryListPayload>('console/stories', undefined, { nonce: refreshKey })
+  const stories = storyList.data?.stories ?? []
+  const canonical = storyList.data?.canonical ?? ''
+  const selected = stories.find((item) => item.id === storyId) ?? stories[0]
+  const storyKey = stories.map((item) => item.id).join('|')
+
+  // 选中的剧本被清理/合并掉之后，回到"最近更新的那一部"，别让面板继续查一个不存在的 id。
+  useEffect(() => {
+    if (!storyId || !storyKey) return
+    if (!stories.some((item) => item.id === storyId)) setStoryId('')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storyKey, storyId])
+
+  async function mergeSelected() {
+    if (!selected || !canonical || !canMergeStory(selected, canonical)) return
+    const ok = window.confirm(
+      `把「${storyLabel(selected)}」并入共享主剧本？\n\n`
+      + '它的剧本条目、记忆、事实、场景会搬进主剧本，原剧本转为「已归档」（内容不会删除）。',
+    )
+    if (!ok) return
+    setMerging(true)
+    setMergeError('')
+    try {
+      await apiPost<StoryListPayload>('console/story-merge', {
+        source_story_id: selected.id,
+        target_story_id: canonical,
+      })
+      setStoryId(canonical)
+      setRefreshKey((value) => value + 1)
+    } catch (error) {
+      setMergeError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setMerging(false)
+    }
+  }
 
   useEffect(() => {
     let unsubscribe = () => {}
@@ -123,11 +165,32 @@ function App() {
           <Icon name={active.icon} class="h-4 w-4 text-muted" />
           <h1 class="text-sm font-semibold">{translate(`pages.console.nav.${active.key}`, active.fallback)}</h1>
           <div class="ml-auto flex items-center gap-2">
+            {stories.length > 1 ? (
+              <div class="w-72">
+                <Select
+                  value={selected ? selected.id : ''}
+                  onChange={(next) => setStoryId(String(next))}
+                  options={stories.map((item) => ({ value: item.id, label: storyLabel(item) }))}
+                  placeholder="选择剧本…"
+                />
+              </div>
+            ) : null}
+            {canMergeStory(selected, canonical) ? (
+              <Button icon="link" disabled={merging} onClick={mergeSelected}>
+                {merging ? '并入中…' : '并入主剧本'}
+              </Button>
+            ) : null}
             <Button icon="refresh" onClick={() => setRefreshKey((value) => value + 1)}>
               刷新
             </Button>
           </div>
         </header>
+
+        {mergeError ? (
+          <div class="border-b border-danger/40 bg-danger/10 px-6 py-2 text-[11px] text-danger">
+            {mergeError}
+          </div>
+        ) : null}
 
         <div class="min-w-0 flex-1 p-6">
           {fatal ? (

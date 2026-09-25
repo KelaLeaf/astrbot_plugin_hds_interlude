@@ -84,6 +84,11 @@ STORY_MS = dt_ms(STORY_TIME)
 
 PRIVATE_STORY_ID = 'onebot:1:2'
 
+#: 共享主剧本（上游 `sharedStoryConfig.enabled` **硬编码 true**）下，私聊剧本的 canonical id。
+#: `PRIVATE_STORY_ID` 是旧 beta 的"按账号"id：该账号首次到访时会被 `migrateLegacyStory`
+#: 迁移成这个 id（旧的按账号 id 行转 `archived`），所以断言要用迁移**之后**的 id。
+SHARED_STORY_ID = 'character:onebot:1'
+
 
 def make_config(**overrides: Any) -> dict[str, Any]:
     """一份最小可用配置（只含本块读到的段，其余走默认值/缺省分支）。"""
@@ -1164,7 +1169,7 @@ class ReceiveGroupTests(ServiceHarness):
         )
         self.assertTrue(await service.receive_group(session, STORY_TIME))
 
-        entries = self.rows('interlude_script_entry')
+        entries = [row for row in self.rows('interlude_script_entry') if row['kind'] == 'group-message']
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]['kind'], 'group-message')
         self.assertEqual(entries[0]['actor'], 'user')
@@ -1175,7 +1180,7 @@ class ReceiveGroupTests(ServiceHarness):
         self.assertEqual(metadata['senderName'], 'Alice')
         self.assertEqual(metadata['messageId'], '-12345')
 
-        turn = service.buffered_group_turns['%s:9' % PRIVATE_STORY_ID]
+        turn = service.buffered_group_turns['%s:9' % SHARED_STORY_ID]
         self.assertEqual(len(turn['messages']), 1)
         message = turn['messages'][0]
         self.assertEqual(message['senderId'], '2')
@@ -1193,7 +1198,12 @@ class ReceiveGroupTests(ServiceHarness):
         service = self.make_service(self._config())
         self.make_story(status='paused')
         self.assertFalse(await service.receive_group(group_session()))
-        self.assertEqual(self.rows('interlude_script_entry'), [])
+        # 共享模式下 canonical 剧本不存在时，`getPausedStory` 会把这部暂停剧本
+        # 迁移成 `character:…` 再交给调用方判断状态（上游同序），迁移本身会写一条
+        # `participant-joined`；**绝不能**出现群消息条目。
+        self.assertEqual(
+            [row for row in self.rows('interlude_script_entry') if row['kind'] == 'group-message'], [],
+        )
 
     @needs('receive_group')
     async def test_database_reset_blocks_group_intake(self) -> None:
@@ -1210,7 +1220,7 @@ class ReceiveGroupTests(ServiceHarness):
 class ReceiveTests(ServiceHarness):
 
     def _config(self) -> dict[str, Any]:
-        return onebot_config(sharedStory={'enabled': False, 'autoEnrollParticipants': True})
+        return onebot_config(sharedStory={'autoEnrollParticipants': True})
 
     def _session(self, **overrides: Any) -> SessionView:
         session = SessionView(
@@ -1253,7 +1263,6 @@ class ReceiveTests(ServiceHarness):
     async def test_unauthorized_session_never_creates_a_story(self) -> None:
         service = self.make_service(onebot_config(
             onebot={'botAccounts': [{'qq': '1'}], 'userAccounts': []},
-            sharedStory={'enabled': False},
         ))
         self.assertFalse(await service.receive(self._session()))
         self.assertEqual(self.rows('interlude_story'), [])
@@ -1267,8 +1276,12 @@ class ReceiveTests(ServiceHarness):
 
     @needs('receive', 'append_entry')
     async def test_missing_participant_without_enrolment_is_rejected(self) -> None:
-        service = self.make_service(onebot_config(sharedStory={'enabled': False}))
-        self.make_story()
+        # 共享模式硬开启，所以"不自动入册"只能靠 `autoEnrollParticipants: False` 表达；
+        # 旧键 `enabled: False` 上游本来就会丢弃（见 `resolve_shared_story_config`）。
+        # 剧本必须已经在 canonical id 上：若是旧按账号 id，`migrateLegacyStory` 会
+        # 顺手把该账号入册（上游同序），那时"未入册"这个前提就不成立了。
+        service = self.make_service(onebot_config(sharedStory={'autoEnrollParticipants': False}))
+        self.make_story(story_id=SHARED_STORY_ID)
         self.assertFalse(await service.receive(self._session()))
         self.assertIn('参与者不存在或已暂停', self.sink.text())
 
@@ -1306,8 +1319,14 @@ class ReceiveTests(ServiceHarness):
         self.assertEqual(metadata['messageId'], 'm-1')
         self.assertEqual(metadata['personId'], '2')
         self.assertNotIn('imageCount', metadata)
-        self.assertEqual(interruptions, [(PRIVATE_STORY_ID, 'onebot:1:2')])
-        self.assertEqual(calls['paused'], [PRIVATE_STORY_ID])
+        self.assertEqual(interruptions, [(SHARED_STORY_ID, 'onebot:1:2')])
+        self.assertEqual(calls['paused'], [SHARED_STORY_ID])
+
+        # 旧的按账号剧本被惰性迁移成共享剧本：新 id 是 active，旧 id 转 archived。
+        stories = {row['id']: row for row in self.rows('interlude_story')}
+        self.assertIn(SHARED_STORY_ID, stories)
+        self.assertEqual(stories[SHARED_STORY_ID]['status'], 'active')
+        self.assertEqual(stories[PRIVATE_STORY_ID]['status'], 'archived')
 
         turn = service.buffered_narrative_turns['onebot:1:2']
         self.assertEqual(len(turn['messages']), 1)
@@ -1345,6 +1364,136 @@ def _async_value(value: Any) -> Any:
     async def factory() -> Any:
         return value
     return factory()
+
+
+# =========================================================================== #
+# 共享主剧本（上游 `sharedStoryConfig.enabled` 硬编码 true）
+# =========================================================================== #
+
+class SharedStoryTests(ServiceHarness):
+    """一个角色一条时间线：所有私聊账号共用同一部剧本，各自是一条关系分支。
+
+    上游 `get sharedStoryConfig`（`service.ts:5570`）把 `enabled` 钉死为 true
+    （注释：Beta2 刻意保留单剧本守卫），因此 `findStory` 走 `character:platform:selfId`
+    这条 canonical 路径；旧的"每 QQ 一部剧本"由 `migrateLegacyStory` 惰性迁移。
+    本移植版曾经漏掉这个解析函数（读原始段 → 没有 enabled → 退回每人一部），
+    这几条用例把行为钉住。
+    """
+
+    def _session(self, user_id: str = '2', **overrides: Any) -> SessionView:
+        session = SessionView(
+            platform='onebot', self_id='1', user_id=user_id, channel_id='private:%s' % user_id,
+            content='你好', message_id='m-1',
+        )
+        for key, value in overrides.items():
+            setattr(session, key, value)
+        return session
+
+    @needs('find_story', 'migrate_legacy_story', 'migrate_legacy_branch_into_shared')
+    async def test_two_accounts_share_one_story_and_keep_the_old_entries(self) -> None:
+        service = self.make_service(onebot_config())
+        self.make_story(story_id=PRIVATE_STORY_ID, userId='2')
+        self.make_entry(story_id=PRIVATE_STORY_ID, kind='script', content='旧剧本的第一段')
+
+        first = await service.find_story(self._session('2'))
+        second = await service.find_story(self._session('3'))
+
+        self.assertEqual(first['id'], SHARED_STORY_ID)
+        self.assertEqual(second['id'], SHARED_STORY_ID, '第二个账号必须落进同一部剧本')
+        # 旧剧本的条目跟着迁移，一条都没丢，而且都挂在新 id 上。
+        entries = self.rows('interlude_script_entry')
+        self.assertIn('旧剧本的第一段', [row['content'] for row in entries])
+        self.assertTrue(all(row['storyId'] == SHARED_STORY_ID for row in entries))
+        # 旧 id 归档、新 id 活动，且只有一部活动剧本。
+        statuses = {row['id']: row['status'] for row in self.rows('interlude_story')}
+        self.assertEqual(statuses[SHARED_STORY_ID], 'active')
+        self.assertEqual(statuses[PRIVATE_STORY_ID], 'archived')
+        self.assertEqual(
+            [sid for sid, status in statuses.items() if status == 'active'], [SHARED_STORY_ID],
+        )
+
+    @needs('find_story', 'get_canonical_story')
+    async def test_single_story_guard_archives_the_other_active_stories(self) -> None:
+        service = self.make_service(onebot_config())
+        self.make_story(story_id=PRIVATE_STORY_ID, userId='2', updatedAt=STORY_TIME)
+        self.make_story(
+            story_id='onebot:1:3', userId='3', updatedAt=STORY_TIME + timedelta(hours=1),
+        )
+        # 单剧本守卫取"最近更新的那部"当 canonical，其余归档（内容保留，不删除）。
+        story = await service.find_story(self._session('2'))
+        self.assertEqual(story['id'], SHARED_STORY_ID)
+        statuses = {row['id']: row['status'] for row in self.rows('interlude_story')}
+        self.assertEqual(
+            sorted(sid for sid, status in statuses.items() if status == 'active'), [SHARED_STORY_ID],
+        )
+
+    @needs('find_story', 'merge_story_into_canonical', 'append_entry')
+    async def test_merge_brings_an_archived_story_into_the_canonical_one(self) -> None:
+        """控制台「并入主剧本」：上游不会自动合并已经归档的旧分支，这里补上入口。"""
+        service = self.make_service(onebot_config())
+        self.make_story(story_id=SHARED_STORY_ID)
+        self.make_story(story_id=PRIVATE_STORY_ID, status='archived', userId='2')
+        self.make_entry(story_id=PRIVATE_STORY_ID, kind='script', content='被归档的旧段落')
+
+        result = await service.merge_story_into_canonical(PRIVATE_STORY_ID, SHARED_STORY_ID)
+
+        self.assertEqual(result['source'], PRIVATE_STORY_ID)
+        self.assertEqual(result['target'], SHARED_STORY_ID)
+        self.assertEqual(result['moved'], 1)
+        entries = self.rows('interlude_script_entry')
+        merged = [row for row in entries if row['content'] == '被归档的旧段落']
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]['storyId'], SHARED_STORY_ID)
+        self.assertEqual(merged[0]['participantId'], result['participant_id'])
+        # 参与者必须是**真 id**：`pick()` 只认 dict / `__getitem__`，自造只有属性的
+        # 小对象会让这里变成 'None:None:None'（实测踩过，别只用"两边相等"断言）。
+        self.assertNotIn('None', str(result['participant_id']))
+        self.assertEqual(result['participant_id'], 'onebot:1:2')
+        self.assertIn('legacy-branch-merged', [row['kind'] for row in entries])
+        statuses = {row['id']: row['status'] for row in self.rows('interlude_story')}
+        self.assertEqual(statuses[PRIVATE_STORY_ID], 'archived')
+
+    @needs('merge_story_into_canonical')
+    async def test_merge_rejects_self_missing_and_archived_targets(self) -> None:
+        service = self.make_service(onebot_config())
+        self.make_story(story_id=SHARED_STORY_ID)
+        with self.assertRaises(ValueError):
+            await service.merge_story_into_canonical(SHARED_STORY_ID, SHARED_STORY_ID)
+        with self.assertRaises(LookupError):
+            await service.merge_story_into_canonical('不存在', SHARED_STORY_ID)
+        # 目标不能是归档剧本（内容会被搬进死档案）。
+        self.make_story(story_id='onebot:1:9', status='archived', userId='9')
+        self.make_story(story_id='onebot:1:8', status='archived', userId='8')
+        with self.assertRaises(ValueError):
+            await service.merge_story_into_canonical('onebot:1:8', 'onebot:1:9')
+
+    @needs('find_story', 'merge_story_into_canonical')
+    async def test_merge_accepts_a_still_legacy_canonical_target(self) -> None:
+        """升级后还没人说过话时，canonical 仍是旧按账号剧本——并进去同样成立。
+
+        那部剧本会在它的下一条消息里被 `migrateLegacyStory` 迁移成共享剧本，
+        并进来的内容跟着一起走，所以这里不该拒绝。
+        """
+        service = self.make_service(onebot_config())
+        self.make_story(story_id=PRIVATE_STORY_ID, userId='2')
+        self.make_story(story_id='onebot:1:3', status='archived', userId='3')
+        self.make_entry(story_id='onebot:1:3', kind='script', content='旧账号的段落')
+
+        result = await service.merge_story_into_canonical('onebot:1:3', PRIVATE_STORY_ID)
+
+        self.assertEqual(result['target'], PRIVATE_STORY_ID)
+        merged = await service.find_story(self._session('2'))
+        self.assertEqual(merged['id'], SHARED_STORY_ID)
+        contents = [row['content'] for row in self.rows('interlude_script_entry')]
+        self.assertIn('旧账号的段落', contents, '并进来的内容要跟着迁移到共享剧本')
+
+    @needs('canonical_story_id')
+    async def test_canonical_story_id_prefers_the_character_story(self) -> None:
+        service = self.make_service(onebot_config())
+        self.assertEqual(await service.canonical_story_id(), '')
+        self.make_story(story_id=PRIVATE_STORY_ID, updatedAt=STORY_TIME + timedelta(hours=2))
+        self.make_story(story_id=SHARED_STORY_ID, updatedAt=STORY_TIME)
+        self.assertEqual(await service.canonical_story_id(), SHARED_STORY_ID)
 
 
 # =========================================================================== #
@@ -1716,7 +1865,13 @@ class UpstreamBehaviourPortTests(ServiceHarness):
         self.make_story(story_id=story_id, userId='2171322646')
         service.user_account_rule = lambda _user_id: {'label': '渔社'}
         self.assertTrue(await service.receive_group(group_session(user_id='2171322646'), STORY_TIME))
-        turn = service.buffered_group_turns['%s:9' % story_id]
+        # 共享模式下这条按账号剧本在同一次调用里被迁移成 `character:onebot:1`
+        # （上游 `findStory` → `migrateLegacyStory`），群缓冲挂在迁移后的 id 上。
+        self.assertEqual(
+            [row['id'] for row in self.rows('interlude_story') if row['status'] == 'active'],
+            [SHARED_STORY_ID],
+        )
+        turn = service.buffered_group_turns['%s:9' % SHARED_STORY_ID]
         self.assertEqual(
             turn['messages'][0]['speaker'], '群成员「渔社」（QQ：2171322646）',
         )
