@@ -386,7 +386,9 @@
             "price_output": 0.0,
             "price_cached_input": 0.0
           }
-        ]
+        ],
+        "hint": "⚠️ AstrBot 自带配置页把这个「列表」当字符串数组渲染，行内字段会被忽略（编辑后整行会变成一个字符串）。请在「幕间控制台 → 配置」里编辑，或用控制台「备份 / 导入」提交 JSON。",
+        "obvious_hint": true
       },
       "main_provider_id": {
         "type": "string",
@@ -662,7 +664,9 @@
             "default": true
           }
         },
-        "default": []
+        "default": [],
+        "hint": "⚠️ AstrBot 自带配置页把这个「列表」当字符串数组渲染，行内字段会被忽略（编辑后整行会变成一个字符串）。请在「幕间控制台 → 配置」里编辑，或用控制台「备份 / 导入」提交 JSON。",
+        "obvious_hint": true
       },
       "user_accounts": {
         "type": "list",
@@ -702,7 +706,9 @@
             "default": true
           }
         },
-        "default": []
+        "default": [],
+        "hint": "⚠️ AstrBot 自带配置页把这个「列表」当字符串数组渲染，行内字段会被忽略（编辑后整行会变成一个字符串）。请在「幕间控制台 → 配置」里编辑，或用控制台「备份 / 导入」提交 JSON。",
+        "obvious_hint": true
       },
       "group_chats": {
         "type": "list",
@@ -821,7 +827,9 @@
             }
           }
         },
-        "default": []
+        "default": [],
+        "hint": "⚠️ AstrBot 自带配置页把这个「列表」当字符串数组渲染，行内字段会被忽略（编辑后整行会变成一个字符串）。请在「幕间控制台 → 配置」里编辑，或用控制台「备份 / 导入」提交 JSON。",
+        "obvious_hint": true
       },
       "ignore_self_messages": {
         "type": "bool",
@@ -1090,7 +1098,8 @@
             "max_interval_minutes": 240
           }
         ],
-        "hint": "例如睡眠或午休，可配置多个"
+        "hint": "⚠️ AstrBot 自带配置页把这个「列表」当字符串数组渲染，行内字段会被忽略（编辑后整行会变成一个字符串）。请在「幕间控制台 → 配置」里编辑，或用控制台「备份 / 导入」提交 JSON。",
+        "obvious_hint": true
       }
     }
   },

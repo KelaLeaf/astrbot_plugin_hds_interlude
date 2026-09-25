@@ -410,13 +410,21 @@ class HDSInterludePlugin(Star):
              '控制台：Agency 与日程'),
             (f'/{PLUGIN_NAME}/console/delivery', self.page_console_delivery, ['GET'],
              '控制台：投递账本'),
-            # 写操作（控制台里唯一会改状态的两处，都是白名单）
+            # 写操作（都走白名单：开关认 FLAG_KEYS，连接行认 CONNECTION_FIELDS，
+            # 配置页认 `_conf_schema.json` 里声明过的路径）
             (f'/{PLUGIN_NAME}/console/flags', self.page_console_set_flag, ['POST'],
              '控制台：切换运行开关'),
             (f'/{PLUGIN_NAME}/console/connections', self.page_console_save_connection, ['POST'],
              '控制台：新增 / 修改模型连接'),
             (f'/{PLUGIN_NAME}/console/connections-delete', self.page_console_delete_connection, ['POST'],
              '控制台：删除模型连接'),
+            # 配置页：schema 驱动的全量配置（替代宿主配置页那个"字符串数组"控件）
+            (f'/{PLUGIN_NAME}/console/config', self.page_console_config, ['GET'],
+             '控制台：配置 schema 与当前值'),
+            (f'/{PLUGIN_NAME}/console/config-set', self.page_console_config_set, ['POST'],
+             '控制台：写入一个配置项'),
+            (f'/{PLUGIN_NAME}/console/participants', self.page_console_participants, ['GET'],
+             '控制台：已知参与者（白名单一键填入）'),
             # 配置备份（原 config-backup 页并入控制台）
             (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
              '导出 HDS Interlude 配置'),
@@ -478,6 +486,19 @@ class HDSInterludePlugin(Star):
 
     async def page_console_delete_connection(self):
         return await self._console_write(lambda api, body: api.delete_connection(body.get('index')))
+
+    # ---- 控制台的配置页（schema 驱动） ---- #
+
+    async def page_console_config(self):
+        return await self._console_json(lambda api, q: api.config_schema())
+
+    async def page_console_config_set(self):
+        return await self._console_write(lambda api, body: api.set_config_value(
+            body.get('path'), body.get('value'),
+        ))
+
+    async def page_console_participants(self):
+        return await self._console_json(lambda api, q: api.participants(q('story_id')))
 
     async def _console_write(self, action):
         """跑一个控制台写操作。

@@ -288,3 +288,67 @@ export interface DeliveryPayload {
   totals: Record<string, number>
   scanned: number
 }
+
+/** 配置页（schema 驱动）：`console/config` 的形状。 */
+export interface ConfigRowSpec {
+  key: string
+  type: string
+  description: string
+  hint: string
+  default?: unknown
+  options?: string[] | null
+}
+
+export interface ConfigNote {
+  level: 'warn' | 'info'
+  text: string
+}
+
+export interface ConfigField {
+  key: string
+  path: string
+  type: string
+  /** 原始 schema 节点（前端递归渲染的依据）。 */
+  node: Record<string, unknown>
+  description: string
+  hint: string
+  default?: unknown
+  options?: string[] | null
+  rows: ConfigRowSpec[] | null
+  item_type: string
+  special: string
+  invisible: boolean
+  value: unknown
+  present: boolean
+  note: ConfigNote | null
+  delegated: boolean
+}
+
+export interface ConfigGroup {
+  key: string
+  description: string
+  invisible: boolean
+  fields: ConfigField[]
+}
+
+export interface ConfigSchemaPayload {
+  groups: ConfigGroup[]
+  choices: Record<string, Array<{ value: string; label: string }>>
+  config_path: string
+  version: string
+}
+
+/** 已知参与者（白名单一键填入用）。 */
+export interface ParticipantRow {
+  participant_id: string
+  story_id: string
+  platform: string
+  self_id: string
+  user_id: string
+  channel_id: string
+  person_id: string
+  display_name: string
+  relationship: string
+  status: string
+  updated_at: string
+}

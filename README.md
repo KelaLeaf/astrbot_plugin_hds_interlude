@@ -69,6 +69,8 @@ pip install -r requirements.txt
 
 配置页一共 22 个分组。**前三组配完就能跑**，剩下的按需要开。
 
+> ⚠️ 白名单、连接池这类「对象行列表」在 AstrBot 自带配置页里是**字符串数组**控件（行内字段会被忽略，编辑后整行会变成一个字符串）。请到 **插件控制台 → 配置** 里改——那里按 schema 渲染，字段有中文名、有提示，改完立刻生效。
+
 ### 先配这三组
 
 | 分组 | 干什么 |
@@ -218,7 +220,7 @@ AstrBot 的命令名不能带点，所以上游的 `interlude.memory.facts` 在�
 | --- | --- | --- |
 | 宿主 | Koishi + OneBot / NapCat | AstrBot（主流平台都行，见 `metadata.yaml`） |
 | 安装 | npm 包 / tgz | AstrBot 插件市场，或从仓库根安装 |
-| 配置 | Koishi Console Schema | 插件配置页 `_conf_schema.json`，22 组，键名 snake_case |
+| 配置 | Koishi Console Schema | 插件配置页 `_conf_schema.json`，22 组 / 196 项，键名 snake_case；控制台「配置」页提供全量编辑器 |
 | 命令 | `interlude.story.start` | `hdsi_story_start`（32 条，语义与文案不变） |
 | 数据 | Koishi ORM | 自带 SQLite，13 张表，**列名与上游逐字一致**（camelCase） |
 | 出站投递 | 直接调 `session.bot` | 统一收敛到 `Transport` 协议，做不到的走 `transport-unavailable` 降级 |
