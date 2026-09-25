@@ -197,7 +197,9 @@ export function SchemaField(props: SchemaFieldProps) {
             <Select
               value={literal}
               onChange={(next) => onChange(next)}
-              options={options.map((option) => ({ value: option, label: option }))}
+              // 候选项可能是数字（如 `vision.max_image_dimension: [0,512,768,1024]`）：
+              // 值原样带类型传回去，标签字符串化给眼睛看。
+              options={options.map((option) => ({ value: option, label: String(option) }))}
             />
           ) : (
             <Input

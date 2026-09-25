@@ -190,7 +190,7 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
         <div class="w-full sm:w-80">
           <Select
             value={group}
-            onChange={setGroup}
+            onChange={(next) => setGroup(String(next))}
             options={[
               { value: OVERVIEW, label: '配置总览（只读）' },
               ...groups.map((item) => ({

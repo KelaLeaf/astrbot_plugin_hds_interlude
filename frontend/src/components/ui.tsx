@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import type { ComponentChildren } from 'preact'
 import { Icon, type IconName } from './Icon'
+import { selectDisplay, selectMatches, type SelectValue } from '../select-match'
 
 export { Icon, type IconName }
 
@@ -240,16 +241,22 @@ export function Select({
   placeholder = '请选择…',
   disabled,
 }: {
-  value: string
-  onChange: (next: string) => void
-  options: Array<{ value: string; label: string }>
+  /** 当前值。**可能是数字**（schema 里 `type: int` 带 `options` 的字段，例如
+   *  `vision.max_image_dimension: [0, 512, 768, 1024]`），所以比较一律走字符串化。 */
+  value: SelectValue
+  /** 选中后回传**原始类型**的值（数字选项回数字，字符串选项回字符串）。 */
+  onChange: (next: SelectValue) => void
+  options: Array<{ value: SelectValue; label: string }>
   placeholder?: string
   disabled?: boolean
 }) {
   const [open, setOpen] = useState(false)
   const [cursor, setCursor] = useState(0)
   const box = useRef<HTMLDivElement>(null)
-  const current = options.find((option) => option.value === value)
+  // 数字选项（int 字段）与字符串化的当前值必须能对上：`1024 === "1024"` 是 false，
+  // 曾因此让「图片最长边像素」显示成占位符（用户实测发现）。
+  const isCurrent = (option: { value: SelectValue }) => selectMatches(option.value, value)
+  const current = options.find(isCurrent)
 
   useEffect(() => {
     if (!open) return
@@ -261,7 +268,7 @@ export function Select({
   }, [open])
 
   useEffect(() => {
-    if (open) setCursor(Math.max(0, options.findIndex((option) => option.value === value)))
+    if (open) setCursor(Math.max(0, options.findIndex(isCurrent)))
   }, [open, options, value])
 
   function onKeyDown(event: KeyboardEvent) {
@@ -302,7 +309,7 @@ export function Select({
         }`}
       >
         <span class={`min-w-0 flex-1 truncate ${current ? '' : 'text-muted'}`}>
-          {current?.label ?? placeholder}
+          {selectDisplay(current?.label, value, placeholder)}
         </span>
         <svg
           viewBox="0 0 10 10"
@@ -326,7 +333,7 @@ export function Select({
                 setOpen(false)
               }}
               class={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition ${
-                option.value === value
+                isCurrent(option)
                   ? 'bg-accent/10 text-accent'
                   : index === cursor
                     ? 'bg-raised'
@@ -334,7 +341,7 @@ export function Select({
               }`}
             >
               <span class="min-w-0 flex-1 truncate">{option.label}</span>
-              {option.value === value && <Icon name="tick" class="h-3 w-3 shrink-0" />}
+              {isCurrent(option) && <Icon name="tick" class="h-3 w-3 shrink-0" />}
             </button>
           ))}
         </div>
