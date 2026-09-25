@@ -326,6 +326,8 @@ export interface ConfigField {
 
 export interface ConfigGroup {
   key: string
+  /** 短标题（schema 的 `title`）：下拉与卡片标题。 */
+  title: string
   description: string
   invisible: boolean
   fields: ConfigField[]

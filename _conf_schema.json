@@ -1,6 +1,7 @@
 ﻿{
   "story_defaults": {
     "type": "object",
+    "title": "故事档案",
     "description": "【必填 1】故事档案：主角、世界、默认关系、地点、时区与叙事风格。",
     "items": {
       "persona_id": {
@@ -87,6 +88,7 @@
   },
   "model_center": {
     "type": "object",
+    "title": "模型中心",
     "description": "【必填 2】模型中心：先添加连接并勾选用途，主叙事参数与高级模块同处。提示词四件套在「提示词」组。",
     "items": {
       "vision": {
@@ -387,7 +389,7 @@
             "price_cached_input": 0.0
           }
         ],
-        "hint": "‼️⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
         "obvious_hint": true
       },
       "main_provider_id": {
@@ -635,6 +637,7 @@
   },
   "qq_access": {
     "type": "object",
+    "title": "QQ 接入",
     "description": "【必填 3】QQ 接入：机器人账号、私聊白名单、群聊与语音。",
     "items": {
       "enabled": {
@@ -665,7 +668,7 @@
           }
         },
         "default": [],
-        "hint": "‼️⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
         "obvious_hint": true
       },
       "user_accounts": {
@@ -707,7 +710,7 @@
           }
         },
         "default": [],
-        "hint": "‼️⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
         "obvious_hint": true
       },
       "group_chats": {
@@ -828,7 +831,7 @@
           }
         },
         "default": [],
-        "hint": "‼️⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
         "obvious_hint": true
       },
       "ignore_self_messages": {
@@ -840,6 +843,7 @@
   },
   "shared_story": {
     "type": "object",
+    "title": "共享主剧本",
     "description": "【结构 4】共享主剧本：多人参与、跨账号行为与管理员权限。",
     "items": {
       "auto_enroll_participants": {
@@ -881,6 +885,7 @@
   },
   "runtime": {
     "type": "object",
+    "title": "运行时",
     "description": "【节奏 5】运行时：消息合并、打字、失败重试与自动生活推进。",
     "items": {
       "split_reply_messages": {
@@ -1098,13 +1103,14 @@
             "max_interval_minutes": 240
           }
         ],
-        "hint": "‼️⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
         "obvious_hint": true
       }
     }
   },
   "urge": {
     "type": "object",
+    "title": "Urge 弹性推进",
     "description": "【节奏 6】Urge 弹性推进：剧本驱动的自动调度，可替代固定间隔。",
     "items": {
       "enabled": {
@@ -1228,6 +1234,7 @@
   },
   "schedule_preplan": {
     "type": "object",
+    "title": "日程预排",
     "description": "【节奏 7】日程预排：近期稳定日程与变化颗粒度。",
     "items": {
       "enabled": {
@@ -1275,6 +1282,7 @@
   },
   "timeline_director": {
     "type": "object",
+    "title": "时间导演",
     "description": "【节奏 8】时间导演：自动回合的相对时间账本与降级保护。",
     "items": {
       "enabled": {
@@ -1287,6 +1295,7 @@
   },
   "agency": {
     "type": "object",
+    "title": "Agency 行动窗口",
     "description": "【节奏 9】Agency 行动窗口：日程压力、隐私、设备与生活来源的联系条件。",
     "items": {
       "enabled": {
@@ -1315,6 +1324,7 @@
   },
   "chat_actions": {
     "type": "object",
+    "title": "聊天动作",
     "description": "【表达 10】聊天动作：引用回复、贴反应与 QQ 原生表情。",
     "items": {
       "enabled": {
@@ -1406,6 +1416,7 @@
   },
   "stickers": {
     "type": "object",
+    "title": "本地表情包",
     "description": "【表达 11】本地表情包：扫描素材并由视觉模型建立描述。",
     "items": {
       "enabled": {
@@ -1455,6 +1466,7 @@
   },
   "memory": {
     "type": "object",
+    "title": "记忆与连续性",
     "description": "【内在 12】记忆与连续性：场景压缩、事实召回、剧情余波与设定演化。",
     "items": {
       "enabled": {
@@ -1659,6 +1671,7 @@
   },
   "alter_system": {
     "type": "object",
+    "title": "Alter 情绪",
     "description": "【内在 13】Alter 情绪：低频氛围偏移、动态阈值与侧端分析。",
     "items": {
       "enabled": {
@@ -1733,6 +1746,7 @@
   },
   "browser": {
     "type": "object",
+    "title": "网页观察",
     "description": "【扩展 14】网页观察：只读浏览与安全边界。",
     "items": {
       "enabled": {
@@ -1846,6 +1860,7 @@
   },
   "blind_mode": {
     "type": "object",
+    "title": "盲区模式",
     "description": "【维护 15】盲区模式：低频心跳的最小运行形态。",
     "items": {
       "enabled": {
@@ -1863,6 +1878,7 @@
   },
   "logging": {
     "type": "object",
+    "title": "日志",
     "description": "【维护 16】日志：级别、信息密度、布局与隐私预览。",
     "items": {
       "level": {
@@ -1936,6 +1952,7 @@
   },
   "prompts": {
     "type": "object",
+    "title": "提示词",
     "description": "【提示词】主叙事的写作指令、格式规则、固定约束与全局文风。这里是提示词的唯一入口。",
     "items": {
       "main_prompt": {
@@ -1962,6 +1979,7 @@
   },
   "chat_rhythm": {
     "type": "object",
+    "title": "节奏反定型（已弃用）",
     "description": "【已弃用】仅兼容旧配置：节奏反定型不再统计或干预写作。",
     "items": {
       "enabled": {
@@ -1999,6 +2017,7 @@
   },
   "black_box": {
     "type": "object",
+    "title": "失明模式（已弃用）",
     "description": "【已弃用】仅兼容旧配置：请改用盲区模式。",
     "items": {
       "enabled": {
@@ -2016,6 +2035,7 @@
   },
   "shared_story_compat": {
     "type": "object",
+    "title": "用户白名单兼容位（已弃用）",
     "description": "【已弃用】仅兼容旧配置：请改用 QQ 接入的用户白名单。",
     "items": {
       "enabled": {
@@ -2038,6 +2058,7 @@
   },
   "runtime_compat": {
     "type": "object",
+    "title": "补写时间表兼容位（已弃用）",
     "description": "【已弃用】仅兼容旧配置：已被明确的补写时间表替代。",
     "items": {
       "pause_after_conversation_minutes": {
@@ -2055,6 +2076,7 @@
   },
   "model_compat": {
     "type": "object",
+    "title": "群聊筛选模型兼容位（已弃用）",
     "description": "【已弃用】仅兼容旧配置：群聊快速筛选模型已移除。",
     "items": {
       "group_gate": {
