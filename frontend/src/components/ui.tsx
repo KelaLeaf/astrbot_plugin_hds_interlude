@@ -6,7 +6,7 @@
  * 组件只做「排版 + 语义色」，不带状态机、不引外部依赖；样式全走 Tailwind 工具类
  * 与 `style.css` 里的语义色板。
  */
-import { useRef, useState } from 'preact/hooks'
+import { useEffect, useRef, useState } from 'preact/hooks'
 import type { ComponentChildren } from 'preact'
 import { Icon, type IconName } from './Icon'
 
@@ -226,27 +226,120 @@ export function Textarea({
   )
 }
 
+/**
+ * 下拉选择：**自己画**，不用原生 `<select>`。
+ *
+ * 原生 select 展开的那层是操作系统画的，跟整套 UI 完全不搭（用户第一眼就指出了）。
+ * 这里用按钮 + 绝对定位面板实现，键盘（↑↓ / Enter / Esc）与点外部关闭都支持；
+ * props 与原来的 `Select` 一致，所以调用点不用改。
+ */
 export function Select({
   value,
   onChange,
   options,
+  placeholder = '请选择…',
+  disabled,
 }: {
   value: string
   onChange: (next: string) => void
   options: Array<{ value: string; label: string }>
+  placeholder?: string
+  disabled?: boolean
 }) {
+  const [open, setOpen] = useState(false)
+  const [cursor, setCursor] = useState(0)
+  const box = useRef<HTMLDivElement>(null)
+  const current = options.find((option) => option.value === value)
+
+  useEffect(() => {
+    if (!open) return
+    const onPointer = (event: MouseEvent) => {
+      if (box.current && !box.current.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onPointer)
+    return () => document.removeEventListener('mousedown', onPointer)
+  }, [open])
+
+  useEffect(() => {
+    if (open) setCursor(Math.max(0, options.findIndex((option) => option.value === value)))
+  }, [open, options, value])
+
+  function onKeyDown(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      setOpen(false)
+      return
+    }
+    if (!open && (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowDown')) {
+      event.preventDefault()
+      setOpen(true)
+      return
+    }
+    if (!open) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setCursor((index) => Math.min(options.length - 1, index + 1))
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setCursor((index) => Math.max(0, index - 1))
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      const picked = options[cursor]
+      if (picked) {
+        onChange(picked.value)
+        setOpen(false)
+      }
+    }
+  }
+
   return (
-    <select
-      value={value}
-      onChange={(event) => onChange((event.currentTarget as HTMLSelectElement).value)}
-      class="w-full rounded-lg border border-line bg-panel px-2 py-1.5 text-xs outline-none focus:border-accent"
-    >
-      {options.map((option) => (
-        <option key={option.value} value={option.value}>
-          {option.label}
-        </option>
-      ))}
-    </select>
+    <div ref={box} class="relative" onKeyDown={onKeyDown}>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen((prev) => !prev)}
+        class={`flex w-full items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-xs transition disabled:cursor-not-allowed disabled:opacity-50 ${
+          open ? 'border-accent bg-panel' : 'border-line bg-panel hover:bg-raised'
+        }`}
+      >
+        <span class={`min-w-0 flex-1 truncate ${current ? '' : 'text-muted'}`}>
+          {current?.label ?? placeholder}
+        </span>
+        <svg
+          viewBox="0 0 10 10"
+          class={`h-3 w-3 shrink-0 text-muted transition ${open ? 'rotate-180' : ''}`}
+          fill="currentColor"
+          aria-hidden="true"
+        >
+          <path d="M2.2 3.9c.2-.2.5-.2.7 0L5 6l2.1-2.1a.5.5 0 0 1 .7.7L5.35 7.05a.5.5 0 0 1-.7 0L2.2 4.6a.5.5 0 0 1 0-.7" />
+        </svg>
+      </button>
+      {open && (
+        <div class="absolute left-0 right-0 z-30 mt-1 max-h-72 overflow-y-auto rounded-xl border border-line bg-panel p-1 shadow-xl">
+          {options.length === 0 && <p class="px-2 py-1.5 text-[11px] text-muted">没有可选项</p>}
+          {options.map((option, index) => (
+            <button
+              key={option.value}
+              type="button"
+              onMouseEnter={() => setCursor(index)}
+              onClick={() => {
+                onChange(option.value)
+                setOpen(false)
+              }}
+              class={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition ${
+                option.value === value
+                  ? 'bg-accent/10 text-accent'
+                  : index === cursor
+                    ? 'bg-raised'
+                    : 'hover:bg-raised'
+              }`}
+            >
+              <span class="min-w-0 flex-1 truncate">{option.label}</span>
+              {option.value === value && <Icon name="tick" class="h-3 w-3 shrink-0" />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 

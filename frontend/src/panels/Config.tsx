@@ -65,7 +65,7 @@ function ConfigOverview({ groups, edits }: { groups: ConfigGroup[]; edits: Recor
       {groups.map((item) => (
         <details key={item.key} class="rounded-xl border border-line bg-panel">
           <summary class="cursor-pointer px-4 py-3 text-sm font-semibold">
-            {shortTitle(item.description) || item.key}
+            {groupTitle(item)}
             <span class="ml-2 text-[11px] font-normal text-muted">
               {item.fields.length} 项
               {item.fields.some((field) => field.path in edits) ? ' · 有未保存改动' : ''}
@@ -195,7 +195,7 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
               { value: OVERVIEW, label: '配置总览（只读）' },
               ...groups.map((item) => ({
                 value: item.key,
-                label: `${shortTitle(item.description) || item.key}${
+                label: `${groupTitle(item)}${
                   item.fields.some((field) => field.path in edits) ? '  · 有改动' : ''
                 }`,
               })),
@@ -209,8 +209,8 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
         <ConfigOverview groups={groups} edits={edits} />
       ) : (
       <SchemaGroupCard
-        title={shortTitle(active!.description) || active!.key}
-        description={active!.description ?? ''}
+        title={groupTitle(active!)}
+        description={groupDetail(active!)}
         actions={
           <>
             <Button
@@ -272,9 +272,19 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
   )
 }
 
-/** 分组标题：schema 的 description 前面挂着 `【必填 2】` 这类标记，导航里省掉。 */
-function shortTitle(text: string | undefined): string {
-  return String(text ?? '').replace(/^【[^】]*】\s*/, '')
+/** 分组短标题：优先用 schema 的 `title`（如「模型中心」），没有才从 description 里剥标记。 */
+function groupTitle(group: ConfigGroup): string {
+  const title = String(group.title ?? '').trim()
+  if (title) return title
+  return String(group.description ?? '').replace(/^【[^】]*】\s*/, '').split('：')[0].trim() || group.key
+}
+
+/** 分组副标题：去掉 `【必填 2】` 标记与开头那句重复的「模型中心：」。 */
+function groupDetail(group: ConfigGroup): string {
+  let text = String(group.description ?? '').replace(/^【[^】]*】\s*/, '')
+  const title = groupTitle(group)
+  if (title && text.startsWith(`${title}：`)) text = text.slice(title.length + 1)
+  return text
 }
 
 /* ------------------------------------------------------------------ #

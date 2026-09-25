@@ -66,7 +66,9 @@ function toNumber(kind: string, text: string): number | null {
  * 控制台里铺那段解释；该说的话写在 `_conf_schema.json` 的 hint 里，由宿主配置页展示。
  * `info` 级别的短提示（行为提醒 / "请在模型面板编辑"）照旧显示，它们是真的有用。 */
 function Label({ node, value, note }: { node: SchemaNode; value: unknown; note?: FieldNote | null }) {
-  const hint = String(node.hint ?? '')
+  // 指向「控制台 → 配置」的那句提示是给**宿主配置页**看的，在本页显示没有意义。
+  const rawHint = String(node.hint ?? '')
+  const hint = rawHint.includes('幕间控制台') ? '' : rawHint
   const short = note?.level === 'info' ? note.text : ''
   return (
     <div class="flex flex-wrap items-center gap-2">
@@ -95,11 +97,24 @@ export interface SchemaFieldProps {
   /** 对象行列表可以提供一个"从已知来源填入"按钮（白名单用）。 */
   autofill?: { label: string; key: string; sourceKey: string; run: () => Promise<Record<string, unknown> | null> }
   depth?: number
+  /** 行内字段（行本身已经是一张卡）不再套一层框。 */
+  flat?: boolean
+}
+
+/** 每个字段的容器样式：**统一**给一层边框 + 底色。
+ *
+ * 之前只有"对象行列表"里的行有框，标量字段和嵌套对象都没有（嵌套对象只有一条左边线），
+ * 于是页面上有的地方有框、有的没有（用户直接指出"看着很乱"）。现在所有字段一律一张卡，
+ * 嵌套层级用底色区分：顶层 `bg-raised/30`、里层 `bg-panel`。 */
+function fieldCard(depth: number, flat = false): string {
+  if (flat) return 'flex flex-col gap-2'
+  // 交替底色：层级越深越"浅一层"，嵌套时一眼能看出从属关系（而不是一片同色）。
+  return `flex flex-col gap-2 rounded-lg border border-line p-3 ${depth % 2 === 0 ? 'bg-raised/30' : 'bg-panel'}`
 }
 
 /** 递归渲染一个 schema 字段。 */
 export function SchemaField(props: SchemaFieldProps) {
-  const { node, value, onChange, path, note, delegated, choices, depth = 0 } = props
+  const { node, value, onChange, path, note, delegated, choices, depth = 0, flat = false } = props
   const kind = String(node.type ?? 'string')
 
   if (kind === 'object') {
@@ -108,7 +123,7 @@ export function SchemaField(props: SchemaFieldProps) {
     const children = Object.entries(items).filter(([, spec]) => !spec?.invisible)
     if (!children.length) return null
     return (
-      <div class={`flex flex-col gap-3 ${depth ? 'border-l border-line pl-3' : ''}`}>
+      <div class={`${fieldCard(depth, flat)} gap-3`}>
         <Label node={node} value={value} note={note} />
         <NoteLine note={note} />
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -162,7 +177,7 @@ export function SchemaField(props: SchemaFieldProps) {
   const vendorOptions = special && choices ? choices[special] ?? [] : []
 
   return (
-    <div class="flex flex-col gap-2">
+    <div class={fieldCard(depth, flat)}>
       <Label node={node} value={value} note={note} />
       {delegated ? (
         <Note>{note?.text ?? '此项请在专用面板里编辑。'}</Note>
@@ -234,11 +249,11 @@ function RowsField({
   const remove = (index: number) => onChange(value.filter((_row, i) => i !== index))
 
   return (
-    <div class="flex flex-col gap-3">
+    <div class={`${fieldCard(0)} gap-3`}>
       <Label node={node} value={value.length ? value : undefined} note={note} />
       <NoteLine note={note} />
       {value.map((row, index) => (
-        <div key={index} class="rounded-lg border border-line bg-raised/40 p-3">
+        <div key={index} class="rounded-lg border border-line bg-panel p-3">
           <div class="mb-2 flex items-center gap-2">
             <span class="text-[11px] font-medium text-muted">第 {index + 1} 行</span>
             <div class="ml-auto flex items-center gap-1">
@@ -271,6 +286,7 @@ function RowsField({
                   value={row[key]}
                   onChange={(next) => patch(index, key, next)}
                   choices={undefined}
+                  flat
                 />
               </div>
             ))}
@@ -310,7 +326,7 @@ function TagsField({
     setDraft('')
   }
   return (
-    <div class="flex flex-col gap-2">
+    <div class={fieldCard(0)}>
       <Label node={node} value={value.length ? value : undefined} />
       <div class="flex flex-wrap items-center gap-1.5">
         {value.map((item, index) => (
@@ -354,7 +370,7 @@ function TagsField({
 function JsonField({ value, onChange, node }: SchemaFieldProps): ComponentChildren {
   const text = JSON.stringify(value ?? node.default ?? null, null, 2)
   return (
-    <div class="flex flex-col gap-2">
+    <div class={fieldCard(0)}>
       <Label node={node} value={value} />
       <Textarea
         mono

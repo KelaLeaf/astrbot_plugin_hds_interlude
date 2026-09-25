@@ -87,7 +87,7 @@ FIELD_NOTES: dict[str, str] = {
 
 #: 宿主配置页编辑不了「对象行列表」的提示（与 `_conf_schema.json` 里的 hint 同一句话）。
 #: 控制台**不**把这句铺在字段上（用户要求别在页面上重复解释），它留在数据里给将来的界面用。
-HOST_LIST_DEGRADED_NOTE = '此配置项在 AstrBot 自带配置页不生效，请在本页配置。'
+HOST_LIST_DEGRADED_NOTE = '⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置'
 
 
 _SCHEMA_CACHE: dict[str, Any] = {'mtime': None, 'schema': {}}
@@ -726,6 +726,9 @@ class ConsoleApi:
                 })
             groups.append({
                 'key': group_key,
+                #: 短标题（`_conf_schema.json` 的 `title`）：下拉与卡片标题用它，
+                #: `description` 是一句话说明，留在卡片里当副标题。
+                'title': _text(group_spec.get('title')),
                 'description': _text(group_spec.get('description')),
                 'invisible': bool(group_spec.get('invisible')),
                 'fields': fields,

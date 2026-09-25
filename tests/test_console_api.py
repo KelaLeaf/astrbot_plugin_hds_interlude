@@ -585,6 +585,20 @@ class ConfigEditorTests(unittest.TestCase):
         self.assertTrue(fields['user_accounts']['rows'], '对象行要把行字段一起给前端')
         self.assertIn('node', fields['user_accounts'], '原始 schema 节点：前端据此递归渲染')
 
+    def test_every_group_carries_a_short_title(self):
+        """分组要有短标题：下拉与卡片用它，`description` 是那句话说明。
+
+        没标题就会出现「模型中心：先添加连接并勾选用途，主叙事参数与高级模块同处。…」
+        这种塞满下拉的标签（用户直接指出太长）。
+        """
+        payload = _run(self.api.config_schema())
+        for group in payload['groups']:
+            with self.subTest(group=group['key']):
+                self.assertTrue(group['title'].strip(), group['key'])
+                self.assertLessEqual(len(group['title']), 16, group['title'])
+                # 短标题不该是整句说明
+                self.assertNotIn('。', group['title'])
+
     def test_object_row_lists_get_the_host_editor_warning(self):
         payload = _run(self.api.config_schema())
         notes = {
