@@ -24,7 +24,24 @@ from ..types import NarrativeDecision
 # 上游 `/<say id="([\w-]{1,64})">([\s\S]*?)<\/say>/g`。
 # ⚠️ JS 的 `\w` 只匹配 `[A-Za-z0-9_]`（ASCII），Python 的 `\w` 默认还匹配汉字，
 # 故这里显式写成 `[A-Za-z0-9_-]`，避免接受上游不会接受的 id。
-_SAY_PATTERN = re.compile(r'<say id="([A-Za-z0-9_-]{1,64})">([\s\S]*?)</say>')
+#
+# 受控偏离（见 `docs/PORTING_NOTES.md` §19）：**标签写法容错**。上游正则只认
+# `<say id="x">` 这一种字面写法，而模型实际会写 `<say id='x'>`、`<say id=x>`、
+# `<SAY ID="x">`、`<say  id = "x">`、`<say id="x" >`，或者因为 JSON 转义层次把引号
+# 写成了 `id=\"x\"`。这些写法在上游都会**一个动作都解析不出来**——于是
+# `interaction.reply` 声明的引用落地不了、`soleActionReply` 也兜不住（它要求恰好一个
+# 动作），整个已经写好的回合被判成「结构化可见回复缺失」白重写一次（用户 2026-09-25
+# 23:56 的日志就是这个形态：草稿里明明有 `<say id="reply">晚安喵～</say>`，
+# 日志却报重写）。容错**只放宽标签的书写形式**：id 字符集与长度、标签的语义、
+# 「重复 id 不可执行」「绝不从散文里猜动作」这些约束一条都没有放宽。
+_SAY_OPEN = r'<\s*say[\s\u200b-\u200d\u2060\ufeff]+id[\s\u200b-\u200d\u2060\ufeff]*=' \
+            r'[\s\u200b-\u200d\u2060\ufeff]*[\\"\'“”‘’]*([A-Za-z0-9_-]{1,64})[\\"\'“”‘’]*' \
+            r'[\s\u200b-\u200d\u2060\ufeff]*>'
+_SAY_PATTERN = re.compile(
+    _SAY_OPEN + r'([\s\S]*?)<\s*/\s*say[\s\u200b-\u200d\u2060\ufeff]*>',
+    re.IGNORECASE,
+)
+_SAY_TOKEN = re.compile(r'<\s*/?\s*say', re.IGNORECASE)
 # 上游 `completeLegacyBubbleBlock` 里的分段与校验正则（`\\n` = 字面量反斜杠 + n）。
 _PARAGRAPH_BREAK = re.compile(r'\r?\n\s*\r?\n|\\n\\n')
 _BAD_BUBBLE_CHAR = re.compile(r'[\r\n<>]|\\n')
@@ -122,6 +139,23 @@ def _mark_resolved(value: Any) -> None:
 def _mark_delivered(value: Any) -> None:
     """上游 `deliveredActions.add(value)`。"""
     _delivered_actions.add(value)
+
+
+def inspect_say_markup(prose: Any) -> dict[str, Any]:
+    """诊断用：`prose` 里还残留多少 `<say …>` 标记。
+
+    解析成功时 `<say>` 标签整个被解包成散文，**不会**留在 `prose` 里；因此
+    `leftover > 0` 就是"模型写了行动、但一个都没解析出来"的铁证——此时
+    `interaction.reply` 的引用必然落地不了（除非恰好一个动作能靠 `sole_action_reply`
+    兜底），回合会被判成「结构化可见回复缺失」白重写一次。出问题时把 `preview`
+    打进日志，就能直接看出模型到底把那个标签写成了什么形状。
+    """
+    text = prose if isinstance(prose, str) else ''
+    first = _SAY_TOKEN.search(text)
+    if first is None:
+        return {'leftover': 0, 'preview': ''}
+    start = max(0, first.start() - 30)
+    return {'leftover': len(_SAY_TOKEN.findall(text)), 'preview': text[start:start + 160]}
 
 
 def read_authored_actions(script: str) -> ReadAuthoredActionsResult:

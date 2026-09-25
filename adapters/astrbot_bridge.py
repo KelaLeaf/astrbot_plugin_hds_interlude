@@ -298,6 +298,31 @@ def _raw_segment_chain(event: Any) -> list[Any]:
     return chain
 
 
+#: OneBot 的非消息事件（`post_type` 不是 `message`）：通知 / 元事件 / 请求。
+#: 宿主也会把它们派到消息处理器上，最典型的是 NapCat 的 `input_status`
+#: （「对方正在输入…」与停止输入），实测一分钟能来十几条。
+_NON_MESSAGE_POST_TYPES = frozenset({'notice', 'meta_event', 'request'})
+
+
+def is_non_message_event(event: Any) -> tuple[bool, str]:
+    """这条事件是不是 OneBot 的非消息事件；返回 `(是否非消息, 类型标签)`。
+
+    标签用来打 debug 日志（`notice:notify:input_status` 比 `post_type=notice` 有用）。
+    取不到 `post_type` 就一律当成消息——telegram / webchat / 官方 QQ 的原始事件里
+    没有这个键，**绝不能误伤**。
+    """
+    raw = getattr(getattr(event, 'message_obj', None), 'raw_message', None)
+    if not isinstance(raw, dict):
+        return False, ''
+    post_type = _text(raw.get('post_type')).lower()
+    if post_type not in _NON_MESSAGE_POST_TYPES:
+        return False, ''
+    kind = _text(raw.get('notice_type') or raw.get('meta_event_type') or raw.get('request_type'))
+    sub_type = _text(raw.get('sub_type'))
+    label = post_type + ((':' + kind) if kind else '') + ((':' + sub_type) if sub_type else '')
+    return True, label
+
+
 # =========================================================================== #
 # AstrBot 消息链 → Koishi `session.content` / `elements`
 # =========================================================================== #
@@ -2465,6 +2490,20 @@ class AstrbotBridge:
         await self.ensure_started()
         endpoint = endpoint_for_event(event)
         session = session_view(event, endpoint)
+        non_message, kind_label = is_non_message_event(event)
+        if non_message:
+            # OneBot 的通知 / 元事件 / 请求不是聊天内容，永远成不了回合。以前它们走的是
+            # "空内容"那条路，每条都打一条 warn——NapCat 的「对方正在输入…」一分钟能来
+            # 十几条，把日志里真正该看的东西全盖掉了（用户 2026-09-25 的日志就是这样）。
+            # 现在静默处理：消费策略与过去逐字一致（只有"归我们管的私聊"才吞，避免空
+            # 事件漏给后面坐着的那个人格），只是不再用 warn 打扰人。
+            if self.owns_private_session(session):
+                event.stop_event()
+                log_fallback('debug', '已吞掉非消息事件（私聊归我们管）类型=%s 平台=%s 用户=%s',
+                             kind_label, session.platform, session.user_id)
+            else:
+                log_fallback('debug', '忽略非消息事件 类型=%s', kind_label)
+            return []
         self.remember_event(event, session, endpoint)
         content = session.content
 
