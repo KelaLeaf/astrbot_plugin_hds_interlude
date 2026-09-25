@@ -136,7 +136,7 @@ export function ConnectionEditor({
         <Field label="接口预设" hint="官方预设会自动补上 endpoint">
           <Select
             value={draft.mode}
-            onChange={(value) => update({ mode: value })}
+            onChange={(value) => update({ mode: String(value) })}
             options={MODES.map((mode) => ({ value: mode, label: mode }))}
           />
         </Field>
@@ -165,7 +165,7 @@ export function ConnectionEditor({
         <Field label="输出格式" hint="模型在 JSON 模式下空回复时改成 prompt-only">
           <Select
             value={draft.response_format}
-            onChange={(value) => update({ response_format: value })}
+            onChange={(value) => update({ response_format: String(value) })}
             options={[
               { value: 'json-object', label: 'json-object' },
               { value: 'prompt-only', label: 'prompt-only' },
