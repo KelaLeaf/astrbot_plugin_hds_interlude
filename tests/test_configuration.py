@@ -790,12 +790,37 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
     # -- 覆盖度对账 ------------------------------------------------------------
 
+    #: 上游放在 `model` 组、本移植版**搬到独立分组**的字段。
+    #:
+    #: 上游 `src/index.ts` 把提示词四件套放在 `ModelConfig` 里；本移植版在配置页
+    #: 给它们单开了一组 `prompts`（键名逐字不变），core 读的仍是 `model.*`——
+    #: 搬家由 `core/service/config.py` 的 `resolve_prompt_fields`（读）与
+    #: `to_schema_shape`（写）负责，见 `docs/CONFIG_MAP.md`。
+    RELOCATED_UPSTREAM_FIELDS = {
+        "prompts": ["mainPrompt", "formatPrompt", "fixedPrompt", "stylePrompt"],
+    }
+
     def test_every_upstream_field_is_covered(self):
         missing = []
         for group, fields in UPSTREAM_FIELDS.items():
             present = set(self.section(group).keys())
             for camel in fields:
-                if snake(camel) not in present:
+                if snake(camel) in present:
+                    continue
+                # 搬过家的字段：原组里**必须没有**（否则配置页又出现两个输入框），
+                # 新组里必须有一份。
+                for target, moved in self.RELOCATED_UPSTREAM_FIELDS.items():
+                    if camel in moved:
+                        self.assertNotIn(
+                            snake(camel), present,
+                            f"{group}.{camel} 应当只留在 {target} 组里",
+                        )
+                        self.assertIn(
+                            snake(camel), set(self.section(target).keys()),
+                            f"{target}.{camel} 缺失",
+                        )
+                        break
+                else:
                     missing.append(f"{group}.{camel} -> {snake(camel)}")
         self.assertEqual(missing, [], f"未覆盖的上游字段：{missing}")
 
@@ -812,7 +837,12 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
     def test_upstream_field_count_matches(self):
         expected = sum(len(v) for v in UPSTREAM_FIELDS.values())
-        actual = sum(len(self.section(g)) for g in UPSTREAM_FIELDS)
+        # 上游字段总数里含被搬到 `prompts` 组的 4 个提示词键（`UPSTREAM_FIELDS`
+        # 记的是**上游的原始归属**），所以实际项数要把新组那一份也数上。
+        actual = (
+            sum(len(self.section(g)) for g in UPSTREAM_FIELDS)
+            + sum(len(self.section(g)) for g in self.RELOCATED_UPSTREAM_FIELDS)
+        )
         local_only = sum(len(v) for v in self.LOCAL_ONLY_FIELDS.values())
         self.assertEqual(actual, expected + local_only,
                          f"上游 {expected} 项 + 本移植版新增 {local_only} 项"
@@ -837,20 +867,24 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
     def test_deep_sections_are_complete(self):
         model = self.section("model_center")
+        prompts = self.section("prompts")
         # providers 行的完整字段数（上游 ProviderIdentity + 模式字段 + ProviderAssignments）。
         self.assertGreaterEqual(len(model["providers"]["items"]), 21)
-        # 提示词四件套（上游 3.4 节）。
+        # 提示词四件套（上游 3.4 节）：**只住在 `prompts` 组**。
+        # 上游把它们放在 `model` 组里；本移植版单开一组，`model_center` 里不能再有
+        # 副本——否则配置页出现两套同名同默认值的输入框，用户改错那一套会静默失效
+        # （v1.1.0 的真实事故，见 `docs/PORTING_NOTES.md`）。
         for key in ("main_prompt", "format_prompt", "fixed_prompt", "style_prompt"):
-            self.assertIn(key, model)
-            self.assertIn(key, self.section("prompts"))
-        self.assertEqual(
-            model["main_prompt"]["default"],
-            self.section("prompts")["main_prompt"]["default"],
-        )
-        self.assertEqual(
-            model["style_prompt"]["default"],
-            self.section("prompts")["style_prompt"]["default"],
-        )
+            self.assertNotIn(key, model, f"model_center.{key} 是重复项，应只留在 prompts 组")
+            self.assertIn(key, prompts)
+        # 分组里的默认值必须与 core 读的那份逐字一致（`prompts` 组默认值 =
+        # `CONFIG_DEFAULTS['model']` 的提示词默认值）。
+        from plugin.core.service.config import CONFIG_DEFAULTS  # noqa: PLC0415
+        for key in ("main_prompt", "format_prompt", "fixed_prompt", "style_prompt"):
+            self.assertEqual(
+                prompts[key]["default"], CONFIG_DEFAULTS["model"][key],
+                f"prompts.{key} 的默认值与 core 不一致",
+            )
 
     # -- AstrBot 格式铁律（AGENTS.md 坑 1） -------------------------------------
 

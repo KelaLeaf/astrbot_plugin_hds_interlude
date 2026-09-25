@@ -87,7 +87,7 @@
   },
   "model_center": {
     "type": "object",
-    "description": "【必填 2】模型中心：先添加连接并勾选用途，主叙事参数与高级模块同处。",
+    "description": "【必填 2】模型中心：先添加连接并勾选用途，主叙事参数与高级模块同处。提示词四件套在「提示词」组。",
     "items": {
       "vision": {
         "type": "object",
@@ -498,26 +498,6 @@
             "default": 5
           }
         }
-      },
-      "main_prompt": {
-        "type": "text",
-        "description": "主叙事行为指令",
-        "default": "Continue the character-centered life script with grounded actions, motives, relationships, and ordinary time passing."
-      },
-      "format_prompt": {
-        "type": "text",
-        "description": "结构化输出补充规则",
-        "default": ""
-      },
-      "fixed_prompt": {
-        "type": "text",
-        "description": "通用长期规则",
-        "default": ""
-      },
-      "style_prompt": {
-        "type": "text",
-        "description": "全局叙事文风",
-        "default": "Use restrained, realistic prose with concrete daily details, natural pauses, and no forced drama."
       },
       "embedding": {
         "type": "object",
@@ -1947,7 +1927,7 @@
   },
   "prompts": {
     "type": "object",
-    "description": "【提示词】主叙事的写作指令、格式规则、固定约束与全局文风。",
+    "description": "【提示词】主叙事的写作指令、格式规则、固定约束与全局文风。这里是提示词的唯一入口。",
     "items": {
       "main_prompt": {
         "type": "text",
