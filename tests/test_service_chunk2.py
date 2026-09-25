@@ -51,6 +51,7 @@ from plugin.core.script.recall_navigation import (
     score_original,
 )
 from plugin.core.service.base import InterludeContext
+from plugin.core.service import chunk3 as chunk3_module
 from plugin.core.service.chunk2 import (
     ServiceChunk2,
     group_message_ref,
@@ -1106,6 +1107,36 @@ class BufferTurnTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
         self.assertEqual(fired, [('p1', 2)], '只有最后一次排期进入 flush')
 
+    async def test_a_turn_field_written_by_flush_is_readable_by_chunk2_guards(self):
+        """回归（用户 2026-09-26 00:22 的日志）：在途请求号必须两种拼写都读得到。
+
+        汐雨. 连发「行吧」「晚安」+ 一张晚安贴图；第 3 条到达时第 2 条那一回合正在跑模型，
+        本该被判过时、与第 3 条合成**一个**回合，结果被拆成两回合——贴图那一回合她已经
+        "睡着了、没看见"。根因是拼写：`bufferUserNarrative` 建的 turn 是 snake_case，而
+        `in_flight_request_id` 是 `flushBufferedNarrative`（Chunk3）**第一次**写进去的，
+        `_turn_set` 按"跟随已有拼写"的规则挑不到 snake 键 → 落在 camelCase；Chunk2 的两个
+        守卫却直接 `turn.get('in_flight_request_id')` → 拿到 None → `shouldSupersede`
+        永远为假。修复前的既有用例手工用 snake_case 造 turn，所以一直没抓到。
+        """
+        host = _host()
+        participant = {'id': 'p1'}
+        story = {'id': 's'}
+
+        host.buffer_user_narrative(story, participant, {'content': '行吧'}, NOW, [])
+        turn = host.buffered_narrative_turns['p1']
+        # Chunk3 起跑时就是这么写的（`flush_buffered_narrative` 内的真实调用形态）。
+        chunk3_module._turn_set(turn, 'inFlightRequestId', 'in_flight_request_id', 4)
+        self.assertEqual(turn['in_flight_request_id'], 4, '两种拼写都要能读到同一个在途请求号')
+
+        host.signal_incoming_interruption(story, participant)
+        self.assertEqual(turn['obsolete_request_ids'], {4}, '在途请求未提交首条回复时必须作废')
+
+        # 同一个守卫也住在 `bufferUserNarrative` 里：新消息进缓冲时顺手作废在途请求。
+        turn['obsolete_request_ids'] = set()
+        host.buffer_user_narrative(story, participant, {'content': '晚安'}, NOW, [])
+        self.assertEqual(turn['obsolete_request_ids'], {4})
+        self.assertEqual(len(turn['messages']), 2, '两条消息留在同一个回合里')
+
     async def test_signal_incoming_interruption_marks_the_in_flight_request_obsolete(self):
         """`signalIncomingInterruption()`（本范围成员，`:2209`）。"""
         host = _host()
@@ -1119,8 +1150,13 @@ class BufferTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn['obsolete_request_ids'], {4})
         self.assertIn('p1', host.interrupted_typing_participants)
         # 已经提交过该请求时不再重复标记。
-        turn['obsolete_request_ids'] = set()
-        turn['first_message_committed_request_id'] = 4
+        # ⚠️ 夹具必须用**生产写入方**的写法（Chunk3 的 `_turn_set` 写两种拼写）：
+        # 只改一种拼写会让"另一个拼写里的旧值"继续生效——这正是 2026-09-26 那个
+        # "连发消息没被合并"的 bug 的同一类陷阱。
+        chunk3_module._turn_set(turn, 'obsoleteRequestIds', 'obsolete_request_ids', set())
+        chunk3_module._turn_set(
+            turn, 'firstMessageCommittedRequestId', 'first_message_committed_request_id', 4,
+        )
         host.signal_incoming_interruption({'id': 's'}, {'id': 'p1'})
         self.assertEqual(turn['obsolete_request_ids'], set())
         # 没有在途请求的参与者也要进中断集合。

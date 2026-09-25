@@ -1,5 +1,34 @@
 # 更新日志
 
+## v1.2.15
+
+**连发的消息终于合并成一个回合了**（用户 2026-09-26 00:22 的日志：汐雨. 连发「行吧」「晚安」
++ 一张晚安贴图，被拆成两个回合 —— 贴图那一回合她已经"睡着了、没看见"）。
+
+- **根因是一处拼写失配**：缓冲回合 dict 里同一个字段有两种拼写（`base.py` 用 camelCase、
+  `config.py` 的 TypedDict 用 snake_case），而 `_turn_set` 原来是"**跟随 dict 已有的拼写**"。
+  `bufferUserNarrative`（Chunk2）建 turn 时只写了 `story_id` / `participant_id` / `messages` /
+  `next_revision` / `obsolete_request_ids`；`in_flight_request_id` 是
+  `flushBufferedNarrative`（Chunk3）**第一次**写进去的 —— 当时 dict 里没有 snake 键，
+  于是它落在 camelCase。而 Chunk2 的两个"新消息到达"守卫直接读
+  `turn.get('in_flight_request_id')` → 拿到 `None` → `shouldSupersedeNarrativeRequest`
+  **永远为假**。于是：
+  - 在飞回合不会被判过时（日志里既没有「新消息到达且首条回复尚未提交，放弃旧请求」，
+    也没有「已丢弃过期主模型结果」）；
+  - 它照常落库、推进游标，下一条消息只能另起一个回合。
+  上游那套"新消息打断在飞请求 → 批次放回 → 合成一个事件"因此静默失效。
+- **修法**：`_turn_set` 改为**两种拼写都写**（回合 dict 是纯内存结构，从不落库也不进 payload，
+  多一个键零代价）；Chunk2 的三个守卫（`signal_incoming_interruption` /
+  `buffer_user_narrative` / `deliver_early_private_reply`）改用共享的双读双写
+  （`helpers._turn_get` / `_turn_set` / `_obsolete_request_ids`）；`base.py` 的暂停恢复路径
+  同样双读。`_obsolete_request_ids()` 保证两种拼写指向**同一个 set**，避免"标记写进 camel、
+  读取只看 snake"的下一轮事故。
+- 修复后的行为：贴图到达时上一回合正在跑模型、且首条回复尚未提交 → 该请求作废、批次放回 →
+  三条消息（两条文字 + 贴图）合成**一个**回合，她会在睡前看到那张晚安贴图。
+
+回归测试 +1：`test_a_turn_field_written_by_flush_is_readable_by_chunk2_guards`
+（用**生产写入方**的写法造 turn，钉死两个守卫都能看到在途请求号）。
+
 ## v1.2.14
 
 **输入状态通知不再刷屏，回合被白重写时日志说得出为什么**（用户 2026-09-25 的日志）。

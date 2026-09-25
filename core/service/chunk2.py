@@ -102,6 +102,8 @@ from .config import (
 )
 from .helpers import (
     SEMANTIC_STICKER_LIMIT,
+    _turn_get,
+    _turn_set,
     calibrated_native_face_willingness,
     clip,
     cosine_similarity,
@@ -294,6 +296,21 @@ def _expires_in_future(value: Any, now: Any) -> bool:
         return True
     parsed = parse_dt(value)
     return parsed is not None and parsed > now
+
+
+def _obsolete_request_ids(turn: dict[str, Any]) -> set:
+    """缓冲回合的「已作废在途请求」集合，**两种拼写指向同一个 set**。
+
+    写侧曾经只写一种拼写，而 `flushBufferedNarrative`（Chunk3）用
+    `_turn_get(turn, 'obsoleteRequestIds', 'obsolete_request_ids')` 读、优先 camelCase——
+    只要两者落在不同的键上，作废标记就会静默丢失（用户 2026-09-26 00:22 的日志里，
+    连发消息因此没有被合并进同一回合）。这里保证两个键拿到的是**同一个对象**。
+    """
+    current = _turn_get(turn, 'obsoleteRequestIds', 'obsolete_request_ids')
+    if not isinstance(current, set):
+        current = set()
+    _turn_set(turn, 'obsoleteRequestIds', 'obsolete_request_ids', current)
+    return current
 
 
 class ServiceChunk2(ServiceBase):
@@ -855,6 +872,7 @@ class ServiceChunk2(ServiceBase):
     # 入站缓冲与流式早发（`src/service.ts:2189-2244`）
     # ------------------------------------------------------------------ #
 
+
     def buffer_user_narrative(
         self,
         story: dict[str, Any],
@@ -893,15 +911,18 @@ class ServiceChunk2(ServiceBase):
             'obsolete_request_ids': set(),
         }
         if should_supersede_narrative_request(
-            turn.get('in_flight_request_id'),
-            turn.get('first_message_committed_request_id'),
-            turn.get('obsolete_request_ids') or set(),
+            _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id'),
+            _turn_get(turn, 'firstMessageCommittedRequestId', 'first_message_committed_request_id'),
+            _obsolete_request_ids(turn),
         ):
-            turn.setdefault('obsolete_request_ids', set()).add(turn.get('in_flight_request_id'))
+            _obsolete_request_ids(turn).add(
+                _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id'),
+            )
             self.report_operation(
                 'standard', 'info', story, 'user-message',
                 '新消息到达且首条回复尚未提交，放弃旧请求 参与者=%s 请求=%d',
-                pick(participant, 'id'), turn.get('in_flight_request_id') or 0,
+                pick(participant, 'id'),
+                _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id') or 0,
             )
         message: dict[str, Any] = {
             'content': content,
@@ -947,17 +968,18 @@ class ServiceChunk2(ServiceBase):
         turn = self.buffered_narrative_turns.get(participant_id)
         if not isinstance(turn, dict):
             return
+        in_flight = _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id')
         if not should_supersede_narrative_request(
-            turn.get('in_flight_request_id'),
-            turn.get('first_message_committed_request_id'),
-            turn.get('obsolete_request_ids') or set(),
+            in_flight,
+            _turn_get(turn, 'firstMessageCommittedRequestId', 'first_message_committed_request_id'),
+            _obsolete_request_ids(turn),
         ):
             return
-        turn.setdefault('obsolete_request_ids', set()).add(turn.get('in_flight_request_id'))
+        _obsolete_request_ids(turn).add(in_flight)
         self.report_operation(
             'standard', 'info', story, 'user-message',
             '新消息到达且首条回复尚未提交，放弃旧请求 参与者=%s 请求=%d',
-            participant_id, turn.get('in_flight_request_id') or 0,
+            participant_id, in_flight or 0,
         )
 
     async def deliver_early_private_reply(
@@ -982,11 +1004,12 @@ class ServiceChunk2(ServiceBase):
         reply_body = interaction.get('reply')
         if not isinstance(reply_body, dict) or reply_body.get('mode') != 'immediate':
             return False
-        if turn.get('next_revision') != request_id:
+        if _turn_get(turn, 'nextRevision', 'next_revision') != request_id:
             return False
-        if request_id in (turn.get('obsolete_request_ids') or set()):
+        if request_id in _obsolete_request_ids(turn):
             return False
-        if turn.get('first_message_committed_request_id') == request_id:
+        if _turn_get(turn, 'firstMessageCommittedRequestId',
+                     'first_message_committed_request_id') == request_id:
             return False
         if not self.can_handle_participant(participant):
             return False
@@ -1010,7 +1033,7 @@ class ServiceChunk2(ServiceBase):
         confirmed = await self.confirm_outgoing_deliveries(story, delivered)
         if not confirmed:
             return False
-        turn['first_message_committed_request_id'] = request_id
+        _turn_set(turn, 'firstMessageCommittedRequestId', 'first_message_committed_request_id', request_id)
         self.report_operation(
             'standard', 'info', story, 'user-message',
             '实验性流式首条回复已提前投递 参与者=%s 请求=%d', participant_id, request_id,

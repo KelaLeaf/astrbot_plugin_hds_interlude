@@ -1522,11 +1522,11 @@ class ServiceChunk0(ServiceBase):
                 turn['timer'] = None
         elif phase == 'running':
             # 只恢复暂停前已经持久化的回合：既不丢消息，也不制造新的用户事件。
-            # 缓冲回合 dict 统一 snake_case（`config.py` 的 `BufferedNarrativeTurn`）；
-            # 创建方 `buffer_user_narrative`（Chunk2）写的就是 `next_revision` /
-            # `in_flight_request_id`，这里读 camelCase 会永远拿到空值。
+            # 缓冲回合 dict 里同一个字段**两种拼写都有**（`helpers._turn_set` 两种都写），
+            # 这里双读，避免"写 camel / 读 snake"式的静默失配（2026-09-26 的合并 bug）。
             for key, turn in list(self.buffered_narrative_turns.items()):
-                if turn.get('timer') or turn.get('in_flight_request_id') or not turn.get('messages'):
+                if (turn.get('timer') or pick(turn, 'inFlightRequestId', 'in_flight_request_id')
+                        or not turn.get('messages')):
                     continue
                 revision = (turn.get('next_revision') or 0) + 1
                 turn['next_revision'] = revision

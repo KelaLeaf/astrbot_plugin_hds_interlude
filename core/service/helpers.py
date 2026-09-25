@@ -1702,6 +1702,45 @@ def resolve_participant_id(explicit: Any, source_entry_ids: Any,
     return found[0] if found else ''
 
 
+# =========================================================================== #
+# 缓冲回合 dict 的字段读写（Chunk2 建 dict、Chunk3 起跑，见 `_turn_set` 的说明）
+# =========================================================================== #
+
+def _turn_get(turn: Any, camel: str, snake: Optional[str] = None) -> Any:
+    """读缓冲回合 / 缓冲消息的字段：camelCase 与 snake_case 都认（优先 camelCase）。
+
+    与 `base.pick` 同义，但**不复用 `pick`**：`pick` 住在 `base.py`，而 `base` 依赖本模块，
+    反向导入会成环。这里自己走一遍 dict 查找（回合与缓冲消息都是纯内存 dict）。
+    """
+    if not isinstance(turn, dict):
+        return None
+    if camel in turn:
+        return turn[camel]
+    key = snake or re.sub(r'(?<!^)(?=[A-Z])', '_', camel).lower()
+    return turn.get(key)
+
+
+def _turn_set(turn: dict[str, Any], camel: str, snake: str, value: Any) -> Any:
+    """写缓冲回合的字段：**两种拼写都写**。
+
+    `base.py`（Chunk0）写/读 camelCase，`config.py` 的 TypedDict 声明的是 snake_case。
+    曾经这里"跟随该 dict 已有的拼写"（有 snake 就写 snake，否则写 camel），听起来很干净，
+    但**同一个字段的第一次写入者未必是同一个 chunk**：
+    `bufferUserNarrative`（Chunk2）建 turn 时只写了 `story_id` / `participant_id` /
+    `messages` / `next_revision` / `obsolete_request_ids`，`in_flight_request_id` 是
+    `flushBufferedNarrative`（Chunk3）**第一次**写进去的——当时 dict 里没有 snake 键，
+    于是它落在 camelCase；而 Chunk2 的 `signalIncomingInterruption` /
+    `bufferUserNarrative` 两个守卫直接 `turn.get('in_flight_request_id')` → 拿到 None →
+    `shouldSupersedeNarrativeRequest` 永远为假。后果（用户 2026-09-26 00:22 的日志）：
+    汐雨. 连发「行吧」「晚安」+ 晚安贴图，贴图到达时上一回合正在跑模型，本该被判过时并与
+    贴图合成一个回合，实际被拆成两回合，贴图那一回合她已经"睡着了、没看见"。
+    写两种拼写（回合 dict 是纯内存结构、从不落库也不进 payload）彻底消灭这类"写读拼写错位"。
+    """
+    turn[camel] = value
+    if snake != camel:
+        turn[snake] = value
+    return value
+
 def should_supersede_narrative_request(
     in_flight_request_id: int | None,
     first_message_committed_request_id: int | None,
