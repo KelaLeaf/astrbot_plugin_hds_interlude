@@ -1,6 +1,6 @@
 allowBuilds:
   esbuild: set this to true or false
-# pnpm 11 把 onlyBuiltDependencies 从 package.json 挪到了这里；
-# 不放开 esbuild 的构建脚本，Vite 起不来（ERR_PNPM_IGNORED_BUILDS）。
+# pnpm 11 把 `onlyBuiltDependencies` 从 package.json 挪到了这里。
+# 不放开 esbuild 的构建脚本，`pnpm build` 会以 ERR_PNPM_IGNORED_BUILDS 失败。
 onlyBuiltDependencies:
   - esbuild

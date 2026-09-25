@@ -1262,6 +1262,66 @@ def normalize_config(raw: Any) -> dict[str, Any]:
     return resolve_prompt_fields(merge(defaults, apply_section_aliases(raw)))
 
 
+def resolve_shared_story_config(value: Any = None) -> dict[str, Any]:
+    """上游 `get sharedStoryConfig`（`service.ts:5570`）：共享主剧本的归一配置。
+
+    ⚠️ **`enabled` 硬编码为 `True`**，这是上游 1.0.1-beta6-rebuild 的刻意选择：
+
+    ```ts
+    const { enabled: _legacyEnabled, ...overrides } = this.config.sharedStory ?? {}
+    // Beta2 deliberately keeps the single-story guard hard-enabled. Older
+    // builds exposed a rollback switch here, but turning it off could create
+    // fresh per-account stories that a later background sweep would revive.
+    ```
+
+    也就是说：**一个角色只有一条时间线**，所有私聊的人共用同一部剧本，各自是
+    这部剧本里的一条"关系分支"（participant）；旧版"每个 QQ 一部剧本"的行为
+    由 `migrate_legacy_story` / `migrate_legacy_branch_into_shared` 惰性合并进来。
+    配置文件里写 `enabled: false` **同样不生效**（`_legacyEnabled` 被丢弃），
+    这与上游逐字一致——别把这个键实现成可关，否则会退回"每人一部剧本"，
+    也就是本移植版 v1.2.6 及更早的实际行为（用户报的"怎么不是所有人共用一个剧本"）。
+
+    输出键名 snake_case（本移植版配置层裁决），读取侧兼容上游 camelCase；
+    `enabled` 之外的字段缺省值逐字取自上游该 getter。
+    """
+    config = value if isinstance(value, dict) else {}
+
+    def flag(name: str, default: bool) -> bool:
+        raw = config.get(name)
+        if raw is None:
+            raw = config.get(_to_snake_key(name))
+        return default if raw is None else bool(raw)
+
+    def number(name: str, default: int) -> int:
+        raw = config.get(name)
+        if raw is None:
+            raw = config.get(_to_snake_key(name))
+        if raw is None:
+            return default
+        try:
+            return max(0, int(float(raw)))
+        except (TypeError, ValueError):
+            return default
+
+    presets = config.get('participant_presets')
+    if presets is None:
+        presets = config.get('participantPresets')
+    managers = config.get('manager_accounts')
+    if managers is None:
+        managers = config.get('managerAccounts')
+    return {
+        # 见上：上游把回滚开关丢掉，这里也不能让它变成可关。
+        'enabled': True,
+        'auto_enroll_participants': flag('autoEnrollParticipants', True),
+        'allow_cross_conversation_messages': flag('allowCrossConversationMessages', True),
+        'share_participant_details': flag('shareParticipantDetails', False),
+        'max_cross_conversation_actions': number('maxCrossConversationActions', 1),
+        'participant_context_limit': number('participantContextLimit', 6),
+        'manager_accounts': list(managers) if isinstance(managers, list) else [],
+        'participant_presets': list(presets) if isinstance(presets, list) else [],
+    }
+
+
 def resolve_blind_mode_config(value: Any = None) -> dict[str, Any]:
     """上游 `resolveBlindModeConfig`（`service.ts:7715`）：盲区模式的归一配置。
 
