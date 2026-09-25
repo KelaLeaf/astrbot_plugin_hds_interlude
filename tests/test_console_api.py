@@ -509,7 +509,7 @@ class ConsoleApiTests(unittest.TestCase):
         payload = _run(self.api.stories())
         ids = [item['id'] for item in payload['stories']]
         self.assertEqual(ids, ['character:qq:20000', 'qq:20000:10001'])
-        self.assertEqual(payload['canonical'], 'character:qq:20000')
+        self.assertEqual(payload['main'], 'character:qq:20000')
         shared, old = payload['stories']
         self.assertTrue(shared['shared'])
         self.assertEqual(shared['entries'], 3)
@@ -517,10 +517,37 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(old['status'], 'archived')
         self.assertEqual(old['entries'], 5)
 
-    def test_stories_without_a_shared_story_falls_back_to_the_newest(self):
+    def test_stories_without_a_main_story_reports_it_explicitly(self):
+        """还没有共享主剧本时 `main` 为空——控制台靠它显示「设为主剧本」而不是「并入」。
+        面板默认读的那一部（`active_story`）仍然是最近更新的旧剧本。"""
         self._story_row('qq:20000:10001', entries=1)
         payload = _run(self.api.stories())
-        self.assertEqual(payload['canonical'], 'qq:20000:10001')
+        self.assertEqual(payload['main'], '')
+        self.assertEqual(payload['active_story'], 'qq:20000:10001')
+        self.assertFalse(payload['stories'][0]['main'])
+
+    def test_stories_marks_the_active_character_story_as_main(self):
+        self._story_row('character:qq:20000', entries=3, updated='2026-01-03T00:00:00Z')
+        self._story_row('qq:20000:10001', status='archived', entries=5, updated='2026-01-01T00:00:00Z')
+        payload = _run(self.api.stories())
+        self.assertEqual(payload['main'], 'character:qq:20000')
+        marked = {item['id']: item['main'] for item in payload['stories']}
+        self.assertEqual(marked, {'character:qq:20000': True, 'qq:20000:10001': False})
+
+    def test_an_archived_character_story_is_not_the_main_story(self):
+        """归档的 `character:…` 不算主剧本——否则「并入」会把内容搬进死档案。"""
+        self._story_row('character:qq:20000', status='archived', entries=3)
+        self._story_row('qq:20000:10001', entries=1, updated='2026-01-04T00:00:00Z')
+        payload = _run(self.api.stories())
+        self.assertEqual(payload['main'], '')
+        self.assertEqual(payload['active_story'], 'qq:20000:10001')
+
+    def test_promote_story_requires_a_service(self):
+        self._story_row('qq:20000:10001')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.promote_story('qq:20000:10001'))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.promote_story(''))
 
     def test_merge_story_reports_a_clear_error_without_a_service(self):
         self._story_row('qq:20000:10001')

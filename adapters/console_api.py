@@ -1206,7 +1206,53 @@ class ConsoleApi:
             brief['participants'] = _safe_count(database, 'interlude_participant', {'storyId': story_id})
             brief['shared'] = story_id.startswith('character:')
             stories.append(brief)
-        return {'stories': stories, 'canonical': await self._canonical_story_id(stories)}
+        # `main` = 真正的共享主剧本（active 且 `character:`）；没有就是空串。
+        # 注意跟 `active_story` 的区别：后者只是"面板当前读哪一部"（没有主剧本时是最近更新的
+        # 那部旧剧本），控制台靠 `main` 决定显示「设为主剧本」还是「并入主剧本」。
+        main = await self._shared_story_id(stories)
+        for item in stories:
+            item['main'] = item['id'] == main
+        return {
+            'stories': stories,
+            'main': main,
+            'active_story': _text(stories[0]['id']) if stories else '',
+        }
+
+    async def promote_story(self, source_story_id: Any) -> dict[str, Any]:
+        """把选中的剧本立为共享主剧本（控制台「设为主剧本」）。
+
+        什么时候需要它：共享主剧本的 id 由 `findStory` 在**收到消息**时才惰性迁移出来，
+        而单剧本守卫（后台扫描/管理路径也会调用）可能先把别的剧本归档，于是库里会出现
+        "好几部旧剧本、一部 `character:` 都没有"的中间态——这时保留哪一部当底座没法选。
+        """
+        service = getattr(self.bridge, 'service', None)
+        if service is None or not callable(getattr(service, 'promote_story_to_canonical', None)):
+            raise ConsoleError('插件服务尚未就绪，稍后再试')
+        source = _text(source_story_id)
+        if not source:
+            raise ConsoleError('请选择要设为主剧本的那一部')
+        try:
+            result = await service.promote_story_to_canonical(source)
+        except LookupError as error:
+            raise ConsoleError('剧本不存在或已被清理：%s' % error) from error
+        except ValueError as error:
+            reason = _text(error)
+            if reason == 'already-canonical':
+                raise ConsoleError('这已经是主剧本了') from error
+            if reason == 'canonical-exists':
+                raise ConsoleError(
+                    '已经有一部主剧本了：请用「并入主剧本」把这部并进去'
+                    '（要换底座得先删掉现有主剧本，控制台不做这种毁数据的操作）',
+                ) from error
+            raise ConsoleError('不能设为主剧本：%s' % reason) from error
+        payload = await self.stories()
+        payload['promoted'] = {
+            'source': source,
+            'target': _text((result or {}).get('target')),
+            'revived': bool((result or {}).get('revived')),
+        }
+        payload['changed'] = 'story-promote %s → %s' % (source, payload['promoted']['target'])
+        return payload
 
     async def merge_story(self, source_story_id: Any, target_story_id: Any = '') -> dict[str, Any]:
         """把一部旧剧本并入共享主剧本（控制台「并入主剧本」）。
@@ -1224,9 +1270,9 @@ class ConsoleApi:
             raise ConsoleError('请选择要并入的剧本')
         target = _text(target_story_id)
         if not target:
-            target = await self._canonical_story_id()
+            target = await self._shared_story_id()
         if not target:
-            raise ConsoleError('找不到共享主剧本，请先让角色说一句话再试')
+            raise ConsoleError('还没有主剧本：先选一部点「设为主剧本」，再把其它旧剧本并进来')
         if target == source:
             raise ConsoleError('这就是当前主剧本，不需要并入')
         try:
@@ -1244,6 +1290,32 @@ class ConsoleApi:
         }
         payload['changed'] = 'story-merge %s → %s' % (source, target)
         return payload
+
+    async def _shared_story_id(self, stories: Optional[list[dict[str, Any]]] = None) -> str:
+        """真正的共享主剧本 id：**active 且 `character:`**，没有就空串。
+
+        `canonical`/`active_story` 那套是"面板该读哪一部"的候选（没有主剧本时回落到
+        最近更新的旧剧本）；这个只回答"主剧本到底定下来没有"。
+        """
+        rows = stories
+        if rows is None:
+            service = getattr(self.bridge, 'service', None)
+            finder = getattr(service, 'shared_story_id', None)
+            if callable(finder):
+                try:
+                    found = _text(await finder())
+                except Exception:  # noqa: BLE001 - 取不到就回落到直接查库
+                    found = ''
+                if found:
+                    return found
+            rows = [self._story_brief(item) for item in _safe_all(
+                self.bridge.db, 'interlude_story', order='updatedAt DESC', limit=50,
+            )]
+        for row in rows:
+            story_id = _text(row.get('id'))
+            if story_id.startswith('character:') and _text(row.get('status')) == 'active':
+                return story_id
+        return ''
 
     async def _canonical_story_id(self, stories: Optional[list[dict[str, Any]]] = None) -> str:
         """当前共享主剧本 id：优先 `character:…`，其次库里最新的 active 剧本。"""

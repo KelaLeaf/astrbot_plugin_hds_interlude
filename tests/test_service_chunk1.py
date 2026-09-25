@@ -1487,6 +1487,63 @@ class SharedStoryTests(ServiceHarness):
         contents = [row['content'] for row in self.rows('interlude_script_entry')]
         self.assertIn('旧账号的段落', contents, '并进来的内容要跟着迁移到共享剧本')
 
+    @needs('promote_story_to_canonical', 'shared_story_id', 'migrate_legacy_story')
+    async def test_promote_makes_the_selected_story_the_main_one(self) -> None:
+        """控制台「设为主剧本」：把选中的旧剧本迁移成 `character:…`，继承它的状态。"""
+        service = self.make_service(onebot_config())
+        self.make_story(story_id=PRIVATE_STORY_ID, userId='2')
+        self.make_entry(story_id=PRIVATE_STORY_ID, kind='script', content='睡觉中的那一段')
+        self.make_story(story_id='onebot:1:3', userId='3')
+
+        result = await service.promote_story_to_canonical(PRIVATE_STORY_ID)
+
+        self.assertEqual(result['target'], SHARED_STORY_ID)
+        self.assertEqual(await service.shared_story_id(), SHARED_STORY_ID)
+        statuses = {row['id']: row['status'] for row in self.rows('interlude_story')}
+        self.assertEqual(statuses[SHARED_STORY_ID], 'active')
+        self.assertEqual(statuses[PRIVATE_STORY_ID], 'archived')
+        # 选中的那部是底座：它的条目、设定与状态被继承。
+        main_entries = [row['content'] for row in self.rows('interlude_script_entry')
+                        if row['storyId'] == SHARED_STORY_ID]
+        self.assertIn('睡觉中的那一段', main_entries)
+        main = [row for row in self.rows('interlude_story') if row['id'] == SHARED_STORY_ID][0]
+        self.assertEqual(main['platform'], 'onebot')
+
+    @needs('promote_story_to_canonical', 'shared_story_id')
+    async def test_promote_revives_an_archived_legacy_story(self) -> None:
+        """归档的旧剧本也能立为主剧本：先复活，否则迁移出来的主剧本也是归档的。"""
+        service = self.make_service(onebot_config())
+        self.make_story(story_id=PRIVATE_STORY_ID, userId='2', status='archived')
+
+        result = await service.promote_story_to_canonical(PRIVATE_STORY_ID)
+
+        self.assertEqual(await service.shared_story_id(), SHARED_STORY_ID)
+        main = [row for row in self.rows('interlude_story') if row['id'] == SHARED_STORY_ID][0]
+        self.assertEqual(main['status'], 'active')
+        self.assertEqual(result['revived'], False)
+
+    @needs('promote_story_to_canonical', 'shared_story_id')
+    async def test_promote_is_refused_when_a_main_story_exists(self) -> None:
+        service = self.make_service(onebot_config())
+        self.make_story(story_id=SHARED_STORY_ID)
+        self.make_story(story_id=PRIVATE_STORY_ID, userId='2')
+        with self.assertRaises(ValueError):
+            await service.promote_story_to_canonical(PRIVATE_STORY_ID)
+        with self.assertRaises(ValueError):
+            await service.promote_story_to_canonical(SHARED_STORY_ID)
+        with self.assertRaises(LookupError):
+            await service.promote_story_to_canonical('不存在')
+
+    @needs('promote_story_to_canonical', 'shared_story_id')
+    async def test_promote_revives_an_archived_main_story(self) -> None:
+        """主剧本自己被人为归档/暂停过：复活它就是，不需要迁移。"""
+        service = self.make_service(onebot_config())
+        self.make_story(story_id=SHARED_STORY_ID, status='archived')
+        result = await service.promote_story_to_canonical(SHARED_STORY_ID)
+        self.assertEqual(result['target'], SHARED_STORY_ID)
+        self.assertTrue(result['revived'])
+        self.assertEqual(await service.shared_story_id(), SHARED_STORY_ID)
+
     @needs('canonical_story_id')
     async def test_canonical_story_id_prefers_the_character_story(self) -> None:
         service = self.make_service(onebot_config())

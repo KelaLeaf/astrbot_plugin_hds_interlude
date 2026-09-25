@@ -12,7 +12,7 @@ import { apiPost, bootstrap, onContext, translate, type BridgeContext } from './
 import { useQuery } from './query'
 import { Icon, type IconName } from './components/Icon'
 import { Button, Select } from './components/ui'
-import { canMergeStory, storyLabel } from './story-label'
+import { canMergeStory, canPromoteStory, storyLabel } from './story-label'
 import type { StoryListPayload } from './types'
 import { Overview } from './panels/Overview'
 import { Models } from './panels/Models'
@@ -65,7 +65,8 @@ function App() {
   // 没有这个入口时，新用户一发消息界面就跳走，看起来像"前面的剧本没了"。
   const storyList = useQuery<StoryListPayload>('console/stories', undefined, { nonce: refreshKey })
   const stories = storyList.data?.stories ?? []
-  const canonical = storyList.data?.canonical ?? ''
+  // `main` = 真正的共享主剧本（active 且 `character:`）；为空表示"主剧本还没定"。
+  const main = storyList.data?.main ?? ''
   const selected = stories.find((item) => item.id === storyId) ?? stories[0]
   const storyKey = stories.map((item) => item.id).join('|')
 
@@ -77,9 +78,9 @@ function App() {
   }, [storyKey, storyId])
 
   async function mergeSelected() {
-    if (!selected || !canonical || !canMergeStory(selected, canonical)) return
+    if (!selected || !main || !canMergeStory(selected, main)) return
     const ok = window.confirm(
-      `把「${storyLabel(selected)}」并入共享主剧本？\n\n`
+      `把「${storyLabel(selected)}」并入主剧本？\n\n`
       + '它的剧本条目、记忆、事实、场景会搬进主剧本，原剧本转为「已归档」（内容不会删除）。',
     )
     if (!ok) return
@@ -88,9 +89,32 @@ function App() {
     try {
       await apiPost<StoryListPayload>('console/story-merge', {
         source_story_id: selected.id,
-        target_story_id: canonical,
+        target_story_id: main,
       })
-      setStoryId(canonical)
+      setStoryId(main)
+      setRefreshKey((value) => value + 1)
+    } catch (error) {
+      setMergeError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setMerging(false)
+    }
+  }
+
+  async function promoteSelected() {
+    if (!selected || !canPromoteStory(selected, main)) return
+    const ok = window.confirm(
+      `把「${storyLabel(selected)}」立为共享主剧本？\n\n`
+      + '它会成为那个「一个角色一条时间线」的主剧本（继承它的设定与当前状态），'
+      + '其余旧剧本之后可以「并入主剧本」。',
+    )
+    if (!ok) return
+    setMerging(true)
+    setMergeError('')
+    try {
+      const payload = await apiPost<StoryListPayload>('console/story-promote', {
+        source_story_id: selected.id,
+      })
+      setStoryId(payload?.promoted?.target || '')
       setRefreshKey((value) => value + 1)
     } catch (error) {
       setMergeError(error instanceof Error ? error.message : String(error))
@@ -175,9 +199,14 @@ function App() {
                 />
               </div>
             ) : null}
-            {canMergeStory(selected, canonical) ? (
+            {canMergeStory(selected, main) ? (
               <Button icon="link" disabled={merging} onClick={mergeSelected}>
-                {merging ? '并入中…' : '并入主剧本'}
+                {merging ? '处理中…' : '并入主剧本'}
+              </Button>
+            ) : null}
+            {canPromoteStory(selected, main) ? (
+              <Button icon="star" disabled={merging} onClick={promoteSelected}>
+                {merging ? '处理中…' : '设为主剧本'}
               </Button>
             ) : null}
             <Button icon="refresh" onClick={() => setRefreshKey((value) => value + 1)}>
@@ -189,6 +218,13 @@ function App() {
         {mergeError ? (
           <div class="border-b border-danger/40 bg-danger/10 px-6 py-2 text-[11px] text-danger">
             {mergeError}
+          </div>
+        ) : null}
+
+        {stories.length && !main ? (
+          <div class="border-b border-line bg-raised px-6 py-2 text-[11px] text-muted">
+            还没有共享主剧本：选一部点「<span class="text-fg">设为主剧本</span>」定下主线，
+            其余旧剧本随后可以「并入主剧本」。正常情况下只应有一部剧本。
           </div>
         ) : null}
 
