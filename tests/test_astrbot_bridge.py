@@ -1214,6 +1214,47 @@ class BridgeIntegrationTests(unittest.TestCase):
         self.assertEqual(asyncio.run(bridge.handle_event(event)), [])
         self.assertFalse(event.stopped)
 
+    def test_session_view_falls_back_to_raw_segments_when_the_chain_is_empty(self):
+        """结构化消息链为空时，退回 `message_obj.raw_message` 里的原始段。
+
+        实测：用户"图片 + 文字分两条发"，图片那条事件的链为空 → 我们既看不到图，
+        又把事件漏给了宿主默认 Agent（另一个"她"回了「主人这是夜班的宵夜吗？」）。
+        """
+        event = FakeMessageEvent(message='', components=[])
+        event.message_obj.raw_message = {
+            'message': [{'type': 'image', 'data': {'url': 'https://example.com/a.jpg'}}],
+        }
+        view = session_view(event)
+        self.assertIn('<img src="https://example.com/a.jpg"/>', view.content)
+        self.assertEqual(view.elements[0]['type'], 'img')
+
+    def test_session_view_raw_fallback_handles_text_and_audio(self):
+        event = FakeMessageEvent(message='', components=[])
+        event.message_obj.raw_message = {'message': [
+            {'type': 'text', 'data': {'text': '看图'}},
+            {'type': 'record', 'data': {'file': 'v.silk', 'url': 'https://example.com/v.silk'}},
+        ]}
+        view = session_view(event)
+        self.assertIn('看图', view.content)
+        self.assertIn('<audio', view.content)
+        from plugin.core.service.helpers import extract_session_voice_count
+
+        self.assertEqual(extract_session_voice_count(view), 1)
+
+    def test_handle_event_consumes_a_private_event_it_cannot_turn_into_a_turn(self):
+        """我们看了却没生成回合时也要吞掉（否则宿主第二个 Agent 接手）。"""
+        import asyncio
+
+        bridge = _make_bridge()
+
+        async def fake_receive(_session):
+            return False
+
+        bridge.service.receive = fake_receive
+        event = FakeMessageEvent(message='普通一句话', components=[Plain('普通一句话')])
+        self.assertEqual(asyncio.run(bridge.handle_event(event)), [])
+        self.assertTrue(event.stopped)
+
     def test_handle_event_keeps_an_image_only_private_event(self):
         """只有图片（没有文字）的私聊必须照常进叙事——图片是合法的原生输入。"""
         import asyncio

@@ -223,8 +223,69 @@ def _downloadable(value: Any) -> bool:
 
 
 def _component_kind(component: Any) -> str:
-    """组件类型名（小写类名，跨 AstrBot 版本稳定，不依赖 `ComponentType` 枚举）。"""
+    """组件类型名（小写类名，跨 AstrBot 版本稳定，不依赖 `ComponentType` 枚举）。
+
+    `_RawSegment` 这类"把原始段包成组件形状"的包装会自带 `_hdsi_kind`：它的类名
+    不是段类型（`_rawsegment`），照类名判会全部落到未知分支。
+    """
+    hint = getattr(component, '_hdsi_kind', None)
+    if hint:
+        return str(hint).lower()
     return type(component).__name__.lower()
+
+
+#: OneBot/NapCat 原始段类型 → 本模块 `serialize_component` 认的组件类型名。
+_RAW_SEGMENT_ALIASES: dict[str, str] = {
+    'text': 'plain', 'plain': 'plain',
+    'image': 'image', 'img': 'image',
+    'record': 'record', 'audio': 'record', 'voice': 'record',
+    'video': 'video',
+    'at': 'at',
+    'face': 'face', 'mface': 'face',
+    'file': 'file',
+    'reply': 'reply',
+}
+
+
+class _RawSegment:
+    """把原始消息段（`{'type': 'image', 'data': {...}}`）包成组件形状。
+
+    为什么需要它：AstrBot 的 `message_obj.message`（结构化消息链）在某些链路上会是空的
+    ——用户实测"图片 + 文字分两条发"时，图片那条事件的链为空，于是我们既看不到图、
+    又把事件漏给了宿主默认 Agent。而 `message_obj.raw_message` 里**仍然留着**适配器的
+    原始段（aiocqhttp 直接放了 OneBot 事件对象），把它包一层就能继续走同一条序列化路径。
+    """
+
+    def __init__(self, kind: str, data: Any = None) -> None:
+        self._hdsi_kind = kind
+        self.type = kind
+        payload = data if isinstance(data, dict) else {}
+        self.data = payload
+        for key, value in payload.items():
+            if isinstance(key, str) and not hasattr(self, key):
+                setattr(self, key, value)
+
+
+def _raw_segment_chain(event: Any) -> list[Any]:
+    """从 `message_obj.raw_message` 里取出原始段并包成组件（取不到就回空列表）。"""
+    message_obj = getattr(event, 'message_obj', None)
+    raw = getattr(message_obj, 'raw_message', None)
+    if raw is None:
+        return []
+    segments = raw.get('message') if isinstance(raw, dict) else getattr(raw, 'message', None)
+    if segments is None and isinstance(raw, (list, tuple)):
+        segments = raw
+    if not isinstance(segments, (list, tuple)):
+        return []
+    chain: list[Any] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        kind = _RAW_SEGMENT_ALIASES.get(_text(segment.get('type')).lower())
+        if not kind:
+            continue
+        chain.append(_RawSegment(kind, segment.get('data')))
+    return chain
 
 
 # =========================================================================== #
@@ -491,6 +552,11 @@ def session_view(event: AstrMessageEvent, endpoint: Optional[AstrbotEndpoint] = 
     resolved = endpoint if endpoint is not None else endpoint_for_event(event)
     chain = _call(event, 'get_messages', []) or []
     content, elements, quote = serialize_message_chain(chain)
+    if not content and not elements:
+        # 结构化链是空的：退回适配器的原始段（见 `_raw_segment_chain`）。
+        raw_chain = _raw_segment_chain(event)
+        if raw_chain:
+            content, elements, quote = serialize_message_chain(raw_chain)
     if not content:
         # 有些适配器只填 `message_str`（纯文本）而没有结构化段。
         content = _text(_call(event, 'get_message_str', ''))
@@ -2420,7 +2486,42 @@ class AstrbotBridge:
             self.end_capture()
         if consumed:
             event.stop_event()
+        elif not endpoint.is_group and self.owns_private_session(session):
+            # 我们看了、但没能把它变成一回合（故事暂停 / 参与者不在 / 适配器给的形状怪…）：
+            # **照样吞掉**。上游在这里 `next()`，而 AstrBot 的后面坐着第二个 Agent——
+            # 那会变成"这段私聊换个人格答话"（见 `docs/PORTING_NOTES.md` §18）。
+            # 同时留一条可见的 warn，把"为什么什么都没发生"写在日志里。
+            event.stop_event()
+            self._report_unconsumed_private(event, session)
         return list(capture.texts)
+
+    def owns_private_session(self, session: SessionView) -> bool:
+        """这条私聊归我们管吗：私聊 + capture 开着 + `can_handle_session` 通过。
+
+        判定本身是纯读，不会动事件；调用方决定"吞掉"还是"交回"。
+        """
+        try:
+            if not session.is_direct:
+                return False
+            if not self.config_flag(
+                'runtime', 'capture_direct_messages', 'captureDirectMessages', default=True,
+            ):
+                return False
+            return bool(self.service.can_handle_session(session))
+        except Exception as error:  # noqa: BLE001 - 归属判定失败按"不归我们"处理
+            log_fallback('warn', '私聊归属判定失败，按不消费处理 错误=%s' % error)
+            return False
+
+    @staticmethod
+    def _report_unconsumed_private(event: AstrMessageEvent, session: SessionView) -> None:
+        outline = _text(_call(event, 'get_message_outline', '')) or '(空)'
+        log_fallback(
+            'warn',
+            '私聊事件未生成回合，已吞掉以免宿主另一个聊天 Agent 接手 '
+            '平台=%s 用户=%s 概要=%s 消息段=%d 内容长度=%d'
+            % (session.platform, session.user_id, outline,
+               len(session.elements or []), len(session.content or '')),
+        )
 
     def consume_unusable_private_event(self, event: AstrMessageEvent, session: SessionView) -> bool:
         """归我们管的私聊里"没有可用内容"的事件：吞掉，并说清楚为什么。
@@ -2434,20 +2535,10 @@ class AstrbotBridge:
         "她在自言自语两套词"。空内容本身也值得留痕：图片/文件这类"消息链解析为空"
         的事件（适配器把附件放在别处）就是从这里漏过去的。
         """
-        try:
-            if not session.is_direct:
-                return False
-            if not self.config_flag(
-                'runtime', 'capture_direct_messages', 'captureDirectMessages', default=True,
-            ):
-                return False
-            # 管理命令交给命令解析器（上面的分支已经处理过），这里只兜"说不出话"的事件。
-            if not self.service.can_handle_session(session):
-                return False
-            event.stop_event()
-        except Exception as error:  # noqa: BLE001 - 兜底判定本身不能成为第二个漏点
-            log_fallback('warn', '私聊事件归属判定失败，按不消费处理 错误=%s' % error)
+        # 管理命令交给命令解析器（上面的分支已经处理过），这里只兜"说不出话"的事件。
+        if not self.owns_private_session(session):
             return False
+        event.stop_event()
         self._report_unusable(event, session)
         return True
 

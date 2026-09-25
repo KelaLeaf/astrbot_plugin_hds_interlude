@@ -2,7 +2,7 @@ name: astrbot_plugin_hds_interlude
 display_name: HDS Interlude
 desc: 时间感知的持续叙事聊天框架 AstrBot 移植版。让角色拥有日程、关系、待办、情绪与未完成事件，用户消息作为一项事件参与角色当下的判断与生活。
 short_desc: 时间感知的持续叙事聊天框架 AstrBot 移植版。
-version: v1.2.11
+version: v1.2.12
 repo: https://github.com/KelaLeaf/astrbot_plugin_hds_interlude
 author: KelaLeaf
 license: AGPL-3.0
