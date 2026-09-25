@@ -266,6 +266,16 @@ class _RawSegment:
                 setattr(self, key, value)
 
 
+def _session_file_facts(session: Any) -> list[Any]:
+    """`extract_session_file_facts(session)` 的弱调用版（诊断用，失败就当空）。"""
+    try:
+        from ..core.service.helpers import extract_session_file_facts  # noqa: PLC0415
+
+        return list(extract_session_file_facts(session) or [])
+    except Exception:  # pragma: no cover - 诊断路径不抛
+        return []
+
+
 def _raw_segment_chain(event: Any) -> list[Any]:
     """从 `message_obj.raw_message` 里取出原始段并包成组件（取不到就回空列表）。"""
     message_obj = getattr(event, 'message_obj', None)
@@ -2492,7 +2502,7 @@ class AstrbotBridge:
             # 那会变成"这段私聊换个人格答话"（见 `docs/PORTING_NOTES.md` §18）。
             # 同时留一条可见的 warn，把"为什么什么都没发生"写在日志里。
             event.stop_event()
-            self._report_unconsumed_private(event, session)
+            await self._report_unconsumed_private(event, session)
         return list(capture.texts)
 
     def owns_private_session(self, session: SessionView) -> bool:
@@ -2512,15 +2522,53 @@ class AstrbotBridge:
             log_fallback('warn', '私聊归属判定失败，按不消费处理 错误=%s' % error)
             return False
 
-    @staticmethod
-    def _report_unconsumed_private(event: AstrMessageEvent, session: SessionView) -> None:
+    async def explain_unconsumed(self, session: SessionView) -> str:
+        """`receive()` 为什么没生成回合：按它的门顺序逐条查，返回第一个不满足的原因。
+
+        为什么需要：core 里这些判断走的是 `report_operation(..., 'diagnostic', ...)`，
+        `logging.verbosity` 不到 diagnostic 时**日志里一个字都看不到**——用户实测
+        "私聊事件未生成回合"只有我们这条 warn，根本猜不出是哪道门（白名单？剧本暂停？
+        参与者不在？还是图片没解析出来？）。这里把门重放一遍，只读、不改状态。
+        """
+        service = self.service
+        try:
+            if not service.can_handle_session(session):
+                return '白名单未通过 can_handle_session'
+            story = await service.find_story(session)
+            if not story:
+                return '找不到剧本，且 runtime.auto_create 关着'
+            status = _text(pick(story, 'status')) or '?'
+            if status != 'active':
+                return '剧本状态=%s（不是 active）' % status
+            participant = await service.find_participant(session, story)
+            if not participant:
+                return '参与者不存在，且 auto_create / auto_enroll_participants 都关着'
+            pstatus = _text(pick(participant, 'status')) or '?'
+            if pstatus != 'active':
+                return '参与者状态=%s（不是 active）' % pstatus
+            content = _text(session.content)
+            voice = self._has_voice(session)
+            if not content.strip() and not voice:
+                return '没有文字也没有语音'
+            observed = service.describe_vision_event(session)
+            sources = pick(observed, 'sources') or []
+            if (not _text(pick(observed, 'content')).strip() and not sources
+                    and not voice and not _session_file_facts(session)):
+                return '没有可用内容：图片/文件都没解析出来（content 里是什么见预览）'
+            return '门都过了（可能是队列/串行化问题，看 core 的 debug 日志）'
+        except Exception as error:  # noqa: BLE001 - 诊断自身不能抛
+            return '诊断失败：%s' % error
+
+    async def _report_unconsumed_private(self, event: AstrMessageEvent, session: SessionView) -> None:
         outline = _text(_call(event, 'get_message_outline', '')) or '(空)'
+        reason = await self.explain_unconsumed(session)
         log_fallback(
             'warn',
             '私聊事件未生成回合，已吞掉以免宿主另一个聊天 Agent 接手 '
-            '平台=%s 用户=%s 概要=%s 消息段=%d 内容长度=%d'
+            '平台=%s 用户=%s 概要=%s 消息段=%d 内容长度=%d 原因=%s 内容预览=%s'
             % (session.platform, session.user_id, outline,
-               len(session.elements or []), len(session.content or '')),
+               len(session.elements or []), len(session.content or ''),
+               reason, _text(session.content)[:80]),
         )
 
     def consume_unusable_private_event(self, event: AstrMessageEvent, session: SessionView) -> bool:
