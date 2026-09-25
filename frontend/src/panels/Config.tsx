@@ -12,8 +12,8 @@ import { useMemo, useState } from 'preact/hooks'
 import { apiPost, downloadFile, uploadFile } from '../bridge'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
-import type { ConfigSchemaPayload, ImportPreview, ParticipantRow } from '../types'
-import { Badge, Button, Empty, ErrorNote, FilePicker, Grid, Icon, Note, Panel, Stack, Stat } from '../components/ui'
+import type { ConfigField, ConfigGroup, ConfigSchemaPayload, ImportPreview, ParticipantRow } from '../types'
+import { Badge, Button, Empty, ErrorNote, FilePicker, Grid, Icon, Note, Panel, Select, Stack, Stat } from '../components/ui'
 import { SchemaField, SchemaGroupCard, rowFields } from '../components/SchemaForm'
 import type { SchemaNode } from '../components/SchemaForm'
 
@@ -28,6 +28,68 @@ function stamp() {
   const now = new Date()
   const pad = (value: number) => String(value).padStart(2, '0')
   return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+}
+
+/** 分组导航里的伪分组：只读总览。 */
+const OVERVIEW = '__overview__'
+
+/** 只读总览里怎么显示一个值（够看就行，不追求精确还原）。 */
+function describeValue(field: ConfigField): string {
+  const value = field.value
+  if (value === undefined || value === null) return '—'
+  if (field.type === 'bool') return value ? '开' : '关'
+  if (Array.isArray(value)) {
+    if (!value.length) return '（空）'
+    if (field.rows) return `${value.length} 条`
+    return value.map((item) => String(item)).join('、')
+  }
+  if (typeof value === 'object') {
+    const text = JSON.stringify(value)
+    return text.length > 90 ? `${text.slice(0, 90)}…` : text
+  }
+  const text = String(value)
+  if (!text) return '（空）'
+  return text.length > 90 ? `${text.slice(0, 90)}…` : text
+}
+
+/** 配置总览：**只读**，一眼看完全部设置现在是什么。 */
+function ConfigOverview({ groups, edits }: { groups: ConfigGroup[]; edits: Record<string, unknown> }) {
+  const total = groups.reduce((sum, item) => sum + item.fields.length, 0)
+  const dirty = Object.keys(edits).length
+  return (
+    <Stack>
+      <Note>
+        只读总览：{groups.length} 个分组、{total} 项。要改哪一项，用上面的下拉切到对应分组。
+        {dirty > 0 && ` 当前有 ${dirty} 项改动还没保存。`}
+      </Note>
+      {groups.map((item) => (
+        <details key={item.key} class="rounded-xl border border-line bg-panel">
+          <summary class="cursor-pointer px-4 py-3 text-sm font-semibold">
+            {shortTitle(item.description) || item.key}
+            <span class="ml-2 text-[11px] font-normal text-muted">
+              {item.fields.length} 项
+              {item.fields.some((field) => field.path in edits) ? ' · 有未保存改动' : ''}
+            </span>
+          </summary>
+          <div class="border-t border-line px-4 py-3">
+            <dl class="grid grid-cols-1 gap-x-6 gap-y-0.5 sm:grid-cols-2">
+              {item.fields.map((field) => (
+                <div key={field.path} class="flex items-baseline gap-2 border-b border-line/40 py-0.5">
+                  <dt class="shrink-0 text-[11px] text-muted">
+                    {field.description || field.key}
+                    {!field.present && <span class="ml-1 opacity-70">未设置</span>}
+                  </dt>
+                  <dd class="ml-auto min-w-0 truncate text-right font-mono text-[11px]">
+                    {describeValue(field.path in edits ? { ...field, value: edits[field.path] } : field)}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        </details>
+      ))}
+    </Stack>
+  )
 }
 
 /** 白名单类列表可以从已知会话一键带出 QQ / 群号。 */
@@ -61,17 +123,18 @@ export function Config({ refreshKey }: PanelProps) {
 function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
   const schema = useQuery<ConfigSchemaPayload>('console/config', {}, { nonce: refreshKey })
   const participants = useQuery<{ participants: ParticipantRow[] }>('console/participants', {}, { nonce: refreshKey })
-  const [group, setGroup] = useState('')
+  const [group, setGroup] = useState(OVERVIEW)
   const [edits, setEdits] = useState<Record<string, unknown>>({})
   const [message, setMessage] = useState('')
   const [failure, setFailure] = useState('')
   const [saving, setSaving] = useState(false)
 
   const groups = schema.data?.groups ?? []
-  const active = useMemo(
-    () => groups.find((item) => item.key === group) ?? groups[0],
-    [groups, group],
-  )
+  const active = useMemo(() => {
+    if (group === OVERVIEW) return null
+    return groups.find((item) => item.key === group) ?? groups[0]
+  }, [groups, group])
+  const overview = group === OVERVIEW
   const dirty = Object.keys(edits)
   const dirtyInGroup = (active?.fields ?? [])
     .filter((field) => field.path in edits)
@@ -102,7 +165,7 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
 
   if (schema.error) return <ErrorNote text={schema.error} onRetry={schema.reload} />
   if (schema.loading && !schema.data) return <Empty text="正在读取配置…" icon="config" />
-  if (!active) return <Empty text="没有读到配置 schema" icon="warning" />
+  if (!active && !overview) return <Empty text="没有读到配置 schema" icon="warning" />
 
   const known = participants.data?.participants ?? []
 
@@ -123,31 +186,31 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
         </Note>
       )}
 
-      <div class="flex flex-wrap gap-1.5">
-        {groups.map((item) => {
-          const warned = item.fields.filter((field) => field.note?.level === 'warn').length
-          const changed = item.fields.filter((field) => field.path in edits).length
-          return (
-            <button
-              key={item.key}
-              type="button"
-              onClick={() => setGroup(item.key)}
-              class={`rounded-lg border px-2 py-1 text-[11px] transition ${
-                item.key === active.key
-                  ? 'border-accent bg-accent/10 text-accent'
-                  : 'border-line bg-panel text-muted hover:bg-raised'
-              }`}
-            >
-              {shortTitle(item.description) || item.key}
-              {changed > 0 ? <span class="ml-1 text-warn">·{changed}</span> : warned > 0 ? <span class="ml-1 text-warn">!</span> : null}
-            </button>
-          )
-        })}
+      <div class="flex flex-wrap items-center gap-2">
+        <div class="w-full sm:w-80">
+          <Select
+            value={group}
+            onChange={setGroup}
+            options={[
+              { value: OVERVIEW, label: '配置总览（只读）' },
+              ...groups.map((item) => ({
+                value: item.key,
+                label: `${shortTitle(item.description) || item.key}${
+                  item.fields.some((field) => field.path in edits) ? '  · 有改动' : ''
+                }`,
+              })),
+            ]}
+          />
+        </div>
+        {!overview && <span class="text-[11px] text-muted">共 {groups.length} 个分组，选一个开始改</span>}
       </div>
 
+      {overview ? (
+        <ConfigOverview groups={groups} edits={edits} />
+      ) : (
       <SchemaGroupCard
-        title={shortTitle(active.description) || active.key}
-        description={active.description ?? ''}
+        title={shortTitle(active!.description) || active!.key}
+        description={active!.description ?? ''}
         actions={
           <>
             <Button
@@ -162,7 +225,7 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
           </>
         }
       >
-        {active.fields
+        {active!.fields
           .filter((field) => !field.invisible)
           .map((field) => {
             const node = field.node as SchemaNode
@@ -204,20 +267,7 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
             )
           })}
       </SchemaGroupCard>
-
-      <Panel title="为什么有些字段标着「宿主页编不了」" icon="warning">
-        <div class="flex flex-col gap-2 text-xs text-muted">
-          <p>
-            AstrBot 自带配置页把 <code class="font-mono">type: list</code> 渲染成字符串数组控件，
-            <code class="font-mono">items</code> 里的行内字段定义会被忽略——在那儿编辑会把整行压成一个字符串
-            （白名单会静默失效、连接池会丢字段）。
-          </p>
-          <p>
-            本页按 <code class="font-mono">_conf_schema.json</code> 自己渲染，所以对象行、嵌套对象、
-            标量列表都能正确编辑。写入仍然只认 schema 里声明过的路径：控制台能改配置，但改不出配置之外的东西。
-          </p>
-        </div>
-      </Panel>
+      )}
     </Stack>
   )
 }
@@ -405,11 +455,6 @@ function ConfigBackup({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
             <li class="flex gap-2">
               <Icon name="tick" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-ok" />
               导入后立即生效，不需要重启 AstrBot。
-            </li>
-            <li class="flex gap-2">
-              <Icon name="warning" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-warn" />
-              一个边界：AstrBot 的插件配置由 <code class="font-mono">_conf_schema.json</code> 定义，
-              插件不认识的键写进去之后会在下次加载时被 AstrBot 清掉。这不影响你认识的任何设置。
             </li>
           </ul>
         </Panel>

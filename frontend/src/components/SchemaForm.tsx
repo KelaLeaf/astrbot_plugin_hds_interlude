@@ -60,23 +60,28 @@ function toNumber(kind: string, text: string): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-/** 一个字段的标签行：中文名 + 兼容性/行为提示 + 默认值提示。 */
+/** 一个字段的标签行：中文名 + 提示。
+ *
+ * `warn` 级别的 note（宿主配置页编不了那类）**不在这里显示**——用户明确要求不要在
+ * 控制台里铺那段解释；该说的话写在 `_conf_schema.json` 的 hint 里，由宿主配置页展示。
+ * `info` 级别的短提示（行为提醒 / "请在模型面板编辑"）照旧显示，它们是真的有用。 */
 function Label({ node, value, note }: { node: SchemaNode; value: unknown; note?: FieldNote | null }) {
   const hint = String(node.hint ?? '')
+  const short = note?.level === 'info' ? note.text : ''
   return (
     <div class="flex flex-wrap items-center gap-2">
       <span class="text-[11px] font-medium">{String(node.description ?? '')}</span>
-      {note?.level === 'warn' && <Badge tone="warn">宿主页编不了</Badge>}
-      {note?.level === 'info' && <Badge tone="neutral">说明</Badge>}
       {value === undefined && <Badge tone="neutral">未设置</Badge>}
       {hint && <span class="text-[11px] text-muted">{hint}</span>}
+      {short && <span class="text-[11px] text-muted">{short}</span>}
     </div>
   )
 }
 
 function NoteLine({ note }: { note?: FieldNote | null }) {
-  if (!note) return null
-  return <Note tone={note.level === 'warn' ? 'warn' : 'neutral'}>{note.text}</Note>
+  // 只有"请在别处编辑"这类 info 提示才落成一行；warn 不再重复一遍说明。
+  if (!note || note.level !== 'info') return null
+  return <Note>{note.text}</Note>
 }
 
 export interface SchemaFieldProps {
@@ -160,7 +165,7 @@ export function SchemaField(props: SchemaFieldProps) {
     <div class="flex flex-col gap-2">
       <Label node={node} value={value} note={note} />
       {delegated ? (
-        <Note tone="neutral">{note?.text ?? '此项请在专用面板里编辑。'}</Note>
+        <Note>{note?.text ?? '此项请在专用面板里编辑。'}</Note>
       ) : (
         <div class="flex flex-col gap-2">
           {kind === 'bool' ? (

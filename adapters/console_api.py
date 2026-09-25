@@ -85,11 +85,10 @@ FIELD_NOTES: dict[str, str] = {
     'runtime.auto_create': '开启后第一次私聊会自动建故事；白名单仍优先决定谁能进来。',
 }
 
-#: 宿主配置页编辑不了「对象行列表」——把它说清楚，别让用户在那儿改坏配置。
-HOST_LIST_DEGRADED_NOTE = (
-    'AstrBot 自带的配置页把「列表」当字符串数组渲染，行内字段会被忽略：在那儿编辑会把整行变成'
-    '一个字符串（白名单会静默失效）。请在本页编辑，或用「备份 / 导入」提交 JSON。'
-)
+#: 宿主配置页编辑不了「对象行列表」的提示（与 `_conf_schema.json` 里的 hint 同一句话）。
+#: 控制台**不**把这句铺在字段上（用户要求别在页面上重复解释），它留在数据里给将来的界面用。
+HOST_LIST_DEGRADED_NOTE = '此配置项在 AstrBot 自带配置页不生效，请在本页配置。'
+
 
 _SCHEMA_CACHE: dict[str, Any] = {'mtime': None, 'schema': {}}
 
