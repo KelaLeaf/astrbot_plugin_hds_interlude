@@ -147,8 +147,29 @@ def _timestamp(value: Any, now_ms: int) -> bool:
 
 # ------------------------------------------------resolve_urge_config
 
+def _window_value(value: Any, fallback: float) -> float:
+    """推进窗口的单个边界值：**缺失或 ≤ 0 都按档位默认**，其余夹到 [1, 1440]。
+
+    为什么不能直接用 `_finite`：上游这几个字段在 Console 里**没有默认值**
+    （`Schema.number().min(1).max(1440)`，描述是「留空按档位」），没填就是 `undefined`，
+    `finite()` 拿不到数字 → 回落档位默认。本移植版的 `_conf_schema.json` 用
+    `default: 0` + hint「0 表示按档位」表达同一个意思，而 **AstrBot 会把 0 真的写进配置**；
+    `_finite(0, …)` 见到有限数就夹取 → 夹成 **1 分钟**，四个窗口（hot/idle/burst/slow）
+    全塌成 `[1, 1]`，于是"下次推进"永远排在 1 分钟后，而后台扫描默认 5 分钟一轮
+    ——每轮都判定到期，剧本就变成**每 5 分钟自动写一段**（用户实测报上来的就是这个现象）。
+    所以这里把 ≤0 明确当作"未设置"。上游不可能出现 0（schema 下限是 1），属于本移植版
+    对"0 = 留空"这一约定的兑现，不是行为偏离。
+    """
+    if _is_finite_number(value) and value > 0:
+        return max(1.0, min(1440.0, float(value)))
+    return float(fallback)
+
+
 def resolve_urge_config(raw: Any = None) -> Dict[str, Any]:
-    """解析 Urge 配置：档位默认值 + 夹取 + 防御读取。对应上游 `resolveUrgeConfig`。"""
+    """解析 Urge 配置：档位默认值 + 夹取 + 防御读取。对应上游 `resolveUrgeConfig`。
+
+    与上游唯一的差别：四个推进窗口的边界值 `≤ 0` 视为"未设置"（见 `_window_value`）。
+    """
     c = _record(raw)
     a = _record(_pick(c, "advanced"))
     frequency_raw = _pick(c, "frequency")
@@ -161,8 +182,8 @@ def resolve_urge_config(raw: Any = None) -> Dict[str, Any]:
         defaults = [10, 20, 35, 55, 3, 7, 110, 130]
 
     def range_(name: str, index: int) -> List[float]:
-        lo = _finite(_pick(a, name + "Min", name + "_min"), defaults[index], 1, 1440)
-        hi = _finite(_pick(a, name + "Max", name + "_max"), defaults[index + 1], 1, 1440)
+        lo = _window_value(_pick(a, name + "Min", name + "_min"), defaults[index])
+        hi = _window_value(_pick(a, name + "Max", name + "_max"), defaults[index + 1])
         return [lo, max(lo, hi)]
 
     return {

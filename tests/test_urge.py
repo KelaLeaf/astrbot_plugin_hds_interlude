@@ -238,6 +238,66 @@ class UrgeTests(unittest.TestCase):
         self.assertEqual(resolve_urge_config({"advanced": {"burstBudget": 99}})["budget"], 10)
         self.assertEqual(resolve_urge_config({"advanced": {"hotMin": 30, "hotMax": 2}})["hot"], [30, 30])
 
+    def test_zero_window_values_mean_use_the_tier_defaults(self):
+        """推进窗口填 0 = 「按档位」（schema hint 的承诺），不是「1 分钟」。
+
+        本移植版的 `_conf_schema.json` 给 hot/idle/burst/slow 用了 `default: 0` 表达"留空"，
+        而 AstrBot 会把 0 真写进配置。若照上游 `finite()` 直接夹取，0 会变成 **1 分钟**，
+        四个窗口全塌成 `[1,1]`：每次写完 1 分钟后就"到期"，而后台扫描默认 5 分钟一轮 →
+        **每轮都写一段**，用户看到的就是「剧本每 5 分钟自动触发一次」。
+        """
+        tiers = {
+            "low": {"hot": [20, 30], "idle": [60, 90], "burst": [5, 10], "slow": [120, 180]},
+            "medium": {"hot": [10, 20], "idle": [35, 55], "burst": [3, 7], "slow": [110, 130]},
+            "high": {"hot": [6, 12], "idle": [20, 35], "burst": [2, 5], "slow": [90, 120]},
+        }
+        zeros = {key: 0 for key in (
+            "hotMin", "hotMax", "idleMin", "idleMax",
+            "burstMin", "burstMax", "slowMin", "slowMax",
+        )}
+        for frequency, expected in tiers.items():
+            with self.subTest(frequency=frequency):
+                config = resolve_urge_config({"frequency": frequency, "advanced": zeros})
+                for key, window in expected.items():
+                    self.assertEqual([float(v) for v in config[key]], [float(v) for v in window], key)
+        # 缺省（不带 advanced）与全 0 必须解析成同一份窗口
+        bare = resolve_urge_config({})
+        self.assertEqual(resolve_urge_config({"advanced": zeros})["idle"], bare["idle"])
+
+    def test_explicit_window_values_still_clamp(self):
+        self.assertEqual(resolve_urge_config({"advanced": {"hotMin": 5, "hotMax": 3}})["hot"], [5.0, 5.0])
+        self.assertEqual(resolve_urge_config({"advanced": {"slowMax": 5000}})["slow"], [110.0, 1440.0])
+        # 负数同样按"未设置"处理（AstrBot 侧没有 min 校验，负值是脏数据）
+        self.assertEqual(resolve_urge_config({"advanced": {"hotMin": -5}})["hot"], [10.0, 20.0])
+
+    def test_non_window_advanced_zeros_keep_upstream_semantics(self):
+        """窗口以外的字段，0 有真实含义，别一起改掉。"""
+        config = resolve_urge_config({"advanced": {
+            "burstBudget": 0, "burstThreshold": 0, "jitter": 0, "extremeChance": 0,
+        }})
+        self.assertEqual(config["budget"], 0)          # 0 = 关闭加速
+        self.assertEqual(config["threshold"], 0.0)     # 0 = 任何 Urge 都算高
+        self.assertEqual(config["jitter"], 0.0)        # 0 = 无随机偏移
+        self.assertEqual(config["extreme_chance"], 0.0)
+        # 联系间隔下限上游是 min 1：0 夹成 1（保持上游语义，不按"未设置"处理）
+        self.assertEqual(resolve_urge_config({"advanced": {"burstContactMinMinutes": 0}})["contact_min"], 1.0)
+
+    def test_all_zero_advanced_config_no_longer_schedules_one_minute_ahead(self):
+        """回归：修复前全 0 配置会把下次推进排到 1 分钟后（= 每次后台扫描都写）。"""
+        config = resolve_urge_config({"advanced": {
+            "hotMin": 0, "hotMax": 0, "idleMin": 0, "idleMax": 0,
+            "burstMin": 0, "burstMax": 0, "slowMin": 0, "slowMax": 0,
+        }})
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+        quiet = normalize_urge_state({"version": 1, "buckets": [], "value": 0.1}, now_ms)
+        planned = plan_urge(quiet, now, config, random=lambda: 0.5)
+        self.assertGreaterEqual(planned["minutes"], 35, "安静期最短等待应回到 35 分钟（medium 档）")
+        hot = normalize_urge_state(
+            {"version": 1, "buckets": [now_ms - 60_000 * (i + 1) for i in range(20)], "value": 0.6}, now_ms,
+        )
+        self.assertGreaterEqual(plan_urge(hot, now, config, random=lambda: 0.5)["minutes"], 10)
+
 
 @unittest.skipUnless(
     _STORY_JSON_READY, "需要 core/story_state.py + core/narrator.py（并行 Agent 产出后自动启用）"
