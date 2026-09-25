@@ -121,6 +121,29 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertTrue(flags['urge'])
         self.assertFalse(flags['blind_mode'])
 
+    def test_overview_flags_read_the_nested_model_groups(self):
+        """嵌在「模型中心」下的四个开关必须按**嵌套**那份读。
+
+        setUp 的配置里 `model_center.vision/audio/embedding.enabled = true`。
+        早期实现只看顶层分组（顶层压根没有 `vision` 这个键），于是读出来是默认值：
+        开着的显示成关着、关着的显示成开着——用户在控制台看到的和角色实际行为相反。
+        """
+        flags = _run(self.api.overview())['flags']
+        self.assertTrue(flags['vision'])
+        self.assertTrue(flags['audio'])
+        self.assertTrue(flags['embedding'])
+
+    def test_overview_flags_follow_nested_compaction_off(self):
+        bridge = _make_bridge({'model_center': {'compaction': {'enabled': False}}})
+        self.assertFalse(_run(ConsoleApi(bridge).overview())['flags']['compaction'])
+
+    def test_nested_flag_read_survives_a_restart_without_junk_keys(self):
+        """重启后宿主会删掉历史遗留的假顶层键，此时也不能读回默认值。"""
+        bridge = _make_bridge({'model_center': {'vision': {'enabled': True}}})
+        # 磁盘上没有顶层 `vision`（宿主按 schema 重建过），读的必须是嵌套那份。
+        self.assertTrue(bridge.section('vision')['enabled'])
+        self.assertTrue(_run(ConsoleApi(bridge).overview())['flags']['vision'])
+
     # ---- models ----
 
     def test_models_never_leaks_the_api_key(self):
@@ -366,12 +389,42 @@ class ConsoleApiTests(unittest.TestCase):
             asyncio.run(self.api.set_flag('', True))
 
     def test_set_flag_writes_model_center_nested_groups_too(self):
-        """`vision` / `compaction` 等嵌在 model_center 下，两处都要写。"""
+        """`vision` / `compaction` 等嵌在 model_center 下，写盘只能写那一处。
+
+        顶层同名分组**不是**合法配置：schema 里没有它，宿主下次加载会当未知键删掉
+        （日志 `Config key removed: vision`），还会混进导出的配置文件。所以这里断言
+        写盘结果里没有假顶层键，而且重载之后控制台仍然读得到刚写的值。
+        """
         import asyncio
 
         saved = self._wire_writes()
-        asyncio.run(self.api.set_flag('vision', True))
+        result = asyncio.run(self.api.set_flag('vision', True))
         self.assertTrue(saved['model_center']['vision']['enabled'])
+        self.assertNotIn('vision', saved, '不该写出一个 schema 里没有的顶层分组')
+        self.assertTrue(result['flags']['vision'])
+        # 关键回归：脱离那次写入的内存副本，从磁盘重新归一化后仍然读得到。
+        self.bridge.reload_config()
+        self.assertTrue(_run(self.api.overview())['flags']['vision'])
+
+    def test_set_flag_cleans_up_the_legacy_top_level_junk_group(self):
+        """旧版本控制台写出来的假顶层键，在下次切换时顺手清掉。"""
+        import asyncio
+
+        saved = self._wire_writes()
+        saved['vision'] = {'enabled': False}   # 历史遗留
+        asyncio.run(self.api.set_flag('vision', True))
+        self.assertNotIn('vision', saved)
+        self.assertTrue(saved['model_center']['vision']['enabled'])
+
+    def test_set_flag_still_writes_real_top_level_sections(self):
+        """顶层分组（runtime / agency / …）还是写原来那一处，别顺手搬家。"""
+        import asyncio
+
+        saved = self._wire_writes()
+        asyncio.run(self.api.set_flag('allow_proactive_messages', True))
+        asyncio.run(self.api.set_flag('agency', False))
+        self.assertTrue(saved['runtime']['allow_proactive_messages'])
+        self.assertFalse(saved['agency']['enabled'])
 
     def test_save_connection_creates_and_keeps_the_key_hidden(self):
         import asyncio

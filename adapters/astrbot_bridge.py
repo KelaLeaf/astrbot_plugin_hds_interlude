@@ -1459,6 +1459,11 @@ CONSOLE_USAGE_BUFFER = 400
 #: `AstrbotBridge.routing_config`），不会写进用户的配置文件。
 ROUTING_ROW_PREFIX = 'hdsi-astrbot-'
 
+#: **嵌在「模型中心」里的配置段**：schema 里它们的位置是 `model_center.<段>`，
+#: core 读的是 `model.<段>`，顶层没有这几个分组。读配置时以嵌套那份为准，
+#: 写配置时也只写嵌套那份（顶层同名键是旧版本控制台留下的垃圾，见 `section()`）。
+NESTED_MODEL_SECTIONS: tuple[str, ...] = ('vision', 'audio', 'embedding', 'compaction')
+
 
 def is_routing_row(provider: Any) -> bool:
     """判断一条连接行是不是本移植版合成的（防止重复注入）。"""
@@ -2444,7 +2449,18 @@ class AstrbotBridge:
         `normalize_config` 已经补过分组别名，正常情况下 `name` 直接命中；这里仍
         按 `CONFIG_SECTION_ALIASES` 反向兜底一次（例如有人直接构造了未过归一化的
         `AstrbotBridge`，或将来别名表变化）。
+
+        **嵌在「模型中心」里的段优先读嵌套的那一份**（`vision` / `audio` /
+        `embedding` / `compaction`）：`_conf_schema.json` 把它们放在
+        `model_center.<段>` 下，core 也读 `model.<段>`，顶层根本没有这几个分组。
+        早期版本只看顶层，于是「运行开关」读出的是默认值而不是真实状态（配置里开着
+        显示成关着、关着显示成开着，重启宿主剥掉历史遗留的假顶层键后必现）。
+        顶层同名键只在嵌套缺失时兜底——那是旧版本控制台写出来的垃圾，宿主下次加载就会删。
         """
+        if name in NESTED_MODEL_SECTIONS:
+            nested = self.section('model').get(name)
+            if isinstance(nested, dict):
+                return nested
         section = self.config.get(name) if isinstance(self.config, dict) else None
         if section is None:
             for alias, target in CONFIG_SECTION_ALIASES.items():

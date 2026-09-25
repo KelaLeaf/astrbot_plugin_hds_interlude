@@ -24,6 +24,7 @@ from ..core.meta import HDS_INTERLUDE_VERSION
 from .astrbot_bridge import (
     CONSOLE_LOG_BUFFER as CONSOLE_LOG_MAX,
     CONSOLE_USAGE_BUFFER as CONSOLE_USAGE_MAX,
+    NESTED_MODEL_SECTIONS,
     PLUGIN_NAME,
     _plugin_version,
 )
@@ -403,19 +404,24 @@ class ConsoleApi:
             raise ConsoleError('不认识的开关：%s' % name)
         section, key, label = spec
         target = dict(self.bridge.raw_config())
-        group = target.get(section)
-        group = dict(group) if isinstance(group, dict) else {}
-        group[key] = bool(value)
-        target[section] = group
-        # `compaction` / `embedding` / `vision` / `audio` 在 schema 里嵌在 `model_center` 下，
-        # 而 core 读的是内部名 `model`；两处都要写，否则配置页看到的是默认值。
-        if section in ('compaction', 'embedding', 'vision', 'audio'):
+        if section in NESTED_MODEL_SECTIONS:
+            # `compaction` / `embedding` / `vision` / `audio` 在 schema 里嵌在
+            # `model_center` 下，顶层**没有**这个分组。只写嵌套那一处：
+            #   * 顶层同名键不是合法配置（宿主下次加载当未知键删掉，还会混进导出文件），
+            #     顺手把旧版本留下的垃圾清掉；
+            #   * 读取侧 `bridge.section()` 对这几个段固定看嵌套那份，写一处也读得对。
             model = target.get('model_center')
             model = dict(model) if isinstance(model, dict) else {}
             nested = dict(model.get(section)) if isinstance(model.get(section), dict) else {}
             nested[key] = bool(value)
             model[section] = nested
             target['model_center'] = model
+            target.pop(section, None)
+        else:
+            group = target.get(section)
+            group = dict(group) if isinstance(group, dict) else {}
+            group[key] = bool(value)
+            target[section] = group
         saved_via = await self.bridge.save_raw_config(target)
         self._reload()
         return {
