@@ -1,3 +1,4 @@
+import { useState } from 'preact/hooks'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { MemoryPayload } from '../types'
@@ -13,6 +14,7 @@ const KNOWLEDGE_LABEL: Record<string, string> = {
 }
 
 export function Memory({ storyId, refreshKey }: PanelProps) {
+  const [showInternal, setShowInternal] = useState(false)
   const { data, error, loading, reload } = useQuery<MemoryPayload>(
     'console/memory',
     { story_id: storyId },
@@ -25,6 +27,10 @@ export function Memory({ storyId, refreshKey }: PanelProps) {
   if (!data.story) return <Empty text="还没有任何剧本。" icon="memory" />
 
   const { facts, memories, intents, patches, overlays, participants } = data
+  // split-message / narrative-retry 是宿主自己的调度账（气泡节拍、失败重试），
+  // 不是用户眼里的承诺——默认折叠，点一下才展开。
+  const visibleIntents = intents.filter((item) => !item.internal)
+  const internalIntents = intents.filter((item) => item.internal)
   const unresolved = facts.filter((item) => item.unresolved).length
   const pending = patches.filter((item) => item.status !== 'applied').length
 
@@ -33,7 +39,11 @@ export function Memory({ storyId, refreshKey }: PanelProps) {
       <Grid cols={4}>
         <Stat label="长期事实" value={facts.length} hint={unresolved ? `其中 ${unresolved} 条未解决` : '均已解决'} />
         <Stat label="记忆条目" value={memories.length} />
-        <Stat label="承诺 / 意图" value={intents.length} hint={intents.filter((item) => item.status === 'pending').length + ' 条待履行'} />
+        <Stat
+          label="承诺 / 意图"
+          value={visibleIntents.length}
+          hint={visibleIntents.filter((item) => item.status === 'pending').length + ' 条待履行'}
+        />
         <Stat label="设定演化候选" value={patches.length} hint={pending ? `${pending} 条待生效` : '无待处理'} tone={pending ? 'warn' : 'neutral'} />
       </Grid>
 
@@ -64,7 +74,22 @@ export function Memory({ storyId, refreshKey }: PanelProps) {
       </Panel>
 
       <Grid cols={2}>
-        <Panel title="承诺与意图" icon="clock">
+        <Panel
+          title="承诺与意图"
+          icon="clock"
+          actions={
+            internalIntents.length > 0 ? (
+              <label class="flex cursor-pointer items-center gap-1 text-[11px] text-muted">
+                <input
+                  type="checkbox"
+                  checked={showInternal}
+                  onChange={(event) => setShowInternal((event.target as HTMLInputElement).checked)}
+                />
+                显示内部调度（{internalIntents.length}）
+              </label>
+            ) : null
+          }
+        >
           <Table
             columns={[
               { key: 'type', title: '类型', render: (row) => <Badge>{row.type || '—'}</Badge> },
@@ -76,8 +101,8 @@ export function Memory({ storyId, refreshKey }: PanelProps) {
               },
               { key: 'not_before', title: '到期', mono: true, render: (row) => row.not_before || '—' },
             ]}
-            rows={intents}
-            empty="没有待履行的承诺"
+            rows={showInternal ? intents : visibleIntents}
+            empty={showInternal ? '没有任何意图记录' : '没有待履行的承诺'}
             rowKey={(row) => String(row.id)}
           />
         </Panel>

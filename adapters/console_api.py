@@ -31,7 +31,7 @@ from .astrbot_bridge import (
     _plugin_version,
 )
 
-__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'mask_endpoint',
+__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'INTERNAL_INTENT_TYPES', 'mask_endpoint',
            'load_config_schema', 'coerce_schema_value']
 
 #: 控制台「模型」页展示的任务顺序与中文名（与 `model_routing` 的任务键一致）。
@@ -44,6 +44,13 @@ CONSOLE_TASKS: tuple[tuple[str, str], ...] = (
     ('stickers', '表情包描述'),
     ('vision', '侧端识图'),
 )
+
+#: 纯宿主调度的 intent 类型：不是"她答应了什么"，用户看它只会困惑。
+#: - `split-message`：拆分气泡的投递节拍（"她还在打字"），投递完就 completed；
+#: - `narrative-retry`：叙事调用失败后的自动重试排程。
+#: 控制台的「承诺与意图」默认只显示人话层面的意图，这些折叠起来（可展开）。
+INTERNAL_INTENT_TYPES: frozenset[str] = frozenset({'split-message', 'narrative-retry'})
+
 
 # ===================================================================== #
 # 配置 schema：控制台配置页的取数与写入依据
@@ -1479,12 +1486,14 @@ class ConsoleApi:
         }
 
     def _intent_brief(self, row: dict[str, Any]) -> dict[str, Any]:
+        kind = _text(row.get('type'))
         return {
             'id': row.get('id'),
-            'type': _text(row.get('type')),
+            'type': kind,
             'summary': _text(row.get('summary')),
             'status': _text(row.get('status')),
             'not_before': _text(row.get('notBefore')),
+            'internal': kind in INTERNAL_INTENT_TYPES,
         }
 
     def _patch_brief(self, row: dict[str, Any]) -> dict[str, Any]:

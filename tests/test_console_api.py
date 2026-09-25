@@ -558,6 +558,40 @@ class ConsoleApiTests(unittest.TestCase):
         with self.assertRaises(ConsoleError):
             _run(self.api.merge_story(''))
 
+    # ---- 承诺与意图：内部调度折叠 ----
+
+    def _intent_row(self, story_id: str, kind: str, status: str = 'completed') -> None:
+        self.bridge.db.insert('interlude_intent', {
+            'storyId': story_id, 'type': kind, 'status': status,
+            'summary': 'The character is still typing the next message segment.'
+                       if kind == 'split-message' else 'Retry the interrupted narrative turn (attempt 1/6).',
+            'notBefore': '2026-09-25T14:33:22Z', 'payload': json.dumps({}),
+            'createdAt': '2026-09-25T14:33:00Z', 'updatedAt': '2026-09-25T14:33:22Z',
+        })
+
+    def test_memory_marks_host_scheduler_intents_as_internal(self):
+        """`split-message`（气泡节拍）与 `narrative-retry`（失败重试）是宿主自己的调度账。
+
+        用户报「承诺与意图」里整列都是 'The character is still typing the next message
+        segment.'，看着像坏了——它们不该混在"她答应了什么"里，控制台默认折叠。
+        """
+        self._story_row('character:qq:20000', entries=1)
+        for kind in ('split-message', 'narrative-retry', 'follow-up-commitment', 'proactive-check'):
+            self._intent_row('character:qq:20000', kind)
+        payload = _run(self.api.memory())
+        flags = {item['type']: item['internal'] for item in payload['intents']}
+        self.assertEqual(flags, {
+            'split-message': True,
+            'narrative-retry': True,
+            'follow-up-commitment': False,
+            'proactive-check': False,
+        }, '人话层面的意图不能被误标成内部调度')
+
+    def test_memory_without_intents_still_returns_the_key(self):
+        self._story_row('character:qq:20000', entries=1)
+        payload = _run(self.api.memory())
+        self.assertEqual(payload['intents'], [])
+
     # ---- 容错 ----
 
     def test_endpoints_survive_a_broken_database(self):
