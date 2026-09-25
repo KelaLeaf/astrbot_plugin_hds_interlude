@@ -873,6 +873,94 @@ class NormalizeConfigTests(unittest.TestCase):
         self.assertIs(h.resolve_black_box_config, c.resolve_blind_mode_config)
 
 
+class PromptSectionTests(unittest.TestCase):
+    """提示词四件套：权威分组 `prompts`，core 读 `model.*`（本移植版的分组搬家）。
+
+    背景：上游把提示词放在 `model` 组（`src/index.ts` 的 `ModelConfig`），本移植版
+    在配置页单开了一组 `prompts`。两边键名逐字相同，搬家由
+    `resolve_prompt_fields`（读）与 `to_schema_shape`（写）负责。
+
+    v1.1.0 的真实事故：schema 的 `model_center` 里也留了一份同名同默认值的副本，
+    而 core 只读 `model_center` → 用户在「提示词」页写的东西**静默失效**。
+    """
+
+    def test_prompts_group_is_authoritative_when_it_is_not_the_default(self):
+        from plugin.core.service import config as c
+        normalized = c.normalize_config({
+            'prompts': {'style_prompt': '用中文写，句子偏短。', 'fixed_prompt': '不许出戏。'},
+            'model_center': {'main_temperature': 0.5},
+        })
+        self.assertEqual(normalized['model']['style_prompt'], '用中文写，句子偏短。')
+        self.assertEqual(normalized['model']['fixed_prompt'], '不许出戏。')
+        # 没写的键仍是上游默认值。
+        self.assertEqual(normalized['model']['main_prompt'],
+                         c.CONFIG_DEFAULTS['model']['main_prompt'])
+
+    def test_prompts_group_value_equal_to_the_builtin_default_is_treated_as_untouched(self):
+        """默认值不算"用户写了东西"——否则老配置里 `model_center` 的自定义会被顶掉。"""
+        from plugin.core.service import config as c
+        normalized = c.normalize_config({
+            'prompts': {'style_prompt': c.CONFIG_DEFAULTS['model']['style_prompt']},
+            'model_center': {'style_prompt': '老配置里真正生效的那份'},
+        })
+        self.assertEqual(normalized['model']['style_prompt'], '老配置里真正生效的那份')
+
+    def test_legacy_model_center_prompts_survive_when_prompts_is_empty(self):
+        from plugin.core.service import config as c
+        normalized = c.normalize_config({
+            'prompts': {'style_prompt': '', 'fixed_prompt': '   '},
+            'model_center': {'style_prompt': '旧版文件里的文风', 'fixed_prompt': '旧版固定约束'},
+        })
+        self.assertEqual(normalized['model']['style_prompt'], '旧版文件里的文风')
+        self.assertEqual(normalized['model']['fixed_prompt'], '旧版固定约束')
+
+    def test_prompts_group_itself_is_preserved(self):
+        from plugin.core.service import config as c
+        normalized = c.normalize_config({'prompts': {'style_prompt': 'x', '未知键': 1}})
+        self.assertEqual(normalized['prompts']['style_prompt'], 'x')
+        self.assertEqual(normalized['prompts']['未知键'], 1)
+
+    def test_to_schema_shape_moves_prompts_out_of_model_center(self):
+        from plugin.core.service import config as c
+        shaped = c.to_schema_shape(c.normalize_config({
+            'prompts': {'style_prompt': '用中文写。'},
+            'model_center': {'main_temperature': 0.5},
+        }))
+        for key in c.PROMPT_FIELD_KEYS:
+            self.assertNotIn(key, shaped['model_center'], f'model_center.{key} 不该再有一份')
+            self.assertIn(key, shaped['prompts'], f'prompts.{key} 缺失')
+        self.assertEqual(shaped['prompts']['style_prompt'], '用中文写。')
+        # 非提示词键照旧留在模型中心。
+        self.assertEqual(shaped['model_center']['main_temperature'], 0.5)
+
+    def test_legacy_file_prompts_are_rescued_into_the_prompts_group_on_write(self):
+        """只写了 `model_center.style_prompt` 的旧文件，写盘后提示词落在 prompts 组。"""
+        from plugin.core.service import config as c
+        shaped = c.to_schema_shape(c.normalize_config({
+            'model_center': {'style_prompt': '旧版文风'},
+        }))
+        self.assertEqual(shaped['prompts']['style_prompt'], '旧版文风')
+        self.assertNotIn('style_prompt', shaped['model_center'])
+
+    def test_schema_shape_is_idempotent_and_round_trips(self):
+        from plugin.core.service import config as c
+        raw = {'prompts': {'main_prompt': 'm', 'style_prompt': 's'}, 'runtime': {'auto_create': True}}
+        first = c.to_schema_shape(c.normalize_config(raw))
+        second = c.to_schema_shape(c.normalize_config(first))
+        self.assertEqual(first['prompts'], second['prompts'])
+        self.assertEqual(first['runtime'], second['runtime'])
+        self.assertEqual(second['prompts']['main_prompt'], 'm')
+        self.assertEqual(second['prompts']['style_prompt'], 's')
+        # 写盘形状里 `prompts` 是唯一的提示词入口；再读回来 core 仍从 `model` 拿到。
+        self.assertNotIn('style_prompt', second['model_center'])
+        self.assertEqual(c.normalize_config(second)['model']['style_prompt'], 's')
+
+    def test_to_schema_shape_without_a_model_section_does_not_invent_prompts(self):
+        from plugin.core.service import config as c
+        self.assertEqual(c.to_schema_shape({'runtime': {'auto_create': True}}),
+                         {'runtime': {'auto_create': True}})
+        self.assertEqual(c.to_schema_shape(None), {})
+
 
 if __name__ == '__main__':
     unittest.main()

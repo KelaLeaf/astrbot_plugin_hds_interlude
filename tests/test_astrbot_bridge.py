@@ -1388,6 +1388,48 @@ class ConfigTransferTests(unittest.TestCase):
         self.assertEqual(written['model_center']['main_model_id'], 'new')
         self.assertEqual(written['model_center']['temperature'], 0.9)
 
+    def test_import_moves_old_prompts_into_the_prompts_group_and_they_take_effect(self):
+        """v1.1.0 的「提示词」组是**哑组**（core 只读 `model_center`）：内容写在里面会静默失效。
+
+        修好之后：导入落盘时提示词只留在 `prompts` 组，`model_center` 里不再有副本，
+        再读回来 core 从 `model` 段拿到同一份内容。
+        """
+        import asyncio
+
+        from plugin.core.service.config import normalize_config
+
+        curated = '用中文写，句子偏短，不写括号动作。'
+        self._write_disk({'prompts': {'style_prompt': curated},
+                          'model_center': {'main_temperature': 0.8}})
+        bridge = _make_bridge({})
+        bridge._live_config = None
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+
+        asyncio.run(bridge.import_config({'prompts': {'style_prompt': curated}}))
+        written = self._read_disk()
+        self.assertEqual(written['prompts']['style_prompt'], curated)
+        self.assertNotIn('style_prompt', written['model_center'], '写盘后不该再有第二份')
+        self.assertEqual(written['model_center']['main_temperature'], 0.8)
+        self.assertEqual(normalize_config(written)['model']['style_prompt'], curated)
+
+    def test_import_rescues_prompts_that_only_exist_in_model_center(self):
+        """反向兼容：内容只写在 `model_center`（旧版真正生效的位置）也不能丢。"""
+        import asyncio
+
+        from plugin.core.service.config import normalize_config
+
+        legacy = '旧版文件里写的文风'
+        self._write_disk({'model_center': {'style_prompt': legacy}})
+        bridge = _make_bridge({})
+        bridge._live_config = None
+        bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+
+        asyncio.run(bridge.import_config({'model_center': {'style_prompt': legacy}}))
+        written = self._read_disk()
+        self.assertEqual(written['prompts']['style_prompt'], legacy)
+        self.assertNotIn('style_prompt', written['model_center'])
+        self.assertEqual(normalize_config(written)['model']['style_prompt'], legacy)
+
     def test_import_report_diff_matches_what_actually_changed(self):
         """报告里的 diff 必须是"磁盘 → 写盘后"的真实差异。"""
         import asyncio

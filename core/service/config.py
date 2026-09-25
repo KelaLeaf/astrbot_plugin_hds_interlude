@@ -109,6 +109,9 @@ __all__ = [
     'CONFIG_SECTION_ALIASES_REVERSE',
     'apply_section_aliases',
     'to_schema_shape',
+    'PROMPT_SECTION',
+    'PROMPT_FIELD_KEYS',
+    'resolve_prompt_fields',
     'snapshot_defaults',
     'resolve_blind_mode_config',
     'resolve_black_box_config',
@@ -1027,6 +1030,55 @@ CONFIG_SECTION_ALIASES_REVERSE: dict[str, str] = {
     upstream: schema for schema, upstream in CONFIG_SECTION_ALIASES.items()
 }
 
+#: 「提示词四件套」的**权威分组**（`plugin/_conf_schema.json` 的顶层 `prompts` 组）。
+#:
+#: 上游把四个提示词放在 `model` 组里（`src/index.ts` 的 `ModelConfig`），本移植版
+#: 给它们在配置页单开了一组，编辑起来清爽得多；core 与上游一致，读的仍然是
+#: `model.main_prompt` / `format_prompt` / `fixed_prompt` / `style_prompt`。
+#: 两边**键名逐字相同**，差的只是分组名，所以搬运不需要改名。
+#: 见 `resolve_prompt_fields`（读）与 `to_schema_shape`（写）。
+PROMPT_SECTION = 'prompts'
+
+#: 提示词四件套的键名（上游 `mainPrompt` / `formatPrompt` / `fixedPrompt` / `stylePrompt`）。
+PROMPT_FIELD_KEYS: tuple[str, ...] = (
+    'main_prompt', 'format_prompt', 'fixed_prompt', 'style_prompt',
+)
+
+
+def resolve_prompt_fields(config: Any) -> dict[str, Any]:
+    """把 `prompts` 组里的提示词搬进 core 读的 `model` 段（**读**，见 `PROMPT_SECTION`）。
+
+    规则（逐键独立判定）：
+
+    * `prompts.<键>` 是**非空且不等于内置默认值**的字符串 → 用它（用户在提示词页写了东西）；
+    * 其余情况 → 保留 `model` / `model_center` 里的值（旧版本配置的兼容位、或用户压根没动过）。
+
+    "等于内置默认值视为没写"这条是必须的：老配置（≤ v1.1.0）在 `model_center` 里
+    也有一份四件套，默认值是同一串英文；如果只按"非空"判优，`model_center` 里
+    用户改过的内容会被 `prompts` 组的默认值顶掉。
+
+    这份函数是**唯一实现源**：`normalize_config` 收尾调用它，所以服务层、适配层、
+    控制台拿到的配置里，提示词都已经在 `model` 段就位（上游键位不变）。
+    """
+    if not isinstance(config, dict):
+        return config
+    prompts = config.get(PROMPT_SECTION)
+    model = config.get('model')
+    if not isinstance(model, dict):
+        model = config.get(CONFIG_SECTION_ALIASES_REVERSE.get('model', 'model_center'))
+    if not isinstance(prompts, dict) or not isinstance(model, dict):
+        return config
+    defaults = CONFIG_DEFAULTS.get('model')
+    defaults = defaults if isinstance(defaults, dict) else {}
+    for key in PROMPT_FIELD_KEYS:
+        value = prompts.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if value == defaults.get(key):
+            continue
+        model[key] = value
+    return config
+
 
 def to_schema_shape(config: Any) -> dict[str, Any]:
     """把内部（上游分组名）配置转回 `_conf_schema.json` 的分组名，**写盘用**。
@@ -1039,12 +1091,40 @@ def to_schema_shape(config: Any) -> dict[str, Any]:
     `apply_section_aliases` 把 schema 名补成上游名，所以写 schema 形状是安全的。
 
     只转这两个已知别名；其余键原样保留（含未知键）。
+
+    提示词四件套是个例外：core 读 `model.*`，用户在「提示词」组里编辑，两边同名。
+    写盘时**只留 `prompts` 组那一份**——把 `model_center` 里的副本摘掉，否则
+    AstrBot 会按 `_conf_schema.json` 把它当未知键删掉（日志刷 `Config key removed`），
+    而且将来 schema 若再改动，两处会漂移。
+
+    搬的是 `model` 段里的**生效值**（`normalize_config` 已经用
+    `resolve_prompt_fields` 裁决过：提示词组写了就以它为准，没写就沿用模型中心的兼容位），
+    所以不会丢用户内容。摘副本时**复制**分组而不是原地 `pop`：入参与出参的嵌套
+    dict 目前是共享引用（浅拷贝），原地改会连带改掉调用方手里那份配置。
     """
     if not isinstance(config, dict):
         return {}
     out: dict[str, Any] = {}
     for key, value in config.items():
         out[CONFIG_SECTION_ALIASES_REVERSE.get(key, key)] = value
+    model_key = CONFIG_SECTION_ALIASES_REVERSE.get('model', 'model_center')
+    effective = config.get('model')
+    if not isinstance(effective, dict):
+        effective = config.get(model_key)
+    model_section = out.get(model_key)
+    if isinstance(model_section, dict) and isinstance(effective, dict):
+        if any(key in model_section for key in PROMPT_FIELD_KEYS):
+            out[model_key] = {
+                key: value for key, value in model_section.items()
+                if key not in PROMPT_FIELD_KEYS
+            }
+        prompts = out.get(PROMPT_SECTION)
+        if not isinstance(prompts, dict):
+            prompts = {}
+            out[PROMPT_SECTION] = prompts
+        for key in PROMPT_FIELD_KEYS:
+            if key in effective:
+                prompts[key] = effective[key]
     return out
 
 
@@ -1145,6 +1225,9 @@ def normalize_config(raw: Any) -> dict[str, Any]:
       此时沿用默认值（与 AstrBot schema 未填即用 default 的行为一致）。
     * 未知键（上游有、本移植版未声明）原样保留，不静默丢弃用户配置。
     * list 里的 dict 同样归一（`onebot.user_accounts` / `group_chats` 等表格）。
+    * **提示词四件套**：`prompts` 组里写了东西（非空且非默认值）就以它为准，搬进
+      core 读的 `model` 段；没写就保留 `model` / `model_center` 的兼容位值。
+      见 `resolve_prompt_fields`。
     * 默认值补全清单见 `CONFIG_DEFAULTS`：顶层分组全部补齐，
       `runtime` / `blind_mode` / `logging` / `memory` / `browser` /
       `chat_actions` / `stickers` / `shared_story` / `onebot` /
@@ -1176,7 +1259,7 @@ def normalize_config(raw: Any) -> dict[str, Any]:
             return [merge(None, item) for item in value]
         return value
 
-    return merge(defaults, apply_section_aliases(raw))
+    return resolve_prompt_fields(merge(defaults, apply_section_aliases(raw)))
 
 
 def resolve_blind_mode_config(value: Any = None) -> dict[str, Any]:
