@@ -807,14 +807,24 @@ class HDSInterludePlugin(Star):
         上游中间件的消费语义：叙事决定沉默时也吞掉事件（不落给其它处理器），
         由 `AstrbotBridge.handle_event()` 调用 `event.stop_event()` 实现；
         管理命令消息在 `runtime.ignore_command_messages` 下不消费，交回命令解析器。
+
+        **我们自己出错也要吞掉事件**：宿主里往往还跑着第二个聊天 Agent（默认 Agent /
+        别的拟人插件），一条异常一旦冒出去，同一段私聊就会冒出第二个人格回答。
+        错误照常记 `error` 级日志（不隐藏 bug），但事件不交回。
         """
         if self._resolve_confirmation(event):
             return
-        if not self.bridge.config_flag(
+        capture = self.bridge.config_flag(
             'runtime', 'capture_direct_messages', 'captureDirectMessages', default=True,
-        ):
+        )
+        if not capture:
             return
-        replies = await self.bridge.handle_event(event)
+        try:
+            replies = await self.bridge.handle_event(event)
+        except Exception as error:  # noqa: BLE001 - 私聊归属不能因为一次异常就漏给别的 Agent
+            logger.error('hds-interlude：私聊事件处理失败，已吞掉事件以免其它 Agent 接手：%s' % error)
+            event.stop_event()
+            return
         for reply in replies:
             yield event.plain_result(reply)
 
