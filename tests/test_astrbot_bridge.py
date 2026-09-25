@@ -1214,6 +1214,58 @@ class BridgeIntegrationTests(unittest.TestCase):
         self.assertEqual(asyncio.run(bridge.handle_event(event)), [])
         self.assertFalse(event.stopped)
 
+    def test_onebot_notices_are_not_mistaken_for_empty_messages(self):
+        """OneBot 的 notice（「对方正在输入…」）不是消息：静默吞掉，**不打 warn**。
+
+        用户 2026-09-25 的日志里，NapCat 的 `input_status` 通知一分钟刷出十几条
+        「私聊事件没有可用内容」warn，把它真正该看的东西全盖掉了。
+        """
+        import asyncio
+
+        bridge = _make_bridge()
+        event = FakeMessageEvent(message='', components=[])
+        event.message_obj.raw_message = {
+            'post_type': 'notice', 'notice_type': 'notify', 'sub_type': 'input_status',
+            'status_text': '对方正在输入...',
+        }
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            self.assertEqual(asyncio.run(bridge.handle_event(event)), [])
+        self.assertTrue(event.stopped, '归我们管的私聊仍然要吞掉，空事件不能漏给第二个人格')
+        levels = [item.args[0] for item in logged.call_args_list if item.args]
+        self.assertNotIn('warn', levels, '输入状态通知不是内容缺失，不许 warn 刷屏')
+        self.assertIn('debug', levels, '静默不等于无痕：debug 里要留下类型')
+        self.assertIn('notice:notify:input_status',
+                      [str(item.args[1]) % tuple(item.args[2:]) for item in logged.call_args_list
+                       if len(item.args) > 2][-1])
+
+    def test_non_message_events_are_classified_without_touching_other_platforms(self):
+        """只有显式声明 `post_type` 且不是 `message` 的原始事件才算非消息。"""
+        notice = FakeMessageEvent(message='', components=[])
+        notice.message_obj.raw_message = {'post_type': 'notice', 'notice_type': 'notify',
+                                          'sub_type': 'input_status'}
+        self.assertEqual(bridge_module.is_non_message_event(notice),
+                         (True, 'notice:notify:input_status'))
+        request = FakeMessageEvent(message='', components=[])
+        request.message_obj.raw_message = {'post_type': 'request', 'request_type': 'friend'}
+        self.assertEqual(bridge_module.is_non_message_event(request), (True, 'request:friend'))
+        # 真消息、以及别的平台（没有 `post_type`）一律当消息。
+        plain = FakeMessageEvent(message='在吗', components=[Plain('在吗')])
+        self.assertEqual(bridge_module.is_non_message_event(plain), (False, ''))
+        telegram = FakeMessageEvent(message='hi', components=[Plain('hi')], platform_name='telegram')
+        telegram.message_obj.raw_message = {'message': [{'type': 'text', 'data': {'text': 'hi'}}]}
+        self.assertEqual(bridge_module.is_non_message_event(telegram), (False, ''))
+
+    def test_a_notice_that_is_not_ours_is_left_to_other_handlers(self):
+        """未接管私聊里的通知不消费：capture 关着时仍然交回其它处理器。"""
+        import asyncio
+
+        bridge = _make_bridge({'runtime': {'capture_direct_messages': False}})
+        event = FakeMessageEvent(message='', components=[])
+        event.message_obj.raw_message = {'post_type': 'notice', 'notice_type': 'notify'}
+        with mock.patch.object(bridge_module, 'log_fallback'):
+            self.assertEqual(asyncio.run(bridge.handle_event(event)), [])
+        self.assertFalse(event.stopped)
+
     def test_session_view_falls_back_to_raw_segments_when_the_chain_is_empty(self):
         """结构化消息链为空时，退回 `message_obj.raw_message` 里的原始段。
 

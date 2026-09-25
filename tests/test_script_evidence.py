@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from plugin.core.script import authored_actions as authored
 from plugin.core.script.authored_actions import (
     complete_legacy_bubble_block,
+    inspect_say_markup,
     read_authored_actions,
     resolve_authored_actions,
 )
@@ -452,6 +453,63 @@ class AuthoredActionsTests(unittest.TestCase):
         self.assertEqual(len(read_authored_actions('<say id="' + 'a' * 64 + '">甲</say>')['actions']), 1)
         # 跨行内容（[\s\S]*?）同样被解包。
         self.assertEqual(read_authored_actions('<say id="r">第一行\n第二行</say>')['actions'][0]['content'], '第一行\n第二行')
+
+    def test_authored_say_tags_tolerate_the_shapes_models_actually_write(self):
+        """受控偏离（PORTING_NOTES §19）：标签写法容错。
+
+        2026-09-25 23:56 的日志里，草稿明明写着 `<say id="reply">晚安喵～</say>`，
+        却被判成「结构化可见回复缺失」白重写一次——因为上游正则只认那一种字面写法，
+        而模型会写单引号、无引号、大写、多余空格、全角空格，或者因为 JSON 转义层次
+        把引号写成 `id=\\"reply\\"`。容错**只放宽书写形式**：id 字符集与长度不放宽。
+        """
+        for tag in ('<say id="r">甲</say>', "<say id='r'>甲</say>", '<say id=r>甲</say>',
+                    '<SAY ID="r">甲</SAY>', '<say  id = "r" >甲</say >',
+                    '<say id=\\"r\\">甲</say>', '<say id=“r”>甲</say>',
+                    '<say\u3000id="r">甲</say>', '<say\u200bid="r">甲</say>'):
+            with self.subTest(tag=tag):
+                parsed = read_authored_actions(tag)
+                self.assertEqual([action['id'] for action in parsed['actions']], ['r'], tag)
+                self.assertEqual(parsed['prose'], '甲', tag)
+        # 拒收条件一条没放宽：非 ASCII id、超长 id、重复 id 都仍然不可执行。
+        self.assertEqual(read_authored_actions('<say id="汉字">甲</say>')['actions'], [])
+        self.assertEqual(read_authored_actions('<say id="' + 'a' * 65 + '">甲</say>')['actions'], [])
+        self.assertEqual(len(read_authored_actions('<say id="' + 'a' * 64 + '">甲</say>')['actions']), 1)
+        self.assertEqual(read_authored_actions('<say id="r">甲</say><say id="r">乙</say>')['actions'], [])
+
+    def test_tolerated_tags_land_the_reply_instead_of_burning_a_rewrite(self):
+        """容错的收益：这一回合不再被扔进「重写一次」，用户直接看到原话。"""
+        for tag in ("<say id='reply'>晚安喵～</say>", '<say id=“reply”>晚安喵～</say>',
+                    '<say id=\\"reply\\">晚安喵～</say>'):
+            with self.subTest(tag=tag):
+                authored._resolved_actions.clear()
+                result = resolve_authored_actions({
+                    'script': '她写道：' + tag,
+                    'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'actionId': 'reply'}},
+                })
+                self.assertEqual(result['interaction']['reply']['content'], '晚安喵～')
+                self.assertFalse(requires_visible_reply_recovery(
+                    'user-message', None, result), '原话已经落地，不该再触发白重写')
+
+    def test_inspect_say_markup_names_the_leftover_tag_for_diagnostics(self):
+        """诊断只看一个信号：散文里是否还残留 `<say>`（解析成功时它会被整个解包）。"""
+        self.assertEqual(inspect_say_markup('她写道：晚安喵～'), {'leftover': 0, 'preview': ''})
+        self.assertEqual(inspect_say_markup(''), {'leftover': 0, 'preview': ''})
+        self.assertEqual(inspect_say_markup(None), {'leftover': 0, 'preview': ''})
+        # 解析成功的写法：`resolve_authored_actions` 交回来的散文里标签已经没了。
+        accepted = resolve_authored_actions({
+            'script': '她写道：<say id=“reply”>晚安喵～</say>',
+            'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'actionId': 'reply'}},
+        })
+        self.assertEqual(inspect_say_markup(accepted['script']), {'leftover': 0, 'preview': ''})
+        # 解析不掉的形状（这里是刻意保留的拒收条件：非 ASCII id）：标签原样留在散文里，
+        # 这就是 2026-09-25 23:56 那次"白重写"的指纹。
+        rejected = resolve_authored_actions({
+            'script': '她写道：<say id="汉字">晚安喵～</say>',
+            'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'actionId': 'reply'}},
+        })
+        markup = inspect_say_markup(rejected['script'])
+        self.assertEqual(markup['leftover'], 2)
+        self.assertIn('<say id="汉字">', markup['preview'])
 
     def test_complete_legacy_bubble_block_only_accepts_an_explicit_terminal_block(self):
         self.assertIsNone(complete_legacy_bubble_block('她拿起手机。\n\n甲||乙', '甲', ''))

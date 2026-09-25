@@ -80,7 +80,7 @@ from ..delivery import (
 from ..logging import phase_label
 from ..narrator_prompts import compact_prompt_entries
 from ..schedule_preplan import schedule_preplan_window
-from ..script.authored_actions import resolve_authored_actions
+from ..script.authored_actions import inspect_say_markup, resolve_authored_actions
 from ..script.commit_builder import (
     decision_to_script_commit,
     find_outgoing_script_event,
@@ -1587,10 +1587,20 @@ class ServiceChunk4(ServiceBase):
                 # 诊断：记录被抛弃草稿里模型实际返回的 interaction（缺失/为空/形状错误），
                 # 让下一次「结构化可见回复缺失」可以直接从日志定位是模型行为还是解析问题。
                 if initial_visible_recovery:
+                    # ⚠️ 这条必须是**可见**的：core 的 `diagnostic` 频道在默认
+                    # `logging.verbosity` 下一个字都不打（见 AGENTS.md 坑 25），而
+                    # 「一个已经写好的回合被白重写一次」正是运维最需要看见的事。
+                    # 带上「残留 say 标记」与预览：解析成功时标签会被整个解包、不会留在
+                    # 散文里，所以 `残留>0` 就是"模型写了行动但一个都没解析出来"的铁证
+                    # （2026-09-25 23:56 那次重写就是靠这个才定位得了的）。
+                    markup = inspect_say_markup(_raw_decision(decision, 'script'))
+                    actions = _raw_decision(decision, 'authoredActions') or []
                     self.report_operation(
-                        'diagnostic', 'warn', story, phase, '被抛弃草稿的结构化回复字段 interaction=%s groupReply=%s',
+                        'standard', 'warn', story, phase,
+                        '被抛弃草稿的结构化回复字段 interaction=%s 已解析动作=%d 残留say标记=%d 残留预览=%s',
                         safe_json_preview(_record(decision).get('interaction')),
-                        safe_json_preview(_record(decision).get('groupReply')),
+                        len(actions) if isinstance(actions, list) else 0,
+                        markup['leftover'], markup['preview'] or '(无)',
                     )
                 self.report_operation(
                     'standard', 'warn', story, phase,

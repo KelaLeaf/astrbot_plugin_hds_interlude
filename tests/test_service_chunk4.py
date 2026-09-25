@@ -1239,6 +1239,37 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state['narrative_update_count'], 1)
 
     @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_a_rejected_draft_says_why_where_operators_can_see_it(self) -> None:
+        """被抛弃的草稿必须**在默认 verbosity 下可见**地说出原因（AGENTS.md 坑 25）。
+
+        用户 2026-09-25 23:56 的日志里只有一句「结构化可见回复缺失」，谁也看不出模型
+        到底写了什么。这条诊断现在带 interaction、已解析动作数与**残留的 `<say>` 标记**——
+        解析成功时标签会被整个解包、不会留在散文里，所以「残留 > 0」就是"模型写了行动
+        但一个都没解析出来"的指纹。
+        """
+        self.service.model_routing = {'main': {'available': True}}
+        self.service.narrator = _FakeNarrator({
+            'script': '她写道：<say id="汉字">晚安喵～</say>',
+            'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'actionId': 'reply'}},
+        })
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '晚安', [],
+        )
+        # 重写还是不合格 → 整回合失败（上游语义），但**原因**必须留在默认可见的日志里。
+        self.assertFalse(result['succeeded'])
+        reasons = [text for level, text in self.sink.records if level == 'warn']
+        diagnostics = [text for text in reasons if '被抛弃草稿的结构化回复字段' in text]
+        self.assertEqual(len(diagnostics), 1, reasons)
+        # 日志是按 `键=值` 渲染成树的，所以断言落在渲染后的字段上（用户真正看到的东西）。
+        self.assertIn('已解析动作', diagnostics[0])
+        self.assertIn('残留say标记', diagnostics[0])
+        self.assertIn('2', diagnostics[0])
+        self.assertIn('汉字', diagnostics[0], '预览里要看得到模型的原样写法')
+        self.assertIn('unresolved_action_id', diagnostics[0])
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
     async def test_missing_narrator_degrades_instead_of_raising(self) -> None:
         """`narrator` 未配置时按 provider 失败降级，而不是把异常抛给调用方。"""
         self.service.narrator = None
