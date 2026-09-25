@@ -927,6 +927,72 @@ class ServiceChunk7(ServiceBase):
             'moved': moved,
         }
 
+    async def promote_story_to_canonical(self, source_story_id: Any) -> dict[str, Any]:
+        """把选中的剧本**立为共享主剧本**（**本移植版扩展**，控制台「设为主剧本」）。
+
+        为什么要这个入口：共享主剧本的 id 是 `character:<平台>:<机器人>`，由 `findStory`
+        在**收到消息**时惰性迁移出来；而归档/单剧本守卫（`getCanonicalStory`，也被后台扫描
+        和若干管理路径调用）会先把"不是它选中的那一部"归档。于是升级后可能出现
+        "库里好几部旧剧本、一部 `character:` 都没有"的中间态——这时**保留哪一部当底座
+        完全没法选**：`findStory` 只会拿最近更新的那部迁移。控制台用这个入口让用户明确指定：
+        选中的剧本被迁移成主剧本（**继承它的 setting / state / 连续性**），其余的随后可以
+        「并入主剧本」。
+
+        规则：
+        - 选中的就是主剧本 → `already-canonical`；
+        - 已经有别的主剧本（active 且 `character:`）→ `canonical-exists`（只能并入，不能顶替：
+          顶替要删掉已有主剧本那一行，属于毁数据的事，不做）；
+        - 选中的是 `character:` 但被归档/暂停 → 直接复活它（它就是主剧本）；
+        - 其余情况：先确保 active（迁移会照抄行的 `status`，归档行直接迁移会得出一部归档主剧本），
+          再走 `migrateLegacyStory` 那条既有路径。
+        """
+        source_id = _text_value(source_story_id)
+        rows = await self.db_get('interlude_story', {'id': source_id})  # type: ignore[attr-defined]
+        source = rows[0] if rows else None
+        if not source:
+            raise LookupError('source-story-not-found')
+        now = self.now()  # type: ignore[attr-defined]
+        main_id = await self.shared_story_id()
+        if main_id == source_id:
+            raise ValueError('already-canonical')
+        if source_id.startswith('character:'):
+            # 主剧本被人为暂停/归档过：复活它，不必迁移。
+            await self.db_set(  # type: ignore[attr-defined]
+                'interlude_story', {'id': source_id}, {'status': 'active', 'updatedAt': now},
+            )
+            return {'source': source_id, 'target': source_id, 'revived': True}
+        if main_id:
+            raise ValueError('canonical-exists')
+        if _text_value(pick(source, 'status')) != 'active':
+            await self.db_set(  # type: ignore[attr-defined]
+                'interlude_story', {'id': source_id}, {'status': 'active', 'updatedAt': now},
+            )
+            source = {**source, 'status': 'active'}
+        session = SessionView(
+            platform=pick(source, 'platform'),
+            self_id=pick(source, 'selfId', 'self_id') or '',
+            user_id=pick(source, 'userId', 'user_id') or '',
+            channel_id=pick(source, 'channelId', 'channel_id') or '',
+        )
+        story = await self.migrate_legacy_story(source, session)
+        return {'source': source_id, 'target': _text_value(pick(story, 'id')), 'revived': False}
+
+    async def shared_story_id(self) -> str:
+        """当前的**共享主剧本** id：active 且以 `character:` 开头，没有就返回空串。
+
+        与 `canonical_story_id()` 的区别：那个是"面板该读哪一部"的候选（没有主剧本时
+        回落到最近更新的旧剧本），这个是"主剧本到底存不存在"的判据——控制台要靠它决定
+        显示「设为主剧本」还是「并入主剧本」。
+        """
+        rows = await self.db_get(  # type: ignore[attr-defined]
+            'interlude_story', {'status': 'active'}, {'sort': {'updatedAt': 'DESC'}, 'limit': 50},
+        )
+        for row in rows:
+            story_id = _text_value(pick(row, 'id'))
+            if story_id.startswith('character:'):
+                return story_id
+        return ''
+
     async def canonical_story_id(self) -> str:
         """当前共享主剧本的 id（`character:…`），没有就返回空串。
 

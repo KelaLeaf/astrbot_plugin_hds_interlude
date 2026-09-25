@@ -429,6 +429,8 @@ class HDSInterludePlugin(Star):
              '控制台：剧本清单（含归档）'),
             (f'/{PLUGIN_NAME}/console/story-merge', self.page_console_story_merge, ['POST'],
              '控制台：把旧剧本并入共享主剧本'),
+            (f'/{PLUGIN_NAME}/console/story-promote', self.page_console_story_promote, ['POST'],
+             '控制台：把选中的剧本立为共享主剧本'),
             # 配置备份（原 config-backup 页并入控制台）
             (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
              '导出 HDS Interlude 配置'),
@@ -510,6 +512,11 @@ class HDSInterludePlugin(Star):
     async def page_console_story_merge(self):
         return await self._console_write(lambda api, body: api.merge_story(
             body.get('source_story_id'), body.get('target_story_id'),
+        ))
+
+    async def page_console_story_promote(self):
+        return await self._console_write(lambda api, body: api.promote_story(
+            body.get('source_story_id'),
         ))
 
     async def _console_write(self, action):

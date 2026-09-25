@@ -18,6 +18,8 @@ export interface StoryLabelInput {
   entries?: number
   participants?: number
   shared?: boolean
+  /** 是不是当前共享主剧本。 */
+  main?: boolean
 }
 
 /** 状态中文名（上游只有 active / paused / archived 三种）。 */
@@ -28,11 +30,17 @@ export function storyStatusText(status: string | undefined): string {
   return status || '未知'
 }
 
-/** 切换器里的显示文案：`凌梦 · qq · 128 条 · 已归档`。 */
+/** 角色定位：主剧本 / 旧剧本。用户分不清"哪部是主线"就是缺这两个字。 */
+export function storyRoleText(item: StoryLabelInput): string {
+  return item.main ? '主剧本' : '旧剧本'
+}
+
+/** 切换器里的显示文案：`凌梦 · qq · 主剧本 · 128 条 · 进行中`。 */
 export function storyLabel(item: StoryLabelInput): string {
   const bits: string[] = []
   bits.push(item.character || item.id.slice(0, 12))
   if (item.platform) bits.push(item.platform)
+  bits.push(storyRoleText(item))
   const entries = typeof item.entries === 'number' ? item.entries : 0
   bits.push(`${entries} 条`)
   if (typeof item.participants === 'number' && item.participants > 1) bits.push(`${item.participants} 人`)
@@ -46,11 +54,23 @@ export function isSharedStory(item: StoryLabelInput | null | undefined): boolean
   return item.shared === true || item.id.startsWith('character:')
 }
 
-/** 该不该给「并入主剧本」按钮：选了剧本、知道主剧本是谁、且不是主剧本本身。 */
+/**
+ * 该不该给「并入主剧本」按钮：主剧本已经定下来了，且选中的不是它。
+ * 还没定主剧本时给的是「设为主剧本」（`canPromoteStory`），两个按钮不同时出现。
+ */
 export function canMergeStory(
   selected: StoryLabelInput | null | undefined,
-  canonicalId: string,
+  mainStoryId: string,
 ): boolean {
-  if (!selected || !canonicalId) return false
-  return selected.id !== canonicalId
+  if (!selected || !mainStoryId) return false
+  return selected.id !== mainStoryId
+}
+
+/** 该不该给「设为主剧本」按钮：还没有主剧本，且选中了某一部（含被归档的旧剧本）。 */
+export function canPromoteStory(
+  selected: StoryLabelInput | null | undefined,
+  mainStoryId: string,
+): boolean {
+  if (!selected) return false
+  return !mainStoryId
 }

@@ -18,13 +18,20 @@ export interface StoryListItem extends StoryBrief {
   entries: number
   participants: number
   shared: boolean
+  /** 是不是当前共享主剧本（`main` 那一部）。 */
+  main: boolean
 }
 
 export interface StoryListPayload {
   stories: StoryListItem[]
-  canonical: string
+  /** 真正的共享主剧本 id（active 且 `character:`）；没有主剧本时是空串。 */
+  main: string
+  /** 面板默认读哪一部（没有主剧本时 = 最近更新的那部旧剧本）。 */
+  active_story: string
   /** 仅「并入主剧本」的响应里出现。 */
   merged?: { source: string; target: string; participant: string; moved: number }
+  /** 仅「设为主剧本」的响应里出现。 */
+  promoted?: { source: string; target: string; revived: boolean }
   changed?: string
 }
 
