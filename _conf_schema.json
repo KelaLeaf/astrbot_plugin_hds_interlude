@@ -860,7 +860,7 @@
         "type": "bool",
         "description": "向模型提供其它参与者历史",
         "default": false,
-        "hint": "关系字段始终匿名，涉及隐私请谨慎开启"
+        "hint": "关闭时「记忆整理 / 场景摘要 / 长期事实」看不到任何对话内容（只能看到系统条目，摘要会退化成「因隐私设置被省略」的空壳）；关系字段始终匿名。单人使用建议打开"
       },
       "max_cross_conversation_actions": {
         "type": "int",

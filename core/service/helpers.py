@@ -1252,7 +1252,14 @@ def _has_structured_interaction(value: Any) -> bool:
     if mode not in ('none', 'immediate', 'delayed'):
         return False
     if mode == 'none':
-        return True
+        # `mode:'none'` 有两种来源：模型真的决定不回（正常），以及**声明了 immediate 但
+        # 引用的 `<say>` 动作落地不了**（`resolve_authored_actions` 退成 none 并留下
+        # `unresolved_action_id`）。后者是坏回合，遇到就沿用既有的「重写一次」机制，
+        # 否则用户看到的是"她读了却不回"（上游的静默语义；本移植版刻意偏离，见
+        # `docs/PORTING_NOTES.md` §17）。
+        return not reply.get('unresolved_action_id')
+    if reply.get('unresolved_action_id'):
+        return False
     if not isinstance(reply.get('content'), str) or not reply['content'].strip():
         return False
     if mode == 'immediate':

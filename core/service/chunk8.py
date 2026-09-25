@@ -841,6 +841,20 @@ class ServiceChunk8(ServiceBase):
                 if entry.get('participantId') else entry
                 for entry in scene_entries
             ]
+            masked = sum(1 for entry in scene_entries if entry.get('participantId'))
+            if masked:
+                # 共享主剧本是硬开启的，于是**每句私聊都挂在某个参与者上**；而
+                # `share_participant_details` 默认关闭时，上面这段会把它们的正文全换成占位串
+                # ——压缩模型看到的就是「内容因隐私设置被省略」，产出「场景摘要全是省略」
+                # +「长期事实 0」。这是上游的隐私语义（刻意如此），但默认组合下的效果很像故障，
+                # 所以在日志里说清楚，并给出唯一的补救开关。
+                self.report_operation(
+                    'standard', 'warn', story, 'advance',
+                    '记忆整理：共享主剧本下的对话内容被隐私开关隐藏 条数=%d ——'
+                    'share_participant_details 关闭时场景摘要与长期事实只能看到系统条目；'
+                    '单人使用（不在乎各账号互相可见）建议在「共享主剧本」里打开它',
+                    masked,
+                )
         visible_compaction_entries = [
             entry for entry in visible_rows if (entry.get('content') or '').strip()
         ]

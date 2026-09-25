@@ -40,6 +40,7 @@ from plugin.core.script.authored_actions import (
     read_authored_actions,
     resolve_authored_actions,
 )
+from plugin.core.service.helpers import requires_visible_reply_recovery
 from plugin.core.script.development import (
     development_context_query,
     development_dimension,
@@ -392,6 +393,48 @@ class AuthoredActionsTests(unittest.TestCase):
         self.assertEqual(partial['interaction']['reply']['content'], '甲||乙')
         self.assertEqual(partial['authored_actions'][0]['content'], '甲||乙')
         self.assertEqual(resolve_authored_actions(partial, False, '||'), partial)
+
+    def test_action_reference_is_read_in_both_spellings_even_with_two_say_actions(self):
+        """模型的 `interaction.reply.actionId` 是 camelCase，本模块内部是 snake_case。
+
+        只认一种拼写时，「模型把两个气泡写成两个 `<say>` 块」的回合解析不出原话：
+        `sole_action_reply` 的兜底只在**恰好一个**动作时生效 → 上层判成
+        「结构化可见回复缺失」→ 白重写一次；重写再不合格就整套 60 秒重试。
+        用户日志里 4 个私聊回合有 2 个是这样被浪费的。
+        """
+        script = '前<say id="reply">在的喵~</say>中<say id="reply2">怎么啦</say>后'
+        camel = {'script': script,
+                 'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'actionId': 'reply'}}}
+        snake = {'script': script,
+                 'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'action_id': 'reply'}}}
+        for raw in (camel, snake):
+            decision = resolve_authored_actions(raw)
+            self.assertEqual(decision['interaction']['reply']['content'], '在的喵~')
+            self.assertFalse(
+                requires_visible_reply_recovery('user-message', None, decision),
+                '引用能落地就不该触发重写：%s' % raw['interaction'],
+            )
+
+    def test_a_reference_that_cannot_land_is_marked_for_one_rewrite(self):
+        """声明了 immediate 却没写 `<say>` 块：不静默吞掉这一回合。
+
+        上游会把它退成 `mode:'none'`（她读了却不回），用户看到的就是"这条她没理我"。
+        本移植版留一个内部标记，让既有的「重写一次」机制接手——不编造内容、不产生
+        第二条回复，只是再要一次合法结构。
+        """
+        raw = {'script': '她看了一眼屏幕，什么也没写。',
+               'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'actionId': 'reply'}}}
+        decision = resolve_authored_actions(raw)
+        reply = decision['interaction']['reply']
+        self.assertEqual(reply['mode'], 'none')
+        self.assertEqual(reply['unresolved_action_id'], 'reply')
+        self.assertTrue(requires_visible_reply_recovery('user-message', None, decision))
+        # 主动不回（模型自己选的 mode:none）不算坏回合，别白花一次调用。
+        quiet = {'script': '她看了一眼屏幕，没回。',
+                 'interaction': {'seen': True, 'reply': {'mode': 'none'}}}
+        self.assertFalse(
+            requires_visible_reply_recovery('user-message', None, resolve_authored_actions(quiet)),
+        )
 
     def test_read_authored_actions_unwraps_speech_and_drops_duplicate_ids(self):
         parsed = read_authored_actions('前<say id="a">甲</say>后<say id="b">乙</say>')
