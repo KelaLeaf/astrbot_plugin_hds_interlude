@@ -545,3 +545,130 @@ class AnsiStrippingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ConfigEditorTests(unittest.TestCase):
+    """控制台配置页：schema 取数 + **按 schema 路径**写配置。
+
+    这一层存在的理由：AstrBot 自带配置页把 `type: list` 渲染成字符串数组控件
+    （`ListConfigItem`，props 里连 `itemMeta` 都没有），对象行字段在那儿编辑会被
+    压成一个字符串。所以控制台按 `_conf_schema.json` 自己渲染表单——写入门禁也
+    随之从"手写 10 个开关"升级为"整份 schema"：路径必须在 schema 里。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self._tmp.name, 'astrbot_plugin_hds_interlude_config.json')
+        with open(self.path, 'w', encoding='utf-8') as handle:
+            handle.write('\ufeff' + json.dumps({
+                'qq_access': {'enabled': False, 'user_accounts': []},
+                'model_center': {'providers': [{'label': 'P', 'api_key': 'sk-real'}]},
+            }, ensure_ascii=False))
+        self.bridge = _make_bridge({})
+        self.bridge._live_config = None
+        self.bridge.config_file_path = lambda: self.path  # type: ignore[method-assign]
+        self.api = ConsoleApi(self.bridge)
+
+    def _read(self):
+        with open(self.path, encoding='utf-8-sig') as handle:
+            return json.load(handle)
+
+    # ---- 读 ----
+
+    def test_schema_payload_covers_every_group_and_field(self):
+        payload = _run(self.api.config_schema())
+        self.assertEqual(len(payload['groups']), 22, '22 个顶层分组都要下发给配置页')
+        qa = next(group for group in payload['groups'] if group['key'] == 'qq_access')
+        fields = {field['key']: field for field in qa['fields']}
+        self.assertEqual(fields['user_accounts']['value'], [])
+        self.assertTrue(fields['user_accounts']['rows'], '对象行要把行字段一起给前端')
+        self.assertIn('node', fields['user_accounts'], '原始 schema 节点：前端据此递归渲染')
+
+    def test_object_row_lists_get_the_host_editor_warning(self):
+        payload = _run(self.api.config_schema())
+        notes = {
+            field['path']: field['note']
+            for group in payload['groups'] for field in group['fields']
+        }
+        for path in ('qq_access.user_accounts', 'qq_access.bot_accounts',
+                     'qq_access.group_chats', 'model_center.providers'):
+            self.assertIsNotNone(notes[path], path)
+            self.assertEqual(notes[path]['level'], 'info' if path == 'model_center.providers' else 'warn', path)
+        # 标量列表不受影响：宿主的字符串数组控件编辑它是 OK 的。
+        self.assertIsNone(notes.get('browser.allowed_domains'))
+        # 连接池有专用面板：这里只给说明，不给通用控件。
+        self.assertTrue(
+            next(
+                field for group in payload['groups'] if group['key'] == 'model_center'
+                for field in group['fields'] if field['key'] == 'providers'
+            )['delegated'],
+        )
+
+    def test_secrets_never_reach_the_browser(self):
+        payload = _run(self.api.config_schema())
+        blob = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn('sk-real', blob)
+
+    # ---- 写 ----
+
+    def test_writes_a_whitelist_row_and_takes_effect(self):
+        _run(self.api.set_config_value('qq_access.user_accounts', [{
+            'qq': '10001', 'label': '主人', 'person_id': 'kela',
+            'profile': '爱喝冷萃', 'relationship': '恋人', 'enabled': True,
+        }]))
+        written = self._read()['qq_access']['user_accounts']
+        self.assertEqual(written[0]['label'], '主人')
+        # 写什么就生效什么：内存里的配置立刻能读到
+        self.assertEqual(self.bridge.section('onebot')['user_accounts'][0]['qq'], '10001')
+
+    def test_paths_outside_the_schema_are_rejected(self):
+        for path in ('不存在.字段', 'qq_access.nope', 'qq_access', ''):
+            with self.subTest(path=path):
+                with self.assertRaises(ConsoleError):
+                    _run(self.api.set_config_value(path, 1))
+
+    def test_list_fields_cannot_be_written_through(self):
+        """`…providers.api_key` 这种路径会把整个列表写成一个字典，必须拒绝。"""
+        with self.assertRaises(ConsoleError):
+            _run(self.api.set_config_value('model_center.providers.api_key', 'x'))
+        self.assertIsInstance(self._read()['model_center']['providers'], list)
+
+    def test_types_are_coerced_and_checked(self):
+        _run(self.api.set_config_value('qq_access.enabled', 'true'))
+        self.assertIs(self._read()['qq_access']['enabled'], True)
+        _run(self.api.set_config_value('runtime.max_message_characters', '1500'))
+        self.assertEqual(self._read()['runtime']['max_message_characters'], 1500)
+        # 行被压成字符串（宿主那个控件干的事）→ 报可读的错，而不是写坏配置
+        with self.assertRaises(ConsoleError):
+            _run(self.api.set_config_value('qq_access.bot_accounts', ['10001']))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.set_config_value('qq_access.user_accounts', {'qq': '1'}))
+
+    def test_clearing_a_key_falls_back_to_the_schema_default(self):
+        _run(self.api.set_config_value('runtime.max_message_characters', 1500))
+        _run(self.api.set_config_value('runtime.max_message_characters', None))
+        self.assertNotIn('max_message_characters', self._read()['runtime'])
+
+    def test_nested_object_field_is_writable(self):
+        _run(self.api.set_config_value('model_center.vision.enabled', True))
+        self.assertIs(self._read()['model_center']['vision']['enabled'], True)
+        # 同组其它字段没被顺手改掉
+        self.assertIn('providers', self._read()['model_center'])
+
+    # ---- 参与者（白名单一键填入） ----
+
+    def test_participants_endpoint_exposes_platform_accounts(self):
+        # 用真实的内存库：控制台读的是"某个会话真的来过"这件事，桩库读不出行。
+        database = Database(':memory:')
+        self.addCleanup(database.close)
+        database.register_tables()
+        database.upsert('interlude_participant', {
+            'id': 'p1', 'storyId': 's1', 'platform': 'qq', 'selfId': '20000',
+            'userId': '10001', 'channelId': '', 'personId': 'kela',
+            'displayName': '主人', 'relationship': '恋人', 'status': 'active',
+        })
+        self.bridge.db = database
+        payload = _run(self.api.participants())
+        self.assertEqual(payload['participants'][0]['user_id'], '10001')
+        self.assertEqual(payload['participants'][0]['display_name'], '主人')

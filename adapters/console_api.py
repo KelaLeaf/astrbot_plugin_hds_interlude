@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import inspect
+import json
 import os
 from typing import Any, Optional
 
@@ -29,7 +31,8 @@ from .astrbot_bridge import (
     _plugin_version,
 )
 
-__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'mask_endpoint']
+__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'mask_endpoint',
+           'load_config_schema', 'coerce_schema_value']
 
 #: 控制台「模型」页展示的任务顺序与中文名（与 `model_routing` 的任务键一致）。
 CONSOLE_TASKS: tuple[tuple[str, str], ...] = (
@@ -42,8 +45,245 @@ CONSOLE_TASKS: tuple[tuple[str, str], ...] = (
     ('vision', '侧端识图'),
 )
 
+# ===================================================================== #
+# 配置 schema：控制台配置页的取数与写入依据
+#
+# 为什么要有这一层：AstrBot 自带的配置页对「列表」只提供字符串数组控件
+# （`ListConfigItem`），`items` 里的行内字段定义**完全不生效**——对象行
+# （`user_accounts` / `group_chats` / `providers` …）在那儿编辑会被压成字符串。
+# 所以控制台自己按 `_conf_schema.json` 渲染表单，并且**只接受 schema 里声明过的
+# 路径**：这是"白名单"从"手写 10 个开关"升级为"整个 schema"的关键——
+# 控制台可以改配置，但改不动 schema 之外的东西。
+# ===================================================================== #
+
+#: 插件包根下的配置 schema（本文件在 `adapters/` 里）。
+CONFIG_SCHEMA_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '_conf_schema.json',
+)
+
+#: 标量列表的元素规格键：带这些键的 `items` 是「元素规格」而不是「行内字段映射」。
+_SCALAR_ITEM_KEYS = frozenset((
+    'type', 'options', 'default', 'description', 'hint', 'slider', 'render_type',
+    'editor_mode', 'editor_language', 'editor_theme', '_special', 'invisible',
+))
+
+#: 有专用面板 / 需要额外语义的字段：控制台配置页只显示说明，不给通用控件。
+DELEGATED_FIELDS: dict[str, str] = {
+    'model_center.providers': '模型连接池请在「模型」面板里编辑：那里不回显密钥，还能看用量与任务路由。',
+}
+
+#: 行为提醒（不是宿主的锅，是配置本身的坑）：路径 → 提示。
+FIELD_NOTES: dict[str, str] = {
+    'qq_access.enabled': '开启后空白名单等于**全部拒绝**：机器人白名单与用户白名单都要有内容。',
+    'qq_access.user_accounts': 'label 决定她怎么称呼你（留空则用平台昵称）；profile / relationship 留空时，'
+                              '回落到「故事档案」的默认用户资料与默认初始关系。',
+    'qq_access.bot_accounts': '只决定"哪个登录账号收消息"，label 不进模型。',
+    'qq_access.group_chats': '群用途与角色定位会进模型的群上下文；其余是节奏与意愿参数。',
+    'story_defaults.style': '故事级文风，接在「提示词」的全局文风之后；两级都生效。',
+    'story_defaults.persona_id': '选中 AstrBot 人格会用它覆盖角色名与角色设定（留空则用下面的手填项）。',
+    'prompts.style_prompt': '全局默认文风；故事档案里的「故事文风」可以在它之后再补一层。',
+    'runtime.auto_create': '开启后第一次私聊会自动建故事；白名单仍优先决定谁能进来。',
+}
+
+#: 宿主配置页编辑不了「对象行列表」——把它说清楚，别让用户在那儿改坏配置。
+HOST_LIST_DEGRADED_NOTE = (
+    'AstrBot 自带的配置页把「列表」当字符串数组渲染，行内字段会被忽略：在那儿编辑会把整行变成'
+    '一个字符串（白名单会静默失效）。请在本页编辑，或用「备份 / 导入」提交 JSON。'
+)
+
+_SCHEMA_CACHE: dict[str, Any] = {'mtime': None, 'schema': {}}
+
+
+def load_config_schema() -> dict[str, Any]:
+    """读 `plugin/_conf_schema.json`（按 mtime 缓存，改完不用重启）。"""
+    try:
+        mtime = os.path.getmtime(CONFIG_SCHEMA_PATH)
+    except OSError:
+        return {}
+    if _SCHEMA_CACHE['mtime'] == mtime and _SCHEMA_CACHE['schema']:
+        return _SCHEMA_CACHE['schema']
+    try:
+        with open(CONFIG_SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            schema = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(schema, dict):
+        return {}
+    _SCHEMA_CACHE['mtime'] = mtime
+    _SCHEMA_CACHE['schema'] = schema
+    return schema
+
+
+def schema_row_fields(spec: Any) -> Optional[dict[str, Any]]:
+    """列表字段是不是「对象行」（`items` 是字段映射）？是就返回行 schema。
+
+    `{"type": "list", "items": {"type": "string"}}` 是**标量**列表（元素规格）；
+    `{"type": "list", "items": {"qq": {...}, "label": {...}}}` 才是对象行
+    —— 后者正是宿主配置页编不了的那一类。
+    """
+    if not isinstance(spec, dict) or spec.get('type') != 'list':
+        return None
+    items = spec.get('items')
+    if not isinstance(items, dict) or not items:
+        return None
+    row = {key: value for key, value in items.items() if key not in _SCALAR_ITEM_KEYS}
+    if not row:
+        return None
+    if all(isinstance(value, dict) and 'type' in value for value in row.values()):
+        return row
+    return None
+
+
+def host_editor_note(path: str, spec: Any) -> Optional[dict[str, str]]:
+    """这个字段在**宿主**配置页里能不能编辑好？返回 `{level, text}` 或 None。
+
+    `level`：`warn` = 宿主控件会写坏这个字段；`info` = 有专用入口或行为提醒。
+    """
+    if path in DELEGATED_FIELDS:
+        return {'level': 'info', 'text': DELEGATED_FIELDS[path]}
+    if schema_row_fields(spec) is not None:
+        return {'level': 'warn', 'text': HOST_LIST_DEGRADED_NOTE}
+    note = FIELD_NOTES.get(path)
+    if note:
+        return {'level': 'info', 'text': note}
+    return None
+
+
+def _coerce_scalar(kind: str, value: Any, path: str) -> Any:
+    if value is None:
+        return None
+    if kind == 'bool':
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ('true', '1', 'yes', 'on'):
+                return True
+            if text in ('false', '0', 'no', 'off', ''):
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        raise ConsoleError('「%s」需要 true / false' % path)
+    if kind == 'int':
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            raise ConsoleError('「%s」需要整数' % path) from None
+    if kind == 'float':
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise ConsoleError('「%s」需要数字' % path) from None
+    if kind in ('string', 'text', 'file'):
+        if isinstance(value, (dict, list)):
+            raise ConsoleError('「%s」需要文本' % path)
+        return str(value)
+    if kind == 'list':
+        if not isinstance(value, list):
+            raise ConsoleError('「%s」需要列表' % path)
+        return value
+    if kind in ('object', 'dict'):
+        if not isinstance(value, dict):
+            raise ConsoleError('「%s」需要对象' % path)
+        return value
+    return value
+
+
+def coerce_schema_value(spec: Any, value: Any, path: str = '') -> Any:
+    """把前端传来的值按 schema 声明的类型收一遍；类型不对就报可读的错。
+
+    对象行列表会逐行按行 schema 收字段，**行里 schema 之外的键原样保留**
+    （用户手写的扩展位不该被控制台吃掉）。
+    """
+    if not isinstance(spec, dict):
+        return value
+    kind = str(spec.get('type') or '')
+    row = schema_row_fields(spec)
+    if row is None:
+        return _coerce_scalar(kind, value, path)
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ConsoleError('「%s」需要列表' % path)
+    rows: list[Any] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ConsoleError('「%s」第 %d 行需要对象（行被压成了字符串？）' % (path, index + 1))
+        clean: dict[str, Any] = dict(item)
+        for key, field in row.items():
+            if key in clean:
+                clean[key] = coerce_schema_value(field, clean[key], '%s[].%s' % (path, key))
+        rows.append(clean)
+    return rows
+
 #: 任务键 → 配置里对应的「指名模型」项（见 `AstrbotBridge.TASK_MODEL_PATHS`）。
 TASK_LABELS = dict(CONSOLE_TASKS)
+
+
+def _resolve_schema_field(schema: Any, path: Any) -> dict[str, Any]:
+    """把 `分组.字段` 解析成 schema 里的字段声明；不在 schema 里就报错。
+
+    这是控制台写配置的**唯一门禁**：只有 `_conf_schema.json` 声明过的路径能写，
+    未知路径一律拒绝——控制台能改配置，但改不出 schema 之外的东西。
+    """
+    parts = [part for part in _text(path).split('.') if part]
+    if not parts:
+        raise ConsoleError('缺少配置路径')
+    if len(parts) < 2:
+        raise ConsoleError('「%s」是分组，不是配置项' % parts[0])
+    spec = schema.get(parts[0]) if isinstance(schema, dict) else None
+    if not isinstance(spec, dict) or spec.get('type') != 'object':
+        raise ConsoleError('不认识的配置分组：%s' % parts[0])
+    walked: list[str] = [parts[0]]
+    for step in parts[1:]:
+        # 只能沿着**对象**往下走：列表/标量字段必须整段写入，否则
+        # `…providers.api_key` 这种路径会把整个列表写成一个字典。
+        if spec.get('type') != 'object':
+            raise ConsoleError('「%s」是 %s 字段，只能整段写入' % ('.'.join(walked), spec.get('type')))
+        items = spec.get('items')
+        nxt = items.get(step) if isinstance(items, dict) else None
+        if not isinstance(nxt, dict):
+            raise ConsoleError('不认识的配置项：%s' % '.'.join(parts))
+        spec = nxt
+        walked.append(step)
+    return spec
+
+
+def _set_schema_path(target: dict[str, Any], path: Any, value: Any) -> None:
+    """把值写进嵌套字典（沿路径浅拷贝，别改到调用方手里那份配置）。"""
+    parts = [part for part in _text(path).split('.') if part]
+    node = target
+    for step in parts[:-1]:
+        child = node.get(step)
+        node[step] = dict(child) if isinstance(child, dict) else {}
+        node = node[step]
+    if parts:
+        node[parts[-1]] = value
+
+
+def _drop_schema_path(target: dict[str, Any], path: Any) -> None:
+    """删掉一个键：清空时让宿主按 schema 默认值重建，而不是留个 null 在配置里。"""
+    parts = [part for part in _text(path).split('.') if part]
+    node: Any = target
+    for step in parts[:-1]:
+        child = node.get(step) if isinstance(node, dict) else None
+        if not isinstance(child, dict):
+            return
+        node = child
+    if parts and isinstance(node, dict):
+        node.pop(parts[-1], None)
+
+
+def _mask_secrets(value: Any) -> Any:
+    """密钥类字段一律不回流到浏览器（连接行的 `api_key`）。"""
+    if isinstance(value, dict):
+        return {
+            key: ('' if key in ('api_key', 'apiKey') else _mask_secrets(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_secrets(item) for item in value]
+    return value
 
 
 def mask_endpoint(value: Any) -> str:
@@ -429,6 +669,178 @@ class ConsoleApi:
             'saved_via': saved_via,
             'changed': f'{label} → {"开启" if value else "关闭"}',
         }
+
+    # ------------------------------------------------------------------ #
+    # 配置页（schema 驱动：所有可配置项都能在控制台改）
+    # ------------------------------------------------------------------ #
+
+    async def config_schema(self) -> dict[str, Any]:
+        """把 `_conf_schema.json` + 磁盘上的当前值一起交给配置页。
+
+        每个字段带三样东西：**当前值**（密钥类字段会抹掉）、**schema 声明**
+        （类型/说明/hint/默认值/候选项），以及**兼容性提示** `note`
+        ——宿主配置页编不了的字段在这里会被点名（见 `host_editor_note`）。
+        """
+        schema = load_config_schema()
+        raw = self.bridge.raw_config()
+        groups: list[dict[str, Any]] = []
+        for group_key, group_spec in schema.items():
+            if not isinstance(group_spec, dict) or group_spec.get('type') != 'object':
+                continue
+            current = raw.get(group_key)
+            current = current if isinstance(current, dict) else {}
+            fields: list[dict[str, Any]] = []
+            for field_key, spec in (group_spec.get('items') or {}).items():
+                if not isinstance(spec, dict):
+                    continue
+                path = '%s.%s' % (group_key, field_key)
+                row = schema_row_fields(spec)
+                fields.append({
+                    'key': field_key,
+                    'path': path,
+                    'type': str(spec.get('type') or 'string'),
+                    #: 原始 schema 节点：前端据此递归渲染（对象/列表/标量都走同一套）。
+                    'node': spec,
+                    'description': _text(spec.get('description')),
+                    'hint': _text(spec.get('hint')),
+                    'default': spec.get('default'),
+                    'options': spec.get('options') if isinstance(spec.get('options'), list) else None,
+                    'rows': [
+                        {
+                            'key': row_key,
+                            'type': str(row_spec.get('type') or 'string'),
+                            'description': _text(row_spec.get('description')),
+                            'hint': _text(row_spec.get('hint')),
+                            'default': row_spec.get('default'),
+                            'options': row_spec.get('options') if isinstance(row_spec.get('options'), list) else None,
+                        }
+                        for row_key, row_spec in (row or {}).items()
+                    ] or None,
+                    'item_type': str((spec.get('items') or {}).get('type') or '') if row is None else '',
+                    'special': _text(spec.get('_special')),
+                    'invisible': bool(spec.get('invisible')),
+                    'advanced': bool(spec.get('advanced')),
+                    'value': _mask_secrets(current.get(field_key, None)),
+                    'present': field_key in current,
+                    'note': host_editor_note(path, spec),
+                    'delegated': path in DELEGATED_FIELDS,
+                })
+            groups.append({
+                'key': group_key,
+                'description': _text(group_spec.get('description')),
+                'invisible': bool(group_spec.get('invisible')),
+                'fields': fields,
+            })
+        return {
+            'groups': groups,
+            'choices': await self._vendor_choices(),
+            'config_path': _text(self.bridge.config_file_path()),
+            'version': _plugin_version(),
+        }
+
+    async def set_config_value(self, path: Any, value: Any) -> dict[str, Any]:
+        """按 schema 路径写一个配置项（**路径必须存在于 schema**）。
+
+        这条接口把老版本的"手写白名单"升级成"整份 schema 白名单"：
+        控制台现在能改所有可配置项，但仍然改不动 schema 之外的东西。
+        写盘走 `Bridge.save_raw_config()`（与配置导入同一条路径），并在内存里立即生效。
+        """
+        schema = load_config_schema()
+        spec = _resolve_schema_field(schema, path)
+        text_path = _text(path)
+        if text_path.endswith(('api_key', 'apiKey')):
+            if value is None:
+                coerced: Any = ''
+            elif value == '':
+                return {  # 空串 = 保留原值（与连接池编辑器的约定一致）
+                    'path': text_path, 'value': '', 'saved_via': '',
+                    'changed': '%s 保持不变' % text_path,
+                }
+            else:
+                coerced = coerce_schema_value(spec, value, text_path)
+        else:
+            coerced = coerce_schema_value(spec, value, text_path)
+        target = dict(self.bridge.raw_config())
+        if coerced is None:
+            # 清空 = 删键，让宿主按 schema 默认值重建；留个 `null` 会污染强类型字段。
+            _drop_schema_path(target, text_path)
+        else:
+            _set_schema_path(target, text_path, coerced)
+        saved_via = await self.bridge.save_raw_config(target)
+        self._reload()
+        return {
+            'path': text_path,
+            'value': _mask_secrets(coerced),
+            'saved_via': saved_via,
+            'changed': '%s 已更新' % text_path,
+            'config_path': _text(self.bridge.config_file_path()),
+        }
+
+    async def participants(self, story_id: str = '') -> dict[str, Any]:
+        """已知参与者（给白名单填表用：从真人会话里直接把 QQ 与昵称带过来）。"""
+        rows = _safe_all(self.bridge.db, 'interlude_participant', order='updatedAt DESC', limit=200)
+        rows = [row for row in rows if isinstance(row, dict)]
+        if story_id:
+            rows = [row for row in rows if _text(row.get('storyId')) == story_id]
+        return {
+            'participants': [
+                {
+                    'participant_id': _text(row.get('id')),
+                    'story_id': _text(row.get('storyId')),
+                    'platform': _text(row.get('platform')),
+                    'self_id': _text(row.get('selfId')),
+                    'user_id': _text(row.get('userId')),
+                    'channel_id': _text(row.get('channelId')),
+                    'person_id': _text(row.get('personId')),
+                    'display_name': _text(row.get('displayName')),
+                    'relationship': _text(row.get('relationship')),
+                    'status': _text(row.get('status')),
+                    'updated_at': _text(row.get('updatedAt')),
+                }
+                for row in rows
+            ],
+        }
+
+    async def _vendor_choices(self) -> dict[str, list[dict[str, str]]]:
+        """`_special` 选择器的候选项（Provider / 人格）。"""
+        providers: list[dict[str, str]] = [{'value': '', 'label': '（留空 = 默认 Provider）'}]
+        for row in self._astrbot_providers():
+            identifier = _text(row.get('id'))
+            if not identifier:
+                continue
+            model = _text(row.get('model'))
+            providers.append({
+                'value': identifier,
+                'label': '%s · %s' % (identifier, model) if model else identifier,
+            })
+        return {
+            'select_provider': providers,
+            'select_provider_stt': providers,
+            'select_persona': await self._persona_choices(),
+        }
+
+    async def _persona_choices(self) -> list[dict[str, str]]:
+        """AstrBot 里的人格列表（`select_persona` 的候选项）。
+
+        `PersonaManager.get_all_personas` 是**协程**（`persona_mgr.py:187`）——
+        漏 await 会得到 `'coroutine' object is not iterable`，整页 500（实测过）。
+        """
+        manager = getattr(self.bridge.context, 'persona_manager', None)
+        getter = getattr(manager, 'get_all_personas', None)
+        if not callable(getter):
+            return []
+        try:
+            personas = getter()
+            if inspect.isawaitable(personas):
+                personas = await personas
+        except Exception:  # noqa: BLE001 - 读不到人格不影响整页
+            return []
+        choices: list[dict[str, str]] = []
+        for persona in personas or []:
+            identifier = _text(getattr(persona, 'persona_id', '') or getattr(persona, 'id', ''))
+            if identifier:
+                choices.append({'value': identifier, 'label': identifier})
+        return choices
 
     #: 连接行允许前端写的字段与类型（其余字段保留原值，杜绝越权写）。
     CONNECTION_FIELDS: dict[str, str] = {

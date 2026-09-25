@@ -196,6 +196,36 @@ export function Input({
   )
 }
 
+/** 多行文本（配置页的 `text` 字段用；原生 textarea，同样不引表单库）。 */
+export function Textarea({
+  value,
+  onInput,
+  rows = 4,
+  placeholder,
+  disabled,
+  mono,
+}: {
+  value: string
+  onInput: (next: string) => void
+  rows?: number
+  placeholder?: string
+  disabled?: boolean
+  mono?: boolean
+}) {
+  return (
+    <textarea
+      rows={rows}
+      value={value}
+      placeholder={placeholder}
+      disabled={disabled}
+      onInput={(event) => onInput((event.currentTarget as HTMLTextAreaElement).value)}
+      class={`w-full resize-y rounded-lg border border-line bg-panel px-2 py-1.5 text-xs leading-5 outline-none transition focus:border-accent disabled:opacity-50 ${
+        mono ? 'font-mono' : ''
+      }`}
+    />
+  )
+}
+
 export function Select({
   value,
   onChange,

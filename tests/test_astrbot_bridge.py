@@ -1560,6 +1560,9 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/flags',
             f'/{main_module.PLUGIN_NAME}/console/connections',
             f'/{main_module.PLUGIN_NAME}/console/connections-delete',
+            f'/{main_module.PLUGIN_NAME}/console/config',
+            f'/{main_module.PLUGIN_NAME}/console/config-set',
+            f'/{main_module.PLUGIN_NAME}/console/participants',
             f'/{main_module.PLUGIN_NAME}/config-export',
             f'/{main_module.PLUGIN_NAME}/config-import-preview',
             f'/{main_module.PLUGIN_NAME}/config-import-apply',
@@ -1585,7 +1588,9 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             handler, methods = seen[f'/{main_module.PLUGIN_NAME}/console/{panel}']
             self.assertEqual(methods, ['GET'], panel)
             self.assertIsNotNone(handler, panel)
-        # 写操作一律 POST，且**只有这三个**——控制台不是配置编辑器
+        # 写操作一律 POST。控制台**不是**随便写：每一条都走白名单——
+        # 开关认 FLAG_KEYS，连接行认 CONNECTION_FIELDS，配置页认 `_conf_schema.json`
+        # 里声明过的路径（`set_config_value` 会拒绝 schema 之外的路径）。
         writer = [
             route for route, _h, methods, _d in context.web_apis
             if route.startswith(f'/{main_module.PLUGIN_NAME}/console/') and 'GET' not in methods
@@ -1594,6 +1599,7 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/flags',
             f'/{main_module.PLUGIN_NAME}/console/connections',
             f'/{main_module.PLUGIN_NAME}/console/connections-delete',
+            f'/{main_module.PLUGIN_NAME}/console/config-set',
         ])
 
     def test_every_registration_carries_a_description(self):

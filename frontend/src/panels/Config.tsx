@@ -1,9 +1,21 @@
-/** 配置备份面板：从原来的 `pages/config-backup/` 页面迁移过来，功能一字未减。 */
-import { useState } from 'preact/hooks'
-import { downloadFile, uploadFile, apiPost } from '../bridge'
+/**
+ * 配置面板。
+ *
+ * 两块：
+ * 1. **配置**（`tab = edit`）：按 `_conf_schema.json` 渲染的**全量编辑器**。为什么要自己做：
+ *    AstrBot 自带配置页把「列表」当字符串数组控件（`ListConfigItem`），对象行
+ *    （`user_accounts` / `group_chats` / `providers`…）在那儿编辑会被压成字符串——
+ *    所以控制台按 schema 自己画表，并在这些字段上挂"宿主页编不了"的提示。
+ * 2. **备份**（`tab = backup`）：导出 / 导入（原 `pages/config-backup/` 的功能，一字未减）。
+ */
+import { useMemo, useState } from 'preact/hooks'
+import { apiPost, downloadFile, uploadFile } from '../bridge'
+import { useQuery } from '../query'
 import type { PanelProps } from '../main'
-import type { ImportPreview } from '../types'
+import type { ConfigSchemaPayload, ImportPreview, ParticipantRow } from '../types'
 import { Badge, Button, Empty, ErrorNote, FilePicker, Grid, Icon, Note, Panel, Stack, Stat } from '../components/ui'
+import { SchemaField, SchemaGroupCard, rowFields } from '../components/SchemaForm'
+import type { SchemaNode } from '../components/SchemaForm'
 
 interface ApplyResult {
   saved_via: string
@@ -18,7 +30,208 @@ function stamp() {
   return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
 }
 
+/** 白名单类列表可以从已知会话一键带出 QQ / 群号。 */
+const AUTOFILL: Record<string, { label: string; keys: string[] }> = {
+  'qq_access.user_accounts': { label: '从最近会话填入', keys: ['user_id', 'display_name'] },
+  'qq_access.bot_accounts': { label: '从最近会话填入', keys: ['self_id'] },
+  'qq_access.group_chats': { label: '从最近会话填入', keys: ['channel_id', 'display_name'] },
+}
+
 export function Config({ refreshKey }: PanelProps) {
+  const [tab, setTab] = useState<'edit' | 'backup'>('edit')
+  return (
+    <Stack>
+      <div class="flex items-center gap-2">
+        <Button variant={tab === 'edit' ? 'primary' : 'default'} icon="config" onClick={() => setTab('edit')}>
+          配置
+        </Button>
+        <Button variant={tab === 'backup' ? 'primary' : 'default'} icon="shield" onClick={() => setTab('backup')}>
+          备份 / 导入
+        </Button>
+      </div>
+      {tab === 'edit' ? <ConfigEditor refreshKey={refreshKey} /> : <ConfigBackup refreshKey={refreshKey} />}
+    </Stack>
+  )
+}
+
+/* ------------------------------------------------------------------ #
+ * 全量配置编辑器
+ * ------------------------------------------------------------------ */
+
+function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
+  const schema = useQuery<ConfigSchemaPayload>('console/config', {}, { nonce: refreshKey })
+  const participants = useQuery<{ participants: ParticipantRow[] }>('console/participants', {}, { nonce: refreshKey })
+  const [group, setGroup] = useState('')
+  const [edits, setEdits] = useState<Record<string, unknown>>({})
+  const [message, setMessage] = useState('')
+  const [failure, setFailure] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const groups = schema.data?.groups ?? []
+  const active = useMemo(
+    () => groups.find((item) => item.key === group) ?? groups[0],
+    [groups, group],
+  )
+  const dirty = Object.keys(edits)
+  const dirtyInGroup = (active?.fields ?? [])
+    .filter((field) => field.path in edits)
+    .map((field) => field.path)
+
+  async function save(paths: string[]) {
+    if (!paths.length) return
+    setSaving(true)
+    setFailure('')
+    setMessage('')
+    try {
+      for (const path of paths) {
+        await apiPost('console/config-set', { path, value: edits[path] ?? null })
+      }
+      setEdits((prev) => {
+        const next = { ...prev }
+        for (const path of paths) delete next[path]
+        return next
+      })
+      setMessage(`已保存并生效（${paths.length} 项）：${paths.join('、')}`)
+      schema.reload()
+    } catch (problem) {
+      setFailure(problem instanceof Error ? problem.message : String(problem))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (schema.error) return <ErrorNote text={schema.error} onRetry={schema.reload} />
+  if (schema.loading && !schema.data) return <Empty text="正在读取配置…" icon="config" />
+  if (!active) return <Empty text="没有读到配置 schema" icon="warning" />
+
+  const known = participants.data?.participants ?? []
+
+  return (
+    <Stack>
+      {failure && <ErrorNote text={failure} onRetry={() => setFailure('')} />}
+      {message && <Note tone="ok">{message}</Note>}
+      {dirty.length > 0 && (
+        <Note tone="warn">
+          有 {dirty.length} 项改动还没保存：{dirty.slice(0, 6).join('、')}
+          {dirty.length > 6 ? ' …' : ''}
+          <span class="ml-2 inline-flex gap-2 align-middle">
+            <Button variant="primary" icon="save" disabled={saving} onClick={() => void save(dirty)}>
+              全部保存
+            </Button>
+            <Button onClick={() => setEdits({})}>丢弃改动</Button>
+          </span>
+        </Note>
+      )}
+
+      <div class="flex flex-wrap gap-1.5">
+        {groups.map((item) => {
+          const warned = item.fields.filter((field) => field.note?.level === 'warn').length
+          const changed = item.fields.filter((field) => field.path in edits).length
+          return (
+            <button
+              key={item.key}
+              type="button"
+              onClick={() => setGroup(item.key)}
+              class={`rounded-lg border px-2 py-1 text-[11px] transition ${
+                item.key === active.key
+                  ? 'border-accent bg-accent/10 text-accent'
+                  : 'border-line bg-panel text-muted hover:bg-raised'
+              }`}
+            >
+              {shortTitle(item.description) || item.key}
+              {changed > 0 ? <span class="ml-1 text-warn">·{changed}</span> : warned > 0 ? <span class="ml-1 text-warn">!</span> : null}
+            </button>
+          )
+        })}
+      </div>
+
+      <SchemaGroupCard
+        title={shortTitle(active.description) || active.key}
+        description={active.description ?? ''}
+        actions={
+          <>
+            <Button
+              variant="primary"
+              icon="save"
+              disabled={saving || !dirtyInGroup.length}
+              onClick={() => void save(dirtyInGroup)}
+            >
+              保存本组{dirtyInGroup.length ? `（${dirtyInGroup.length}）` : ''}
+            </Button>
+            <Button icon="refresh" onClick={schema.reload}>重新读取</Button>
+          </>
+        }
+      >
+        {active.fields
+          .filter((field) => !field.invisible)
+          .map((field) => {
+            const node = field.node as SchemaNode
+            const value = field.path in edits ? edits[field.path] : field.value
+            const rows = rowFields(node)
+            const fill = AUTOFILL[field.path]
+            return (
+              <SchemaField
+                key={field.path}
+                path={field.path}
+                node={node}
+                value={value}
+                note={field.note}
+                delegated={field.delegated}
+                choices={schema.data?.choices}
+                autofill={
+                  fill && rows
+                    ? {
+                        label: fill.label,
+                        key: fill.keys[0],
+                        sourceKey: fill.keys[0],
+                        run: async () => {
+                          const source = fill.keys.find((key) => known.some((row) => (row as never)[key]))
+                          const row = known.find((item) => source && (item as never)[source])
+                          if (!row || !source) return null
+                          const filled: Record<string, unknown> = {}
+                          if (source === 'user_id') filled.qq = row.user_id
+                          if (source === 'self_id') filled.qq = row.self_id
+                          if (source === 'channel_id') filled.group_id = row.channel_id
+                          if (row.display_name && 'label' in rows) filled.label = row.display_name
+                          participants.reload()
+                          return filled
+                        },
+                      }
+                    : undefined
+                }
+                onChange={(next) => setEdits((prev) => ({ ...prev, [field.path]: next }))}
+              />
+            )
+          })}
+      </SchemaGroupCard>
+
+      <Panel title="为什么有些字段标着「宿主页编不了」" icon="warning">
+        <div class="flex flex-col gap-2 text-xs text-muted">
+          <p>
+            AstrBot 自带配置页把 <code class="font-mono">type: list</code> 渲染成字符串数组控件，
+            <code class="font-mono">items</code> 里的行内字段定义会被忽略——在那儿编辑会把整行压成一个字符串
+            （白名单会静默失效、连接池会丢字段）。
+          </p>
+          <p>
+            本页按 <code class="font-mono">_conf_schema.json</code> 自己渲染，所以对象行、嵌套对象、
+            标量列表都能正确编辑。写入仍然只认 schema 里声明过的路径：控制台能改配置，但改不出配置之外的东西。
+          </p>
+        </div>
+      </Panel>
+    </Stack>
+  )
+}
+
+/** 分组标题：schema 的 description 前面挂着 `【必填 2】` 这类标记，导航里省掉。 */
+function shortTitle(text: string | undefined): string {
+  return String(text ?? '').replace(/^【[^】]*】\s*/, '')
+}
+
+/* ------------------------------------------------------------------ #
+ * 备份 / 导入（原「配置备份」页）
+ * ------------------------------------------------------------------ */
+
+function ConfigBackup({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
   void refreshKey
   const [exporting, setExporting] = useState('')
   const [importing, setImporting] = useState('')
