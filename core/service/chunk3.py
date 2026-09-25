@@ -47,7 +47,7 @@
    （`next_revision` / `in_flight_request_id`），而已经落地的 `base.py`（Chunk0
    `set_desktop_runtime_phase`）读写的是 camelCase（`nextRevision` /
    `inFlightRequestId`）。两者都能创建这个 dict，所以本文件用 `_turn_get` 双读、
-   用 `_turn_set` **跟随该 dict 已有的拼写**（空 dict 默认上游 camelCase），
+   用 `_turn_set` **两种拼写都写**（见 `helpers._turn_set` 的说明），
    两种拼写都不会被读漏。
 2. **`id > cursor` 查询**：`Database` 只支持等值 `where`（见 `base.db_get`
    文档串），所以上游 `{storyId, id: {$gt: cursor}}` 的归档窗口改为
@@ -89,6 +89,8 @@ from ..time import format_log_time, iso, parse_dt
 from .base import ServiceBase, pick
 from .config import RECALLABLE_ENTRY_KINDS, is_trusted_image_host
 from .helpers import (
+    _turn_get,
+    _turn_set,
     guess_audio_format,
     guess_image_mime,
     is_animated_image_mime,
@@ -300,24 +302,6 @@ def _runtime_config(service: Any) -> dict[str, Any]:
     return _group(service.config, 'runtime')
 
 
-# =========================================================================== #
-# 缓冲回合 dict 的拼写自适应（见模块文档串「互操作」第 1 条）
-# =========================================================================== #
-
-def _turn_get(turn: Any, camel: str, snake: Optional[str] = None) -> Any:
-    """读缓冲回合 / 缓冲消息的字段：camelCase 与 snake_case 都认。"""
-    return pick(turn, camel, snake or _to_snake(camel))
-
-
-def _turn_set(turn: dict[str, Any], camel: str, snake: str, value: Any) -> Any:
-    """写缓冲回合的字段：**跟随该 dict 已有的拼写**，空 dict 用上游 camelCase。
-
-    `base.py`（Chunk0）写/读 camelCase，`config.py` 的 TypedDict 声明的是
-    snake_case；创建这个 dict 的 chunk 未知，所以不能单方面固定一种拼写。
-    """
-    key = snake if (snake in turn and camel not in turn) else camel
-    turn[key] = value
-    return value
 
 
 # =========================================================================== #

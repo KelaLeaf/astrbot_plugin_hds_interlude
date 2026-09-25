@@ -4,12 +4,12 @@
 
 HDS Interlude 是一个给 **AstrBot** 用的持续叙事聊天插件（上游 Koishi 版的完整移植）。装上以后，你的角色不再"收到一条消息就回一条"，而是**一直在过自己的日子**——你发过去的消息只是这段时间里发生的一件事，她可能马上看见，也可能没看见、不想回、正忙着、晚点再回。
 
-当前版本 `v1.2.14`，对应上游 `1.0.1-beta6-rebuild`。
+当前版本 `v1.2.15`，对应上游 `1.0.1-beta6-rebuild`。
 
 | | |
 | --- | --- |
 | 插件名 | `astrbot_plugin_hds_interlude` |
-| 版本 | `v1.2.14` |
+| 版本 | `v1.2.15` |
 | AstrBot | `>=4.16,<5` |
 | 依赖 | `httpx`、`pyyaml` |
 | 上游 | [HDS Interlude（Koishi）](https://gitee.com/MomoiCore/hds-interlude) |
