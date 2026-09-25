@@ -185,7 +185,15 @@ export interface MemoryPayload {
   story: StoryBrief | null
   facts: FactRow[]
   memories: Array<{ id: number; category: string; content: string; importance: number; status: string; updated_at: string }>
-  intents: Array<{ id: number; type: string; summary: string; status: string; not_before: string }>
+  intents: Array<{
+    id: number
+    type: string
+    summary: string
+    status: string
+    not_before: string
+    /** 纯宿主调度（拆分气泡节拍 / 失败重试），默认折叠。 */
+    internal?: boolean
+  }>
   patches: Array<{
     id: number
     target: string
