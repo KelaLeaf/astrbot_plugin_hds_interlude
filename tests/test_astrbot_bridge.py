@@ -1183,14 +1183,55 @@ class BridgeIntegrationTests(unittest.TestCase):
         self.assertIs(bridge.service.ctx, bridge.interlude_context)
         self.assertFalse(bridge.config_flag('runtime', 'capture_direct_messages', default=True))
 
-    def test_handle_event_skips_empty_content(self):
+    def test_handle_event_consumes_an_empty_private_event_so_no_second_persona_answers(self):
+        """空内容的私聊事件：**吞掉**（受控偏离，见 PORTING_NOTES §18）。
+
+        上游在这里 `next()`（交回其它处理器）。AstrBot 的部署里通常还有第二个聊天
+        Agent，交回去就是同一段私聊里冒出第二个人格——实测：用户"一张图 + 一句文字"
+        分两条发来，图片那条的消息链解析为空，另一个她回了「主人这是夜班的宵夜吗？」。
+        """
         import asyncio
 
         bridge = _make_bridge()
         event = FakeMessageEvent(message='', components=[])
         replies = asyncio.run(bridge.handle_event(event))
         self.assertEqual(replies, [])
+        self.assertTrue(event.stopped, '归我们管的私聊必须吞掉，不能让别的 Agent 接手')
+
+    def test_handle_event_leaves_an_empty_group_event_alone(self):
+        import asyncio
+
+        bridge = _make_bridge()
+        event = FakeMessageEvent(message='', components=[], group_id='90001')
+        self.assertEqual(asyncio.run(bridge.handle_event(event)), [])
+        self.assertFalse(event.stopped, '群聊没内容时保持上游语义，交回其它处理器')
+
+    def test_handle_event_leaves_an_empty_private_event_alone_when_capture_is_off(self):
+        import asyncio
+
+        bridge = _make_bridge({'runtime': {'capture_direct_messages': False}})
+        event = FakeMessageEvent(message='', components=[])
+        self.assertEqual(asyncio.run(bridge.handle_event(event)), [])
         self.assertFalse(event.stopped)
+
+    def test_handle_event_keeps_an_image_only_private_event(self):
+        """只有图片（没有文字）的私聊必须照常进叙事——图片是合法的原生输入。"""
+        import asyncio
+
+        bridge = _make_bridge()
+        calls = []
+
+        async def fake_receive(session):
+            calls.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        event = FakeMessageEvent(message='', components=[Image(url='https://example.com/a.jpg')])
+        replies = asyncio.run(bridge.handle_event(event))
+        self.assertEqual(replies, [])
+        self.assertEqual(len(calls), 1, '图片消息不能被当成"空消息"丢掉')
+        self.assertIn('<img', calls[0].content)
+        self.assertTrue(event.stopped)
 
     def test_handle_event_ignores_management_command_by_default(self):
         import asyncio

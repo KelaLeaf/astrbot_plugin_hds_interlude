@@ -2373,7 +2373,9 @@ class AstrbotBridge:
 
         逐条对应上游 `apply()` 里的中间件（`upstream/src/index.ts:503-516`）：
 
-        1. 空文本且没有语音 → 不处理，交回其它处理器；
+        1. 空文本且没有语音 → 不处理；**但只要是归我们管的私聊（capture 开着、
+           白名单通过），仍然吞掉事件**，别让宿主的另一个聊天 Agent 在同一段私聊里
+           用第二个人格回答（受控偏离，见 `docs/PORTING_NOTES.md` §18）；
         2. 盲区模式下的管理命令 → 静默吞掉（`blindMode.enabled` 时上游直接
            `return`，不返回 `next()`）；
         3. `runtime.ignore_command_messages` 下的管理命令 → 交回命令解析器；
@@ -2391,6 +2393,12 @@ class AstrbotBridge:
         content = session.content
 
         if not content.strip() and not self._has_voice(session):
+            # 上游这里 `next()`：把这条消息交回其它处理器。但 AstrBot 的部署里往往还有
+            # 另一个聊天 Agent（默认 Agent / 别的拟人插件），交回去 = 同一个私聊里冒出
+            # 第二个人格（实测：用户"一张图 + 一句文字"分两条发来，图片那条事件的消息链
+            # 解析为空，于是另一个她回了「主人这是夜班的宵夜吗？」）。
+            # 所以：这条私聊归我们管就**吞掉**，并留一条 warn 说明为什么什么都没发生。
+            self.consume_unusable_private_event(event, session)
             return []
 
         if looks_like_management_command(content):
@@ -2413,6 +2421,45 @@ class AstrbotBridge:
         if consumed:
             event.stop_event()
         return list(capture.texts)
+
+    def consume_unusable_private_event(self, event: AstrMessageEvent, session: SessionView) -> bool:
+        """归我们管的私聊里"没有可用内容"的事件：吞掉，并说清楚为什么。
+
+        返回是否真的吞了。判定三件套：**私聊** + `capture_direct_messages` 开着 +
+        `can_handle_session` 通过（OneBot 白名单）。三者缺一就保持上游语义（交回其它
+        处理器）——没被我们接管的聊天，别人答不答与我们无关。
+
+        为什么需要它：宿主常配着第二个聊天 Agent（默认 Agent、别的拟人插件）。我们的
+        事件一旦"看了但不消费"，同一段私聊里就会出现第二个人格回答，用户看到的是
+        "她在自言自语两套词"。空内容本身也值得留痕：图片/文件这类"消息链解析为空"
+        的事件（适配器把附件放在别处）就是从这里漏过去的。
+        """
+        try:
+            if not session.is_direct:
+                return False
+            if not self.config_flag(
+                'runtime', 'capture_direct_messages', 'captureDirectMessages', default=True,
+            ):
+                return False
+            # 管理命令交给命令解析器（上面的分支已经处理过），这里只兜"说不出话"的事件。
+            if not self.service.can_handle_session(session):
+                return False
+            event.stop_event()
+        except Exception as error:  # noqa: BLE001 - 兜底判定本身不能成为第二个漏点
+            log_fallback('warn', '私聊事件归属判定失败，按不消费处理 错误=%s' % error)
+            return False
+        self._report_unusable(event, session)
+        return True
+
+    @staticmethod
+    def _report_unusable(event: AstrMessageEvent, session: SessionView) -> None:
+        outline = _text(_call(event, 'get_message_outline', '')) or '(空)'
+        log_fallback(
+            'warn',
+            '私聊事件没有可用内容：已吞掉以免宿主另一个聊天 Agent 接手 '
+            '平台=%s 用户=%s 概要=%s 消息段=%d'
+            % (session.platform, session.user_id, outline, len(session.elements or [])),
+        )
 
     # ------------------------------------------------------------------ #
     # 回合捕获
