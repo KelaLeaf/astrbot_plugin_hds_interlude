@@ -712,6 +712,77 @@ class Chunk8IntegrationTests(unittest.IsolatedAsyncioTestCase):
         again = await host.prepare_compaction(story, later + timedelta(hours=1), False)
         self.assertEqual(again['phase'], 'skip')
 
+    async def test_privacy_switch_hides_conversation_from_compaction_and_warns(self):
+        """共享主剧本硬开启后**每句私聊都挂在参与者上**；`share_participant_details`
+        关闭时压缩只能看到系统条目，摘要于是退化成「内容因隐私设置被省略」
+        （用户日志里出现过，长期事实也会是 0）。隐私语义照上游，但必须有日志说清楚。
+        """
+        host = _PipelineHost({
+            'memory': {'sceneEntryThreshold': 3, 'overlayCompressionEnabled': False},
+            'schedulePreplan': {'enabled': False},
+            'sharedStory': {'shareParticipantDetails': False},
+        })
+        self._hosts.append(host)
+        host.compactor = _PipelineCompactor()
+        host.db.insert('interlude_story', {
+            'id': 'story', 'platform': 'onebot', 'selfId': 'bot', 'userId': '', 'channelId': '',
+            'status': 'active', 'setting': {'timezone': 'Asia/Shanghai'}, 'state': {},
+            'cursorAt': NOW, 'createdAt': NOW, 'updatedAt': NOW,
+        })
+        story = await host.get_story('story')
+        await host.ensure_continuity(story, NOW)
+        for index in range(1, 4):
+            await host.append_entry('story', {
+                'kind': 'script', 'actor': 'narrator',
+                'content': '她说了第%d句话。' % index,
+                'occurredAt': (NOW + timedelta(minutes=index)).isoformat(), 'metadata': {},
+            }, NOW, 'onebot:bot:user:story')
+        await host.append_entry('story', {
+            'kind': 'setup', 'actor': 'system', 'content': '故事开始。',
+            'occurredAt': NOW.isoformat(), 'metadata': {},
+        }, NOW)
+
+        later = NOW + timedelta(hours=1)
+        context = await host.prepare_compaction(story, later, False)
+        self.assertEqual(context['phase'], 'run')
+        contents = [entry.get('content') for entry in context['compact_request']['entries']]
+        self.assertIn('[participant-specific conversation omitted by privacy setting]', contents)
+        self.assertNotIn('她说了第1句话。', contents)
+        self.assertIn('故事开始。', contents, '系统条目不受隐私开关影响')
+        self.assertTrue(
+            any('隐私开关隐藏' in ' '.join(str(part) for part in args) for args in host.reports),
+            '必须留下一条日志说明摘要为什么成了空壳：%s' % (host.reports[-3:],),
+        )
+
+    async def test_privacy_switch_on_lets_compaction_see_the_conversation(self):
+        host = _PipelineHost({
+            'memory': {'sceneEntryThreshold': 3, 'overlayCompressionEnabled': False},
+            'schedulePreplan': {'enabled': False},
+            'sharedStory': {'shareParticipantDetails': True},
+        })
+        self._hosts.append(host)
+        host.compactor = _PipelineCompactor()
+        host.db.insert('interlude_story', {
+            'id': 'story', 'platform': 'onebot', 'selfId': 'bot', 'userId': '', 'channelId': '',
+            'status': 'active', 'setting': {'timezone': 'Asia/Shanghai'}, 'state': {},
+            'cursorAt': NOW, 'createdAt': NOW, 'updatedAt': NOW,
+        })
+        story = await host.get_story('story')
+        await host.ensure_continuity(story, NOW)
+        for index in range(1, 4):
+            await host.append_entry('story', {
+                'kind': 'script', 'actor': 'narrator',
+                'content': '她说了第%d句话。' % index,
+                'occurredAt': (NOW + timedelta(minutes=index)).isoformat(), 'metadata': {},
+            }, NOW, 'onebot:bot:user:story')
+        later = NOW + timedelta(hours=1)
+        context = await host.prepare_compaction(story, later, False)
+        contents = [entry.get('content') for entry in context['compact_request']['entries']]
+        self.assertIn('她说了第1句话。', contents)
+        self.assertFalse(
+            any('隐私开关隐藏' in ' '.join(str(part) for part in args) for args in host.reports),
+        )
+
     async def test_compact_overlay_unlocked_archives_weekly_patches(self):
         host = self._host()
         host.compactor = _OverlayCompactor()

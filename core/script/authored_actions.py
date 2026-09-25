@@ -147,6 +147,23 @@ def read_authored_actions(script: str) -> ReadAuthoredActionsResult:
     }
 
 
+def _reply_action_id(reply: Any) -> Any:
+    """回复里声明的 say 引用：**两种拼写都认**。
+
+    上游是 TS，读的就是 camelCase `reply.actionId`；本移植版的内部结构用 snake_case
+    `action_id`。而 `narrator.decide()` 把**模型原样返回的 JSON**直接交给本模块
+    （camelCase），`chunk4` 的两条写入路径才会先过 `_dual()`（转 snake_case）——
+    只认一种拼写会让"模型写了两个 `<say>` 动作"的回合解析不出原话：`sole_action_reply`
+    的兜底只在**恰好一个**动作时生效，于是 `interaction.reply` 缺 content →
+    `requiresVisibleReplyRecovery` 判成"结构化可见回复缺失" → 白花一次模型调用，
+    重写仍不合格时还会整套 60 秒重试（用户日志里 2/3 的回合都撞上了）。
+    """
+    if not isinstance(reply, dict):
+        return None
+    value = reply.get('action_id')
+    return reply.get('actionId') if value is None else value
+
+
 def _action_in_prose(action: Any, prose: str) -> bool:
     """上游 filter：`action.start >= 0 && action.end <= prose.length && prose.slice(...) === action.content`。
 
@@ -237,7 +254,7 @@ def resolve_authored_actions(
 
     if (not already_sent and one_private_recipient and len(actions) == 1
             and isinstance(private_reply, dict) and private_reply.get('mode') == 'immediate'
-            and private_reply.get('action_id') == actions[0]['id']):
+            and _reply_action_id(private_reply) == actions[0]['id']):
         tail = complete_legacy_bubble_block(prose, actions[0]['content'], separator)
         if tail and actions[0]['start'] == len(prose) - len(tail):
             actions[0] = {**actions[0], 'content': tail, 'end': len(prose)}
@@ -248,14 +265,20 @@ def resolve_authored_actions(
             return reply
         if already_sent:
             # 已经提前流式发出的回合：引用作废，但内容（若已有）保持原样。
-            return {**reply, 'action_id': None}
-        if not reply.get('action_id') or reply.get('mode') != 'immediate':
+            return {**reply, 'action_id': None, 'actionId': None}
+        action_id = _reply_action_id(reply)
+        if not action_id or reply.get('mode') != 'immediate':
             return reply
-        action = next((item for item in actions if item['id'] == reply['action_id']
+        action = next((item for item in actions if item['id'] == action_id
                        and _split_limit(item, prose)), None)
         if action is not None:
             return {**reply, 'content': action['content']}
-        return {**reply, 'mode': 'none', 'content': None}
+        # 引用落地不了（模型声明了 immediate 却没写 `<say>` 块，或 id 对不上，且有多个 say
+        # 动作让 `sole_action_reply` 兜不住）。上游在这种情况静默退成 `mode:'none'`——
+        # 也就是"她读了但没回"，用户那边看起来就是**这条消息她压根没理**。
+        # 本移植版额外留一个内部标记，让上层沿用既有的「重写一次」机制：不编造任何内容、
+        # 不产生第二条回复，只是再问模型要一次合法结构（见 helpers._has_structured_interaction）。
+        return {**reply, 'mode': 'none', 'content': None, 'unresolved_action_id': action_id}
 
     # 引用失配的保守兜底：整份剧本只有一个已授权 say 行动、本回合只有一个私聊
     # 接收者、且回复没有可用 content 时，该行动就是这条回复的本体——模型常照抄
@@ -276,7 +299,7 @@ def resolve_authored_actions(
         complete_legacy_bubble_block(prose, private_reply['content'], separator)
         if (not already_sent and one_private_recipient and not actions
             and isinstance(private_reply, dict) and private_reply.get('mode') == 'immediate'
-            and not private_reply.get('action_id') and private_reply.get('content'))
+            and not _reply_action_id(private_reply) and private_reply.get('content'))
         else None
     )
 
