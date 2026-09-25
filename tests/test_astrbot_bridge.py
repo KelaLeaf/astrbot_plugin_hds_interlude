@@ -1241,6 +1241,60 @@ class BridgeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(extract_session_voice_count(view), 1)
 
+    def test_explain_unconsumed_names_the_failing_gate(self):
+        """`receive()` 返回 False 时必须说得出是哪道门——core 的 debug 报告在默认
+        verbosity 下完全看不见（用户实测：只有"未生成回合"一句话，根本猜不出来）。"""
+        import asyncio
+
+        bridge = _make_bridge()
+        notes = []
+        bridge.service.report_standalone_operation = lambda *args, **kwargs: notes.append(args)
+
+        async def no_story(_session):
+            return None
+
+        async def no_participant(_session, _story=None):
+            return None
+
+        cases = []
+        event = FakeMessageEvent(message='看图', components=[Plain('看图')])
+        view = session_view(event)
+
+        bridge.service.can_handle_session = lambda _session: False
+        cases.append(('白名单未通过', asyncio.run(bridge.explain_unconsumed(view))))
+        bridge.service.can_handle_session = lambda _session: True
+
+        bridge.service.find_story = no_story
+        cases.append(('找不到剧本', asyncio.run(bridge.explain_unconsumed(view))))
+
+        async def paused_story(_session):
+            return {'id': 's', 'status': 'paused'}
+
+        bridge.service.find_story = paused_story
+        cases.append(('剧本状态=paused', asyncio.run(bridge.explain_unconsumed(view))))
+
+        async def active_story(_session):
+            return {'id': 's', 'status': 'active'}
+
+        bridge.service.find_story = active_story
+        bridge.service.find_participant = no_participant
+        cases.append(('参与者不存在', asyncio.run(bridge.explain_unconsumed(view))))
+
+        async def active_participant(_session, _story=None):
+            return {'id': 'p', 'status': 'paused'}
+
+        bridge.service.find_participant = active_participant
+        cases.append(('参与者状态=paused', asyncio.run(bridge.explain_unconsumed(view))))
+
+        async def ok_participant(_session, _story=None):
+            return {'id': 'p', 'status': 'active'}
+
+        bridge.service.find_participant = ok_participant
+        cases.append(('门都过了', asyncio.run(bridge.explain_unconsumed(view))))
+
+        for expected, reason in cases:
+            self.assertIn(expected, reason, '%s → %s' % (expected, reason))
+
     def test_handle_event_consumes_a_private_event_it_cannot_turn_into_a_turn(self):
         """我们看了却没生成回合时也要吞掉（否则宿主第二个 Agent 接手）。"""
         import asyncio

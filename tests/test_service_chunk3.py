@@ -45,6 +45,7 @@ from typing import Any, Optional
 
 from plugin.core.service import chunk3
 from plugin.core.service.chunk3 import ServiceChunk3
+from plugin.core.service.session import SessionView
 from plugin.core.service.transport import NullTransport
 
 try:  # 组装后的服务（并行移植期间某些 chunk 可能尚未落地）
@@ -1096,6 +1097,44 @@ class TestNativeAudio(unittest.IsolatedAsyncioTestCase):
             return value
 
         return transcode
+
+
+class LocalImageSourceTests(unittest.TestCase):
+    """适配器把图片落成本地文件时的图片源识别（v1.2.13）。
+
+    上游 Koishi 的 `<img>` 永远带 CDN 地址，所以 `add()` 只认 http/data；AstrBot 的
+    NapCat 适配器可能给**本地路径**。丢掉它 → `describeVisionEvent` 得到"既无文字也无来源"
+    → `receive` 的视觉门把整条消息判死（用户实测：图片消息全部不产生回合）。
+    ⚠️ 本地路径**只认适配器给的元素**——正文是用户可控的，认它等于开一个本地读文件的口子。
+    """
+
+    def _sources(self, content, elements):
+        session = SessionView(platform='onebot', self_id='1', user_id='2',
+                              content=content, elements=elements)
+        return chunk3._fallback_extract_session_image_sources(session)
+
+    def test_adapter_provided_local_path_is_kept(self):
+        for path, expected in (('file:///AstrBot/data/temp/napcat/a.jpg',
+                                '/AstrBot/data/temp/napcat/a.jpg'),
+                               ('/tmp/napcat/b.png', '/tmp/napcat/b.png')):
+            content = '<img src="%s"/>' % path
+            elements = [{'type': 'img', 'attrs': {'src': path}, 'children': []}]
+            # `file://` 前缀会被归一成文件系统路径（读取时要用的就是它）。
+            self.assertEqual(self._sources(content, elements), ['onebot-file:%s' % expected])
+
+    def test_local_path_in_user_text_is_refused(self):
+        # 任何人都能在正文里写这个；认了就等于让模型读本地文件。
+        self.assertEqual(self._sources('<img src="/etc/passwd"/>', []), [])
+        self.assertEqual(self._sources('<img src="file:///etc/passwd"/>', []), [])
+
+    def test_http_sources_still_work_in_both_paths(self):
+        url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=x'
+        self.assertEqual(self._sources('<img src="%s"/>' % url, []), [url])
+        self.assertEqual(
+            self._sources('<img src="%s"/>' % url,
+                          [{'type': 'img', 'attrs': {'src': url}, 'children': []}]),
+            [url],
+        )
 
 
 class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):

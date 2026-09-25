@@ -341,6 +341,24 @@ def _fallback_format_buffered_user_messages(messages: list[Any]) -> str:
     return '\n\n'.join(blocks)
 
 
+def _local_image_path(value: Any) -> str:
+    """把适配器给的本地图片路径归一成文件系统路径（`file:///x` → `/x`）。"""
+    text = _text(value).strip()
+    if text.lower().startswith('file://'):
+        text = text[len('file://'):]
+        # `file:///a/b` → `/a/b`；`file://host/a` 这种少见形式只取路径段。
+        if not text.startswith('/'):
+            slash = text.find('/')
+            text = text[slash:] if slash >= 0 else ''
+        try:
+            from urllib.parse import unquote  # noqa: PLC0415
+
+            text = unquote(text)
+        except Exception:  # pragma: no cover - 解码失败就用原串
+            pass
+    return text.strip()
+
+
 def _fallback_extract_session_image_sources(session: Any) -> list[str]:
     """上游 `extractSessionImageSources`（`src/service.ts:7036`）逐字移植。
 
@@ -363,6 +381,29 @@ def _fallback_extract_session_image_sources(session: Any) -> list[str]:
         elif kind == 'file':
             sources.append('onebot-file:%s' % source)
 
+    def image_src(element: Any) -> Any:
+        if not is_record(element):
+            return None
+        attrs = element.get('attrs') if is_record(element.get('attrs')) else {}
+        data = element.get('data') if is_record(element.get('data')) else {}
+        return attrs.get('src') or attrs.get('url') or data.get('src') or data.get('url')
+
+    # ---- 第一遍：**适配器直给的元素**（`session.elements`），这一份是可信的 ----
+    #
+    # AstrBot 的 NapCat 适配器可能把图片落到本地再交给我们（`file:///…` / 绝对路径），
+    # 而上游 Koishi 那边 `<img>` 永远带 CDN 地址，所以上游的 `add()` 只认 http/data。
+    # 若这里也丢掉，`describeVisionEvent` 会得到"既无文字也无来源" → `receive` 的视觉门
+    # 把整条消息判死（用户实测：图片消息全部不产生回合，日志里只有"未生成回合"）。
+    #
+    # ⚠️ 本地路径**只认适配器给的元素**：正文（`session.content`）是用户可控的字符串，
+    # 谁都能发一句 `<img src="/etc/passwd"/>`，从正文里认路径就等于给模型开一个本地读文件的口子。
+    trusted = _member(session, 'elements')
+    if isinstance(trusted, list):
+        for element in trusted:
+            src = image_src(element)
+            if src and not re.match(r'^(?:https?://|data:image/)', _text(src), re.IGNORECASE):
+                add(_local_image_path(src), 'file')
+
     parse = _helper('_parse_mini_xml_elements')
     visit_elements = _helper('_visit_elements')
     if parse is not None and visit_elements is not None:
@@ -373,7 +414,7 @@ def _fallback_extract_session_image_sources(session: Any) -> list[str]:
             if element_type in ('img', 'image'):
                 attrs = element.get('attrs') if is_record(element.get('attrs')) else {}
                 data = element.get('data') if is_record(element.get('data')) else {}
-                src = attrs.get('src') or attrs.get('url') or data.get('src') or data.get('url')
+                src = image_src(element)
                 if src:
                     add(src)
                 else:
@@ -915,7 +956,14 @@ class ServiceChunk3(ServiceBase):
                 return None
             info = await _resolve_adapter_image(self.transport, file, bot)
             if not info:
-                return None
+                # 适配器没提供 resolver（本移植版的 AstrBot 传输层就没有）：这条路只在
+                # `onebot-file:` 上开放，而它**只能由适配器所有的 element 产生**
+                # （见 `_fallback_extract_session_image_sources`），因此直接读本地文件是安全的。
+                try:
+                    data = await asyncio.to_thread(_read_local_file, _local_image_path(file))
+                except Exception:
+                    return None
+                return await self.image_bytes_to_native(data, guess_image_mime(data))
             candidates = [
                 _text(info.get(key)).strip() for key in ('url', 'file', 'path')
             ]
