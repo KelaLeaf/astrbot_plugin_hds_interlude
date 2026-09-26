@@ -1171,6 +1171,67 @@ class GroupGateExplanationTests(ServiceTestCase):
                 self.assertIn(expected, text)
 
 
+class WhitelistSemanticsTests(ServiceTestCase):
+    """`qq_access` 的真值表（v1.2.18 起写进 hint / README，这里钉住行为本身）。
+
+    用户按自己的理解复述过一遍，三处都对不上，所以这段语义值得有一条回归测试：
+    * 闸门**关**着时白名单**完全不看**（私聊谁都能聊）——不是"名单内针对性处理、
+      名单外走默认提示词"；
+    * 闸门关着时**群聊永远不会被接入**（上游 `canHandleGroupSession` 与 `canHandleSession`
+      在这里刻意不对称，`service.ts:955`）；
+    * 群聊不看 `userAccounts`（群成员不需要私聊授权）；
+    * 闸门只对 OneBot 家族生效，telegram 之类的平台一律放行。
+    """
+
+    def _matrix(self, onebot: dict[str, Any]) -> list[bool]:
+        service = self.make_service(make_config(onebot=onebot))
+        sessions = (
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='2', is_direct=True),
+            SessionView(platform='onebot', self_id='1', user_id='9', channel_id='9', is_direct=True),
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9', guild_id='9'),
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='8', guild_id='8'),
+            SessionView(platform='telegram', self_id='1', user_id='9', channel_id='9', is_direct=True),
+        )
+        return [
+            service.can_handle_session(s) if s.is_direct else service.can_handle_group_session(s)
+            for s in sessions
+        ]
+
+    def test_the_gate_matrix(self) -> None:
+        bot = [{'qq': '1'}]
+        user = [{'qq': '2'}]
+        group = [{'groupId': '9'}]
+        cases = (
+            # 闸门关：白名单完全不看；私聊全放行（含非 OneBot），群聊一个都不接。
+            ({'enabled': False, 'botAccounts': [], 'userAccounts': [], 'groupChats': []},
+             [True, True, False, False, True]),
+            ({'enabled': False, 'botAccounts': bot, 'userAccounts': user, 'groupChats': group},
+             [True, True, False, False, True]),
+            # 闸门开 + 空白名单 = 全拒（非 OneBot 仍放行）。
+            ({'enabled': True, 'botAccounts': [], 'userAccounts': [], 'groupChats': []},
+             [False, False, False, False, True]),
+            ({'enabled': True, 'botAccounts': bot, 'userAccounts': [], 'groupChats': []},
+             [False, False, False, False, True]),
+            ({'enabled': True, 'botAccounts': bot, 'userAccounts': user, 'groupChats': []},
+             [True, False, False, False, True]),
+            ({'enabled': True, 'botAccounts': bot, 'userAccounts': user, 'groupChats': group},
+             [True, False, True, False, True]),
+            # 群聊不看 userAccounts：没有用户白名单，群照样接。
+            ({'enabled': True, 'botAccounts': bot, 'userAccounts': [], 'groupChats': group},
+             [False, False, True, False, True]),
+            # 群规则显式关掉 = 那个群不接。
+            ({'enabled': True, 'botAccounts': bot, 'userAccounts': user,
+              'groupChats': [{'groupId': '9', 'enabled': False}]},
+             [True, False, False, False, True]),
+            # 机器人账号不在名单里：私聊与群聊全拒（telegram 照旧）。
+            ({'enabled': True, 'botAccounts': [{'qq': '999'}], 'userAccounts': user, 'groupChats': group},
+             [False, False, False, False, True]),
+        )
+        for onebot, expected in cases:
+            with self.subTest(onebot=onebot):
+                self.assertEqual(self._matrix(onebot), expected)
+
+
 class ConfigAccessorTests(ServiceTestCase):
     """`cachedXxxConfig` 的段位（上游 `:2247` / `:2260`）。"""
 
