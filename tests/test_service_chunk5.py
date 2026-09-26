@@ -822,6 +822,35 @@ class ServiceChunk5Tests(unittest.TestCase):
         self.assertIsNone(chunk5_module.resolve_browser_target(
             {'mode': 'visit', 'url': 'http://localhost/x'}, config,
         ))
+        # v1.3.4：**用户显式点名**的内网主机放行——`allowedDomains` 里的域名，以及
+        # `searchUrlTemplate` 自己那一台（SearXNG 挂在局域网是常见做法）。
+        lan = 'http://192.168.1.9:8080/search?q={query}'
+        self.assertTrue(allowed('http://192.168.1.9:8080/search?q=x', {'searchUrlTemplate': lan}))
+        self.assertEqual(
+            chunk5_module.resolve_browser_target(
+                {'mode': 'search', 'query': '地震'}, {'searchUrlTemplate': lan},
+            ),
+            'http://192.168.1.9:8080/search?q=%E5%9C%B0%E9%9C%87',
+        )
+        self.assertTrue(allowed('https://192.168.1.9/nas', {'allowedDomains': ['192.168.1.9']}))
+        # 反向：没点名还是拒绝；localhost 与黑名单永远拒绝。
+        self.assertFalse(allowed('http://192.168.1.9:8080/search?q=x', config))
+        self.assertFalse(allowed('http://192.168.1.9:8080/x', {
+            'searchUrlTemplate': lan, 'blockedDomains': ['192.168.1.9'],
+        }), '黑名单优先于搜索模板主机')
+        self.assertFalse(allowed('http://localhost/x', {
+            'searchUrlTemplate': 'http://localhost:8888/search?q={query}',
+        }), 'localhost 连模板都不放行')
+        # 模板主机是**整台**被信任的：搜索结果、翻页、`/preferences` 都在同一台的别的路径上，
+        # 只信任那一条搜索路径会让翻页与重定向断掉。
+        self.assertTrue(allowed('http://192.168.1.9:8080/page/2', {
+            'searchUrlTemplate': 'http://192.168.1.9:8080/search?q={query}',
+            'allowedDomains': ['example.com'],
+        }))
+        self.assertFalse(allowed('http://192.168.1.10/x', {
+            'searchUrlTemplate': 'http://192.168.1.9:8080/search?q={query}',
+            'allowedDomains': ['example.com'],
+        }), '设了白名单时，别的私网主机一律拒绝')
         self.assertIsNone(chunk5_module.normalize_browser_intent_draft(
             {'mode': 'visit', 'purpose': 'p'}, config,
         ), 'visit 必须有 url')

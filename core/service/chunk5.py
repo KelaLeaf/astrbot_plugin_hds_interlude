@@ -273,8 +273,30 @@ def _resolve_browser_target(draft: Any, config: Any) -> Optional[str]:
     return None
 
 
+def _search_template_host(config: Any) -> str:
+    """`searchUrlTemplate` 的主机名：用户亲手填的搜索服务，视为已授权（本移植版 v1.3.4）。
+
+    上游只放行公网地址；本移植版自从宿主没有搜索接口时"真的去抓模板那一页"（见
+    `docs/PORTING_NOTES.md` §23），把 SearXNG 挂在局域网就成了常见做法。所以**这一台**
+    允许是私网地址；随手 `visit` 的地址仍然禁私网，除非显式写进 `allowedDomains`。
+    模板缺 `{query}` 时返回空串（那种模板本来就不会被使用）。
+    """
+    template = str(_cfg(config, 'searchUrlTemplate', '') or '')
+    if '{query}' not in template:
+        return ''
+    try:
+        return (urlsplit(template.replace('{query}', 'q')).hostname or '').lower()
+    except Exception:
+        return ''
+
+
 def _is_safe_public_web_url(value: Any, config: Any) -> bool:
-    """上游 `isSafePublicWebUrl`（`:7924`）逐字移植：只放行公开 http(s) 地址。"""
+    """上游 `isSafePublicWebUrl`（`:7924`）：只放行公开 http(s) 地址。
+
+    与上游唯一的差别：**用户显式点名的内网主机**放行——写进 `allowedDomains` 的域名，
+    以及 `searchUrlTemplate` 自己那一台（v1.3.4，见 `docs/PORTING_NOTES.md` §23）。
+    localhost / `*.local` 与一切非 http(s) 地址仍然一律拒绝。
+    """
     try:
         parsed = urlsplit(str(value))
         if parsed.scheme not in ('http', 'https'):
@@ -286,13 +308,15 @@ def _is_safe_public_web_url(value: Any, config: Any) -> bool:
             host = host[:-1]
         if not host or host == 'localhost' or host.endswith('.localhost') or host == '::1':
             return False
-        if _is_private_host(host):
-            return False
         blocked = _normalize_domains(_cfg(config, 'blockedDomains', []))
         allowed = _normalize_domains(_cfg(config, 'allowedDomains', []))
         if any(_domain_matches(host, domain) for domain in blocked):
             return False
-        return not allowed or any(_domain_matches(host, domain) for domain in allowed)
+        whitelisted = any(_domain_matches(host, domain) for domain in allowed)
+        search_host = bool(host) and host == _search_template_host(config)
+        if _is_private_host(host) and not (whitelisted or search_host):
+            return False
+        return not allowed or whitelisted or search_host
     except Exception:
         return False
 
