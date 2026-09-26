@@ -989,8 +989,9 @@ class SendOutgoingMessagesTests(unittest.IsolatedAsyncioTestCase):
         blocked = _SendStub([{**self.PARTICIPANT, 'platform': 'onebot', 'selfId': 'bot'}])
         blocked.transport = _RecordingTransport()
         blocked.config = _make_config(onebot={
-            'enabled': True,
+            'botAccountsOnly': True,
             'botAccounts': [{'qq': 'bot'}],
+            'userAccountsOnly': True,
             'userAccounts': [{'qq': 'someone-else'}],
         })
         await ServiceChunk6.send_outgoing_messages(blocked, self.STORY, [self._message()])

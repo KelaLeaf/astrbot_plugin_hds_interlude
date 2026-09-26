@@ -637,15 +637,9 @@
   },
   "qq_access": {
     "type": "object",
-    "title": "QQ 接入",
-    "description": "【必填 3】QQ 接入：机器人账号、私聊白名单、群聊与语音。",
+    "title": "接入与名单",
+    "description": "【必填 3】接入与名单：机器人账号、用户与群聊名单（三张名单各自可以\"只处理名单内\"或\"名单外也接\"），以及语音转写。",
     "items": {
-      "enabled": {
-        "type": "bool",
-        "description": "启用 OneBot / NapCat 账号过滤",
-        "default": false,
-        "hint": "只对 OneBot / NapCat 家族生效（telegram、webchat 等平台一律放行，与本开关无关）。关闭：私聊全部放行，但群聊永远不会被接入。打开：空白名单＝全部拒绝；私聊要「机器人账号 + 用户账号」两条都命中，群聊要「机器人账号 + 群聊白名单」命中（群成员不必在用户白名单里）"
-      },
       "bot_accounts": {
         "type": "list",
         "description": "机器人账号白名单",
@@ -654,7 +648,7 @@
             "type": "string",
             "description": "机器人 QQ 号",
             "default": "",
-            "hint": "留空表示不限制发送账号"
+            "hint": "机器人自己的账号；「仅处理名单内的机器人账号」打开时只有这里列出的账号收消息"
           },
           "label": {
             "type": "string",
@@ -671,6 +665,12 @@
         "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
         "obvious_hint": true
       },
+      "bot_accounts_only": {
+        "type": "bool",
+        "description": "仅处理名单内的机器人账号",
+        "default": false,
+        "hint": "关闭（默认）：名单只用来做针对性处理（称呼 / 背景 / 初始关系 / 群规则），名单外的照样处理，走默认设定。打开：只处理名单内的，名单外一律不接。所有平台一视同仁。"
+      },
       "user_accounts": {
         "type": "list",
         "description": "用户白名单与初始关系",
@@ -679,7 +679,7 @@
             "type": "string",
             "description": "用户 QQ",
             "default": "",
-            "hint": "未列出的账号直接拒绝"
+            "hint": "「仅处理名单内的用户」打开时只有这里列出的账号能私聊；关闭时名单外的人也走默认设定"
           },
           "label": {
             "type": "string",
@@ -713,6 +713,12 @@
         "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
         "obvious_hint": true
       },
+      "user_accounts_only": {
+        "type": "bool",
+        "description": "仅处理名单内的用户",
+        "default": false,
+        "hint": "关闭（默认）：名单只用来做针对性处理（称呼 / 背景 / 初始关系 / 群规则），名单外的照样处理，走默认设定。打开：只处理名单内的，名单外一律不接。所有平台一视同仁。"
+      },
       "group_chats": {
         "type": "list",
         "description": "群聊白名单与角色定位",
@@ -721,7 +727,7 @@
             "type": "string",
             "description": "QQ 群号",
             "default": "",
-            "hint": "只有列在这里且启用的群会被处理"
+            "hint": "「仅处理名单内的群聊」打开时只有这里列出的群会被接入；关闭时名单外的群按默认群规则处理"
           },
           "label": {
             "type": "string",
@@ -833,6 +839,12 @@
         "default": [],
         "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
         "obvious_hint": true
+      },
+      "group_chats_only": {
+        "type": "bool",
+        "description": "仅处理名单内的群聊",
+        "default": false,
+        "hint": "关闭（默认）：名单只用来做针对性处理（称呼 / 背景 / 初始关系 / 群规则），名单外的照样处理，走默认设定。打开：只处理名单内的，名单外一律不接。所有平台一视同仁。"
       },
       "ignore_self_messages": {
         "type": "bool",

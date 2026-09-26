@@ -360,24 +360,26 @@ class HDSInterludePlugin(Star):
             self._capability_task = asyncio.create_task(self._self_check_model_capabilities())
         except RuntimeError:  # pragma: no cover - 没有运行中的事件循环（测试/极旧宿主）
             self._capability_task = None
-        self._log_group_access()
+        self._log_access()
 
-    def _log_group_access(self) -> None:
-        """启动时就说清楚"群聊会不会被接入"。
+    def _log_access(self) -> None:
+        """启动时就说清楚"接入与名单"的现状。
 
-        群聊没生效是完全静默的：消息进得来、`on_group_message` 也被调到，但什么都不发生
-        （用户 2026-09-26 的日志就是这样，直到主动来问才发现）。这里在启动日志里给一句
-        结论——没接入时用 warn，接入正常时用 info。
+        被名单挡掉是**完全静默**的：消息进得来、handler 也被调到，但什么都不发生
+        （用户 2026-09-26 的日志就是这样，直到主动来问才发现）。这里把三张名单各自的
+        现状（几条 / 是否"仅名单内"）打进启动日志；"开了仅名单内但名单是空的"这种
+        一定不会生效的组合用 warn。
         """
         try:
-            level, text = self.bridge.service.describe_group_access()
+            notes = self.bridge.service.describe_access()
         except Exception as error:  # noqa: BLE001 - 启动自述失败不能挡住插件
-            logger.debug('hds-interlude：群聊接入自述失败：%s' % error)
+            logger.debug('hds-interlude：接入与名单自述失败：%s' % error)
             return
-        if level == 'warn':
-            logger.warning('hds-interlude：%s' % text)
-        else:
-            logger.info('hds-interlude：%s' % text)
+        for level, text in notes:
+            if level == 'warn':
+                logger.warning('hds-interlude：%s' % text)
+            else:
+                logger.info('hds-interlude：%s' % text)
 
     async def _self_check_model_capabilities(self) -> None:
         """等 Provider 管理器就绪，再做一次能力自检（失败绝不影响插件运行）。"""
@@ -860,7 +862,7 @@ class HDSInterludePlugin(Star):
         warn（键与 `receiveGroup` 内部一致，所以不会重复）。
         """
         session = await self._prepare(event)
-        allowed, reason = self.bridge.service.explain_group_gate(session)
+        allowed, reason = self.bridge.service.explain_group_access(session)
         if not allowed:
             self.bridge.service.note_group_skip(session, reason)
             return
