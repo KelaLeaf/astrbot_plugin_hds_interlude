@@ -511,6 +511,53 @@ class AuthoredActionsTests(unittest.TestCase):
         self.assertEqual(markup['leftover'], 2)
         self.assertIn('<say id="汉字">', markup['preview'])
 
+    def test_a_declared_reference_with_a_bare_bubble_block_still_lands(self):
+        """受控偏离（PORTING_NOTES §20）：声明了 `<say>` 引用、却一个标签都没写时，认下裸气泡块。
+
+        用户 2026-09-26 11:44 的真实形状：`interaction.reply.actionId = "reply"`，
+        剧本里把回复裸写成 `甲<sep/>乙<sep/>丙`（`<say>` 标签一个都没有），后面还跟着
+        「发出去……」的叙述。零已授权动作 ⇒ `sole_action_reply` 兜不住 ⇒ 上游会判成
+        「结构化可见回复缺失」白重写一次、重写又犯同样的错 ⇒ 整套 60 秒重试，
+        那一轮她压根没回上话。
+        """
+        raw = {
+            'script': '碗和盘子还摊在桌上。\n\n手指落到屏幕上，敲得快。\n\n'
+                      '哟，这会儿才想起来吃饭<sep/>我都收摊了，紫米粥配葱油饼<sep/>又拿图糊弄我\n\n'
+                      '发出去，手机搁回桌上，屏幕朝上。',
+            'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'actionId': 'reply'}},
+        }
+        resolved = resolve_authored_actions(raw, False, '<sep/>')
+        reply = resolved['interaction']['reply']
+        self.assertEqual(reply['content'], '哟，这会儿才想起来吃饭<sep/>我都收摊了，紫米粥配葱油饼<sep/>又拿图糊弄我')
+        self.assertEqual(reply['mode'], 'immediate')
+        self.assertIsNone(reply.get('unresolved_action_id'), '认下来的回复不该再留引用失配标记')
+        self.assertFalse(requires_visible_reply_recovery('user-message', None, resolved),
+                         '原话已经取回，不该再触发白重写')
+        self.assertIn('<sep/>', resolved['script'], '正文里那一段仍留在剧本里，不被吞掉')
+
+    def test_the_bare_bubble_fallback_refuses_ambiguous_or_malformed_blocks(self):
+        """兜底必须保守：歧义、空气泡、没有分隔符、已是 none 的回合一律不认，走原来的重写路径。"""
+        base = {'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'actionId': 'reply'}}}
+        for label, script in (
+            ('两段都含分隔符（歧义）', '甲<sep/>乙\n\n丙<sep/>丁'),
+            ('空气泡', '前言。\n\n甲<sep/>'),
+            ('只有一段、没有分隔符', '前言。\n\n就一句话'),
+            ('段里带尖括号', '前言。\n\n甲<sep/><b>乙</b>'),
+        ):
+            with self.subTest(label=label):
+                authored._resolved_actions.clear()
+                out = resolve_authored_actions({**base, 'script': script}, False, '<sep/>')
+                self.assertEqual(out['interaction']['reply']['mode'], 'none', label)
+                self.assertEqual(out['interaction']['reply']['unresolved_action_id'], 'reply', label)
+                self.assertIsNone(out['interaction']['reply']['content'], label)
+        # 没有声明引用（模型真的不回）时，绝不因为末尾有块就替它发一条。
+        out = resolve_authored_actions({
+            'script': '前言。\n\n甲<sep/>乙',
+            'interaction': {'seen': True, 'reply': {'mode': 'none'}},
+        }, False, '<sep/>')
+        self.assertEqual(out['interaction']['reply']['mode'], 'none')
+        self.assertIsNone(out['interaction']['reply'].get('content'))
+
     def test_complete_legacy_bubble_block_only_accepts_an_explicit_terminal_block(self):
         self.assertIsNone(complete_legacy_bubble_block('她拿起手机。\n\n甲||乙', '甲', ''))
         self.assertIsNone(complete_legacy_bubble_block('她想起“甲||乙”。', '甲', '||'))
