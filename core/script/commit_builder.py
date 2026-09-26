@@ -21,7 +21,7 @@ JS 默认参数只在实参为 `undefined` 时生效，而 Python 的 `None` 同
 
 `stableCommitId` 的哈希前像是**上游 camelCase 的 JSON 逐字节复刻**（紧凑分隔符、
 不转义非 ASCII），这样同一份语义输入在两端得到同一个 commit id；字段名不参与
-`PORT_PLAN.md` §2 的 snake_case 改名，因为是哈希前像而非数据协议。
+键名约定的 snake_case 改名，因为是哈希前像而非数据协议。
 """
 
 from __future__ import annotations

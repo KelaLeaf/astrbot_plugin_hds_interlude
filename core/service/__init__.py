@@ -1,7 +1,7 @@
 """`plugin.core.service`：`upstream/src/service.ts` 的组装入口。
 
 上游 `InterludeService` 有 **277 个成员**、类体 624–7084 行，单文件无法高质量
-一次移植，因此按 `docs/PORT_PLAN_SERVICE.md` 的**受控分解**切成 10 个 mixin，
+一次移植，因此按移植约定 的**受控分解**切成 10 个 mixin，
 在这里用多重继承组装：
 
     class InterludeService(ServiceChunk0, ServiceChunk1, ..., ServiceChunk9)

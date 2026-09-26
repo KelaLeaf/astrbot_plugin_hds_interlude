@@ -24,14 +24,14 @@
 ``AlterTurnResult``              ``AlterTurnResult``
 ===============================  ==================================================
 
-语言映射（见 `docs/PORT_PLAN.md` §2）
+语言映射（见键名约定）
 ------------------------------------
 * 领域对象一律 `dict`；字段名 ``camelCase`` → ``snake_case``（``alter_value`` /
   ``alter_weight`` / ``last_trigger_direction`` / ``emotional_offset`` /
   ``pending_scopes`` / ``last_analysis_attempt_at`` / ``participant_id`` …）。
 * 时间统一 timezone-aware UTC ``datetime``；ISO 输出走 `core/time.py` 的 ``iso()``
   （与上游 ``Date#toISOString()`` 同形：UTC、毫秒三位、``Z`` 结尾）。状态里存的
-  仍是 ISO **字符串**（上游就是这么持久化的，见 PORT_PLAN §2「时间」最后一条）。
+  仍是 ISO **字符串**（上游就是这么持久化的，见时间约定最后一条）。
 * ``Math.round`` → :func:`_js_round`（**半值向上**，不是 Python 的银行家舍入）。
 * ``?? fallback`` → ``_pick()`` 只认「键存在且值为 None 以外」；``undefined`` 位置
   一律由 :func:`_finite_number` 的 fallback 承担。
@@ -42,7 +42,7 @@
    （``_pick(obj, 'alter_value', 'alterValue')``）。理由：上游测试与历史数据里
    的旧 JSON 就是 camelCase（``alter-system.test.ts`` 的第 5 条用例专门喂
    ``lastTriggerAlter`` / ``emotionalOffset`` / ``lastUpdatedAt`` 做「遗留状态归一」），
-   而 PORT_PLAN §2 要求新写入的字段名是 snake_case。二者不冲突。
+   而 键名约定 要求新写入的字段名是 snake_case。二者不冲突。
 2. **缺失的配置键**：上游直接读 ``config.maxIntensity`` 这类必填字段，缺键会得到
    ``NaN``；本移植版回落到 ``DEFAULT_ALTER_SYSTEM_CONFIG`` 里的同名默认值。
    正常调用点都会先过 ``resolve_alter_system_config()``，故行为一致。

@@ -48,7 +48,7 @@
 取值，从而与 base.py 的原始段返回、`plugin/core/service/config.py` 的
 `CONFIG_DEFAULTS` 两种来源都兼容。
 
-键名法（`docs/PORT_PLAN.md` §2）：
+键名约定：
 
 - 从模型 / 旧数据 / 配置读入的值一律 `pick(value, 'camelCase', 'snake_case')` 双读；
 - `story.state` 经 `story_state.decode_story_state` / `encode_story_state` 归一，
@@ -325,7 +325,7 @@ def _trim(value: Any) -> str:
 def _readable_metadata(entry: Any) -> Any:
     """补全 `metadata` 里两种拼写的 `lifeHandoff` / `timelinePlan`（只补，不改原行）。
 
-    `docs/PORT_PLAN.md` §2「键名法」要求从旧数据 / 模型输出读入时同时接受
+    键名约定要求从旧数据 / 模型输出读入时同时接受
     camelCase 与 snake_case。本移植版的底层读取器口径恰好不一致：
     `script/life_handoff.py` 读 snake_case（`life_handoff`），而
     `helpers.timeline_entry_prompt_projection` 读上游 camelCase（`timelinePlan`）。

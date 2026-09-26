@@ -1,26 +1,12 @@
-"""HDS Interlude 的 AstrBot 插件入口（`upstream/src/index.ts` 的 AstrBot 等价物）。
+"""HDS Interlude 的 AstrBot 插件入口。
 
-职责边界（`docs/PORT_PLAN.md` §0.3）：
+只碰 AstrBot 的插件 API 与 `plugin/adapters/`；叙事核心的一切都经 `AstrbotBridge`
+（`self.bridge`）转发。命令注册、消息中间件、生命周期、权限判定与上游 `src/index.ts`
+逐条对应，命令名从上游的点号层级改成下划线形式（`interlude.memory.facts` 在这里叫
+`hdsi_memory_facts`，上游写法也照样认）。
 
-* 本文件**只碰 AstrBot 的插件 API 与 `plugin/adapters/`**；叙事核心的一切都经
-  `AstrbotBridge`（`self.bridge`）转发，不 import 任何 `plugin/core/` 实现细节。
-* 命令注册、消息中间件、生命周期、权限判定逐条对应上游 `src/index.ts`。
-
-命令对照表（上游 `interlude.*` ↔ AstrBot `hdsi_*`）见 `COMMANDS` 与
-`docs/COMMANDS.md`。AstrBot 的命令名不能带点号层级，因此统一改成下划线形式。
-
-盲区模式（上游 `blindMode.enabled`）
------------------------------------
-
-上游在失明模式下**不注册任何命令**（`if (blindModeEnabled) { ctx.on('command/before-execute', () => '') } else { registerCommands(...) }`）。
-AstrBot 的 `@filter.command` 是类定义期静态注册的，运行期无法"不写这个装饰器"，
-所以本移植版在 `__init__` 里把本插件模块注册到 `star_handlers_registry` 的全部
-管理命令 handler **真正摘掉**（`StarHandlerRegistry.remove`），效果与上游一致：
-
-* 管理命令完全不响应（连"无权限"都不会返回）；
-* 普通私聊 / 群聊叙事照常进行；
-* 每个 handler 里还有一道 `if self.blind_mode: return` 的兜底守卫，防止宿主
-  版本漂移导致摘除失败。
+盲区模式开启时，本插件注册到 `star_handlers_registry` 的管理命令会被真正摘掉，
+管理命令完全不响应，而私聊/群聊叙事照常。
 """
 
 from __future__ import annotations
@@ -70,7 +56,7 @@ class CommandSpec:
     """`admin` = 需要 `sharedStory.managerAccounts` 管理员；`member` = 通过白名单的已授权用户。"""
 
     usage: str
-    """用法（`docs/COMMANDS.md` 对照表的"用法"列）。"""
+    """用法。"""
 
 
 #: 全部 32 条管理命令，顺序与上游 `registerCommands` 一致。

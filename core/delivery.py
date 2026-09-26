@@ -7,7 +7,7 @@
 **所有气泡共享同一个 ``commitId`` / ``eventId`` 身份**，只是 ``bubbleIndex``
 不同——投递意图与回执因此可以追溯到同一条权威剧本行。
 
-命名约定（docs/PORT_PLAN.md §2）
+命名约定（键名约定）
 -------------------------------
 上游 camelCase 字段转 snake_case（``script_event`` / ``later_segments`` /
 ``bubble_index`` / ``bubble_count`` / ``full_content`` / ``caused_by_event_ids``

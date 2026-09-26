@@ -147,13 +147,11 @@ pip install -r requirements.txt
 
 剩下五个分组（`chat_rhythm`、`black_box`、`shared_story_compat`、`runtime_compat`、`model_compat`）是**旧配置兼容位**，默认折叠，正常用不到。
 
-每个字段的类型、默认值、含义与上游出处都在 `docs/CONFIG_MAP.md` 里逐条列出。
-
 ## 命令
 
 AstrBot 的命令名不能带点，所以上游的 `interlude.memory.facts` 在这里叫 `hdsi_memory_facts`，调用时加前缀：`/hdsi_memory_facts`。上游那套 `interlude.*` 写法也照样能被识别（不会被当成聊天内容），从 Koishi 迁过来的用户不会踩坑。
 
-**完整 32 条对照表在 `docs/COMMANDS.md`。** 常用的这些：
+上游一共 32 条命令，常用的这些：
 
 **看看状态**
 
@@ -249,7 +247,7 @@ AstrBot 的命令名不能带点，所以上游的 `interlude.memory.facts` 在�
 | 人格 | 上游 Console 手填 | 多一个 `story_defaults.persona_id`，可直接导入 AstrBot 人格 |
 | 群表态 / 原生表情 | Satori 原生接口 | 平台不支持时返回失败，由调用方走既有的投递失败分支 |
 
-几个已知的、刻意的行为差异（原因写在 `docs/PORTING_NOTES.md`）：网页观察落库前不传 `id`（自增主键不会被 `0` 占住）；范围查询退化成"取足够行 + Python 侧过滤"，遇到不支持的算子**显式抛错**而不是静默返回偏窄结果；`interlude_schedule_preplan` 换主键是 no-op（只能删旧行插新行）；群规则 `enabled` 缺省视为启用。
+几个已知的、刻意的行为差异：网页观察落库前不传 `id`（自增主键不会被 `0` 占住）；范围查询退化成"取足够行 + Python 侧过滤"，遇到不支持的算子**显式抛错**而不是静默返回偏窄结果；`interlude_schedule_preplan` 换主键是 no-op（只能删旧行插新行）；群规则 `enabled` 缺省视为启用。
 
 > 上游 README 里提到的 npm 安装、Koishi Console、Puppeteer、`interlude.*` 命令名都不适用于本移植版；上面这张表就是换算关系。
 
@@ -291,14 +289,6 @@ AstrBot 的命令名不能带点，所以上游的 `interlude.memory.facts` 在�
 - 数据落在本地 SQLite，除了你配的模型接口和 `browser` 里允许的域名，不发任何其它请求。
 - `logging` 的剧本/消息内容预览默认关闭。
 
-## 文档
-
-- 逐字段配置对照：`docs/CONFIG_MAP.md`
-- 命令全表：`docs/COMMANDS.md`
-- 移植决策、刻意的行为差异与实测修复：`docs/PORTING_NOTES.md`
-- 架构总览：`docs/ARCHITECTURE.md`
-- 跟进上游更新：`docs/UPSTREAM_SYNC.md`
-- 版本记录：`CHANGELOG.md`
 
 ## 许可
 

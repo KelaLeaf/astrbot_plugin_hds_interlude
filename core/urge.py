@@ -16,7 +16,7 @@
 
 命名约定
 --------
-上游 camelCase 字段按 `docs/PORT_PLAN.md` 转 snake_case（``source_entry_id`` /
+上游 camelCase 字段按移植约定 转 snake_case（``source_entry_id`` /
 ``participant_id`` / ``basis_quote`` / ``suggested_delay_minutes`` …）。
 读取侧**两种拼写都接受**（旧 JSON 可能仍是 camelCase），写出侧只写 snake_case。
 """

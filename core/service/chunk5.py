@@ -41,7 +41,7 @@
    刻意**拒绝算子**（见其 docstring）。本 chunk 一律"取回后 Python 侧过滤/按主键逐行取"，
    语义与上游一致。
 2. **网页观察**：上游 `ctx.puppeteer.page()` → `Transport.search_web` / `visit_web`
-   （`docs/PORT_PLAN_SERVICE.md` §7/§8）。浏览器不可用时的 `failed` 分支原样保留。
+   （移植约定/§8）。浏览器不可用时的 `failed` 分支原样保留。
 3. **`interlude_web_observation` 的主键**：上游写入 `id: 0` 让 ORM 生成 id；本移植版的
    `Database.insert` 会把显式 `0` 当真实主键（第二次写入就撞 UNIQUE），因此落库前省略
    `id` 字段交给 sqlite 回填（见 `save_web_observation`）。
@@ -144,7 +144,7 @@ _CAMEL_BOUNDARY = re.compile(r'(?<!^)(?=[A-Z])')
 
 
 # =========================================================================== #
-# 键名法小工具（`docs/PORT_PLAN.md` §2）
+# 键名法小工具（键名约定）
 # =========================================================================== #
 
 def _snake(name: str) -> str:
@@ -276,8 +276,7 @@ def _resolve_browser_target(draft: Any, config: Any) -> Optional[str]:
 def _search_template_host(config: Any) -> str:
     """`searchUrlTemplate` 的主机名：用户亲手填的搜索服务，视为已授权（本移植版 v1.3.4）。
 
-    上游只放行公网地址；本移植版自从宿主没有搜索接口时"真的去抓模板那一页"（见
-    `docs/PORTING_NOTES.md` §23），把 SearXNG 挂在局域网就成了常见做法。所以**这一台**
+    上游只放行公网地址；本移植版自从宿主没有搜索接口时"真的去抓模板那一页"（见移植说明），把 SearXNG 挂在局域网就成了常见做法。所以**这一台**
     允许是私网地址；随手 `visit` 的地址仍然禁私网，除非显式写进 `allowedDomains`。
     模板缺 `{query}` 时返回空串（那种模板本来就不会被使用）。
     """
@@ -294,7 +293,7 @@ def _is_safe_public_web_url(value: Any, config: Any) -> bool:
     """上游 `isSafePublicWebUrl`（`:7924`）：只放行公开 http(s) 地址。
 
     与上游唯一的差别：**用户显式点名的内网主机**放行——写进 `allowedDomains` 的域名，
-    以及 `searchUrlTemplate` 自己那一台（v1.3.4，见 `docs/PORTING_NOTES.md` §23）。
+    以及 `searchUrlTemplate` 自己那一台（v1.3.4，见移植说明）。
     localhost / `*.local` 与一切非 http(s) 地址仍然一律拒绝。
     """
     try:
@@ -455,7 +454,7 @@ def _domain_entry(row: Any) -> dict[str, Any]:
 def _prefer_helper(name: str, fallback: Callable[..., Any]) -> Callable[..., Any]:
     """优先用 `helpers.py` 的移植版（与 `base.py` 的 `_prefer_helper` 同一模式）。
 
-    `service.ts:7881-8036` 的模块级函数按 `docs/PORT_PLAN_SERVICE.md` 归 `helpers.py`；
+    `service.ts:7881-8036` 的模块级函数按移植约定 归 `helpers.py`；
     它们尚未落地时用本文件的等价实现，落地后自动切换，避免两份实现漂移。
     """
     candidate = getattr(_helpers_module, name, None)

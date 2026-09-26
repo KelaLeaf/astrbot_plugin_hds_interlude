@@ -30,7 +30,7 @@
   `compactionFingerprint` / `noteCompactionFailure` / `compactionIsBackedOff` /
   `compactionCheckpointAdvanced`（5866–5896）属于 **chunk7**；一律 `self.…()`。
 
-键名法（`docs/PORT_PLAN.md` §2）
+键名约定
 -------------------------------
 * **数据库行**（`db_get`/`db_create`/`db_set` 的列名）：保持上游 camelCase ——
   列名是持久化 wire format（`plugin/core/database.py` 的 `TABLES`）。
@@ -50,7 +50,7 @@
 并带瞬时错误重试与行归一化）。`plugin/core/database.py` 的 `all()` 只支持等值
 `where`，上游的 `$gt` / `$gte` / `$lte` / `$in` 查询由本文件的 `_scan_entries` /
 `_entries_by_ids` **先按上游形状问库、遇到 `NotImplementedError` 再降级为取回后
-在 Python 侧过滤**（与 `docs/PORT_PLAN_SERVICE.md` §2 的约定一致）。
+在 Python 侧过滤**（与 移植约定 的约定一致）。
 """
 
 from __future__ import annotations

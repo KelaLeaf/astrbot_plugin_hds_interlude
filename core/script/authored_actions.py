@@ -5,7 +5,7 @@
 解析出的 `AuthoredAction` 会被下游运输层使用，因此这里保持与上游一致的
 「同一份 actions 数组对象」语义（见下方 WeakSet 说明）。
 
-移植约定（见 `docs/PORT_PLAN.md`）：
+移植约定（见移植约定）：
 - 字段名 `camelCase` → `snake_case`（`authoredActions` → `authored_actions`、
   `actionId` → `action_id`、`groupReply` → `group_reply`、
   `crossConversationActions` → `cross_conversation_actions`）。
@@ -25,7 +25,7 @@ from ..types import NarrativeDecision
 # ⚠️ JS 的 `\w` 只匹配 `[A-Za-z0-9_]`（ASCII），Python 的 `\w` 默认还匹配汉字，
 # 故这里显式写成 `[A-Za-z0-9_-]`，避免接受上游不会接受的 id。
 #
-# 受控偏离（见 `docs/PORTING_NOTES.md` §19）：**标签写法容错**。上游正则只认
+# 受控偏离（见移植说明）：**标签写法容错**。上游正则只认
 # `<say id="x">` 这一种字面写法，而模型实际会写 `<say id='x'>`、`<say id=x>`、
 # `<SAY ID="x">`、`<say  id = "x">`、`<say id="x" >`，或者因为 JSON 转义层次把引号
 # 写成了 `id=\"x\"`。这些写法在上游都会**一个动作都解析不出来**——于是
@@ -71,7 +71,7 @@ class ReadAuthoredActionsResult(TypedDict, total=False):
 # 同一个 list 对象上，而不是内容相同的新 list（伪造的 authoredActions 必须被忽略）。
 #
 # Python 的 list 不支持弱引用（`weakref.ref([])` 直接 TypeError），按
-# `docs/PORT_PLAN.md` §2 的约定改用 `set[int]` 保存 `id(list)`，并用显式辅助函数
+# 键名约定 的约定改用 `set[int]` 保存 `id(list)`，并用显式辅助函数
 # 集中读写标记，业务代码里绝不裸操作集合。
 #
 # ⚠️ 纯 `set[int]` 会破坏「行为一致」：被标记的 list 一旦被 GC，它的 `id` 会立刻被
@@ -83,7 +83,7 @@ class ReadAuthoredActionsResult(TypedDict, total=False):
 #   * `_pins` 有上限（4096），淘汰时**同时**从 `_ids` 移除，所以也不会留下失效 id；
 #     代价只是「极老的、仍被外部持有的 actions 数组会丢标记」——而上游那种数组早已
 #     被 GC 掉，实际语义等价。
-# 若允许偏离 PORT_PLAN 指定的 `set[int]`，用带 `_resolved` 标记位的 list 子类可以
+# 若允许偏离 移植约定 指定的 `set[int]`，用带 `_resolved` 标记位的 list 子类可以
 # 零成本做到完全一致（list 子类支持弱引用），此处按约定不加。
 # --------------------------------------------------------------------------------------
 class _ActionMarkRegistry:
@@ -161,7 +161,7 @@ def inspect_say_markup(prose: Any) -> dict[str, Any]:
 def sole_bubble_block(prose: Any, separator: str) -> Optional[str]:
     """整份散文里**只有一段**含分隔符、且那段本身就是合法气泡块 → 把整段交回来。
 
-    受控偏离（`docs/PORTING_NOTES.md` §20）。模型声明了 `interaction.reply.actionId`，
+    受控偏离（移植说明）。模型声明了 `interaction.reply.actionId`，
     却把回复**裸写**在剧本里（`甲<sep/>乙<sep/>丙`，一个 `<say>` 标签都不写）：
     上游的 `soleActionReply` 要求"恰好一个已授权动作"，零动作时兜不住 → 已经写好的回复
     被判成「结构化可见回复缺失」→ 白重写一次 → 重写又犯同样的错 → 整套 60 秒自动重试

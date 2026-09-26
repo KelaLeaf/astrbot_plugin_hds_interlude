@@ -1,6 +1,6 @@
 """AstrBot 平台适配层：把 `AstrMessageEvent` / `Context` 翻译进 `plugin/core/`。
 
-本模块是 `plugin/core/` 与 AstrBot 之间**唯一**的接缝（`docs/PORT_PLAN.md` §0.3）。
+本模块是 `plugin/core/` 与 AstrBot 之间**唯一**的接缝（移植约定）。
 `core/` 里任何模块都不得 `import astrbot`；平台相关的一切都在这里落地。
 
 对应关系
@@ -13,7 +13,7 @@
 | `ctx.logger` / `ctx.database` / `ctx.http` / `ctx.setTimeout` | `AstrbotInterludeContext`（内部用 `InterludeContext`） |
 | `apply(ctx, config)` | `AstrbotBridge`（`main.py` 的 `Star` 子类持有它） |
 
-键名法（`docs/PORT_PLAN.md` §2）
+键名约定
 ------------------------------
 
 发给模型的 payload、数据库列名保持上游 camelCase（由 `core/` 负责）；
@@ -21,7 +21,7 @@
 以及把 `core/` 的 camelCase 出站内容翻成 AstrBot 消息链。
 从外部读入的行（数据库行 / 参与者 dict）一律用 `pick()` 双读。
 
-降级路径清单（`docs/PORT_PLAN_SERVICE.md` §8）
+降级路径清单（移植约定）
 --------------------------------------------
 
 AstrBot 没有对应能力的上游功能一律**返回失败/空值并记日志**，绝不抛异常：
@@ -827,7 +827,7 @@ class AstrbotTransport:
     ) -> dict[str, Any]:
         """发送平台原生表情。上游 `:2119`（只有 OneBot 平台支持）。
 
-        平台不是 OneBot 家族时按 `docs/PORT_PLAN_SERVICE.md` §8 降级：返回
+        平台不是 OneBot 家族时按移植约定 降级：返回
         `{'ok': False}`，调用方走既有的"投递失败"分支。
         """
         umo = self.bridge.group_umo(channel_id) if is_group else self.bridge.channel_umo(channel_id)
@@ -2502,7 +2502,7 @@ class AstrbotBridge:
 
         1. 空文本且没有语音 → 不处理；**但只要是归我们管的私聊（capture 开着、
            白名单通过），仍然吞掉事件**，别让宿主的另一个聊天 Agent 在同一段私聊里
-           用第二个人格回答（受控偏离，见 `docs/PORTING_NOTES.md` §18）；
+           用第二个人格回答（受控偏离，见移植说明）；
         2. 盲区模式下的管理命令 → 静默吞掉（`blindMode.enabled` 时上游直接
            `return`，不返回 `next()`）；
         3. `runtime.ignore_command_messages` 下的管理命令 → 交回命令解析器；
@@ -2564,7 +2564,7 @@ class AstrbotBridge:
         elif not endpoint.is_group and self.owns_private_session(session):
             # 我们看了、但没能把它变成一回合（故事暂停 / 参与者不在 / 适配器给的形状怪…）：
             # **照样吞掉**。上游在这里 `next()`，而 AstrBot 的后面坐着第二个 Agent——
-            # 那会变成"这段私聊换个人格答话"（见 `docs/PORTING_NOTES.md` §18）。
+            # 那会变成"这段私聊换个人格答话"（见移植说明）。
             # 同时留一条可见的 warn，把"为什么什么都没发生"写在日志里。
             event.stop_event()
             await self._report_unconsumed_private(event, session)

@@ -37,7 +37,7 @@
 （先失败信封、再通用错误）。这不是笔误，是逐字保留的上游行为。
 未知命令与上游一致：**静默忽略**，不发任何事件。
 
-## 安全降级分支（`docs/PORT_PLAN_SERVICE.md` §8）
+## 安全降级分支（移植约定）
 
 1. **`process.send` → `sink`**：上游 `sendToDesktop()` 在没有 `process.send` 时
    直接返回；本移植版 `emit()` 在没有 sink 时仍把事件记进缓冲区
@@ -56,7 +56,7 @@
 5. **上游 disposer 不重置 event sink**；本移植版的 `stop()` 额外
    `set_desktop_event_sink(None)`，避免停桥后仍向已死的 sink 推送。
 
-## 键名法（`docs/PORT_PLAN.md` §2）
+## 键名约定
 
 桌面报文是**外部不可信输入**，因此所有读取都走 `pick(value, 'camelCase',
 'snake_case')` 双读、优先上游 camelCase（比上游只认 camelCase 更宽容，不会漏读）。

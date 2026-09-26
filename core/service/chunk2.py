@@ -39,7 +39,7 @@
 入站消息缓冲与实验性流式早发、贴纸库扫描与向量回填、历史语义召回（`recallHistory`
 + `ensureHistoryVectors`）。
 
-键名约定（`docs/PORT_PLAN.md` §2，本文件里逐处落实）：
+键名约定（键名约定，本文件里逐处落实）：
 
 * **数据库行**：上游 camelCase（`assetId` / `filePath` / `occurredAt` / `metadata`…）。
   `base.db_get()` 经 `helpers.normalize_database_row()` 后**保持 camelCase**，因此

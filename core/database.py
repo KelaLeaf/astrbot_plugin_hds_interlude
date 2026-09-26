@@ -4,7 +4,7 @@
 上游用 Koishi ORM（`ctx.model.extend(...)`，底层 minato + sql.js）声明式注册表；
 本移植版用标准库 `sqlite3` 建等价的表与索引。
 
-语言映射约定（详见 `docs/PORT_PLAN.md`）：
+语言映射约定（详见移植约定）：
 - 字段名一律**保留上游 camelCase**（`selfId` / `occurredAt` / `sourceEntryIds` …）：
   service 层按名字读写，转换会破坏兼容性。
 - `unsigned` → `INTEGER`；`double` → `REAL`；`boolean` → `INTEGER`；

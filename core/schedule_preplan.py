@@ -1,7 +1,7 @@
 """日程预排（Schedule Preplan）—— 上游 `src/schedule-preplan.ts` 的逐句移植。
 
 上游是 Koishi / TypeScript（v1.0.1-beta6-rebuild，432 行）；本文件是
-`docs/PORT_PLAN.md` §1 目录映射表里的 `src/schedule-preplan.ts` → `core/schedule_preplan.py`。
+上游 `src/schedule-preplan.ts` → `core/schedule_preplan.py`。
 
 这一层写的是**计划**，绝不是已观察到的事实
 -------------------------------------------------
@@ -19,7 +19,7 @@
 --------
 * 时间：`now` / `createdAt` / `updatedAt` 一律 timezone-aware `datetime`（统一 UTC，
   见 `core/time.py`）；**日期键与 `SchedulePreplanRecord.validFrom` 等继续是
-  `string(10)` 的 `YYYY-MM-DD`**（PORT_PLAN §2「时间」：上游存字符串的地方继续存字符串）。
+  `string(10)` 的 `YYYY-MM-DD`**（时间约定：上游存字符串的地方继续存字符串）。
 * 键名：写出侧一律 snake_case（`story_id` / `valid_from` / `source_entry_ids` …
   与 `core/types.py` 的 TypedDict 对齐）；读取侧**同时接受上游 camelCase**，因为上游
   `src/database.ts` 的列名就是 camelCase，读回旧数据行必须仍能识别。
@@ -71,7 +71,7 @@ class SchedulePreplanConfig(TypedDict, total=False):
     """上游 `src/schedule-preplan.ts` 的 `SchedulePreplanConfig`
     （它不在 `types.ts` 里，故随本模块移植）。
 
-    字段名照 PORT_PLAN 转 snake_case；`resolve_schedule_preplan_config()` 的输出
+    字段名按约定转 snake_case；`resolve_schedule_preplan_config()` 的输出
     七个字段全部就位，传入的配置可以缺省（等价上游的 `Partial<...>`）。
     """
 
@@ -212,7 +212,7 @@ def schedule_preplan_needs_model(
 # ============================================================ 写入
 
 
-#: 记录字段的上游 camelCase 拼写 → 本移植版 snake_case（PORT_PLAN §2「命名」）。
+#: 记录字段的上游 camelCase 拼写 → 本移植版 snake_case（键名约定）。
 _RECORD_ALIASES = {
     'storyId': 'story_id',
     'validFrom': 'valid_from',

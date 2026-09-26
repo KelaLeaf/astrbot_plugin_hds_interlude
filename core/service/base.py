@@ -8,7 +8,7 @@
 - `ServiceChunk0`：`src/service.ts:717-1247` 的全部成员（constructor、后台调度、
   narrator/compactor/embedder 注入、桌面桥入口与只读投影、权限判定、故事与参与者）。
 
-模块级共用小工具（供全部 9 个 mixin 复用，见 `docs/PORT_PLAN.md` §2「键名法」）：
+模块级共用小工具（供全部 9 个 mixin 复用，见键名约定）：
 
 - `pick(value, camel, snake=None)`：**从外部读入**的 dict 双读，优先上游 camelCase。
   这是全工程唯一的公开实现，`plugin.core.service` 会 re-export。
@@ -93,7 +93,7 @@ def pick(value: Any, camel: str, snake: Optional[str] = None) -> Any:
     """从**外部读入**的 dict 里取值，两种拼写都认，优先上游 camelCase。
 
     与 `plugin/core/agency.py` / `plugin/core/story_state.py` 里的同名私有实现
-    语义逐字一致（`docs/PORT_PLAN.md` §2「键名法」）。本移植版把它的**唯一公开
+    语义逐字一致（键名约定）。本移植版把它的**唯一公开
     位置**定在这里，`plugin.core.service` 会 re-export；9 个 chunk 一律
     `from .base import pick`，不要再各写各的。
 
@@ -490,7 +490,7 @@ def _no_bots() -> list[Any]:
 
 
 def random_random() -> float:
-    """默认随机源：`random.random()`（`docs/PORT_PLAN.md` §2）。"""
+    """默认随机源：`random.random()`（键名约定）。"""
     return random.random()
 
 
@@ -1794,7 +1794,7 @@ class ServiceChunk0(ServiceBase):
     #
     # 上游把这件事做成**一个总闸**（`onebot.enabled`）+ 三张名单：闸门关着时私聊全放行、
     # 群聊一律不接；闸门开着时空白名单＝全部拒绝，而且**只对 OneBot 家族生效**。
-    # 本移植版按用户要求改成正交的三开关（`PORTING_NOTES.md` §22）：
+    # 本移植版按用户要求改成正交的三开关（移植说明）：
     #
     #   * 每个开关**关闭**（默认）＝ 名单只用来做**针对性处理**（称呼 / 背景 / 初始关系 /
     #     群规则），名单外的照样进，走 `story_defaults` 的默认设定；
@@ -1864,7 +1864,7 @@ class ServiceChunk0(ServiceBase):
         """名单外群的默认群规则（`group_chats_only` 关闭时用）。
 
         上游没有这条路径（群规则不存在就直接不接），本移植版按用户要求补上
-        （`PORTING_NOTES.md` §22）。取值与 schema 里群规则的默认值一致：
+        （移植说明）。取值与 schema 里群规则的默认值一致：
         `mention-only`（不 @ 就不说话，最保守）、防抖 1 秒、冷却 60 秒、附带 20 条上下文、
         本地意愿门**关闭**（`evaluate_group_willingness` 未配置时 `should_call=True`）。
         """
@@ -2008,7 +2008,7 @@ class ServiceChunk0(ServiceBase):
         """上游 `canHandleStory(story)`（`src/service.ts:991`）：后台生活更新只要求机器人账号仍启用。
 
         v1.3.0 起同样平台无关，且只在「仅处理名单内的机器人账号」打开时才看名单
-        （`docs/PORTING_NOTES.md` §22）。
+        （移植说明）。
         """
         if not self._access_flag('botAccountsOnly', 'bot_accounts_only'):
             return True
@@ -2184,7 +2184,7 @@ class ServiceChunk0(ServiceBase):
         """上游 `storyStartReadiness(session)`（`src/service.ts:1122`）逐条移植。
 
         `new Intl.DateTimeFormat('en-US', { timeZone })` 的等价校验用
-        `zoneinfo.ZoneInfo`（`docs/PORT_PLAN.md` §2 Node → Python 映射表）。
+        `zoneinfo.ZoneInfo`（键名约定 Node → Python 映射表）。
         """
         setting = self.initial_story_setting()
         blockers: list[str] = []

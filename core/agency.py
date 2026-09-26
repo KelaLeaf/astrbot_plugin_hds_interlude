@@ -30,7 +30,7 @@
 - 复核时间取 `notBefore` / 容量 `nextOpportunityAt` / 窗口 `nextOpportunityAt` 中
   **严格晚于 now 的最早者**，无则回落 `now + 30 分钟`，最后与 `expiresAt` 取小。
 
-时间映射（见 docs/PORT_PLAN.md §2）：上游 `Date` → timezone-aware UTC `datetime`；
+时间映射（见键名约定）：上游 `Date` → timezone-aware UTC `datetime`；
 上游 `Date#toISOString()` 的输出形状由 `core/time.py` 的 `iso()` 保证（毫秒三位 + `Z`），
 因此返回对象里的时间字段与上游一样是**字符串**。
 """
@@ -311,7 +311,7 @@ def proactive_origin_bypasses_ordinary_interval(origin: ProactiveContactOrigin) 
 
 
 # --------------------------------------------------------------------------------------
-# 内部助手（上游未 export 的模块级函数，一律加 `_` 前缀，见 docs/PORT_PLAN.md §2）
+# 内部助手（上游未 export 的模块级函数，一律加 `_` 前缀，见键名约定）
 # --------------------------------------------------------------------------------------
 
 
@@ -399,7 +399,7 @@ def _pick(value: Mapping[str, Any], *keys: str) -> Any:
     """按顺序读取字段：优先上游原文 `camelCase` 键，其次本移植版的 `snake_case` 键。
 
     上游整条链路都在同一个 `camelCase` 命名空间里，因此 `activeAgencyWindow(normalizeAgencyWindowDraft(...))`
-    这类「自产自销」的调用天然成立。按 docs/PORT_PLAN.md §2，本移植版把字段名统一改成
+    这类「自产自销」的调用天然成立。按键名约定，本移植版把字段名统一改成
     `snake_case`（`types.py` 的 TypedDict 如此声明），于是这两个函数必须同时认得两种写法的键，
     否则「草稿 → 状态 → 活跃窗口」的往返（以及 `story.state.agency_window` 的反序列化结果）
     会读不到字段。

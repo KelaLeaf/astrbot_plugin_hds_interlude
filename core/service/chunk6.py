@@ -42,14 +42,14 @@
 2. **平台出站**：上游 `session.send(...)` / `bot.sendMessage(channelId, ...)` /
    `desktopDeliveryHandler({...})` 三条路径，本移植版分别落到
    `Transport.send_session` / `Transport.send_private` / `self.desktop_delivery_handler`
-   （`docs/PORT_PLAN_SERVICE.md` §7）。`findBotForParticipant` 原样保留为**可用性判定**，
+   （移植约定）。`findBotForParticipant` 原样保留为**可用性判定**，
    因为 AstrBot 侧没有 Koishi 的 `ctx.bots` 出站对象；只有"既无匹配 bot、也没有
    Transport"时才走上游 `bot-not-found` 分支。
 3. **引用消息**：上游把可见正文换成 `h('quote', {id}) + '\\u200b'`。本移植版把引用目标
    交给 `send_private` / `send_group` 的 `reply_to`；只有实时会话路径（`send_session`
    协议没有 `reply_to`）在**带引用**时退回按参与者投递，避免只剩一个零宽占位
    （§8：能力无法复现时必须写出可用降级分支，而不是静默丢消息）。
-4. **键名法**（`docs/PORT_PLAN.md` §2）：
+4. **键名法**（键名约定）：
    * 数据库行列名逐字 camelCase（`storyId` / `notBefore` / `participantId`）；
    * **intent payload** 是跨模块 wire format：`helpers.automatic_delivery_from_payload`
      只认 `payload.automaticDelivery`，模型提示词投影读 `payload.expiresAt` /
@@ -75,7 +75,7 @@
    （`Object.create(InterludeService.prototype)`）当 `this`，JS 里缺失的属性是
    `undefined`。因此当前时刻统一走 `_now_of(self)`（真实服务用可注入的 `self.now()`，
    桩对象回落 `utc_now()`），打字延迟与 Urge 采样走模块级 `random.random()`
-   （`docs/PORT_PLAN.md` §2 的映射），而不是 `self.rng()`——后者需要 `self.ctx`，
+   （键名约定 的映射），而不是 `self.rng()`——后者需要 `self.ctx`，
    字面量桩没有。
 
 ## 与 helpers.py 的关系
@@ -212,7 +212,7 @@ def _prefer_helper(name: str, fallback: Any) -> Any:
 
 
 def _snake(name: str) -> str:
-    """`camelCase` → `snake_case`（`docs/PORT_PLAN.md` §2 命名映射）。"""
+    """`camelCase` → `snake_case`（键名约定 命名映射）。"""
     import re
     return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
 
@@ -1441,7 +1441,7 @@ class ServiceChunk6(ServiceBase):
             _cfg(runtime, 'typingJitterRatio', _DEFAULT_TYPING_JITTER_RATIO), 0.0,
         )
         jitter = max(0.0, min(0.5, jitter))
-        # 上游 `Math.random()` → 模块级 `random.random()`（`docs/PORT_PLAN.md` §2）。
+        # 上游 `Math.random()` → 模块级 `random.random()`（键名约定）。
         factor = 1 + (random.random() * 2 - 1) * jitter if jitter else 1
         return int(max(250, min(maximum_seconds * _SECOND_MS,
                                 _js_round(nominal * factor * _SECOND_MS))))

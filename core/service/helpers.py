@@ -1,11 +1,11 @@
 """上游 `src/service.ts` 第 7084–8524 行的移植：全部模块级纯函数。
 
-本模块是 `docs/PORT_PLAN_SERVICE.md` 分解契约里的 `helpers.py`：只含**模块级函数**，
+本模块是 移植约定 分解契约里的 `helpers.py`：只含**模块级函数**，
 不含 `InterludeService` 的任何成员。`upstream/src/service.ts` 该范围内出现、但实际
 定义在别处的辅助函数（`isRecord` / `clip` / `clampNumber` / `toDate` / `cosineSimilarity`
 等）按上游同样归属本模块。
 
-## 键名法（`docs/PORT_PLAN.md` §2「⚠️ 键名法」）
+## 键名约定
 
 | 位置 | 键名 | 理由 |
 | --- | --- | --- |
@@ -26,7 +26,7 @@
 * JS 正则 ``\\d``/``\\w`` 只匹配 ASCII → Python 一律用 `re.ASCII` 或显式 `[0-9]`/`[A-Za-z0-9_]`。
 
 不含任何 `astrbot` 依赖：Session 一律走 `plugin/core/service/session.py` 的视图协议，
-平台能力走 `Transport` 抽象（见 `docs/PORT_PLAN_SERVICE.md` §6–7）。
+平台能力走 `Transport` 抽象（见移植约定–7）。
 """
 
 from __future__ import annotations
@@ -1256,7 +1256,7 @@ def _has_structured_interaction(value: Any) -> bool:
         # 引用的 `<say>` 动作落地不了**（`resolve_authored_actions` 退成 none 并留下
         # `unresolved_action_id`）。后者是坏回合，遇到就沿用既有的「重写一次」机制，
         # 否则用户看到的是"她读了却不回"（上游的静默语义；本移植版刻意偏离，见
-        # `docs/PORTING_NOTES.md` §17）。
+        # 移植说明）。
         return not reply.get('unresolved_action_id')
     if reply.get('unresolved_action_id'):
         return False

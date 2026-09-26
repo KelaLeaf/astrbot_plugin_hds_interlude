@@ -1,6 +1,6 @@
 """上游 `src/story-state.ts` 的对应物：版本化故事状态编解码与幂等升级。
 
-约定（见 docs/PORT_PLAN.md §2「键名法」）：
+约定（见键名约定）：
 - Python 侧输出一律 snake_case；读入时同时接受上游 camelCase（旧数据/模型产物）。
 - 未知的顶层键会被搬进 `extensions` 保留，而不是在写回时丢失。
 """

@@ -7,7 +7,7 @@
 轮换由调用方（`core/narrator.py`）在候选列表之上进行——本文件只负责
 **静态、按配置顺序** 的挑选，与上游完全一致。
 
-语言映射约定（详见 `docs/PORT_PLAN.md`）：
+语言映射约定（详见移植约定）：
 - 函数 `camelCase` → `snake_case`；配置/领域对象的字段名同样 snake_case
   （与 `core/types.py` 的 `AlterSystemConfig` 等保持一致：`model_id`、
   `provider_id`、`max_tokens`、`response_format`、`use_for_main` …）。

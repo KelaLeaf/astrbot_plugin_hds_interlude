@@ -6,7 +6,7 @@
 commit 的 prose，事件、场景增量、投递账本（M6.1）与可选的时间线计划都进 metadata。
 **M6.1 只增加元数据**：不新增第二个发送者，也不改变既有投递时序。
 
-命名约定（docs/PORT_PLAN.md §2）：camelCase 字段转 snake_case；读取侧两种拼写都
+命名约定（键名约定）：camelCase 字段转 snake_case；读取侧两种拼写都
 接受（兄弟模块或旧 JSON 可能仍是 camelCase），写出侧只写 snake_case。
 """
 

@@ -6,7 +6,7 @@
 正文的第二份散文：它把「已确认送达 / 未确认 / 出错后仍未确认 / 已取消」如实报告
 给叙事器，绝不改写原文。
 
-键名（`docs/PORT_PLAN.md` §2「⚠️ 键名法」）
+键名（键名约定）
 ------------------------------------------
 - **返回值是 wire format**：它由 `narrator_prompts.to_prompt_payload` 放进
   `ongoingThreads.deliveryReality` 直接发给模型，上游 `systemPrompt` 也按

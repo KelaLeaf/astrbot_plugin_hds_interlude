@@ -1,6 +1,6 @@
 """上游 `src/service.ts` 第 1–623 行的移植：配置接口 + 桌面时间线只读投影。
 
-本模块是 `docs/PORT_PLAN_SERVICE.md` 分解契约里的 `config.py`：
+本模块是 移植约定 分解契约里的 `config.py`：
 
 * **1–258 行**：桌面（desktop）协议的只读投影纯函数 +
   `desktopTimelineEntryView` / `isHistoryEntryVisibleToParticipant` /
@@ -15,7 +15,7 @@
   `ExecutableGroupChatActions` / `GroupDeliveryResult` / `DueIntentWake` /
   `PreparedCompaction*` / `CompactionBackoff` / `HistoryVectorEntry`）。
 
-## 键名法（`docs/PORT_PLAN.md` §2「⚠️ 键名法」）
+## 键名约定
 
 | 位置 | 键名 | 理由 |
 | --- | --- | --- |
@@ -844,7 +844,7 @@ class Config(TypedDict, total=False):
 # =========================================================================== #
 #
 # 这些形状只在本移植版的 service 内部流转，故字段名一律 snake_case
-# （`docs/PORT_PLAN.md` §2 键名法）。
+# （键名约定 键名法）。
 # 例外：`ExecutableMessageReaction` / `ExecutableGroupChatActions` /
 # `GroupDeliveryResult` / `SessionFileFact` 是发给适配层的 wire format，保 camelCase。
 

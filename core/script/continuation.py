@@ -17,7 +17,7 @@
 它**不**生成场景摘要、**不**复制台词、**不**推断用户尚未回复（「他还没回我」这类
 债务式结论必须由模型从原文自行判断，不能由 bookmark 凭空断言）。
 
-键名（`docs/PORT_PLAN.md` §2「⚠️ 键名法」）
+键名（键名约定）
 ------------------------------------------
 - **返回值是 wire format**：它由 `narrator_prompts.to_prompt_payload` 放进
   `authoringWindow.continuation` 直接发给模型，上游 `systemPrompt` 的
