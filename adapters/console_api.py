@@ -81,17 +81,12 @@ DELEGATED_FIELDS: dict[str, str] = {
 
 #: 行为提醒（不是宿主的锅，是配置本身的坑）：路径 → 提示。
 FIELD_NOTES: dict[str, str] = {
-    'qq_access.bot_accounts_only': '打开后只有名单里的机器人账号收消息；关闭时名单只做备注。',
-    'qq_access.user_accounts_only': '打开后只有名单里的用户能私聊；关闭时名单外的人也进叙事，'
-                                   '走「故事档案」的默认用户资料与默认关系（名单里的行则用自己填的称呼 / 背景 / 关系）。',
-    'qq_access.group_chats_only': '打开后只有名单里的群会被接入；关闭时名单外的群也接，'
-                                  '按默认群规则处理（不 @ 就不说话）。',
     'qq_access.user_accounts': '名单里的行决定她怎么称呼你、以及你的背景与初始关系'
                               '（label 留空时用平台昵称；profile / relationship 留空时回落到「故事档案」的默认值）。'
                               '只作用于私聊；群聊成员不需要在这里。',
     'qq_access.bot_accounts': '只决定"哪个登录账号收消息"，label 不进模型。',
-    'qq_access.group_chats': '名单里的群用这一行的触发方式 / 防抖 / 冷却 / 发言意愿，'
-                             '以及群用途与角色定位；群号不在名单里也能接（见「仅处理名单内的群聊」）。',
+    'qq_access.group_chats': '这一行决定那个群的触发方式（mention-only 只回 @ / always）与节奏，'
+                             '以及群用途与角色定位。',
     'story_defaults.style': '故事级文风，接在「提示词」的全局文风之后；两级都生效。',
     'story_defaults.persona_id': '选中 AstrBot 人格会用它覆盖角色名与角色设定（留空则用下面的手填项）。',
     'prompts.style_prompt': '全局默认文风；故事档案里的「故事文风」可以在它之后再补一层。',

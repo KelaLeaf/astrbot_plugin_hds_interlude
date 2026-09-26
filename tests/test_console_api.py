@@ -658,6 +658,20 @@ if __name__ == '__main__':
     unittest.main()
 
 
+class ConfigNoteTests(unittest.TestCase):
+    """配置页字段说明的回归：开关自己那行标题已经说清了，别再叠一句重复的。"""
+
+    def test_the_three_switches_have_no_extra_note(self) -> None:
+        from plugin.adapters import console_api
+        for key in ('bot_accounts_only', 'user_accounts_only', 'group_chats_only'):
+            self.assertNotIn('qq_access.%s' % key, console_api.FIELD_NOTES, key)
+
+    def test_the_lists_keep_their_notes(self) -> None:
+        from plugin.adapters import console_api
+        for key in ('user_accounts', 'bot_accounts', 'group_chats'):
+            self.assertIn('qq_access.%s' % key, console_api.FIELD_NOTES, key)
+
+
 class ConfigEditorTests(unittest.TestCase):
     """控制台配置页：schema 取数 + **按 schema 路径**写配置。
 

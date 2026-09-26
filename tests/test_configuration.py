@@ -761,6 +761,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertNotIn("enabled", qq)
         for key in ("bot_accounts_only", "user_accounts_only", "group_chats_only"):
             self.assertIs(qq[key]["default"], False, key)
+            # 开关的说明就是它自己那行标题：**不留 hint**（用户明确要求删掉那段
+            # "关闭（默认）…打开…所有平台一视同仁"的长说明，它跟标题重复）。
+            self.assertNotIn("hint", qq[key], key)
         self.assertEqual(qq["bot_accounts"]["default"], [])
         self.assertEqual(qq["user_accounts"]["default"], [])
         self.assertEqual(qq["group_chats"]["default"], [])
