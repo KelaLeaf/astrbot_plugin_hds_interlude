@@ -1426,17 +1426,18 @@ class BridgeIntegrationTests(unittest.TestCase):
         from datetime import datetime
         from zoneinfo import ZoneInfo
 
-        today = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+        # 今天与明天各排一块：测试正好压在零点前后时，只排"今天"会取不到（2026-09-27 00:00 实拍撞上）。
+        from datetime import timedelta
+        base = datetime.now(ZoneInfo('Asia/Shanghai')).date()
+        block = {'id': 'b1', 'start': '00:00', 'end': '23:59',
+                 'kind': 'fixed', 'label': '上班', 'location': '公司'}
         record = {
             'timezone': 'Asia/Shanghai',
             'revision': 3,
-            'materializedDays': [{
-                'date': today,
-                'blocks': [{
-                    'id': 'b1', 'start': '00:00', 'end': '23:59',
-                    'kind': 'fixed', 'label': '上班', 'location': '公司',
-                }],
-            }],
+            'materializedDays': [
+                {'date': (base + timedelta(days=offset)).isoformat(), 'blocks': [block]}
+                for offset in (0, 1)
+            ],
         }
         lines = _make_bridge().schedule_window_lines(record, 'Asia/Shanghai')
         self.assertTrue(lines)
