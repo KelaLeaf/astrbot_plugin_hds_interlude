@@ -1151,6 +1151,164 @@ def rows_of(rows: list[Any]) -> list[dict[str, Any]]:
 
 
 # =========================================================================== #
+# 受控偏离（移植说明 §23）：后台回合的即时回复投给谁
+# =========================================================================== #
+
+WAITING_ID = 'test:1:3'
+
+
+class BackgroundReplyRoutingTests(unittest.IsolatedAsyncioTestCase):
+    """用户 2026-09-27 06:19 的实测：她回的是主人的两条未读，消息却落进「汐雨.」的
+
+    对话框——因为那一回合是「汐雨.」那条到期计划开的。这里钉住改投逻辑与跨对话闸门。
+    """
+
+    def setUp(self) -> None:
+        self.sink = _Sink()
+        interlude_logging.set_log_sink(self.sink)
+        self.addCleanup(interlude_logging.set_log_sink, interlude_logging._default_sink)
+        self.db = Database(':memory:')
+        self.addCleanup(self.db.close)
+        self.db.register_tables()
+        self.ctx = InterludeContext(logger=None, database=self.db, clock=lambda: NOW)
+        self.service = _IntegrationService(
+            self.ctx, self.share_config(allow_cross=True), self.db, NullTransport(),
+        )
+        self.db.insert('interlude_story', {
+            'id': STORY_ID, 'platform': 'test', 'selfId': '1', 'userId': '1',
+            'channelId': 'private:1', 'status': 'active',
+            'setting': make_setting(), 'state': encode_story_state(empty_story_state()),
+            'cursorAt': FROM, 'createdAt': FROM, 'updatedAt': FROM,
+        })
+        self.add_participant(PARTICIPANT_ID, '2', '汐雨.', unread=0)
+
+    @staticmethod
+    def share_config(*, allow_cross: bool) -> dict[str, Any]:
+        config = make_service_config()
+        config['sharedStory'] = {
+            'allowCrossConversationMessages': allow_cross,
+            'shareParticipantDetails': True,
+            'participantContextLimit': 4,
+            'maxCrossConversationActions': 2,
+        }
+        return config
+
+    def add_participant(self, participant_id: str, user_id: str, name: str, unread: int) -> None:
+        self.db.insert('interlude_participant', {
+            'id': participant_id, 'storyId': STORY_ID, 'platform': 'test', 'selfId': '1',
+            'userId': user_id, 'channelId': 'private:%s' % user_id, 'personId': 'person:%s' % user_id,
+            'displayName': name, 'profile': '', 'relationship': '',
+            'state': {
+                'openThreads': [], 'relationshipNotes': [],
+                'unreadMessageCount': unread, 'pendingReplyCount': unread,
+            },
+            'status': 'active', 'createdAt': FROM, 'updatedAt': FROM,
+        })
+
+    def turn_participant(self) -> dict[str, Any]:
+        return normalize_database_row(
+            'interlude_participant', self.db.get('interlude_participant', {'id': PARTICIPANT_ID}),
+        )
+
+    async def persist(self, raw: dict[str, Any]) -> dict[str, Any]:
+        story = normalize_database_row(
+            'interlude_story', self.db.get('interlude_story', {'id': STORY_ID}),
+        )
+        return await self.service.persist_decision(
+            story, self.turn_participant(), raw, FROM, NOW, True, 'intent-due', [], False, None,
+        )
+
+    @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
+    async def test_the_reply_goes_to_the_branch_that_is_actually_waiting(self) -> None:
+        self.add_participant(WAITING_ID, '3', '主人', unread=2)
+        # 与用户日志同形：模型只声明 actionId，原话写在剧本的 <say> 里。
+        raw = {
+            'script': '指头落下去。22:37「在么」。\n\n<say id="reply">早～</say>\n\n退出来。',
+            'interaction': {'seen': False, 'reply': {'mode': 'immediate', 'actionId': 'reply'}},
+        }
+
+        result = await self.persist(raw)
+
+        self.assertEqual([message['participant_id'] for message in result['messages']], [WAITING_ID])
+        self.assertEqual([message['content'] for message in result['messages']], ['早～'])
+        outgoing = [event for event in result['commit']['events'] if event['kind'] == 'outgoing-message']
+        self.assertEqual([event['participant_id'] for event in outgoing], [WAITING_ID])
+        self.assertIn('已改投', self.sink.text())
+
+    @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
+    async def test_the_reply_stays_when_this_branch_is_the_one_waiting(self) -> None:
+        self.db.update('interlude_participant', {'id': PARTICIPANT_ID}, {
+            'state': {'openThreads': [], 'relationshipNotes': [], 'unreadMessageCount': 2},
+        })
+        raw = {
+            'script': '嗯，我在。',
+            'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'content': '嗯，我在。'}},
+        }
+
+        result = await self.persist(raw)
+
+        self.assertEqual([message['participant_id'] for message in result['messages']], [PARTICIPANT_ID])
+
+    @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
+    async def test_two_waiting_branches_are_left_alone(self) -> None:
+        self.add_participant(WAITING_ID, '3', '主人', unread=2)
+        self.add_participant('test:1:4', '4', '第三个', unread=3)
+        raw = {
+            'script': '她放下手机。',
+            'interaction': {'seen': False, 'reply': {'mode': 'immediate', 'content': '在。'}},
+        }
+
+        result = await self.persist(raw)
+
+        self.assertEqual([message['participant_id'] for message in result['messages']], [PARTICIPANT_ID])
+
+    @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
+    async def test_a_due_turn_may_answer_a_waiting_branch(self) -> None:
+        self.add_participant(WAITING_ID, '3', '主人', unread=2)
+        raw = {
+            'script': '「早～」\n\n那边还等着。',
+            'interaction': {'seen': False, 'reply': {'mode': 'none'}},
+            'crossConversationActions': [{
+                'participantId': WAITING_ID, 'mode': 'immediate', 'content': '早～',
+            }],
+        }
+
+        result = await self.persist(raw)
+
+        self.assertEqual([message['participant_id'] for message in result['messages']], [WAITING_ID])
+
+    @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
+    async def test_a_due_turn_cannot_start_an_unprompted_contact(self) -> None:
+        self.add_participant(WAITING_ID, '3', '主人', unread=0)
+        raw = {
+            'script': '她想了想。',
+            'interaction': {'seen': False, 'reply': {'mode': 'none'}},
+            'crossConversationActions': [{
+                'participantId': WAITING_ID, 'mode': 'immediate', 'content': '在么？',
+            }],
+        }
+
+        result = await self.persist(raw)
+
+        self.assertEqual(result['messages'], [])
+
+    @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
+    async def test_without_the_cross_channel_the_reply_is_not_moved(self) -> None:
+        self.add_participant(WAITING_ID, '3', '主人', unread=2)
+        self.service = _IntegrationService(
+            self.ctx, self.share_config(allow_cross=False), self.db, NullTransport(),
+        )
+        raw = {
+            'script': '早～',
+            'interaction': {'seen': False, 'reply': {'mode': 'immediate', 'content': '早～'}},
+        }
+
+        result = await self.persist(raw)
+
+        self.assertEqual([message['participant_id'] for message in result['messages']], [PARTICIPANT_ID])
+
+
+# =========================================================================== #
 # 端到端（真实 `InterludeService`：全部 10 个 chunk + 假 narrator）
 # =========================================================================== #
 

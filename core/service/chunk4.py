@@ -433,6 +433,82 @@ def _normalize_conversation_action(
     return action
 
 
+# --------------------------------------------------------------------------- #
+# 受控偏离（见移植说明 §24）：后台回合里「回答另一条对话的来信」
+# --------------------------------------------------------------------------- #
+
+def _participant_waiting_for_reply(participant: Any) -> bool:
+    """这条关系分支是否还有等待她的来信（未读 / 待回）。
+
+    只读参与者状态里的两个计数。它们是「账本上的到达记录」，不是她的注意力——
+    但作为**投递归属**的证据足够：没有等待来信的分支，这一回合不可能凭空产生
+    一条「回复」。
+    """
+    state = normalize_participant_state(_record(participant).get('state'))
+    return bool(state.get('unreadMessageCount') or state.get('pendingReplyCount'))
+
+
+def _redirect_background_reply(
+    raw: Any,
+    phase: str,
+    participant: Any,
+    all_participants: list[Any],
+    permitted_participant_ids: set[str],
+    permit_messages: bool,
+    shared: dict[str, Any],
+) -> tuple[Any, str]:
+    """把后台回合里「回答另一条对话的来信」挪到 `crossConversationActions`。
+
+    上游语义是 `interaction.reply` 永远投给本回合的 participant。共享主剧本下，
+    后台回合的 participant 来自**到期的计划**（可能只是一条关于某人的待办），
+    而这一回合写出来的散文完全可能是「她翻到另一个人的未读、顺手回了话」——
+    上游那条规则会把这句回话投进错的聊天窗（用户 2026-09-27 06:19 的实测：
+    她回的是主人那两条未读，三条消息却落进陌生账号「汐雨.」的对话框）。
+
+    指纹：后台回合 + 本回合分支**没有等待她的来信** + 恰好**另一条**分支有未读
+    来信。命中后本条即时回复改挂到那条分支的跨对话通道（上游已有的「发给另一条
+    对话」），本对话的回复收成 `none`。投递坐标、剧本事件与投递账本因此全部自动
+    落在正确的分支上。
+
+    只在「另一条分支唯一」时改投；有两条以上都在等她时保持原样——改投错人比
+    不改投更糟，那两种情况交给提示词，让模型自己写 `crossConversationActions`。
+    """
+    if phase != 'intent-due' or not permit_messages or not is_record(raw):
+        return raw, ''
+    if not _cfg(shared, 'allowCrossConversationMessages', False):
+        return raw, ''
+    if int(_cfg(shared, 'maxCrossConversationActions', 0) or 0) <= 0:
+        return raw, ''
+    interaction = _raw_decision(raw, 'interaction')
+    reply = _record(_record(interaction).get('reply'))
+    content = pick(reply, 'content')
+    if pick(reply, 'mode') != 'immediate' or not isinstance(content, str) or not content.strip():
+        return raw, ''
+    current_id = _record(participant).get('id') or ''
+    if not current_id or _participant_waiting_for_reply(participant):
+        return raw, ''
+    waiting = [
+        item for item in all_participants
+        if _record(item).get('id') in permitted_participant_ids
+        and _record(item).get('id') != current_id
+        and _participant_waiting_for_reply(item)
+    ]
+    if len(waiting) != 1:
+        return raw, ''
+    target_id = _record(waiting[0]).get('id')
+    if not target_id:
+        return raw, ''
+    existing = [
+        action for action in (_raw_decision(raw, 'crossConversationActions') or [])
+        if is_record(action)
+    ]
+    if not any(pick(action, 'participantId', 'participant_id') == target_id for action in existing):
+        existing.insert(0, {'participantId': target_id, 'mode': 'immediate', 'content': content.strip()})
+    updated = {**raw, 'crossConversationActions': existing}
+    updated['interaction'] = {**_record(interaction), 'reply': {**reply, 'mode': 'none'}}
+    return updated, target_id
+
+
 def _normalize_browser_intent_draft_loose(value: Any) -> Optional[dict[str, Any]]:
     """上游 `normalizeBrowserIntentDraftLoose`（`:7881`）。"""
     if not is_record(value) or value.get('mode') not in ('search', 'visit'):
@@ -1729,6 +1805,18 @@ class ServiceChunk4(ServiceBase):
         permitted_participant_ids = {
             item['id'] for item in all_participants if self.can_handle_participant(item)
         }
+        # 受控偏离（见移植说明 §24）：后台回合里「回答另一条对话的来信」改走跨对话通道，
+        # 免得上游那条「回复永远投给本回合 participant」把回话投进错的聊天窗。
+        raw, redirected_to = _redirect_background_reply(
+            raw, phase, participant, all_participants, permitted_participant_ids,
+            permit_messages, shared,
+        )
+        if redirected_to:
+            self.report_operation(
+                'standard', 'warn', story, phase,
+                '即时回复的对话与本回合不一致，已改投等待来信的那条：本回合=%s 改投=%s',
+                participant_id or '(无)', redirected_to,
+            )
         refresh_continuity = self.should_refresh_continuity(story, phase)
         decision = _normalize_decision(
             raw, from_, now, permit_messages, self.effective_urge_runtime, shared,
@@ -2083,6 +2171,18 @@ class ServiceChunk4(ServiceBase):
                 if action.get('participantId') == agency_candidate['participant_id']
                 and action.get('mode') == 'immediate'
             ][:1]
+        elif phase == 'intent-due':
+            # 受控偏离（见移植说明 §24）：到期回合里「回一条还在等她的对话」是**回信**，
+            # 不是主动联系——它不该被主动开关和 Agency 容量挡住，也不该被丢进错的聊天窗。
+            # 判据与改投同源：目标分支确实有未读 / 待回的来信。
+            waiting_ids = {
+                _record(item).get('id') for item in all_participants
+                if _participant_waiting_for_reply(item)
+            }
+            cross_actions = [
+                action for action in cross_all
+                if action.get('mode') == 'immediate' and action.get('participantId') in waiting_ids
+            ]
         else:
             cross_actions = []
         if phase == 'advance' and cross_all and not cross_actions:
