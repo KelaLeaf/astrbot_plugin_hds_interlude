@@ -1876,6 +1876,45 @@ class ConfigPageAssetTests(unittest.TestCase):
         self.assertLess(total, 400 * 1024, f'控制台资源合计 {total} 字节，太大了')
 
 
+class HtmlTextExtractionTests(unittest.TestCase):
+    """网页观察的正文提取：装饰性容器整块丢掉（v1.3.4）。
+
+    为什么值得钉住：SearXNG 的语言下拉有两千多字，全落在 `max_excerpt_characters`（默认 3000）
+    里的话，她"读到"的就只有一份语言列表——搜索结果一个字都进不去。
+    """
+
+    def test_decorative_containers_are_dropped(self):
+        from plugin.adapters.astrbot_bridge import _strip_html
+        page = (
+            '<html><head><title>标题</title></head><body>'
+            '<nav>首页 关于 联系</nav>'
+            '<select><option>Afrikaans [af]</option><option>Dansk [da]</option></select>'
+            '<svg><title>search</title><path d="M10 10"/></svg>'
+            '<button>提交</button><footer>© 2026 某某</footer><noscript>请开 JS</noscript>'
+            '<header><h1>文章标题</h1></header>'
+            '<form><label>邮箱</label><input/></form>'
+            '<script>var a = 1;</script><style>.a{}</style>'
+            '<p>正文第一段。</p><p>正文第二段。</p>'
+            '</body></html>'
+        )
+        text = _strip_html(page)
+        for noise in ('首页 关于', 'Afrikaans', 'search', '提交', '© 2026', '请开 JS', 'var a = 1'):
+            self.assertNotIn(noise, text, noise)
+        # `<header>` 与 `<form>` 保留：文章标题常常就在 header 里。
+        self.assertIn('文章标题', text)
+        self.assertIn('邮箱', text)
+        self.assertIn('正文第一段。', text)
+        self.assertIn('正文第二段。', text)
+
+    def test_wrapped_console_landing_keeps_results_at_the_front(self):
+        from plugin.adapters.astrbot_bridge import _strip_html
+        languages = ''.join('<option>%s [x]</option>' % ('L%d' % i) for i in range(200))
+        page = '<select>%s</select><article><h3>结果一</h3><p>摘要一</p></article>' % languages
+        text = _strip_html(page)
+        self.assertLess(text.index('结果一'), 40, '结果必须排在很前面')
+        self.assertNotIn('L199', text)
+
+
 class ConfigPageHandlerTests(unittest.TestCase):
     """配置导入导出处理函数的返回值形状（控制台「配置」面板按这些字段渲染）。"""
 

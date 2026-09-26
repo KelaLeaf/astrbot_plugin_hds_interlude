@@ -1098,6 +1098,14 @@ def _normalize_search_results(result: Any, query: str) -> list[dict[str, Any]]:
 
 
 _SCRIPT_STYLE_RE = re.compile(r'<(script|style)\b[^>]*>.*?</\1>', re.IGNORECASE | re.DOTALL)
+#: 纯装饰/导航容器：整块丢掉，否则正文提取会被语言下拉、菜单、图标标签淹没。
+#: 判据是「里面不会有文章正文」——`select`/`option`（SearXNG 的语言列表能占两千多字）、
+#: `svg`（图标路径里的 `<title>` 会变成乱码词）、`button`/`nav`/`footer`/`noscript`。
+#: **不丢 `<header>` 与 `<form>`**：前者常常就是文章标题所在，后者可能带正文。
+_CHROME_RE = re.compile(
+    r'<(select|option|svg|button|nav|footer|noscript)\b[^>]*>.*?</\1>',
+    re.IGNORECASE | re.DOTALL,
+)
 _TAG_RE = re.compile(r'<[^>]+>')
 _TITLE_RE = re.compile(r'<title[^>]*>(.*?)</title>', re.IGNORECASE | re.DOTALL)
 _WS_RE = re.compile(r'\s{2,}')
@@ -1105,6 +1113,7 @@ _WS_RE = re.compile(r'\s{2,}')
 
 def _strip_html(html: str) -> str:
     text = _SCRIPT_STYLE_RE.sub(' ', html)
+    text = _CHROME_RE.sub(' ', text)
     text = _TAG_RE.sub(' ', text)
     for entity, char in (('&nbsp;', ' '), ('&amp;', '&'), ('&lt;', '<'), ('&gt;', '>'), ('&quot;', '"')):
         text = text.replace(entity, char)
