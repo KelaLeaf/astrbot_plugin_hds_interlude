@@ -35,7 +35,7 @@ from typing import Any, Optional
 from ..time import dt_ms, iso, parse_dt, utc_now
 from .. import logging as interlude_logging
 from ..database import timestamp_columns
-from ..logging import log_layered, phase_label
+from ..logging import format_layered_log, log_layered, phase_label
 from ..story_state import decode_story_state
 from ..types import InterludeParticipant, InterludeStory, StorySetting, StoryState, StoryStatus
 
@@ -52,6 +52,7 @@ except ImportError:  # pragma: no cover - Config 接口尚未落地时用宽松�
 
 __all__ = [
     'Config',
+    'GROUP_SKIP_NOTE_INTERVAL_MS',
     'InterludeContext',
     'ServiceBase',
     'ServiceChunk0',
@@ -69,6 +70,10 @@ __all__ = [
     'same_participant_endpoint',
     'story_id_for_character',
 ]
+
+#: 群聊"为什么没动静"的可见日志节流窗口（10 分钟）。
+#: 群消息是持续的，不节流会淹掉整个日志；但完全静默会让"群聊没生效"变成只能靠猜。
+GROUP_SKIP_NOTE_INTERVAL_MS = 600_000
 
 
 def _prefer_helper(name: str, fallback: Callable[..., Any]) -> Callable[..., Any]:
@@ -686,6 +691,9 @@ class ServiceBase:
         self.due_intent_wake_timers = {}
         self.interrupted_typing_participants = set()
         self.narrating_stories = set()
+        #: 可见的"为什么没动静"日志节流表（key → 上次打印的毫秒时间戳）。
+        #: 见 `note_access_skip`：群聊的拒绝/跳过至少要让人看见一次，但绝不能刷屏。
+        self.access_notes = {}
 
         # ---- 后台整理 ----
         self.fact_backfills = set()
@@ -981,10 +989,20 @@ class ServiceBase:
         return rank.get(configured, 2) >= rank.get(required, 2)
 
     def emit_log(self, level: str, output: str) -> None:
-        """上游 `emitLog`（`src/service.ts:6811`）：走 Koishi logger 的等价物。"""
+        """上游 `emitLog`（`src/service.ts:6811`）：走 Koishi logger 的等价物。
+
+        `output` 是**已经渲染好**的文本（`write_report` / `write_standalone` 的产物），
+        所以这里只负责投递、**绝不能再渲染一次**：早先没有宿主 logger 时走的是
+        `log_fallback(level, output)`，而它会把这段文本当成"原始消息"再套一层分层渲染，
+        于是每条 report / standalone 日志被投递两次、第二份还是嵌套的（见坑 49）。
+        """
         logger = self.service_logger
         if logger is None:
-            log_fallback(level, output)
+            # 没有宿主 logger：直接交给 sink（默认写 stderr），只投一次。
+            try:
+                interlude_logging.get_log_sink()(level, output)
+            except Exception:  # pragma: no cover - 日志通道绝不抛异常
+                return
             return
         try:
             if level == 'error':
@@ -1009,7 +1027,9 @@ class ServiceBase:
         if rank.get(logging_config.get('level') or 'info', 3) < rank.get(level, 3):
             return
         if (logging_config.get('format') or 'layered') == 'layered':
-            output = log_layered({
+            # 用**纯渲染**（`format_layered_log`）：投递统一在下面的 `emit_log` 里做一次。
+            # 早先用 `log_layered` 会先投一次 sink、再被 `emit_log` 投一次（见坑 49）。
+            output = format_layered_log({
                 'level': level,
                 'protagonist': 'HDSI',
                 'message': message,
@@ -1042,7 +1062,8 @@ class ServiceBase:
         protagonist = str(pick(character, 'name') or '') if character else ''
         logging_format = logging_config.get('format') or 'layered'
         if logging_format == 'layered':
-            output = log_layered({
+            # 同上：纯渲染 + `emit_log` 单次投递。
+            output = format_layered_log({
                 'level': level,
                 'phase': phase,
                 'protagonist': protagonist,
@@ -1790,22 +1811,45 @@ class ServiceChunk0(ServiceBase):
         return allowed
 
     def can_handle_group_session(self, session: Any) -> bool:
-        """上游 `canHandleGroupSession(session)`（`src/service.ts:955`）逐条移植。"""
+        """上游 `canHandleGroupSession(session)`（`src/service.ts:955`）逐条移植。
+
+        判定本身在 `explain_group_gate` 里（那份同时给出**原因**），这里只取布尔值。
+        """
+        return self.explain_group_gate(session)[0]
+
+    def explain_group_gate(self, session: Any) -> tuple[bool, str]:
+        """群聊闸门的**原因版**：返回 `(是否放行, 原因)`，门顺序与上游逐条一致。
+
+        为什么不只留布尔值：适配层拿到 `False` 就直接 `return`，而 core 里那几条拒绝
+        报告走的是 `diagnostic` 频道——`logging.verbosity` 默认 `standard`，**日志里一个字
+        都没有**（用户 2026-09-26 的日志：群里 @ 了机器人、Kela 也说了话，HDSI 全程沉默，
+        既没有回复也没有任何解释，看起来就是"群聊功能完全没生效"）。
+        原因串给适配层，由它按 `note_access_skip` 节流后打出来。
+        """
         platform = pick(session, 'platform') or ''
         if not is_one_bot_platform(platform):
-            return False
+            return False, '平台不是 OneBot 家族（platform=%s），群聊闸门只对 OneBot 生效' % platform
         config = _config_section(self.config, 'onebot')
         if not config.get('enabled'):
-            return False
+            return False, ('QQ 接入闸门没开（`qq_access.enabled=false`）：私聊仍按旧行为放行，'
+                           '但群聊必须先打开这个开关才会被接入')
         self_id = normalize_account_id(pick(session, 'selfId', 'self_id'))
         user_id = normalize_account_id(pick(session, 'userId', 'user_id'))
         if pick(config, 'ignoreSelfMessages', 'ignore_self_messages') and self_id and self_id == user_id:
-            return False
+            return False, '机器人自己发的消息（`ignore_self_messages`）'
         if not is_enabled_account(pick(config, 'botAccounts', 'bot_accounts'), self_id):
-            return False
-        group = self.group_rule(self._session_group_id(session))
+            return False, ('机器人账号不在 `qq_access.bot_accounts` 白名单里（selfId=%s）'
+                           % (pick(session, 'selfId', 'self_id') or '?'))
+        group_id = self._session_group_id(session)
+        group = self.group_rule(group_id)
         if not group:
-            return False
+            # `group_rule` 会跳过 `enabled=false` 的规则，所以"没规则"有两种可能：
+            # 群压根没列进白名单，或者列进去了但那条规则被关掉了。两者的修法完全不同，
+            # 别让用户去猜。
+            if self._listed_group_rule(group_id) is not None:
+                return False, '这条群规则写了 `enabled=false`（群号=%s）' % group_id
+            return False, ('这个群不在 `qq_access.group_chats` 白名单里（群号=%s），'
+                           '群聊只有列进白名单才会被接入' % (group_id or '?'))
         # 上游字面是 `return !!group?.enabled`（`:964`），但 Koishi Console 的
         # `GroupChatRuleSchema.enabled` 是 `Schema.boolean().default(true)`（`index.ts:392`）：
         # 每条群规则**落盘时一定带真值** `enabled`，`??` 只兜「规则不存在」。
@@ -1813,7 +1857,82 @@ class ServiceChunk0(ServiceBase):
         # 不为 list 元素补默认值），照抄 `!!group?.enabled` 会把这类群**整体拒收**，
         # 与上游实际行为不符。因此这里只在 `enabled` **显式存在**时按真值判定。
         enabled = pick(group, 'enabled')
-        return True if enabled is None else bool(enabled)
+        if enabled is not None and not bool(enabled):
+            return False, '这条群规则写了 `enabled=false`（群号=%s）' % group_id
+        return True, ''
+
+    def describe_group_access(self) -> tuple[str, str]:
+        """一句话说明"群聊到底会不会被接入"，返回 `(级别, 文本)`（启动日志用）。
+
+        为什么要在启动时就说：群聊没生效是**完全静默**的——消息进得来、
+        `on_group_message` 也被调到，但什么都不发生。等到用户在群里 @ 半天没人理
+        再回来问，中间已经浪费了一天（用户 2026-09-26 就是这样）。
+        """
+        config = _config_section(self.config, 'onebot')
+        if not config.get('enabled'):
+            return 'warn', ('群聊未接入：`qq_access.enabled=false`。私聊不受影响（旧行为），'
+                            '但群聊必须先打开这个开关，再把群号加进 `qq_access.group_chats`。')
+        accounts = pick(config, 'botAccounts', 'bot_accounts') or []
+        enabled_bots = [a for a in accounts if isinstance(a, dict) and a.get('enabled') is not False]
+        if not enabled_bots:
+            return 'warn', ('群聊不会生效：`qq_access.bot_accounts` 是空的，'
+                            '而闸门一旦打开，空白名单＝全部拒绝。请把机器人自己的账号填进去。')
+        rules = pick(config, 'groupChats', 'group_chats') or []
+        enabled_groups = [
+            normalize_group_id(pick(rule, 'groupId', 'group_id'))
+            for rule in rules
+            if isinstance(rule, dict) and pick(rule, 'enabled') is not False
+        ]
+        if not enabled_groups:
+            return 'warn', ('群聊未生效：`qq_access.group_chats` 是空的，'
+                            '群里任何消息都不会被接入。请把要接管的群号加进去。')
+        modes = sorted({
+            str(pick(rule, 'responseMode', 'response_mode') or 'auto')
+            for rule in rules if isinstance(rule, dict) and pick(rule, 'enabled') is not False
+        })
+        return 'info', ('群聊接入已开启：%d 个群（%s），回应模式=%s'
+                        % (len(enabled_groups), '、'.join(enabled_groups[:6]),
+                           '/'.join(modes) or 'auto'))
+
+    def note_access_skip(self, key: str, interval_ms: int, message: str, *args: Any) -> bool:
+        """同一条"没动静"的原因在 `interval_ms` 内只打一次（返回这次是否打了）。
+
+        为什么是节流而不是静默：群聊里一条拒绝原因每分钟能来十几条，直接打 warn 会把
+        整个日志淹掉（坑 45 就是这个教训）；但"群聊完全没生效"这种状态必须至少说一次，
+        否则用户只能靠猜。key 里带上原因本身，所以「换了原因」会立刻重新打一条。
+        """
+        now = self.now_ms()
+        last = self.access_notes.get(key)
+        if last is not None and now - last < interval_ms:
+            return False
+        self.access_notes[key] = now
+        self.report_standalone('warn', message, *args)
+        return True
+
+    def note_group_skip(self, session: Any, reason: str) -> bool:
+        """群聊消息没能进叙事时，打一条**看得见**的 warn（按"群 + 原因"节流 10 分钟）。
+
+        节流键里带原因，所以"原因变了"会立刻重新打一条——排查时能看到门是一道道关上的。
+        """
+        group_id = self._session_group_id(session)
+        sender = normalize_account_id(pick(session, 'userId', 'user_id')) or '?'
+        name = str(pick(session, 'username', 'user_name') or '').strip()
+        content = str(pick(session, 'content') or pick(session, 'rawContent', 'raw_content') or '')
+        preview = content.replace('\n', ' ')[:60]
+        return self.note_group_skip_reason(
+            group_id, reason,
+            '发送者=%s%s 内容=%s' % (sender, ('(%s)' % name) if name else '', preview or '(空)'),
+        )
+
+    def note_group_skip_reason(self, group_id: Any, reason: str, detail: str = '') -> bool:
+        """`note_group_skip` 的无会话版本：群回合已建成、但没走到模型调用（意愿 / 冷却 / 暂停）。"""
+        normalized = normalize_group_id(group_id) or '?'
+        return self.note_access_skip(
+            'group-skip:%s:%s' % (normalized, reason),
+            GROUP_SKIP_NOTE_INTERVAL_MS,
+            '群聊消息未接入：%s ｜ 群=%s%s', reason, normalized,
+            (' %s' % detail) if detail else '',
+        )
 
     def group_rule(self, group_id: Any) -> Optional[dict[str, Any]]:
         """上游 `groupRule(groupId)`（`src/service.ts:967`）。
@@ -1828,6 +1947,15 @@ class ServiceChunk0(ServiceBase):
                 continue
             if normalize_group_id(pick(group, 'groupId', 'group_id')) == normalized:
                 return group if isinstance(group, dict) else _as_mapping(group)
+        return None
+
+    def _listed_group_rule(self, group_id: Any) -> Optional[Any]:
+        """**不管 `enabled`** 地找那条群规则：用来区分"没列进白名单"与"列了但关掉了"。"""
+        normalized = normalize_group_id(group_id)
+        config = _config_section(self.config, 'onebot')
+        for group in pick(config, 'groupChats', 'group_chats') or []:
+            if normalize_group_id(pick(group, 'groupId', 'group_id')) == normalized:
+                return group
         return None
 
     def can_handle_participant(self, participant: Any) -> bool:

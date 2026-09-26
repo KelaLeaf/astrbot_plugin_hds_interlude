@@ -223,6 +223,10 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(payload['total_rows'], sum(table['rows'] for table in payload['tables']))
 
     def test_logs_are_newest_first_and_filterable(self):
+        # 构造 bridge 时 core 就会报一条「服务初始化完成」；v1.2.17 起它也会进日志缓冲
+        # （core 的 report 走 `emit_log` → 适配器单次投递，见坑 49）。这条断言问的是
+        # 排序与过滤，所以先把缓冲清干净，别让启动那一条混进来。
+        self.bridge.log_buffer.clear()
         self.bridge.log_buffer.append({'at': '1', 'level': 'info', 'text': '第一条'})
         self.bridge.log_buffer.append({'at': '2', 'level': 'warn', 'text': '第二条'})
         payload = _run(self.api.logs())
