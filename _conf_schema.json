@@ -1790,7 +1790,7 @@
         "type": "string",
         "description": "搜索地址模板",
         "default": "https://html.duckduckgo.com/html/?q={query}",
-        "hint": "必须包含 {query}"
+        "hint": "必须含 {query}。宿主没有搜索接口时按它自己抓一页，所以要选**服务端就出结果**的地址（例如 https://cn.bing.com/search?q={query}）；靠 JS 出结果的（百度/搜狗/Google）抓回来是空白。"
       },
       "allowed_domains": {
         "type": "list",

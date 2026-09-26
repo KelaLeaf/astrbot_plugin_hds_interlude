@@ -1372,9 +1372,21 @@ class ServiceChunk5(ServiceBase):
                 if mode == 'search':
                     results = await search_web(query, timeout)
                     top = results[0] if isinstance(results, list) and results else None
-                    final_url = str(_row(top, 'url') or target)
-                    title = clip(_row(top, 'title'), 500)
-                    text = clip(_row(top, 'text') or _row(top, 'excerpt'), max_text)
+                    if top is None and target:
+                        # 宿主没有搜索 API（AstrBot 现状：`Context` 不暴露插件级搜索）→
+                        # 按 `search_url_template` 自己抓一页。上游在 Koishi 里就是
+                        # "把搜索结果页开出来读"，所以这里是把模板真正用上的那条路；
+                        # 没有它，模板只是个没人读的字符串、观察会静默留空。
+                        page = await visit_web(target, timeout)
+                        if not page:
+                            raise RuntimeError('搜索通道不可用，且按模板抓取没有返回内容。')
+                        final_url = str(_row(page, 'url') or target)
+                        title = clip(_row(page, 'title'), 500)
+                        text = clip(_row(page, 'text') or _row(page, 'excerpt'), max_text)
+                    else:
+                        final_url = str(_row(top, 'url') or target)
+                        title = clip(_row(top, 'title'), 500)
+                        text = clip(_row(top, 'text') or _row(top, 'excerpt'), max_text)
                 else:
                     page = await visit_web(target, timeout)
                     if not page:

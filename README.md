@@ -4,12 +4,12 @@
 
 HDS Interlude 是一个给 **AstrBot** 用的持续叙事聊天插件（上游 Koishi 版的完整移植）。装上以后，你的角色不再"收到一条消息就回一条"，而是**一直在过自己的日子**——你发过去的消息只是这段时间里发生的一件事，她可能马上看见，也可能没看见、不想回、正忙着、晚点再回。
 
-当前版本 `v1.3.2`，对应上游 `1.0.1-beta6-rebuild`。
+当前版本 `v1.3.3`，对应上游 `1.0.1-beta6-rebuild`。
 
 | | |
 | --- | --- |
 | 插件名 | `astrbot_plugin_hds_interlude` |
-| 版本 | `v1.3.2` |
+| 版本 | `v1.3.3` |
 | AstrBot | `>=4.16,<5` |
 | 依赖 | `httpx`、`pyyaml` |
 | 上游 | [HDS Interlude（Koishi）](https://gitee.com/MomoiCore/hds-interlude) |
@@ -141,7 +141,7 @@ pip install -r requirements.txt
 | 分组 | 干什么 |
 | --- | --- |
 | **提示词** `prompts` | 提示词的**唯一入口**：主叙事写作指令、结构化输出补充规则、长期固定约束、全局文风。上游把这四项放在模型组里，这里单独一组（键名与默认值一样，读写由插件自动搬运）。 |
-| **网页观察** `browser` | 只读浏览：时机、搜索模板、域名黑白名单、并发与超时、正文长度上限。 |
+| **网页观察** `browser` | 只读浏览：时机、搜索模板、域名黑白名单、并发与超时、正文长度上限。搜索模板要填**服务端就出结果**的地址（`https://cn.bing.com/search?q={query}` 这类），靠 JS 出结果的（百度/搜狗/Google）抓回来是空白。 |
 | **盲区模式** `blind_mode` | 沉浸运行：屏蔽全部管理命令，日志只留周期心跳。 |
 | **日志** `logging` | 级别、信息密度、布局配色、颜文字，以及是否输出剧本/消息内容预览。 |
 
@@ -243,7 +243,7 @@ AstrBot 的命令名不能带点，所以上游的 `interlude.memory.facts` 在�
 | 命令 | `interlude.story.start` | `hdsi_story_start`（32 条，语义与文案不变） |
 | 数据 | Koishi ORM | 自带 SQLite，13 张表，**列名与上游逐字一致**（camelCase） |
 | 出站投递 | 直接调 `session.bot` | 统一收敛到 `Transport` 协议，做不到的走 `transport-unavailable` 降级 |
-| 网页观察 | Puppeteer 服务 | 走 `Transport` 的 `search_web` / `visit_web`，由适配层提供 |
+| 网页观察 | Puppeteer 服务 | 走 `Transport` 的 `search_web` / `visit_web`，由适配层提供；宿主没有搜索接口时按 `browser.search_url_template` 自己抓一页 |
 | 图像处理 | Puppeteer + sharp | `PIL`；没装就透传原图（可选依赖） |
 | 桌面桥 | 与 Koishi 进程 `process.send` | 可选 HTTP 桥（`HDSI_DESKTOP_BRIDGE=1` 才启用） |
 | 人格 | 上游 Console 手填 | 多一个 `story_defaults.persona_id`，可直接导入 AstrBot 人格 |
