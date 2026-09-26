@@ -109,10 +109,11 @@ def make_config(**overrides: Any) -> dict[str, Any]:
 
 
 def onebot_config(onebot: Optional[dict[str, Any]] = None, **overrides: Any) -> dict[str, Any]:
-    """启用 OneBot 闸门 + 群白名单的配置。"""
+    """名单配置（v1.3.0 起没有总闸：要"只处理名单内"就打开对应的 `*_only`）。"""
     section: dict[str, Any] = {
-        'enabled': True,
+        'botAccountsOnly': True,
         'botAccounts': [{'qq': '1'}],
+        'userAccountsOnly': True,
         'userAccounts': [{'qq': '2'}],
         'groupChats': [],
     }
@@ -1142,13 +1143,25 @@ class ReceiveGroupTests(ServiceHarness):
         self.assertFalse(await service.receive_group(group_session(platform='telegram')))
 
     @needs('receive_group')
-    async def test_gate_disabled_is_rejected(self) -> None:
-        service = self.make_service(make_config(onebot={'enabled': False}))
-        self.assertFalse(await service.receive_group(group_session()))
+    async def test_an_unlisted_group_is_still_handled_by_default(self) -> None:
+        """v1.3.0：`group_chats_only` 默认关闭 ⇒ 名单外的群照样接，用默认群规则。
+
+        默认群规则与 schema 里群规则的默认值一致：`mention-only`，所以这里要 @ 才成回合。
+        """
+        service = self.make_service(make_config(onebot={}))
+        self.make_story()
+        self.assertTrue(await service.receive_group(group_session(
+            channel_id='77', guild_id='77', content='@bot 在吗',
+            elements=[{'type': 'at', 'attrs': {'id': '1'}}],
+        )))
+        turn = service.buffered_group_turns['%s:77' % SHARED_STORY_ID]
+        self.assertEqual(turn['rule']['responseMode'], 'mention-only')
 
     @needs('receive_group')
-    async def test_group_outside_the_allowlist_is_rejected(self) -> None:
-        service = self.make_service(self._config())
+    async def test_group_outside_the_allowlist_is_rejected_when_restricted(self) -> None:
+        service = self.make_service(make_config(onebot={
+            'groupChatsOnly': True, 'groupChats': [group_rule_stub()],
+        }))
         self.assertFalse(await service.receive_group(group_session(channel_id='77')))
 
     @needs('receive_group')
@@ -1266,7 +1279,11 @@ class ReceiveTests(ServiceHarness):
         ))
         self.assertFalse(await service.receive(self._session()))
         self.assertEqual(self.rows('interlude_story'), [])
-        self.assertIn('OneBot 白名单拒绝用户账号', self.sink.text())
+        # v1.3.0：拒绝原因不再走 diagnostic 报告，而是由 `explain_session_access` 给出，
+        # 适配层负责把它打成人能看到的行（见 `AccessVisibilityTests`）。
+        allowed, reason = service.explain_session_access(self._session())
+        self.assertFalse(allowed)
+        self.assertIn('仅处理名单内的用户', reason)
 
     @needs('receive')
     async def test_missing_story_without_auto_create_is_rejected(self) -> None:

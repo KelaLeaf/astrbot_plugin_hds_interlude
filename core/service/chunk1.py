@@ -957,7 +957,7 @@ class ServiceChunk1(ServiceBase):
         """
         if self.database_resetting:
             return False
-        allowed, reason = self.explain_group_gate(session)
+        allowed, reason = self.explain_group_access(session)
         if not allowed:
             # 群聊进不来时必须**看得见**：以前这里直接 return，日志里一个字都没有
             # （用户 2026-09-26 的日志里群里 @ 了机器人、Kela 也说了话，HDSI 全程沉默，
@@ -965,10 +965,9 @@ class ServiceChunk1(ServiceBase):
             self.note_group_skip(session, reason)
             return False
         group_id = self._session_group_id(session)
-        rule = self.group_rule(group_id)
-        if not rule:
-            self.note_group_skip(session, '这个群没有可用的群规则（群号=%s）' % group_id)
-            return False
+        # 名单里的群用那条规则；名单外的群（`group_chats_only` 关闭时才会走到这里）
+        # 用默认群规则——与 schema 里群规则的默认值一致，不 @ 就不说话。
+        rule = self.group_rule_or_default(group_id)
         mentioned_bot = _mentions_bot(session)
         quoted_bot = _quotes_bot(session)
         if pick(rule, 'responseMode', 'response_mode') == 'mention-only' and not mentioned_bot:

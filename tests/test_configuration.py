@@ -80,8 +80,10 @@ UPSTREAM_FIELDS = {
         "failover", "mainPrompt", "formatPrompt", "fixedPrompt", "stylePrompt",
         "embedding", "compaction",
     ],
+    # v1.3.0 受控偏离：上游那个「账号过滤总闸」（`onebot.enabled`）被删掉，换成三张名单
+    # 各自的 `*_only` 开关（登记在 `LOCAL_ONLY_FIELDS`）。见 `docs/PORTING_NOTES.md` §22。
     "qq_access": [
-        "enabled", "botAccounts", "userAccounts", "groupChats", "ignoreSelfMessages",
+        "botAccounts", "userAccounts", "groupChats", "ignoreSelfMessages",
     ],
     "shared_story": [
         "autoEnrollParticipants", "allowCrossConversationMessages", "shareParticipantDetails",
@@ -754,7 +756,11 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
     def test_onebot_gate_defaults_and_account_tables(self):
         qq = self.section("qq_access")
-        self.assertIs(qq["enabled"]["default"], False)
+        # v1.3.0：没有总闸了，三张名单各自一个"仅处理名单内"开关，默认全关
+        # （名单只做针对性处理、名单外照常处理）。
+        self.assertNotIn("enabled", qq)
+        for key in ("bot_accounts_only", "user_accounts_only", "group_chats_only"):
+            self.assertIs(qq[key]["default"], False, key)
         self.assertEqual(qq["bot_accounts"]["default"], [])
         self.assertEqual(qq["user_accounts"]["default"], [])
         self.assertEqual(qq["group_chats"]["default"], [])
@@ -833,6 +839,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
         "story_defaults": {"persona_id", "extra_setting"},
         "model_center": {"main_provider_id", "compaction_provider_id", "alter_provider_id"},
         "stickers": {"provider_id"},
+        # v1.3.0 受控偏离：三张名单各自的"仅处理名单内"开关（上游只有一个总闸 `enabled`，
+        # 本移植版删掉它、换成这三个正交开关）。见 `docs/PORTING_NOTES.md` §22。
+        "qq_access": {"bot_accounts_only", "user_accounts_only", "group_chats_only"},
     }
 
     def test_upstream_field_count_matches(self):

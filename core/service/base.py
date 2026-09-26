@@ -1780,119 +1780,136 @@ class ServiceChunk0(ServiceBase):
     # ------------------------------------------------------------------ #
 
     def can_handle_session(self, session: Any) -> bool:
-        """上游 `canHandleSession(session)`（`src/service.ts:932`）逐条移植。
+        """这条私聊/会话能不能进叙事（**v1.3.0 起平台无关**）。
 
-        Koishi 的 OneBot 适配器用 `selfId` 表示登录机器人 QQ、`userId` 表示发送者；
-        其它适配器刻意保持旧行为（直接放行）。
+        判定在 `explain_session_access` 里（那份同时给出原因），这里只取布尔值。
         """
-        platform = pick(session, 'platform') or ''
-        if not is_one_bot_platform(platform):
-            return True
-        config = _config_section(self.config, 'onebot')
-        # 向后兼容：未配置/未启用的闸门不改变旧安装的行为。一旦启用，空列表即拒绝全部。
-        if not config.get('enabled'):
-            return True
-        self_id = normalize_account_id(pick(session, 'selfId', 'self_id'))
-        user_id = normalize_account_id(pick(session, 'userId', 'user_id'))
-        if pick(config, 'ignoreSelfMessages', 'ignore_self_messages') and self_id and self_id == user_id:
-            return False
-        if not is_enabled_account(pick(config, 'botAccounts', 'bot_accounts'), self_id):
-            self.report_standalone_operation(
-                'diagnostic', 'debug', 'OneBot 白名单拒绝机器人账号 平台=%s 原始机器人ID=%s 规范化ID=%s',
-                platform, pick(session, 'selfId', 'self_id'), self_id,
-            )
-            return False
-        allowed = is_enabled_account(pick(config, 'userAccounts', 'user_accounts'), user_id)
-        if not allowed:
-            self.report_standalone_operation(
-                'diagnostic', 'debug', 'OneBot 白名单拒绝用户账号 原始用户ID=%s 规范化ID=%s',
-                pick(session, 'userId', 'user_id'), user_id,
-            )
-        return allowed
+        return self.explain_session_access(session)[0]
 
     def can_handle_group_session(self, session: Any) -> bool:
-        """上游 `canHandleGroupSession(session)`（`src/service.ts:955`）逐条移植。
+        """这个群能不能进叙事（判定见 `explain_group_access`，v1.3.0 起平台无关）。"""
+        return self.explain_group_access(session)[0]
 
-        判定本身在 `explain_group_gate` 里（那份同时给出**原因**），这里只取布尔值。
+    # ---- v1.3.0：三张名单各自一个"仅处理名单内"开关 ---------------------- #
+    #
+    # 上游把这件事做成**一个总闸**（`onebot.enabled`）+ 三张名单：闸门关着时私聊全放行、
+    # 群聊一律不接；闸门开着时空白名单＝全部拒绝，而且**只对 OneBot 家族生效**。
+    # 本移植版按用户要求改成正交的三开关（`PORTING_NOTES.md` §22）：
+    #
+    #   * 每个开关**关闭**（默认）＝ 名单只用来做**针对性处理**（称呼 / 背景 / 初始关系 /
+    #     群规则），名单外的照样进，走 `story_defaults` 的默认设定；
+    #   * 每个开关**打开**＝ 只处理名单内的，名单外不接；
+    #   * 三张名单**互相独立**，不再有"必须两个都命中"的耦合；
+    #   * **所有平台一视同仁**（telegram / webchat 也受这套名单约束）。
+
+    def _access_config(self) -> dict[str, Any]:
+        """接入与名单那一段（schema 分组 `qq_access`，上游名 `onebot`）。"""
+        return _config_section(self.config, 'onebot')
+
+    def _access_flag(self, camel: str, snake: str, default: bool = False) -> bool:
+        value = pick(self._access_config(), camel, snake)
+        return default if value is None else bool(value)
+
+    def explain_session_access(self, session: Any) -> tuple[bool, str]:
+        """私聊路径的**原因版**：返回 `(是否放行, 原因)`。
+
+        门顺序：忽略自己的消息 → 机器人名单（仅当"仅处理名单内"打开）→ 用户名单（同）。
         """
-        return self.explain_group_gate(session)[0]
-
-    def explain_group_gate(self, session: Any) -> tuple[bool, str]:
-        """群聊闸门的**原因版**：返回 `(是否放行, 原因)`，门顺序与上游逐条一致。
-
-        为什么不只留布尔值：适配层拿到 `False` 就直接 `return`，而 core 里那几条拒绝
-        报告走的是 `diagnostic` 频道——`logging.verbosity` 默认 `standard`，**日志里一个字
-        都没有**（用户 2026-09-26 的日志：群里 @ 了机器人、Kela 也说了话，HDSI 全程沉默，
-        既没有回复也没有任何解释，看起来就是"群聊功能完全没生效"）。
-        原因串给适配层，由它按 `note_access_skip` 节流后打出来。
-        """
-        platform = pick(session, 'platform') or ''
-        if not is_one_bot_platform(platform):
-            return False, '平台不是 OneBot 家族（platform=%s），群聊闸门只对 OneBot 生效' % platform
-        config = _config_section(self.config, 'onebot')
-        if not config.get('enabled'):
-            return False, ('QQ 接入闸门没开（`qq_access.enabled=false`）：私聊仍按旧行为放行，'
-                           '但群聊必须先打开这个开关才会被接入')
+        config = self._access_config()
         self_id = normalize_account_id(pick(session, 'selfId', 'self_id'))
         user_id = normalize_account_id(pick(session, 'userId', 'user_id'))
         if pick(config, 'ignoreSelfMessages', 'ignore_self_messages') and self_id and self_id == user_id:
             return False, '机器人自己发的消息（`ignore_self_messages`）'
-        if not is_enabled_account(pick(config, 'botAccounts', 'bot_accounts'), self_id):
-            return False, ('机器人账号不在 `qq_access.bot_accounts` 白名单里（selfId=%s）'
-                           % (pick(session, 'selfId', 'self_id') or '?'))
-        group_id = self._session_group_id(session)
-        group = self.group_rule(group_id)
-        if not group:
-            # `group_rule` 会跳过 `enabled=false` 的规则，所以"没规则"有两种可能：
-            # 群压根没列进白名单，或者列进去了但那条规则被关掉了。两者的修法完全不同，
-            # 别让用户去猜。
-            if self._listed_group_rule(group_id) is not None:
-                return False, '这条群规则写了 `enabled=false`（群号=%s）' % group_id
-            return False, ('这个群不在 `qq_access.group_chats` 白名单里（群号=%s），'
-                           '群聊只有列进白名单才会被接入' % (group_id or '?'))
-        # 上游字面是 `return !!group?.enabled`（`:964`），但 Koishi Console 的
-        # `GroupChatRuleSchema.enabled` 是 `Schema.boolean().default(true)`（`index.ts:392`）：
-        # 每条群规则**落盘时一定带真值** `enabled`，`??` 只兜「规则不存在」。
-        # 本移植版的 AstrBot 适配层/旧配置可能写出缺 `enabled` 的规则（`normalize_config`
-        # 不为 list 元素补默认值），照抄 `!!group?.enabled` 会把这类群**整体拒收**，
-        # 与上游实际行为不符。因此这里只在 `enabled` **显式存在**时按真值判定。
-        enabled = pick(group, 'enabled')
-        if enabled is not None and not bool(enabled):
-            return False, '这条群规则写了 `enabled=false`（群号=%s）' % group_id
+        if self._access_flag('botAccountsOnly', 'bot_accounts_only'):
+            if not is_enabled_account(pick(config, 'botAccounts', 'bot_accounts'), self_id):
+                return False, ('「仅处理名单内的机器人账号」开着，而这个登录账号（selfId=%s）不在 '
+                               '`bot_accounts` 里' % (pick(session, 'selfId', 'self_id') or '?'))
+        if self._access_flag('userAccountsOnly', 'user_accounts_only'):
+            if not is_enabled_account(pick(config, 'userAccounts', 'user_accounts'), user_id):
+                return False, ('「仅处理名单内的用户」开着，而发送者（userId=%s）不在 `user_accounts` 里'
+                               % (pick(session, 'userId', 'user_id') or '?'))
         return True, ''
 
-    def describe_group_access(self) -> tuple[str, str]:
-        """一句话说明"群聊到底会不会被接入"，返回 `(级别, 文本)`（启动日志用）。
+    def explain_group_access(self, session: Any) -> tuple[bool, str]:
+        """群聊路径的**原因版**：返回 `(是否放行, 原因)`。
 
-        为什么要在启动时就说：群聊没生效是**完全静默**的——消息进得来、
-        `on_group_message` 也被调到，但什么都不发生。等到用户在群里 @ 半天没人理
-        再回来问，中间已经浪费了一天（用户 2026-09-26 就是这样）。
+        为什么不只留布尔值：适配层拿到 `False` 就直接 `return`，而 core 里那几条拒绝
+        报告走的是 `diagnostic` 频道——`logging.verbosity` 默认 `standard`，**日志里一个字
+        都没有**（用户 2026-09-26 的日志：群里 @ 了机器人、Kela 也说了话，HDSI 全程沉默，
+        看起来就是"群聊功能完全没生效"）。原因串给适配层，由它按 `note_group_skip` 节流打出来。
         """
-        config = _config_section(self.config, 'onebot')
-        if not config.get('enabled'):
-            return 'warn', ('群聊未接入：`qq_access.enabled=false`。私聊不受影响（旧行为），'
-                            '但群聊必须先打开这个开关，再把群号加进 `qq_access.group_chats`。')
-        accounts = pick(config, 'botAccounts', 'bot_accounts') or []
-        enabled_bots = [a for a in accounts if isinstance(a, dict) and a.get('enabled') is not False]
-        if not enabled_bots:
-            return 'warn', ('群聊不会生效：`qq_access.bot_accounts` 是空的，'
-                            '而闸门一旦打开，空白名单＝全部拒绝。请把机器人自己的账号填进去。')
-        rules = pick(config, 'groupChats', 'group_chats') or []
-        enabled_groups = [
-            normalize_group_id(pick(rule, 'groupId', 'group_id'))
-            for rule in rules
-            if isinstance(rule, dict) and pick(rule, 'enabled') is not False
-        ]
-        if not enabled_groups:
-            return 'warn', ('群聊未生效：`qq_access.group_chats` 是空的，'
-                            '群里任何消息都不会被接入。请把要接管的群号加进去。')
-        modes = sorted({
-            str(pick(rule, 'responseMode', 'response_mode') or 'auto')
-            for rule in rules if isinstance(rule, dict) and pick(rule, 'enabled') is not False
-        })
-        return 'info', ('群聊接入已开启：%d 个群（%s），回应模式=%s'
-                        % (len(enabled_groups), '、'.join(enabled_groups[:6]),
-                           '/'.join(modes) or 'auto'))
+        group_id = self._session_group_id(session)
+        self_id = normalize_account_id(pick(session, 'selfId', 'self_id'))
+        user_id = normalize_account_id(pick(session, 'userId', 'user_id'))
+        if self._access_flag('ignoreSelfMessages', 'ignore_self_messages', default=True) \
+                and self_id and self_id == user_id:
+            return False, '机器人自己发的消息（`ignore_self_messages`）'
+        if self._access_flag('botAccountsOnly', 'bot_accounts_only'):
+            # 群聊**只看机器人账号**那一张名单：群成员不需要在用户名单里
+            # （上游语义，v1.3.0 保留；被"仅处理名单内的用户"误伤过一次，别写回去）。
+            if not is_enabled_account(
+                pick(self._access_config(), 'botAccounts', 'bot_accounts'), self_id,
+            ):
+                return False, ('「仅处理名单内的机器人账号」开着，而这个登录账号（selfId=%s）不在 '
+                               '`bot_accounts` 里' % (pick(session, 'selfId', 'self_id') or '?'))
+        if self._access_flag('groupChatsOnly', 'group_chats_only'):
+            if self.group_rule(group_id) is None:
+                if self._listed_group_rule(group_id) is not None:
+                    return False, '这条群规则写了 `enabled=false`（群号=%s）' % group_id
+                return False, ('「仅处理名单内的群聊」开着，而这个群（%s）不在 `group_chats` 里'
+                               % (group_id or '?'))
+        return True, ''
+
+    def default_group_rule(self, group_id: Any) -> dict[str, Any]:
+        """名单外群的默认群规则（`group_chats_only` 关闭时用）。
+
+        上游没有这条路径（群规则不存在就直接不接），本移植版按用户要求补上
+        （`PORTING_NOTES.md` §22）。取值与 schema 里群规则的默认值一致：
+        `mention-only`（不 @ 就不说话，最保守）、防抖 1 秒、冷却 60 秒、附带 20 条上下文、
+        本地意愿门**关闭**（`evaluate_group_willingness` 未配置时 `should_call=True`）。
+        """
+        return {
+            'groupId': normalize_group_id(group_id),
+            'enabled': True,
+            'label': '',
+            'purpose': '',
+            'characterRole': '',
+            # 与 schema 里群规则的默认值一致：不 @ 就不说话（最保守）。
+            'responseMode': 'mention-only',
+            'contextLimit': 20,
+            'debounceSeconds': 1.0,
+            'cooldownSeconds': 60,
+        }
+
+    def group_rule_or_default(self, group_id: Any) -> dict[str, Any]:
+        """名单里就用那一条，否则用 `default_group_rule`。"""
+        return self.group_rule(group_id) or self.default_group_rule(group_id)
+
+    def describe_access(self) -> list[tuple[str, str]]:
+        """启动时把"接入与名单"的现状说清楚，返回 `[(级别, 文本), ...]`。
+
+        为什么要在启动时就说：接入侧被名单挡掉是**完全静默**的（消息进得来、
+        handler 也被调到，但什么都不发生）。等到用户 @ 半天没人理再回来问，
+        中间已经浪费了一天（用户 2026-09-26 就是这样）。
+        """
+        config = self._access_config()
+        notes: list[tuple[str, str]] = []
+        specs = (
+            ('botAccountsOnly', 'bot_accounts_only', 'botAccounts', 'bot_accounts', '机器人账号名单'),
+            ('userAccountsOnly', 'user_accounts_only', 'userAccounts', 'user_accounts', '用户名单（私聊）'),
+            ('groupChatsOnly', 'group_chats_only', 'groupChats', 'group_chats', '群聊名单'),
+        )
+        parts: list[str] = []
+        for flag_camel, flag_snake, list_camel, list_snake, label in specs:
+            only = self._access_flag(flag_camel, flag_snake)
+            size = len(pick(config, list_camel, list_snake) or [])
+            parts.append('%s %d 条→%s' % (label, size, '仅名单内' if only else '名单外也接'))
+            if only and size == 0:
+                notes.append(('warn', '%s打开了「仅处理名单内」但名单是空的：这一类消息全部不会被接入。'
+                              % label))
+        if not self._access_flag('groupChatsOnly', 'group_chats_only'):
+            parts.append('名单外的群按默认群规则处理（不 @ 就不说话）')
+        return notes + [('info', '接入与名单：%s' % '；'.join(parts))]
 
     def note_access_skip(self, key: str, interval_ms: int, message: str, *args: Any) -> bool:
         """同一条"没动静"的原因在 `interval_ms` 内只打一次（返回这次是否打了）。
@@ -1959,28 +1976,19 @@ class ServiceChunk0(ServiceBase):
         return None
 
     def can_handle_participant(self, participant: Any) -> bool:
-        """上游 `canHandleParticipant(participant)`（`src/service.ts:973`）。"""
-        platform = pick(participant, 'platform') or ''
-        if not is_one_bot_platform(platform):
-            return True
-        config = _config_section(self.config, 'onebot')
-        if not config.get('enabled'):
-            return True
-        if not is_enabled_account(
-            pick(config, 'botAccounts', 'bot_accounts'),
-            normalize_account_id(pick(participant, 'selfId', 'self_id')),
-        ):
-            return False
-        return is_enabled_account(
-            pick(config, 'userAccounts', 'user_accounts'),
-            normalize_account_id(pick(participant, 'userId', 'user_id')),
-        )
+        """上游 `canHandleParticipant(participant)`（`src/service.ts:973`）。
+
+        v1.3.0 起与 `explain_session_access` 用同一套判定（平台无关、两张名单各自一个开关）：
+        出站 / 侧写路径上"这个人还算不算我们的人"必须与入站闸门一致，否则会出现
+        "进来时算、投递时又被拒绝"的分裂。
+        """
+        return self.explain_session_access(participant)[0]
 
     def can_manage_session(self, session: Any) -> bool:
         """上游 `canManageSession(session)`（`src/service.ts:981`）逐条移植。"""
         if not self.can_handle_session(session):
             self.report_standalone_operation(
-                'diagnostic', 'debug', '私聊被 OneBot 白名单拦截 平台=%s 机器人ID=%s 用户ID=%s',
+                'diagnostic', 'debug', '私聊被接入名单拦截 平台=%s 机器人ID=%s 用户ID=%s',
                 pick(session, 'platform'), pick(session, 'selfId', 'self_id'), pick(session, 'userId', 'user_id'),
             )
             return False
@@ -1997,15 +2005,15 @@ class ServiceChunk0(ServiceBase):
         )
 
     def can_handle_story(self, story: Any) -> bool:
-        """上游 `canHandleStory(story)`（`src/service.ts:991`）：后台生活更新只要求机器人账号仍启用。"""
-        platform = pick(story, 'platform') or ''
-        if not is_one_bot_platform(platform):
-            return True
-        config = _config_section(self.config, 'onebot')
-        if not config.get('enabled'):
+        """上游 `canHandleStory(story)`（`src/service.ts:991`）：后台生活更新只要求机器人账号仍启用。
+
+        v1.3.0 起同样平台无关，且只在「仅处理名单内的机器人账号」打开时才看名单
+        （`docs/PORTING_NOTES.md` §22）。
+        """
+        if not self._access_flag('botAccountsOnly', 'bot_accounts_only'):
             return True
         return is_enabled_account(
-            pick(config, 'botAccounts', 'bot_accounts'),
+            pick(self._access_config(), 'botAccounts', 'bot_accounts'),
             normalize_account_id(pick(story, 'selfId', 'self_id')),
         )
 

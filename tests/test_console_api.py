@@ -760,8 +760,8 @@ class ConfigEditorTests(unittest.TestCase):
         self.assertIsInstance(self._read()['model_center']['providers'], list)
 
     def test_types_are_coerced_and_checked(self):
-        _run(self.api.set_config_value('qq_access.enabled', 'true'))
-        self.assertIs(self._read()['qq_access']['enabled'], True)
+        _run(self.api.set_config_value('qq_access.group_chats_only', 'true'))
+        self.assertIs(self._read()['qq_access']['group_chats_only'], True)
         _run(self.api.set_config_value('runtime.max_message_characters', '1500'))
         self.assertEqual(self._read()['runtime']['max_message_characters'], 1500)
         # 行被压成字符串（宿主那个控件干的事）→ 报可读的错，而不是写坏配置

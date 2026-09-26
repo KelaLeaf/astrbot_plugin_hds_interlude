@@ -964,91 +964,172 @@ _TOP_LEVEL_SECTIONS = ('sharedStory', 'logging', 'runtime', 'memory', 'stickers'
 
 
 def onebot_config(**overrides: Any) -> dict[str, Any]:
-    """构造一份 onebot 闸门配置；`sharedStory` 等顶层段自动提到顶层。"""
+    """构造一份「接入与名单」配置；`sharedStory` 等顶层段自动提到顶层。
+
+    v1.3.0 起没有"账号过滤总闸"了：三张名单各自带一个 `*_only` 开关，
+    默认全关（名单只做针对性处理、名单外照常处理）。测试要"只处理名单内"时显式打开。
+    """
     top_level = {key: overrides.pop(key) for key in list(overrides) if key in _TOP_LEVEL_SECTIONS}
-    onebot: dict[str, Any] = {'enabled': True}
+    onebot: dict[str, Any] = {}
     onebot.update(overrides)
     return make_config(onebot=onebot, **top_level)
 
 
-class CanHandleSessionTests(ServiceTestCase):
-    """上游 `canHandleSession`（`src/service.ts:932`）。"""
+class SessionAccessTests(ServiceTestCase):
+    """私聊进站判定（v1.3.0 起是"两张名单 + 各自一个开关"，不再有总闸）。
 
-    def test_non_onebot_platform_always_allowed(self) -> None:
-        service = self.make_service(onebot_config(userAccounts=[]))
-        self.assertTrue(service.can_handle_session(SessionView(platform='telegram', user_id='1')))
+    上游 `canHandleSession`（`src/service.ts:932`）的四条断言中：
 
-    def test_gate_disabled_allows_everything(self) -> None:
-        service = self.make_service(make_config(onebot={'enabled': False, 'userAccounts': []}))
-        self.assertTrue(service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='2')))
+    * "非 OneBot 平台一律放行" —— **v1.3.0 反转为"平台一视同仁"**；
+    * "总闸关闭时全放行" —— 总闸已删除，等价的是"两个 `*_only` 都关闭"（默认）；
+    * "总闸打开 + 空白名单＝全拒" —— 变成"打开了某个 `*_only` 而那张名单是空的＝该类全拒"；
+    * "机器人与用户两个都命中" —— 变成两张名单**互相独立**。
+    受控偏离记录在 `docs/PORTING_NOTES.md` §22。
+    """
 
-    def test_missing_onebot_section_allows_everything(self) -> None:
+    def test_defaults_let_everyone_in(self) -> None:
+        """默认（两个开关都关）：谁都能聊，名单完全不参与判定——所有平台一样。"""
+        service = self.make_service(make_config(onebot={'userAccounts': []}))
+        for platform in ('onebot', 'telegram', 'webchat'):
+            with self.subTest(platform=platform):
+                self.assertTrue(service.can_handle_session(
+                    SessionView(platform=platform, self_id='1', user_id='2'),
+                ))
+
+    def test_missing_section_allows_everything(self) -> None:
         service = self.make_service(make_config())
         self.assertTrue(service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='2')))
 
-    def test_enabled_gate_with_empty_allowlist_denies_all(self) -> None:
-        service = self.make_service(onebot_config(botAccounts=[], userAccounts=[]))
+    def test_user_only_with_empty_allowlist_denies_all(self) -> None:
+        service = self.make_service(make_config(onebot={'userAccountsOnly': True}))
         self.assertFalse(service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='2')))
+        # 非 OneBot 平台同样受名单约束（v1.3.0 起平台无关）。
+        self.assertFalse(service.can_handle_session(SessionView(platform='telegram', self_id='1', user_id='2')))
 
-    def test_bot_and_user_accounts_must_both_match(self) -> None:
-        service = self.make_service(onebot_config(
-            botAccounts=[{'qq': '1'}],
-            userAccounts=[{'qq': '2'}],
-        ))
+    def test_user_only_lets_the_listed_through(self) -> None:
+        service = self.make_service(make_config(onebot={
+            'userAccountsOnly': True, 'userAccounts': [{'qq': '2'}],
+        }))
         self.assertTrue(service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='2')))
         self.assertFalse(service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='3')))
-        self.assertFalse(service.can_handle_session(SessionView(platform='onebot', self_id='9', user_id='2')))
+
+    def test_the_two_lists_are_independent(self) -> None:
+        """只开机器人名单时，用户名单不参与判定（不再"两个都要命中"）。"""
+        service = self.make_service(make_config(onebot={
+            'botAccountsOnly': True, 'botAccounts': [{'qq': '1'}],
+            'userAccountsOnly': False, 'userAccounts': [],
+        }))
+        self.assertTrue(service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='9')))
+        self.assertFalse(service.can_handle_session(SessionView(platform='onebot', self_id='7', user_id='9')))
+
+    def test_closed_toggle_ignores_a_non_empty_list(self) -> None:
+        """开关关着时名单只做针对性处理，不影响"谁能进"。"""
+        service = self.make_service(make_config(onebot={'userAccounts': [{'qq': '2'}]}))
+        self.assertTrue(service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='3')))
 
     def test_account_ids_are_normalized(self) -> None:
-        service = self.make_service(onebot_config(
-            botAccounts=[{'qq': 'private:1'}],
-            userAccounts=[{'qq': '2'}],
+        service = self.make_service(make_config(onebot={
+            'botAccountsOnly': True, 'botAccounts': [{'qq': 'private:1'}],
+            'userAccountsOnly': True, 'userAccounts': [{'qq': '2'}],
+        }))
+        self.assertTrue(service.can_handle_session(
+            SessionView(platform='onebot', self_id='onebot:1', user_id='user:2'),
         ))
-        self.assertTrue(service.can_handle_session(SessionView(platform='onebot', self_id='onebot:1', user_id='user:2')))
 
     def test_ignore_self_messages(self) -> None:
-        service = self.make_service(onebot_config(
-            botAccounts=[{'qq': '1'}],
-            userAccounts=[{'qq': '1'}],
-            ignoreSelfMessages=True,
+        service = self.make_service(make_config(onebot={
+            'ignoreSelfMessages': True, 'userAccountsOnly': False,
+        }))
+        self.assertFalse(service.can_handle_session(
+            SessionView(platform='onebot', self_id='1', user_id='1'),
         ))
-        # 被忽略的自消息直接拒绝；其它账号仍走白名单（'2' 不在 userAccounts 里）。
-        self.assertFalse(service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='1')))
-        self.assertFalse(service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='2')))
-
-    def test_denial_is_logged(self) -> None:
-        service = self.make_service(onebot_config(botAccounts=[{'qq': '1'}], userAccounts=[]))
-        service.can_handle_session(SessionView(platform='onebot', self_id='1', user_id='2'))
-        self.assertIn('OneBot 白名单拒绝用户账号', self.sink.text())
-
-
-class CanHandleGroupSessionTests(ServiceTestCase):
-    """上游 `canHandleGroupSession`（`src/service.ts:955`）与 `groupRule`（`:967`）。"""
-
-    def test_non_onebot_denied(self) -> None:
-        service = self.make_service(onebot_config(groupChats=[{'groupId': '9'}]))
-        self.assertFalse(service.can_handle_group_session(SessionView(platform='telegram', channel_id='9')))
-
-    def test_gate_disabled_denied(self) -> None:
-        service = self.make_service(make_config(onebot={'enabled': False}))
-        self.assertFalse(service.can_handle_group_session(SessionView(platform='onebot', channel_id='9')))
-
-    def test_group_allowlist(self) -> None:
-        service = self.make_service(onebot_config(
-            botAccounts=[{'qq': '1'}],
-            groupChats=[{'groupId': 'group:9', 'enabled': True}],
+        self.assertTrue(service.can_handle_session(
+            SessionView(platform='onebot', self_id='1', user_id='2'),
         ))
-        allowed = SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9')
-        self.assertTrue(service.can_handle_group_session(allowed))
+
+    def test_the_reason_names_the_gate(self) -> None:
+        service = self.make_service(make_config(onebot={
+            'userAccountsOnly': True, 'userAccounts': [],
+        }))
+        allowed, reason = service.explain_session_access(
+            SessionView(platform='onebot', self_id='1', user_id='2'),
+        )
+        self.assertFalse(allowed)
+        self.assertIn('仅处理名单内的用户', reason)
+
+
+class GroupAccessTests(ServiceTestCase):
+    """群聊进站判定 + `groupRule`（`src/service.ts:955` / `:967`）。
+
+    v1.3.0 起群聊只由「机器人名单（可选）」+「群聊名单（可选）」决定，
+    **不再有总闸、也不再和 OneBot 绑定**（`docs/PORTING_NOTES.md` §22）。
+    """
+
+    def test_defaults_accept_every_group(self) -> None:
+        service = self.make_service(make_config(onebot={'groupChats': [{'groupId': '9'}]}))
+        self.assertTrue(service.can_handle_group_session(
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
+        ))
+        self.assertTrue(service.can_handle_group_session(
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='8'),
+        ))
+
+    def test_group_only_restricts_to_the_list(self) -> None:
+        service = self.make_service(make_config(onebot={
+            'groupChatsOnly': True, 'groupChats': [{'groupId': 'group:9', 'enabled': True}],
+        }))
+        self.assertTrue(service.can_handle_group_session(
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
+        ))
         self.assertFalse(service.can_handle_group_session(
             SessionView(platform='onebot', self_id='1', user_id='2', channel_id='8'),
         ))
 
-    def test_guild_id_takes_priority_over_channel(self) -> None:
-        service = self.make_service(onebot_config(
-            botAccounts=[{'qq': '1'}],
-            groupChats=[{'groupId': '9', 'enabled': True}],
+    def test_group_only_with_an_empty_list_denies_all(self) -> None:
+        service = self.make_service(make_config(onebot={'groupChatsOnly': True}))
+        self.assertFalse(service.can_handle_group_session(
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
         ))
+
+    def test_other_platforms_obey_the_same_rules(self) -> None:
+        """v1.3.0 起平台一视同仁：telegram 的群同样只受名单约束。"""
+        service = self.make_service(make_config(onebot={'groupChatsOnly': True, 'groupChats': []}))
+        self.assertFalse(service.can_handle_group_session(
+            SessionView(platform='telegram', self_id='1', user_id='2', channel_id='9', guild_id='9'),
+        ))
+        loose = self.make_service(make_config(onebot={}))
+        self.assertTrue(loose.can_handle_group_session(
+            SessionView(platform='telegram', self_id='1', user_id='2', channel_id='9', guild_id='9'),
+        ))
+
+    def test_bot_accounts_only_also_applies_to_groups(self) -> None:
+        service = self.make_service(make_config(onebot={
+            'botAccountsOnly': True, 'botAccounts': [{'qq': '1'}], 'groupChats': [],
+        }))
+        self.assertTrue(service.can_handle_group_session(
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
+        ))
+        self.assertFalse(service.can_handle_group_session(
+            SessionView(platform='onebot', self_id='7', user_id='2', channel_id='9'),
+        ))
+
+    def test_user_accounts_are_irrelevant_for_groups(self) -> None:
+        """群成员不需要在用户名单里（上游语义，v1.3.0 保留）。"""
+        service = self.make_service(make_config(onebot={
+            'userAccountsOnly': True, 'userAccounts': [],
+            'groupChatsOnly': True, 'groupChats': [{'groupId': '9'}],
+        }))
+        self.assertFalse(service.can_handle_session(
+            SessionView(platform='onebot', self_id='1', user_id='2'),
+        ))
+        self.assertTrue(service.can_handle_group_session(
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
+        ))
+
+    def test_guild_id_takes_priority_over_channel(self) -> None:
+        service = self.make_service(make_config(onebot={
+            'groupChatsOnly': True, 'groupChats': [{'groupId': '9', 'enabled': True}],
+        }))
         session = SessionView(platform='onebot', self_id='1', channel_id='77', guild_id='9')
         self.assertTrue(service.can_handle_group_session(session))
 
@@ -1057,97 +1138,58 @@ class CanHandleGroupSessionTests(ServiceTestCase):
         self.assertIsNotNone(service.group_rule('group:9'))
         self.assertIsNone(service.group_rule('10'))
 
-    def test_group_rule_skips_explicitly_disabled(self) -> None:
-        service = self.make_service(make_config(onebot={'groupChats': [{'groupId': '9', 'enabled': False}]}))
-        self.assertIsNone(service.group_rule('9'))
-
-    def test_group_rule_missing_section(self) -> None:
-        service = self.make_service(make_config())
-        self.assertIsNone(service.group_rule('9'))
-
     def test_rule_without_an_explicit_enabled_flag_is_accepted(self) -> None:
         """Console 的 `enabled` 默认 true（`index.ts:392`）：缺省不得把整个群拒收。"""
-        service = self.make_service(onebot_config(
-            botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '9'}],
-        ))
+        service = self.make_service(make_config(onebot={
+            'groupChatsOnly': True, 'groupChats': [{'groupId': '9'}],
+        }))
         self.assertTrue(service.can_handle_group_session(
             SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
         ))
 
     def test_explicitly_disabled_rule_is_still_rejected(self) -> None:
-        service = self.make_service(onebot_config(
-            botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '9', 'enabled': False}],
-        ))
+        service = self.make_service(make_config(onebot={
+            'groupChatsOnly': True, 'groupChats': [{'groupId': '9', 'enabled': False}],
+        }))
         self.assertFalse(service.can_handle_group_session(
             SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
         ))
 
+    def test_the_default_rule_keeps_unlisted_groups_quiet(self) -> None:
+        """名单外的群用默认群规则：不 @ 就不说话（与 schema 的默认值一致）。"""
+        service = self.make_service(make_config(onebot={}))
+        rule = service.group_rule_or_default('853402770')
+        self.assertEqual(rule['responseMode'], 'mention-only')
+        self.assertEqual(rule['groupId'], '853402770')
+        self.assertEqual(service.group_rule_or_default('853402770')['debounceSeconds'], 1.0)
+        # 名单里的群仍然用自己那一条
+        listed = self.make_service(make_config(onebot={
+            'groupChats': [{'groupId': '853402770', 'responseMode': 'always'}],
+        }))
+        self.assertEqual(listed.group_rule_or_default('853402770')['responseMode'], 'always')
 
-class GroupGateExplanationTests(ServiceTestCase):
-    """群聊闸门的**原因版** + 可见日志节流（v1.2.17）。
 
-    用户 2026-09-26 的日志里群聊"完全没生效"：消息进得来、`on_group_message` 也被调到，
-    但日志里一个字都没有（core 的拒绝报告走 `diagnostic`，默认 verbosity 看不见）。
-    这一组钉住"每一道门都要说得出为什么"，以及"说了但不会刷屏"。
-    """
-
-    def test_every_denial_names_its_own_gate(self) -> None:
-        cases = (
-            (onebot_config(groupChats=[{'groupId': '9'}]),
-             SessionView(platform='telegram', channel_id='9'), '平台不是 OneBot'),
-            (make_config(onebot={'enabled': False}),
-             SessionView(platform='onebot', channel_id='9'), 'qq_access.enabled'),
-            (onebot_config(botAccounts=[{'qq': '77'}], groupChats=[{'groupId': '9'}]),
-             SessionView(platform='onebot', self_id='1', channel_id='9'), 'bot_accounts'),
-            (onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '8'}]),
-             SessionView(platform='onebot', self_id='1', channel_id='9'), 'group_chats'),
-            (onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '9', 'enabled': False}]),
-             SessionView(platform='onebot', self_id='1', channel_id='9'), 'enabled=false'),
-        )
-        for config, session, expected in cases:
-            with self.subTest(expected=expected):
-                allowed, reason = self.make_service(config).explain_group_gate(session)
-                self.assertFalse(allowed)
-                self.assertIn(expected, reason)
-
-    def test_the_reason_agrees_with_the_boolean(self) -> None:
-        """原因版与布尔版必须永远同源——否则日志会把用户引到错的方向。"""
-        sessions = (
-            SessionView(platform='telegram', channel_id='9'),
-            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
-            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='8'),
-        )
-        configs = (
-            make_config(onebot={'enabled': False}),
-            onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '9'}]),
-            onebot_config(botAccounts=[{'qq': '77'}], groupChats=[{'groupId': '9'}]),
-            onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '9', 'enabled': False}]),
-        )
-        for config in configs:
-            service = self.make_service(config)
-            for session in sessions:
-                with self.subTest(config=config, session=session.channel_id):
-                    allowed, _reason = service.explain_group_gate(session)
-                    self.assertEqual(allowed, service.can_handle_group_session(session))
-
-    def _group_notes(self) -> int:
-        """打了几条「群聊消息未接入」（按**记录**数：分层渲染会把同一条套两层）。"""
-        return sum(1 for _level, text in self.sink.records if '群聊消息未接入' in text)
+class AccessVisibilityTests(ServiceTestCase):
+    """被名单挡掉时要**看得见**，且不能刷屏（v1.2.17 起，v1.3.0 换成三开关）。"""
 
     def test_a_skip_is_visible_once_then_throttled(self) -> None:
-        service = self.make_service(make_config(onebot={'enabled': False}))
+        service = self.make_service(make_config(onebot={'groupChatsOnly': True}))
         session = SessionView(
             platform='onebot', self_id='161461357', user_id='3387273135',
             channel_id='853402770', username='钟神秀', content='中秋快乐啊',
         )
-        self.assertTrue(service.note_group_skip(session, '闸门关着'))
-        self.assertFalse(service.note_group_skip(session, '闸门关着'), '10 分钟内不重复打扰')
+        self.assertTrue(service.note_group_skip(session, '「仅处理名单内的群聊」开着'))
+        self.assertFalse(service.note_group_skip(session, '「仅处理名单内的群聊」开着'), '10 分钟内不重复打扰')
         self.assertEqual(self._group_notes(), 1)
         self.assertIn('853402770', self.sink.text())
         self.assertIn('钟神秀', self.sink.text())
         # 原因变了要立刻再打一条：排查时能看到门是一道道关上的。
-        self.assertTrue(service.note_group_skip(session, '这个群不在白名单里'))
+        self.assertTrue(service.note_group_skip(session, '这条群消息没 @ 机器人'))
         self.assertEqual(self._group_notes(), 2)
+
+    def _group_notes(self) -> int:
+        """打了几条「群聊消息未接入」（按**记录**数：分层渲染会把同一条套两层）。"""
+        return sum(1 for _level, text in self.sink.records if '群聊消息未接入' in text)
 
     def test_flush_stage_skips_share_the_same_visible_channel(self) -> None:
         service = self.make_service()
@@ -1156,80 +1198,24 @@ class GroupGateExplanationTests(ServiceTestCase):
         self.assertEqual(self._group_notes(), 1)
         self.assertIn('853402770', self.sink.text())
 
-    def test_the_startup_summary_names_the_missing_piece(self) -> None:
-        cases = (
-            (make_config(onebot={'enabled': False}), 'warn', 'qq_access.enabled=false'),
-            (onebot_config(botAccounts=[]), 'warn', 'bot_accounts'),
-            (onebot_config(botAccounts=[{'qq': '1'}], groupChats=[]), 'warn', 'group_chats'),
-            (onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '853402770'}]),
-             'info', '853402770'),
-        )
-        for config, level, expected in cases:
-            with self.subTest(expected=expected):
-                got_level, text = self.make_service(config).describe_group_access()
-                self.assertEqual(got_level, level)
-                self.assertIn(expected, text)
+    def test_the_startup_summary_lists_every_list(self) -> None:
+        service = self.make_service(make_config(onebot={
+            'botAccounts': [{'qq': '1'}], 'userAccounts': [{'qq': '2'}],
+            'groupChats': [{'groupId': '853402770'}],
+        }))
+        notes = service.describe_access()
+        text = '\n'.join(item for _level, item in notes)
+        self.assertIn('机器人账号名单 1 条', text)
+        self.assertIn('用户名单（私聊） 1 条', text)
+        self.assertIn('群聊名单 1 条', text)
+        self.assertIn('名单外也接', text)
+        self.assertTrue(all(level == 'info' for level, _text in notes))
 
-
-class WhitelistSemanticsTests(ServiceTestCase):
-    """`qq_access` 的真值表（v1.2.18 起写进 hint / README，这里钉住行为本身）。
-
-    用户按自己的理解复述过一遍，三处都对不上，所以这段语义值得有一条回归测试：
-    * 闸门**关**着时白名单**完全不看**（私聊谁都能聊）——不是"名单内针对性处理、
-      名单外走默认提示词"；
-    * 闸门关着时**群聊永远不会被接入**（上游 `canHandleGroupSession` 与 `canHandleSession`
-      在这里刻意不对称，`service.ts:955`）；
-    * 群聊不看 `userAccounts`（群成员不需要私聊授权）；
-    * 闸门只对 OneBot 家族生效，telegram 之类的平台一律放行。
-    """
-
-    def _matrix(self, onebot: dict[str, Any]) -> list[bool]:
-        service = self.make_service(make_config(onebot=onebot))
-        sessions = (
-            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='2', is_direct=True),
-            SessionView(platform='onebot', self_id='1', user_id='9', channel_id='9', is_direct=True),
-            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9', guild_id='9'),
-            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='8', guild_id='8'),
-            SessionView(platform='telegram', self_id='1', user_id='9', channel_id='9', is_direct=True),
-        )
-        return [
-            service.can_handle_session(s) if s.is_direct else service.can_handle_group_session(s)
-            for s in sessions
-        ]
-
-    def test_the_gate_matrix(self) -> None:
-        bot = [{'qq': '1'}]
-        user = [{'qq': '2'}]
-        group = [{'groupId': '9'}]
-        cases = (
-            # 闸门关：白名单完全不看；私聊全放行（含非 OneBot），群聊一个都不接。
-            ({'enabled': False, 'botAccounts': [], 'userAccounts': [], 'groupChats': []},
-             [True, True, False, False, True]),
-            ({'enabled': False, 'botAccounts': bot, 'userAccounts': user, 'groupChats': group},
-             [True, True, False, False, True]),
-            # 闸门开 + 空白名单 = 全拒（非 OneBot 仍放行）。
-            ({'enabled': True, 'botAccounts': [], 'userAccounts': [], 'groupChats': []},
-             [False, False, False, False, True]),
-            ({'enabled': True, 'botAccounts': bot, 'userAccounts': [], 'groupChats': []},
-             [False, False, False, False, True]),
-            ({'enabled': True, 'botAccounts': bot, 'userAccounts': user, 'groupChats': []},
-             [True, False, False, False, True]),
-            ({'enabled': True, 'botAccounts': bot, 'userAccounts': user, 'groupChats': group},
-             [True, False, True, False, True]),
-            # 群聊不看 userAccounts：没有用户白名单，群照样接。
-            ({'enabled': True, 'botAccounts': bot, 'userAccounts': [], 'groupChats': group},
-             [False, False, True, False, True]),
-            # 群规则显式关掉 = 那个群不接。
-            ({'enabled': True, 'botAccounts': bot, 'userAccounts': user,
-              'groupChats': [{'groupId': '9', 'enabled': False}]},
-             [True, False, False, False, True]),
-            # 机器人账号不在名单里：私聊与群聊全拒（telegram 照旧）。
-            ({'enabled': True, 'botAccounts': [{'qq': '999'}], 'userAccounts': user, 'groupChats': group},
-             [False, False, False, False, True]),
-        )
-        for onebot, expected in cases:
-            with self.subTest(onebot=onebot):
-                self.assertEqual(self._matrix(onebot), expected)
+    def test_an_empty_restricted_list_warns_at_startup(self) -> None:
+        service = self.make_service(make_config(onebot={'groupChatsOnly': True, 'groupChats': []}))
+        notes = service.describe_access()
+        self.assertEqual(notes[0][0], 'warn')
+        self.assertIn('群聊名单', notes[0][1])
 
 
 class ConfigAccessorTests(ServiceTestCase):
@@ -1270,34 +1256,39 @@ class ConfigAccessorTests(ServiceTestCase):
         self.assertNotIn('settingOverlay', normalized['state'])
 
 
-class CanHandleParticipantAndStoryTests(ServiceTestCase):
-    """上游 `canHandleParticipant`（`:973`）与 `canHandleStory`（`:991`）。"""
+class ParticipantAndStoryAccessTests(ServiceTestCase):
+    """`can_handle_participant`（上游 `:973`）与 `canHandleStory`（`:991`）。
 
-    def test_participant_non_onebot_allowed(self) -> None:
-        service = self.make_service(onebot_config(userAccounts=[]))
-        self.assertTrue(service.can_handle_participant({'platform': 'telegram'}))
+    v1.3.0 起 `can_handle_participant` 与私聊进站判定是**同一套**（两张名单 + 各自的
+    开关），否则会出现"进来时算、投递时又被拒绝"的分裂（`docs/PORTING_NOTES.md` §22）。
+    """
 
-    def test_participant_gate_disabled_allowed(self) -> None:
-        service = self.make_service(make_config(onebot={'enabled': False, 'userAccounts': []}))
-        self.assertTrue(service.can_handle_participant({'platform': 'onebot', 'selfId': '1', 'userId': '2'}))
-
-    def test_participant_both_accounts_required(self) -> None:
-        service = self.make_service(onebot_config(
-            botAccounts=[{'qq': '1'}], userAccounts=[{'qq': '2'}],
+    def test_participants_are_open_by_default(self) -> None:
+        service = self.make_service(make_config(onebot={'userAccounts': []}))
+        self.assertTrue(service.can_handle_participant({'platform': 'telegram', 'userId': '2'}))
+        self.assertTrue(service.can_handle_participant(
+            {'platform': 'onebot', 'selfId': '1', 'userId': '2'},
         ))
+
+    def test_participant_follows_the_same_two_lists(self) -> None:
+        service = self.make_service(make_config(onebot={
+            'botAccountsOnly': True, 'botAccounts': [{'qq': '1'}],
+            'userAccountsOnly': True, 'userAccounts': [{'qq': '2'}],
+        }))
         self.assertTrue(service.can_handle_participant({'platform': 'onebot', 'selfId': '1', 'userId': '2'}))
         self.assertFalse(service.can_handle_participant({'platform': 'onebot', 'selfId': '1', 'userId': '3'}))
         self.assertFalse(service.can_handle_participant({'platform': 'onebot', 'selfId': '9', 'userId': '2'}))
 
-    def test_story_only_requires_bot_account(self) -> None:
-        service = self.make_service(onebot_config(
-            botAccounts=[{'qq': '1'}], userAccounts=[],
-        ))
+    def test_story_access_is_about_the_bot_account(self) -> None:
+        """`canHandleStory` 只看机器人账号那张名单（故事挂在机器人账号上）。"""
+        service = self.make_service(make_config(onebot={
+            'botAccountsOnly': True, 'botAccounts': [{'qq': '1'}],
+        }))
         self.assertTrue(service.can_handle_story({'platform': 'onebot', 'selfId': '1'}))
         self.assertFalse(service.can_handle_story({'platform': 'onebot', 'selfId': '2'}))
 
-    def test_story_non_onebot_or_disabled_gate_allowed(self) -> None:
-        service = self.make_service(make_config(onebot={'enabled': False, 'botAccounts': []}))
+    def test_story_access_is_open_when_the_bot_list_is_off(self) -> None:
+        service = self.make_service(make_config(onebot={'botAccounts': []}))
         self.assertTrue(service.can_handle_story({'platform': 'onebot', 'selfId': '1'}))
         self.assertTrue(service.can_handle_story({'platform': 'telegram', 'selfId': '1'}))
 
@@ -1333,9 +1324,9 @@ class CanManageSessionTests(ServiceTestCase):
         self.assertTrue(service.can_manage_session(SessionView(platform='onebot', self_id='1', user_id='2')))
 
     def test_denied_session_is_rejected_and_logged(self) -> None:
-        service = self.make_service(onebot_config(botAccounts=[{'qq': '1'}], userAccounts=[]))
+        service = self.make_service(onebot_config(botAccounts=[{'qq': '1'}], userAccountsOnly=True))
         self.assertFalse(service.can_manage_session(SessionView(platform='onebot', self_id='1', user_id='2')))
-        self.assertIn('私聊被 OneBot 白名单拦截', self.sink.text())
+        self.assertIn('私聊被接入名单拦截', self.sink.text())
 
 
 # =========================================================================== #
