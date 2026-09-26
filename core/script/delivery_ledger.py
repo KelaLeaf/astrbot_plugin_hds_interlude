@@ -17,7 +17,7 @@
 * ``failed`` / ``cancelled`` 混合时不得误报 ``partial``。
 * 尚有 ``pending`` 且无任何成功时保持 ``pending``。
 
-命名约定（docs/PORT_PLAN.md §2）
+命名约定（键名约定）
 -------------------------------
 上游 camelCase 字段一律转 snake_case（``commit_id`` / ``event_id`` /
 ``segment_index`` / ``attempted_at`` / ``completed_at`` …）；读取侧两种拼写都

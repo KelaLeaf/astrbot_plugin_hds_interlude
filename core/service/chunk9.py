@@ -48,9 +48,9 @@
    路径（渲染 → `serviceLogger`），本文件改用**纯渲染** `format_layered_log()`
    再由 `emit_log` 单点投递，与上游一致。
 2. `emit_log` 在 `service_logger` 缺位时直接落到 `plugin.core.logging` 的 sink
-   （`get_log_sink()`），即 `docs/PORT_PLAN_SERVICE.md` 要求的"与 sink 通道对接"。
+   （`get_log_sink()`），即 移植约定 要求的"与 sink 通道对接"。
 
-## 键名法（`docs/PORT_PLAN.md` §2）
+## 键名约定
 
 * `development_for_prompt` 的返回值会被 `narrator_prompts.to_prompt_payload()`
   **原样 JSON 序列化进提示词**（`developmentTendencies`），因此输出键名逐字保持
@@ -58,7 +58,7 @@
 * 数据库列名保持上游 camelCase；从数据库行/会话里读入的一律 `pick()` 双读。
 * 本文件内部变量与 `report_*` 的参数名保持 snake_case。
 
-## 本移植版的必要偏离（`docs/PORT_PLAN_SERVICE.md` §8）
+## 本移植版的必要偏离（移植约定）
 
 * `resolveCompactionFacts` 上游用 `{ id: { $in: ids } }`。本移植版的
   `Database` 只支持等值 `where`（见 `base.db_get` 的显式约定），故改为
@@ -164,7 +164,7 @@ class ServiceChunk9(ServiceBase):
         → `filter(score >= 0.12)` → `sort(score desc)` → `slice(0, 2)` → `map(...)`。
 
         返回项的键名是**发给模型的 payload**（`developmentTendencies`），逐字保持上游
-        camelCase（`sourceEntryIds`），见 `docs/PORT_PLAN.md` §2「键名法」。
+        camelCase（`sourceEntryIds`），见键名约定。
         """
         text = query if isinstance(query, str) else ''
         if not text.strip():

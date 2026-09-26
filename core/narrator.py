@@ -10,7 +10,7 @@
   行到文件末尾——提示词组装。上游的 `from './narrator'` 调用点都从本文件
   导入，因此这里把提示词模块的公开函数 **re-export**（见文件末尾）。
 
-语言映射约定（详见 `docs/PORT_PLAN.md`）：
+语言映射约定（详见移植约定）：
 
 - `camelCase` → `snake_case`（类名保持上游的 PascalCase）。
 - **键名法**：发给模型的请求体（`messages` / `response_format` / `max_tokens` /
@@ -502,7 +502,7 @@ class HttpClient(Protocol):
         `embedding` / `stickers` / `vision`）：宿主适配层可以据此把该任务改派到
         AstrBot 里配好的模型。上游没有这个概念（Koishi 侧每类任务固定用自己的
         provider 连接），所以它只是**可选**参数：普通 HTTP 传输实现直接忽略，
-        `url` 仍然是权威目标。见 `docs/PORTING_NOTES.md` 的「模型来源」一节。
+        `url` 仍然是权威目标。见 模型来源说明。
         """
         ...
 

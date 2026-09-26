@@ -19,7 +19,7 @@
 ----------
 - `RecallSpan` 上游是 TS `interface`（`{start, end, keys: Set<string>}`）→ 这里用
   `TypedDict`，`keys` 为 `set[str]`。
-- 返回对象字段 `camelCase → snake_case`（PORT_PLAN §2）：
+- 返回对象字段 `camelCase → snake_case`（键名约定）：
   `RecallSpan` 内部字段本就是单词，无变化；`scoreOriginal` 返回
   `{'score', 'index'}`；`originalWindow` 返回 `{'content', 'start', 'end'}`。
 - 长度一律用 `len()`。上游按 UTF-16 码元计长，Python 按码点计长：BMP 文本

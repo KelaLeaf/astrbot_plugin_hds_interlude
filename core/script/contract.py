@@ -4,7 +4,7 @@
 每个事件都带稳定的、由宿主拥有的 id。契约本身不做模型调用，也不发明叙事决策。
 
 移植自 Koishi / TypeScript 上游快照 `upstream/src/script/contract.ts`（92 行）。
-命名按 `docs/PORT_PLAN.md` §2：`camelCase` → `snake_case`；
+命名按键名约定：`camelCase` → `snake_case`；
 `ScriptEventKind` / `ScriptDeliveryMode` / `ScriptActionBinding` / `ScriptEventDraft` /
 `ScriptCommitDraft` / `ScriptMessageEventReference` 六个类型名保持上游原名。
 

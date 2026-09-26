@@ -6,7 +6,7 @@
 由 `core/narrator.py` 负责并从本模块 re-export 这些提示词函数，避免循环 import
 （本模块**绝不** import `plugin.core.narrator`）。
 
-命名与键名（docs/PORT_PLAN.md §2「⚠️ 键名法」，最高优先级）
+命名与键名（键名约定，最高优先级）
 ----------------------------------------------------------
 - Python 标识符（函数名/参数名/局部变量）一律 snake_case。
 - **发给模型的字符串与 payload 键名逐字保持上游 camelCase**：
@@ -1756,7 +1756,7 @@ def _local_continuation_bookmark(entries: list[dict[str, Any]], from_: Any, now:
     return bookmark
 
 
-#: 兄弟模块优先，但**必须先通过 wire 键名契约自检**（PORT_PLAN §2「键名法」）。
+#: 兄弟模块优先，但**必须先通过 wire 键名契约自检**（键名约定）。
 #:
 #: 这些助手的结果都会进入 `to_prompt_payload` 的返回值，也就是直接发给模型的 payload：
 #: 上游字段名（`storyIdentity`/`sourceEntryId`/`communicationOutcome`/`recentCommunications`…）

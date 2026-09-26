@@ -3,7 +3,7 @@
 证据只是**指向原文的指针**（谁、在哪一条条目里、原话是哪一段），永远不是叙事的替身。
 本模块全部是纯函数：不 import `astrbot`，也不碰数据库。
 
-移植约定（见 `docs/PORT_PLAN.md` §2「⚠️ 键名法」）：
+移植约定（见键名约定）：
 - Python 标识符一律 snake_case；**内部结构**（`KnowledgeEvidence`、落库的事实行、
   `ScriptEntry.metadata`）同样 snake_case（`related_fact_ids` / `source_entry_id` /
   `life_handoff`），与 `plugin/core/types.py` 的 TypedDict 一致。
@@ -34,7 +34,7 @@ from typing import Any, Literal, Optional, Required, TypedDict
 from ..time import iso
 from ..types import NarrativeFact, ScriptEntry
 
-# 上游 `const modes` / `const roles`（未 export，按 PORT_PLAN 加 `_` 前缀）。
+# 上游 `const modes` / `const roles`（未 export，按约定加 `_` 前缀）。
 _MODES = ('observed', 'reported', 'belief', 'proposal', 'conditional', 'confirmed', 'unclassified')
 _ROLES = ('observation', 'interpretation', 'proposal', 'condition', 'confirmation')
 # 上游内联数组：算作「已投递」的条目类型。

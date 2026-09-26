@@ -15,7 +15,7 @@ M4 桥：把 beta10 那些被验证过的字段编译成**正向续写脚手架*
 6. `incomingEvent`                —— 触发本回合的入站事件
 7. `authoringWindow`              —— 本回合的写作窗口与能力开关
 
-键名（`docs/PORT_PLAN.md` §2「⚠️ 键名法」）——本模块**输入输出全是 wire format**
+键名（键名约定）——本模块**输入输出全是 wire format**
 --------------------------------------------------------------------------------
 `compile_narrative_context` 的产物由 `narrator_prompts.to_prompt_payload` 直接
 `JSON.stringify` 进发给模型的 payload；上游 `systemPrompt` 里的 FIELD MAP 明文按

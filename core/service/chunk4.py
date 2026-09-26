@@ -15,7 +15,7 @@
 `persistDecision` 是权重最大的一个成员：正文、投递草稿、剧本条目、记忆、意图、
 状态补丁、Alter、Agency 与 Urge 的交接都在这里一次性落库。
 
-## 键名约定（`docs/PORT_PLAN.md` §2「键名法」）
+## 键名约定（键名约定）
 
 1. **数据库行**：列名逐字 camelCase（`normalize_database_row` 的产物），因此
    `story['setting']['timezone']` / `participant['state']` / `intent['notBefore']`

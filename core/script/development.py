@@ -3,7 +3,7 @@
 指向所提供原文的**引用**，把「观察 / 解释 / 接收」三者绑在一起，而不另写一份
 心理摘要。
 
-键名（`docs/PORT_PLAN.md` §2「⚠️ 键名法」）
+键名（键名约定）
 ------------------------------------------
 - `interaction_evidence()` 是**模型可见的 wire 投影**：它的结果由
   `narrator_prompts.to_compaction_payload` 放进 `interactionEvidence` 发给模型，

@@ -1,7 +1,7 @@
 """`Transport` 协议与 `NullTransport` 空实现。
 
 上游 `src/service.ts` 里所有平台出站动作都挂在 `session.bot` 上；本移植版
-统一收敛到 `self.transport`（见 `docs/PORT_PLAN_SERVICE.md` §7）：
+统一收敛到 `self.transport`（见移植约定）：
 
 | 上游调用点 | 上游写法 | Transport 方法 |
 | --- | --- | --- |
@@ -19,7 +19,7 @@
 | 网页观察（Chunk5，上游 Puppeteer） | `ctx.puppeteer.page()` | `search_web` / `visit_web` |
 | typ-0 后台投递出口（Chunk0 `desktop_delivery_handler`） | bridge handler | `deliver_background` |
 
-**降级原则**（`docs/PORT_PLAN_SERVICE.md` §8）：确实无法在 AstrBot 复现的能力
+**降级原则**（移植约定）：确实无法在 AstrBot 复现的能力
 （Puppeteer 截图、sharp 抽帧、Satori 原生表情）必须返回失败而不是抛异常，
 由调用方走既有的"投递失败"分支。`NullTransport` 就是那条降级路径的默认实现。
 """

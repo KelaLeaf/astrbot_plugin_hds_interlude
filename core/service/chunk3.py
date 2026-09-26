@@ -1,6 +1,6 @@
 """Chunk3：`upstream/src/service.ts` 第 2573–3216 行的成员。
 
-按 `docs/PORT_PLAN_SERVICE.md` 的分块表，本文件只包含**声明起始行落在
+按移植约定 的分块表，本文件只包含**声明起始行落在
 [2573, 3216) 内**的 20 个成员，成员顺序与上游一致：
 
 | 上游行 | 成员 | 主题 |
@@ -31,7 +31,7 @@
 `persistTimelineRetry`(3698) / `tryDecide`(3720) 的**声明起始行都 ≥ 3217**，
 归 Chunk4，本文件刻意不定义（两个 mixin 重复定义同名成员会让 MRO 静默覆盖）。
 
-## 键名法（`docs/PORT_PLAN.md` §2）
+## 键名约定
 
 * 类字段/方法名一律 snake_case；跨成员调用 `self.other_method()`。
 * **发给模型的 payload / 持久化 wire format 保持上游 camelCase**：
@@ -57,7 +57,7 @@
 3. **`{$in: ids}` 更新**：上游 `dbSet('interlude_intent', {id: {$in: consumedDueIds}})`
    在本移植版拆成逐 id 的 `db_set`（`Database` 无算子支持）。
 
-## 降级（`docs/PORT_PLAN_SERVICE.md` §8，不是 TODO）
+## 降级（移植约定，不是 TODO）
 
 * Puppeteer 的降采样 / 抽帧 → `PIL`（try-import）。`PIL` 缺失时
   `downscale_image_for_vision` / `render_animated_image_frame` 返回 `None`，

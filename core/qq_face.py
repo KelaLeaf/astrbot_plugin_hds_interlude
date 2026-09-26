@@ -5,7 +5,7 @@
 依赖替换说明
 ------------
 上游第 1 行 ``import * as qface from 'qface'`` 只用于查询 ID ≤ 348 的系统表情表，
-且只取 ``qface.get(id).QDes``（形如 ``'/微笑'``）。按 PORT_PLAN「不引入第三方依赖」，
+且只取 ``qface.get(id).QDes``（形如 ``'/微笑'``）。按 「不引入第三方依赖」这条约定，
 这里**不引入 qface**，改为把 ``qface@1.4.1``（``upstream/package.json`` 声明 ``"qface": "^1.4.1"``）
 ``lib/data.json`` 的全表逐条内联为 QFACE_SYSTEM_FACE_NAMES：275 条，覆盖 ID 0–348，
 取值已按上游 ``face?.QDes?.replace(/^\\//, '').trim()`` 去掉前导斜杠并 trim。

@@ -4,7 +4,7 @@
 （上游版本 `1.0.1-beta6-rebuild`，1157 行）。这是整个移植工程的公共协议文件，
 所有模块一律从这里 import 领域类型。
 
-语言映射约定（详见 `docs/PORT_PLAN.md`）：
+语言映射约定（详见移植约定）：
 - 上游 `export interface X {...}` → `class X(TypedDict, total=False)`。
   上游的必填字段（声明中无 `?`）用 `Required[...]` 标注；可选字段（有 `?`）保持裸注解。
   注意：本模块使用 `from __future__ import annotations`（因为上游存在大量前向引用，

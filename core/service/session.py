@@ -14,7 +14,7 @@
 本移植版把这一组读取需求固化成**纯数据视图**：它是 `plugin/adapters/astrbot_bridge.py`
 要构造的对象，`core/` 里任何位置都不得 `import astrbot`。
 
-键名法（`docs/PORT_PLAN.md` §2）：本类字段是 Python 标识符，一律 snake_case；
+键名约定：本类字段是 Python 标识符，一律 snake_case；
 `elements` / `quote` / `event` 里承载的是**外部读入**的适配器数据，既可能是上游
 camelCase 也可能是 snake_case，因此一律通过 `pick()` 双读，优先 camelCase。
 """

@@ -1,7 +1,7 @@
 """AstrBot 适配层：把 AstrBot 事件翻译进 `plugin/core/`。
 
 本包是全项目**唯一**允许 `import astrbot` 的地方（另一个是 `plugin/main.py`）。
-`plugin/core/` 必须保持平台无关、可独立测试（`docs/PORT_PLAN.md` §0.3）。
+`plugin/core/` 必须保持平台无关、可独立测试（移植约定）。
 
 对外入口：
 

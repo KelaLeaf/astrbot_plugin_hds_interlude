@@ -5,7 +5,7 @@
 这些任务**有自己的执行器**，绝不由实时叙事回合顺手结清；把它们排除在「实时回合
 消费的意图」之外，延迟的/后台的意图才不会被一次普通对话误标为已完成。
 
-命名约定（docs/PORT_PLAN.md §2）：camelCase 转 snake_case；读取侧两种拼写都接受。
+命名约定（键名约定）：camelCase 转 snake_case；读取侧两种拼写都接受。
 """
 
 from __future__ import annotations

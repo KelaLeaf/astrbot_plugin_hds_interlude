@@ -34,7 +34,7 @@
 任务清单里提到的「群冷却 / 群表态执行 / 贴纸与原生表情解析与发送 /
 `bufferUserNarrative` / `signalIncomingInterruption` / `deliverEarlyPrivateReply` /
 `describeUserEvent`」**声明起始行都落在 1929-2572（Chunk2）**，
-按 `docs/PORT_PLAN_SERVICE.md`「每个 mixin 文件只包含本行范围内的成员」，
+按移植约定「每个 mixin 文件只包含本行范围内的成员」，
 它们不在本文件里；本文件通过 `self.xxx()` 跨 mixin 调用（Python MRO 解析），
 `receive` / `receiveGroup` / `flushGroupTurn` 因此能照上游顺序调用它们。
 
@@ -42,12 +42,12 @@
 --------------
 上游在 `service.ts` 模块作用域定义了 `samePlatformFamily` / `mentionsBot` /
 `quotesBot` / `targetableMessageId` / `groupMessageRef` / `normalizeGroupDisplayName`
-（`service.ts:7300-7710`），它们归 `docs/PORT_PLAN_SERVICE.md` 的 Helpers 块
+（`service.ts:7300-7710`），它们归 移植约定 的 Helpers 块
 （`helpers.py`）。`helpers.py` 目前只导出了私有版 `_normalize_group_display_name`，
 其余五个尚未落地，因此这里用 base.py 同款的「**优先 helpers、缺失时本文件等价实现**」
 模式（`_prefer` 系列）；`helpers.py` 一旦补上同名导出，本文件的本地实现自动让位。
 
-键名法（`docs/PORT_PLAN.md` §2）
+键名约定
 -------------------------------
 - 内部中转结构（缓冲回合、`accepted` / `result`）一律 snake_case；
 - **发给模型的 payload**（`groupContext` 及其 messages）与**数据库列名 / metadata**
@@ -212,7 +212,7 @@ def _session_read(session: Any, camel: str, snake: Optional[str] = None) -> Any:
     """读 Koishi `Session` 字段：同时支持 `SessionView`（snake_case 属性）与 dict。
 
     `plugin/adapters/astrbot_bridge.py` 提供的是 `plugin.core.service.session.SessionView`
-    （`docs/PORT_PLAN_SERVICE.md` §6），它的字段是 snake_case；测试与桌面桥可能直接给
+    （移植约定），它的字段是 snake_case；测试与桌面桥可能直接给
     dict（camelCase 或 snake_case）。这里统一成一个读取口。
     """
     if session is None:
@@ -1215,8 +1215,7 @@ class ServiceChunk1(ServiceBase):
     async def lookup_group_member_name(self, cache_key: str, group_id: str, user_id: str, self_id: str) -> str:
         """上游 `lookupGroupMemberName(cacheKey, groupId, userId, selfId)`（`src/service.ts:1735`）。
 
-        上游在这里直接找 OneBot 机器人并调 `bot.getGuildMember`；本移植版按
-        `docs/PORT_PLAN_SERVICE.md` §7 把平台调用收敛到 `transport.fetch_member_name`
+        上游在这里直接找 OneBot 机器人并调 `bot.getGuildMember`；本移植版按移植约定 把平台调用收敛到 `transport.fetch_member_name`
         （「本平台到底有没有群成员查询能力」由适配器回答：不支持时返回 `''`）。
         查询成功则写入 12 小时缓存。
         """
