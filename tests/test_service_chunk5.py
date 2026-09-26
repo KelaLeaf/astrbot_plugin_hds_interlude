@@ -647,6 +647,56 @@ class ServiceChunk5Tests(unittest.TestCase):
     # 网页浏览：目标校验、缓存、并发闸门
     # ------------------------------------------------------------------ #
 
+    def test_search_falls_back_to_the_url_template_without_a_host_api(self):
+        """宿主没有搜索 API 时，按 `search_url_template` 自己抓一页（v1.3.3）。
+
+        上游在 Koishi 里就是把搜索结果页开出来读；AstrBot 的 `Context` 不暴露插件级搜索，
+        适配层的 `search_web` 会返回空列表。那时若不回落到模板 URL，观察会静默留空——
+        模板就成了一个没人读的字符串（实测就是这个现象）。
+        """
+        if not _has_member('collect_web_observation'):
+            self.skipTest('chunk5 未组装')
+
+        class NoSearchTransport:
+            def __init__(self, page):
+                self.calls: list[tuple[str, Any]] = []
+                self.page = page
+
+            async def search_web(self, query: str, timeout_ms: int) -> list[dict[str, Any]]:
+                self.calls.append(('search', query))
+                return []
+
+            async def visit_web(self, url: str, timeout_ms: int):
+                self.calls.append(('visit', url))
+                return self.page
+
+        service = self._service(browser={
+            'enabled': True,
+            'searchUrlTemplate': 'https://cn.bing.com/search?q={query}',
+        })
+        transport = NoSearchTransport(
+            {'url': 'https://cn.bing.com/search?q=%E7%8C%AB', 'title': '猫 - 搜索', 'text': '结果正文 ' * 50},
+        )
+        service.transport = transport
+        self.service = service
+        fallback = asyncio.run(service.collect_web_observation(
+            {'id': 's'}, {'mode': 'search', 'query': '猫', 'purpose': 'p'}, 'p1', 21, NOW,
+        ))
+        self.assertEqual(fallback['status'], 'success')
+        self.assertEqual(fallback['title'], '猫 - 搜索')
+        self.assertIn('cn.bing.com', fallback['url'])
+        self.assertIn(('search', '猫'), transport.calls)
+        self.assertIn(('visit', 'https://cn.bing.com/search?q=%E7%8C%AB'), transport.calls)
+
+        # 模板抓取也拿不到内容 → 记成失败观察（而不是留一条空白"成功"）。
+        dead = self._service(browser={'enabled': True, 'searchUrlTemplate': 'https://example.com/s?q={query}'})
+        dead.transport = NoSearchTransport(None)
+        self.service = dead
+        failed = asyncio.run(dead.collect_web_observation(
+            {'id': 's2'}, {'mode': 'search', 'query': '猫', 'purpose': 'p'}, 'p1', 22, NOW,
+        ))
+        self.assertEqual(failed['status'], 'failed')
+
     def test_browser_observation_public_policy_cache_and_no_persist(self):
         if not _has_member('collect_web_observation'):
             self.skipTest('chunk5 未组装')

@@ -1,5 +1,30 @@
 # 更新日志
 
+## v1.3.3
+
+**搜索地址模板以前是个没人读的字符串，现在真会被用上**（用户问「帮我找找合适的搜索地址模板」时查出来的）。
+
+AstrBot 的 `Context` 不向插件暴露搜索 API，适配层的 `search_web` 只能返回空列表；而核心在
+「搜索结果为空」时既没有回落到模板 URL，也没有报错——于是**观察记录一条空白"成功"**，
+`browser.search_url_template` 填什么完全不影响结果。现在：搜索返回空且模板可用时，
+按模板 URL 自己抓一页（`visit_web`，`httpx` 只读 GET + 正文提取），抓不到就记成**失败**观察
+（不再留假成功）。这也更接近上游：Koishi 那边本来就是"把搜索结果页打开来读"。
+
+**模板要选「服务端就把结果渲染出来的」地址**——提取的是可见文本，靠 JS 出结果的页面抓回来是空白。
+实测（本机网络）：
+
+| 模板 | 结果 |
+| --- | --- |
+| `https://cn.bing.com/search?q={query}` | ✅ 200，标题 + 摘要都在 HTML 里（**推荐**） |
+| `https://cn.bing.com/search?q={query}&format=rss` | ✅ 200，干净 XML（title/link/description），结构最好 |
+| `https://www.bing.com/search?q={query}` | ✅ 国际版，同上 |
+| `https://html.duckduckgo.com/html/?q={query}` | ⚠️ 结构好，但**国内直连不通**（默认值就是它，需要代理） |
+| `https://lite.duckduckgo.com/lite/?q={query}` | ⚠️ 同上 |
+| `https://www.mojeek.com/search?q={query}` | ❌ 403（反爬） |
+| `https://www.baidu.com/s?wd={query}` / `https://www.sogou.com/web?query={query}` | ❌ 200 但正文是 JS 渲染，抓到空白 |
+
+配置页那句 hint 也改成了「必须含 `{query}`；要选服务端出结果的地址」+ 一个示例。
+
 ## v1.3.2
 
 **把「推进节奏」这件事写在配置页上**（用户问「他怎么每 20 分钟就推进一次」时查出来的）。
