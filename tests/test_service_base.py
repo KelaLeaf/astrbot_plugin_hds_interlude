@@ -65,6 +65,8 @@ REQUIRED_FIELDS = (
     'buffered_narrative_turns', 'buffered_group_turns', 'group_member_name_cache',
     'group_member_name_lookups', 'group_willingness', 'due_intent_wake_timers',
     'interrupted_typing_participants', 'narrating_stories', 'fact_backfills',
+    #: 本移植版新增：群聊"为什么没动静"的可见日志节流表（见 `note_access_skip`）。
+    'access_notes',
     'scheduled_compactions', 'scheduled_alter_analyses', 'database_write_queue',
     'browser_active', 'browser_waiters', 'service_logger', 'background_started',
     'database_resetting', 'sweep_running', 'compaction_sweep_running',
@@ -1079,6 +1081,94 @@ class CanHandleGroupSessionTests(ServiceTestCase):
         self.assertFalse(service.can_handle_group_session(
             SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
         ))
+
+
+class GroupGateExplanationTests(ServiceTestCase):
+    """群聊闸门的**原因版** + 可见日志节流（v1.2.17）。
+
+    用户 2026-09-26 的日志里群聊"完全没生效"：消息进得来、`on_group_message` 也被调到，
+    但日志里一个字都没有（core 的拒绝报告走 `diagnostic`，默认 verbosity 看不见）。
+    这一组钉住"每一道门都要说得出为什么"，以及"说了但不会刷屏"。
+    """
+
+    def test_every_denial_names_its_own_gate(self) -> None:
+        cases = (
+            (onebot_config(groupChats=[{'groupId': '9'}]),
+             SessionView(platform='telegram', channel_id='9'), '平台不是 OneBot'),
+            (make_config(onebot={'enabled': False}),
+             SessionView(platform='onebot', channel_id='9'), 'qq_access.enabled'),
+            (onebot_config(botAccounts=[{'qq': '77'}], groupChats=[{'groupId': '9'}]),
+             SessionView(platform='onebot', self_id='1', channel_id='9'), 'bot_accounts'),
+            (onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '8'}]),
+             SessionView(platform='onebot', self_id='1', channel_id='9'), 'group_chats'),
+            (onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '9', 'enabled': False}]),
+             SessionView(platform='onebot', self_id='1', channel_id='9'), 'enabled=false'),
+        )
+        for config, session, expected in cases:
+            with self.subTest(expected=expected):
+                allowed, reason = self.make_service(config).explain_group_gate(session)
+                self.assertFalse(allowed)
+                self.assertIn(expected, reason)
+
+    def test_the_reason_agrees_with_the_boolean(self) -> None:
+        """原因版与布尔版必须永远同源——否则日志会把用户引到错的方向。"""
+        sessions = (
+            SessionView(platform='telegram', channel_id='9'),
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='9'),
+            SessionView(platform='onebot', self_id='1', user_id='2', channel_id='8'),
+        )
+        configs = (
+            make_config(onebot={'enabled': False}),
+            onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '9'}]),
+            onebot_config(botAccounts=[{'qq': '77'}], groupChats=[{'groupId': '9'}]),
+            onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '9', 'enabled': False}]),
+        )
+        for config in configs:
+            service = self.make_service(config)
+            for session in sessions:
+                with self.subTest(config=config, session=session.channel_id):
+                    allowed, _reason = service.explain_group_gate(session)
+                    self.assertEqual(allowed, service.can_handle_group_session(session))
+
+    def _group_notes(self) -> int:
+        """打了几条「群聊消息未接入」（按**记录**数：分层渲染会把同一条套两层）。"""
+        return sum(1 for _level, text in self.sink.records if '群聊消息未接入' in text)
+
+    def test_a_skip_is_visible_once_then_throttled(self) -> None:
+        service = self.make_service(make_config(onebot={'enabled': False}))
+        session = SessionView(
+            platform='onebot', self_id='161461357', user_id='3387273135',
+            channel_id='853402770', username='钟神秀', content='中秋快乐啊',
+        )
+        self.assertTrue(service.note_group_skip(session, '闸门关着'))
+        self.assertFalse(service.note_group_skip(session, '闸门关着'), '10 分钟内不重复打扰')
+        self.assertEqual(self._group_notes(), 1)
+        self.assertIn('853402770', self.sink.text())
+        self.assertIn('钟神秀', self.sink.text())
+        # 原因变了要立刻再打一条：排查时能看到门是一道道关上的。
+        self.assertTrue(service.note_group_skip(session, '这个群不在白名单里'))
+        self.assertEqual(self._group_notes(), 2)
+
+    def test_flush_stage_skips_share_the_same_visible_channel(self) -> None:
+        service = self.make_service()
+        self.assertTrue(service.note_group_skip_reason('853402770', '群聊意愿没到阈值'))
+        self.assertFalse(service.note_group_skip_reason('853402770', '群聊意愿没到阈值'))
+        self.assertEqual(self._group_notes(), 1)
+        self.assertIn('853402770', self.sink.text())
+
+    def test_the_startup_summary_names_the_missing_piece(self) -> None:
+        cases = (
+            (make_config(onebot={'enabled': False}), 'warn', 'qq_access.enabled=false'),
+            (onebot_config(botAccounts=[]), 'warn', 'bot_accounts'),
+            (onebot_config(botAccounts=[{'qq': '1'}], groupChats=[]), 'warn', 'group_chats'),
+            (onebot_config(botAccounts=[{'qq': '1'}], groupChats=[{'groupId': '853402770'}]),
+             'info', '853402770'),
+        )
+        for config, level, expected in cases:
+            with self.subTest(expected=expected):
+                got_level, text = self.make_service(config).describe_group_access()
+                self.assertEqual(got_level, level)
+                self.assertIn(expected, text)
 
 
 class ConfigAccessorTests(ServiceTestCase):

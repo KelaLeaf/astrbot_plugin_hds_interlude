@@ -68,6 +68,7 @@ from ..script.delivery_ledger import platform_action_reference
 from ..story_state import decode_story_state, encode_story_state
 from ..types import empty_participant_state, empty_story_state
 from .base import (
+    GROUP_SKIP_NOTE_INTERVAL_MS,
     ServiceBase,
     _config_section,
     _config_value,
@@ -954,20 +955,40 @@ class ServiceChunk1(ServiceBase):
         `mention-only` 模式下未被 @ 的消息直接丢弃。消息先按故事串行落库，
         再进入群回合缓冲（debounce 后由 `flush_group_turn` 处理）。
         """
-        if self.database_resetting or not self.can_handle_group_session(session):
+        if self.database_resetting:
+            return False
+        allowed, reason = self.explain_group_gate(session)
+        if not allowed:
+            # 群聊进不来时必须**看得见**：以前这里直接 return，日志里一个字都没有
+            # （用户 2026-09-26 的日志里群里 @ 了机器人、Kela 也说了话，HDSI 全程沉默，
+            # 看起来就是"群聊功能完全没生效"）。节流 10 分钟，避免群消息刷屏。
+            self.note_group_skip(session, reason)
             return False
         group_id = self._session_group_id(session)
         rule = self.group_rule(group_id)
         if not rule:
+            self.note_group_skip(session, '这个群没有可用的群规则（群号=%s）' % group_id)
             return False
         mentioned_bot = _mentions_bot(session)
         quoted_bot = _quotes_bot(session)
         if pick(rule, 'responseMode', 'response_mode') == 'mention-only' and not mentioned_bot:
+            self.note_group_skip(
+                session,
+                '这条群消息没 @ 机器人，而该群的 response_mode=mention-only（引用机器人不算）',
+            )
             return False
         story = await self.find_story(session)
         if not story and bool(_config_value(self.runtime_config, 'autoCreate', 'auto_create', False)):
             story = await self.create_story(session)
-        if not story or pick(story, 'status') != 'active':
+        if not story:
+            self.note_group_skip(
+                session, '找不到这部剧本，且 runtime.auto_create 关着（群聊不能自己建剧本）',
+            )
+            return False
+        if pick(story, 'status') != 'active':
+            self.note_group_skip(
+                session, '剧本状态=%s（不是 active）' % (pick(story, 'status') or '?'),
+            )
             return False
         now = parse_dt(received_at) or self.now()
         story_id = pick(story, 'id')
@@ -1271,7 +1292,11 @@ class ServiceChunk1(ServiceBase):
         turn = self.buffered_group_turns.get(key)
         if turn is None or int(turn.get('revision') or 0) != revision:
             return
-        if self.database_resetting or self.desktop_runtime_phase == 'paused':
+        group_id_hint = turn.get('group_id')
+        if self.database_resetting:
+            return
+        if self.desktop_runtime_phase == 'paused':
+            self.note_group_skip_reason(group_id_hint, '桌面端把运行阶段切成 paused，群回合暂停推进')
             return
         if turn.get('story_id') in self.narrating_stories:
             turn['timer'] = self.ctx.set_timeout(
@@ -1294,6 +1319,10 @@ class ServiceChunk1(ServiceBase):
                 self.buffered_group_turns.pop(key, None)
             return
         if pick(story, 'status') != 'active':
+            self.note_group_skip_reason(
+                turn.get('group_id'),
+                '剧本状态=%s（不是 active），群回合不会推进' % (pick(story, 'status') or '?'),
+            )
             if not turn.get('messages') and not turn.get('timer'):
                 self.buffered_group_turns.pop(key, None)
             return
@@ -1323,6 +1352,14 @@ class ServiceChunk1(ServiceBase):
                 '%.3f' % willingness['probability'],
                 willingness['reason'],
             )
+            # 「配好了但一直不开口」最常停在这一步，所以除了 diagnostic 报告，
+            # 再留一条节流的可见说明（见 `note_group_skip_reason`）。
+            self.note_group_skip_reason(
+                group_id, '群聊意愿没到阈值，这一批不调用模型',
+                '分数=%.3f 概率=%.3f 原因=%s' % (
+                    willingness['state']['score'], willingness['probability'], willingness['reason'],
+                ),
+            )
             if not turn.get('messages') and not turn.get('timer'):
                 self.buffered_group_turns.pop(key, None)
             return
@@ -1333,6 +1370,7 @@ class ServiceChunk1(ServiceBase):
                 'diagnostic', 'debug', story, 'user-message',
                 '群聊仍在冷却期，跳过群发言 群=%s', group_id,
             )
+            self.note_group_skip_reason(group_id, '群聊仍在冷却期，跳过本次群发言')
             if not turn.get('messages') and not turn.get('timer'):
                 self.buffered_group_turns.pop(key, None)
             return

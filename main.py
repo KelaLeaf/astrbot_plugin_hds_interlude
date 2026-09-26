@@ -360,6 +360,24 @@ class HDSInterludePlugin(Star):
             self._capability_task = asyncio.create_task(self._self_check_model_capabilities())
         except RuntimeError:  # pragma: no cover - 没有运行中的事件循环（测试/极旧宿主）
             self._capability_task = None
+        self._log_group_access()
+
+    def _log_group_access(self) -> None:
+        """启动时就说清楚"群聊会不会被接入"。
+
+        群聊没生效是完全静默的：消息进得来、`on_group_message` 也被调到，但什么都不发生
+        （用户 2026-09-26 的日志就是这样，直到主动来问才发现）。这里在启动日志里给一句
+        结论——没接入时用 warn，接入正常时用 info。
+        """
+        try:
+            level, text = self.bridge.service.describe_group_access()
+        except Exception as error:  # noqa: BLE001 - 启动自述失败不能挡住插件
+            logger.debug('hds-interlude：群聊接入自述失败：%s' % error)
+            return
+        if level == 'warn':
+            logger.warning('hds-interlude：%s' % text)
+        else:
+            logger.info('hds-interlude：%s' % text)
 
     async def _self_check_model_capabilities(self) -> None:
         """等 Provider 管理器就绪，再做一次能力自检（失败绝不影响插件运行）。"""
@@ -835,9 +853,16 @@ class HDSInterludePlugin(Star):
         上游中间件对非私聊会话一律调 `service.receiveGroup(session)`，由它自己先做
         白名单判定；这里多一道 `can_handle_group_session` 预检，纯粹是为了不去
         打扰未授权的群（判定结果与 `receiveGroup` 内部完全一致）。
+
+        **不通过时要说得出为什么**：以前这里直接 `return`，加上 core 的拒绝报告走的是
+        `diagnostic` 频道（默认 verbosity 下不打印），结果是群消息在日志里**一点痕迹都没有**
+        ——用户只能得出"群聊功能完全没生效"。现在把原因按"群 + 原因"节流 10 分钟打一条
+        warn（键与 `receiveGroup` 内部一致，所以不会重复）。
         """
         session = await self._prepare(event)
-        if not self.bridge.service.can_handle_group_session(session):
+        allowed, reason = self.bridge.service.explain_group_gate(session)
+        if not allowed:
+            self.bridge.service.note_group_skip(session, reason)
             return
         replies = await self.bridge.handle_event(event)
         for reply in replies:

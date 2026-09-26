@@ -1125,12 +1125,29 @@ def _extract_text(html: str) -> str:
 # =========================================================================== #
 
 class _AstrbotLoggerAdapter:
-    """`ctx.logger('hds-interlude')` 的等价物（`service.emit_log` 读它）。"""
+    """`ctx.logger('hds-interlude')` 的等价物（`service.emit_log` 读它）。
 
-    def __init__(self, logger: Any) -> None:
+    这里也负责把 core 的 report / standalone 日志留一份到控制台缓冲：那些日志走
+    `write_report` → `emit_log` → 本适配器（**单次投递**），不再经过 `set_log_sink`
+    的 sink（见坑 49），所以缓冲得在这里补上，否则「运行日志」面板会看不到叙事侧的行。
+    """
+
+    def __init__(self, logger: Any, buffer: Any = None) -> None:
         self._logger = logger
+        self._buffer = buffer
+
+    def _buffer_line(self, level: str, text: str) -> None:
+        if self._buffer is None:
+            return
+        try:
+            self._buffer.append({
+                'at': _now_iso(), 'level': level, 'text': _ANSI_RE.sub('', text),
+            })
+        except Exception:  # pragma: no cover - 缓冲失败不影响日志本身
+            pass
 
     def _write(self, level: str, text: str) -> None:
+        self._buffer_line(level, text)
         writer = getattr(self._logger, level, None)
         if not callable(writer):
             log_fallback('info', '%s', text)
@@ -1836,7 +1853,7 @@ class AstrbotBridge:
             bridge=self,
             database=self.db,
             http_client=self.http_client,
-            logger=_AstrbotLoggerAdapter(logger) if logger is not None else None,
+            logger=_AstrbotLoggerAdapter(logger, self.log_buffer) if logger is not None else None,
             base_dir=self.data_dir,
         )
         self.service = InterludeService(
