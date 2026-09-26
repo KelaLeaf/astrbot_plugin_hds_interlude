@@ -99,6 +99,12 @@ export interface SchemaFieldProps {
   depth?: number
   /** 行内字段（行本身已经是一张卡）不再套一层框。 */
   flat?: boolean
+  /** 属于这个字段的「仅处理名单内」开关（`schema-pairs.ts` 配的对）。
+   *
+   * 为什么放在这里而不是让它自己渲染成一张卡：开关是**这张名单的**开关，平铺渲染会
+   * 变成名单卡下面另一张独立的小卡，看着像不属于谁（用户指出"开关按钮不在它所属配置
+   * 项目的背景框里"）。收进名单卡里，一眼就知道它管的是上面那张名单。 */
+  attached?: { node: SchemaNode; value: unknown; note?: FieldNote | null; onChange: (next: unknown) => void } | null
 }
 
 /** 每个字段的容器样式：**统一**给一层边框 + 底色。
@@ -138,6 +144,7 @@ export function SchemaField(props: SchemaFieldProps) {
                 note={undefined}
                 delegated={false}
                 autofill={undefined}
+                attached={undefined}
                 onChange={(next) => {
                   const merged = { ...current }
                   if (next === null) delete merged[key]
@@ -227,6 +234,7 @@ function RowsField({
   node,
   note,
   autofill,
+  attached,
   path,
 }: Omit<SchemaFieldProps, 'value' | 'onChange'> & {
   rows: Record<string, SchemaNode>
@@ -253,6 +261,16 @@ function RowsField({
   return (
     <div class={`${fieldCard(0)} gap-3`}>
       <Label node={node} value={value.length ? value : undefined} note={note} />
+      {attached && (
+        <div class="flex items-center gap-2">
+          <Switch
+            checked={Boolean(attached.value ?? attached.node.default ?? false)}
+            onChange={(next) => attached.onChange(next)}
+            label={String(attached.node.description ?? '')}
+          />
+          <span class="text-[11px]">{String(attached.node.description ?? '')}</span>
+        </div>
+      )}
       <NoteLine note={note} />
       {value.map((row, index) => (
         <div key={index} class="rounded-lg border border-line bg-panel p-3">

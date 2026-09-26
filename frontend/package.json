@@ -7,7 +7,7 @@
     "dev": "vite build --watch",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "test:unit": "node --experimental-strip-types scripts/check-select.ts && node --experimental-strip-types scripts/check-story-label.ts",
+    "test:unit": "node --experimental-strip-types scripts/check-select.ts && node --experimental-strip-types scripts/check-story-label.ts && node --experimental-strip-types scripts/check-schema-pairs.ts",
     "icons": "node scripts/fetch-icons.mjs"
   },
   "dependencies": {

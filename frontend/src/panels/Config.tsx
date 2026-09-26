@@ -15,6 +15,7 @@ import type { PanelProps } from '../main'
 import type { ConfigField, ConfigGroup, ConfigSchemaPayload, ImportPreview, ParticipantRow } from '../types'
 import { Badge, Button, Empty, ErrorNote, FilePicker, Grid, Icon, Note, Panel, Select, Stack, Stat } from '../components/ui'
 import { SchemaField, SchemaGroupCard, rowFields } from '../components/SchemaForm'
+import { attachOnlySwitches } from '../schema-pairs'
 import type { SchemaNode } from '../components/SchemaForm'
 
 interface ApplyResult {
@@ -135,6 +136,12 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
     return groups.find((item) => item.key === group) ?? groups[0]
   }, [groups, group])
   const overview = group === OVERVIEW
+  // `${名单}_only` 这类开关**收进它管的那张名单卡里**渲染（见 `schema-pairs.ts`），
+  // 独立成卡会看着像不属于谁。`dirtyInGroup` 仍然按全量字段算，保存不受影响。
+  const paired = useMemo(
+    () => attachOnlySwitches((active?.fields ?? []).filter((field) => !field.invisible)),
+    [active],
+  )
   const dirty = Object.keys(edits)
   const dirtyInGroup = (active?.fields ?? [])
     .filter((field) => field.path in edits)
@@ -225,13 +232,12 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
           </>
         }
       >
-        {active!.fields
-          .filter((field) => !field.invisible)
-          .map((field) => {
+        {paired.visible.map((field) => {
             const node = field.node as SchemaNode
             const value = field.path in edits ? edits[field.path] : field.value
             const rows = rowFields(node)
             const fill = AUTOFILL[field.path]
+            const only = paired.attached[field.path]
             return (
               <SchemaField
                 key={field.path}
@@ -241,6 +247,16 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
                 note={field.note}
                 delegated={field.delegated}
                 choices={schema.data?.choices}
+                attached={
+                  only
+                    ? {
+                        node: only.node as SchemaNode,
+                        value: only.path in edits ? edits[only.path] : only.value,
+                        onChange: (next: unknown) =>
+                          setEdits((prev) => ({ ...prev, [only.path]: next })),
+                      }
+                    : undefined
+                }
                 autofill={
                   fill && rows
                     ? {
