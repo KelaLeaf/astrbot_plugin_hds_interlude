@@ -1126,7 +1126,7 @@
         "type": "bool",
         "description": "启用弹性推进",
         "default": false,
-        "hint": "替代固定间隔与对话后补写；总自动推进开关仍优先"
+        "hint": "打开后走弹性节奏，会替代「自动推进间隔」与对话后补写；总开关仍优先。"
       },
       "frequency": {
         "type": "string",
@@ -1138,7 +1138,7 @@
           "high",
           "custom"
         ],
-        "hint": "custom 未填写项沿用中频"
+        "hint": "medium：热络 10–20 分钟 / 空闲 35–55；low：20–30 / 60–90；high：6–12 / 20–35。在「高级」里填了分钟数就以那里为准。"
       },
       "proactive_willingness_threshold": {
         "type": "float",
@@ -1285,7 +1285,8 @@
       "anchor_auto_advance": {
         "type": "bool",
         "description": "固定日程作为推进锚点",
-        "default": true
+        "default": true,
+        "hint": "打开：自动推进会被提前到日程里每个「固定」块的边界——日程排得越细，推进就越密（例如日程是 20 分钟一格，就变成 20 分钟推进一次）；关闭：只按 Urge 的推进节奏走。"
       }
     }
   },
