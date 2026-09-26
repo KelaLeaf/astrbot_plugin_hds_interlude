@@ -158,6 +158,37 @@ def inspect_say_markup(prose: Any) -> dict[str, Any]:
     return {'leftover': len(_SAY_TOKEN.findall(text)), 'preview': text[start:start + 160]}
 
 
+def sole_bubble_block(prose: Any, separator: str) -> Optional[str]:
+    """整份散文里**只有一段**含分隔符、且那段本身就是合法气泡块 → 把整段交回来。
+
+    受控偏离（`docs/PORTING_NOTES.md` §20）。模型声明了 `interaction.reply.actionId`，
+    却把回复**裸写**在剧本里（`甲<sep/>乙<sep/>丙`，一个 `<say>` 标签都不写）：
+    上游的 `soleActionReply` 要求"恰好一个已授权动作"，零动作时兜不住 → 已经写好的回复
+    被判成「结构化可见回复缺失」→ 白重写一次 → 重写又犯同样的错 → 整套 60 秒自动重试
+    （用户 2026-09-26 11:44 的日志：那一轮她压根没回上话）。
+
+    "只有一段含分隔符"这条限定与**位置无关**（块后面常常还跟着「发出去……」的叙述），
+    同时排除"叙述里也提到分隔符"的歧义：只要出现两段候选、或那一段不是合法气泡块，
+    就一律不认，退回原来的重写路径——**绝不从散文里猜动作**这条底线没动。
+    """
+    if not separator or not isinstance(prose, str):
+        return None
+    candidates = [
+        paragraph.strip()
+        for paragraph in _PARAGRAPH_BREAK.split(prose.strip())
+        if separator in paragraph
+    ]
+    if len(candidates) != 1:
+        return None
+    block = candidates[0]
+    if not block or len(block) > 4000:
+        return None
+    parts = block.split(separator)
+    if len(parts) < 2 or any((not part.strip()) or _BAD_BUBBLE_CHAR.search(part) for part in parts):
+        return None
+    return block
+
+
 def read_authored_actions(script: str) -> ReadAuthoredActionsResult:
     """把 `<say id="...">...</say>` 拆成「散文 + 可执行发言」。
 
@@ -318,6 +349,23 @@ def resolve_authored_actions(
     # 接收者、且回复没有可用 content 时，该行动就是这条回复的本体——模型常照抄
     # 协议示例里的 id 字面量导致引用对不上。零行动、重复 id、伪造继承与已提前
     # 流式发送的情况都不适用，保持原有的 none 语义。
+    def bare_bubble_reply(reply: Any) -> Any:
+        """声明了引用、却一个 `<say>` 都没写、散文里恰有一段裸气泡块时，认下那一段。
+
+        与 `sole_action_reply` 同一族兜底：只在「单私聊接收者 + 明确 immediate 引用 +
+        零已授权动作 + 回复没有内容」时生效；内容是从散文里**取回**的，不是我们编的。
+        认下之后把引用清掉（`action_id` / `actionId` = None），否则后面的 `resolve()`
+        会按"引用落地不了"把刚认下来的内容又擦回去。
+        """
+        if (already_sent or not one_private_recipient or not isinstance(reply, dict)
+                or reply.get('mode') != 'immediate' or reply.get('content')
+                or actions or not _reply_action_id(reply)):
+            return reply
+        block = sole_bubble_block(prose, separator)
+        if not block:
+            return reply
+        return {**reply, 'action_id': None, 'actionId': None, 'content': block}
+
     def sole_action_reply(reply: Any) -> Any:
         if (already_sent or not one_private_recipient or not isinstance(reply, dict)
                 or reply.get('mode') != 'immediate' or reply.get('content') or len(actions) != 1):
@@ -348,6 +396,7 @@ def resolve_authored_actions(
             reply = {**private_reply, 'content': legacy_tail}
         else:
             reply = sole_action_reply(private_reply)
+        reply = bare_bubble_reply(reply)
         result['interaction'] = {**decision['interaction'], 'reply': resolve(reply)}
     if decision.get('group_reply'):
         result['group_reply'] = resolve(decision['group_reply'])
