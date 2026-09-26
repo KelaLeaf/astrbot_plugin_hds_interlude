@@ -644,7 +644,7 @@
         "type": "bool",
         "description": "启用 OneBot / NapCat 账号过滤",
         "default": false,
-        "hint": "关闭时不过滤；启用后空白名单拒绝全部，须同时配置机器人与用户白名单"
+        "hint": "只对 OneBot / NapCat 家族生效（telegram、webchat 等平台一律放行，与本开关无关）。关闭：私聊全部放行，但群聊永远不会被接入。打开：空白名单＝全部拒绝；私聊要「机器人账号 + 用户账号」两条都命中，群聊要「机器人账号 + 群聊白名单」命中（群成员不必在用户白名单里）"
       },
       "bot_accounts": {
         "type": "list",

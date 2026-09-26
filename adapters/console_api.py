@@ -81,11 +81,17 @@ DELEGATED_FIELDS: dict[str, str] = {
 
 #: 行为提醒（不是宿主的锅，是配置本身的坑）：路径 → 提示。
 FIELD_NOTES: dict[str, str] = {
-    'qq_access.enabled': '开启后空白名单等于**全部拒绝**：机器人白名单与用户白名单都要有内容。',
-    'qq_access.user_accounts': 'label 决定她怎么称呼你（留空则用平台昵称）；profile / relationship 留空时，'
+    'qq_access.enabled': '只对 OneBot / NapCat 家族生效（telegram、webchat 等平台一律放行，与本开关无关）。'
+                         '关闭：私聊全部放行，但**群聊永远不会被接入**。'
+                         '打开：空白名单＝全部拒绝；私聊要「机器人账号 + 用户账号」两条都命中，'
+                         '群聊要「机器人账号 + 群聊白名单」命中（群成员不必在用户白名单里）。',
+    'qq_access.user_accounts': '只作用于私聊（群聊成员不需要在这里）。'
+                              'label 决定她怎么称呼你（留空则用平台昵称）；profile / relationship 留空时，'
                               '回落到「故事档案」的默认用户资料与默认初始关系。',
-    'qq_access.bot_accounts': '只决定"哪个登录账号收消息"，label 不进模型。',
-    'qq_access.group_chats': '群用途与角色定位会进模型的群上下文；其余是节奏与意愿参数。',
+    'qq_access.bot_accounts': '只决定"哪个登录账号收消息"，label 不进模型。'
+                              '打开闸门后这里是空的＝私聊与群聊全部拒绝。',
+    'qq_access.group_chats': '群号不在这里＝这个群永远不会被接入（与本开关开不开无关）。'
+                             '群用途与角色定位会进模型的群上下文；其余是节奏与意愿参数。',
     'story_defaults.style': '故事级文风，接在「提示词」的全局文风之后；两级都生效。',
     'story_defaults.persona_id': '选中 AstrBot 人格会用它覆盖角色名与角色设定（留空则用下面的手填项）。',
     'prompts.style_prompt': '全局默认文风；故事档案里的「故事文风」可以在它之后再补一层。',
