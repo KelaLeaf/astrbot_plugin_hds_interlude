@@ -53,7 +53,8 @@ export function Database({ refreshKey }: PanelProps) {
           rows={data.tables}
           empty="数据库里还没有表"
           rowKey={(row) => row.name}
-        />
+        maxRows={0}
+          />
       </Panel>
 
       <Panel title="位置" icon="disk">

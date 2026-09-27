@@ -10,6 +10,7 @@ import { useEffect, useRef, useState } from 'preact/hooks'
 import type { ComponentChildren } from 'preact'
 import { Icon, type IconName } from './Icon'
 import { selectDisplay, selectMatches, type SelectValue } from '../select-match'
+import { countLabel, listWindow, moreLabel } from '../list-view'
 
 export { Icon, type IconName }
 
@@ -460,41 +461,130 @@ export function Table<T>({
   rows,
   empty = '暂无数据',
   rowKey,
+  maxRows = DEFAULT_LIST_LIMIT,
 }: {
   columns: Array<Column<T>>
   rows: T[]
   empty?: string
   rowKey?: (row: T, index: number) => string
+  /** 超过这个行数就折叠；`0` = 不折叠（本来就短的固定表）。 */
+  maxRows?: number
 }) {
+  // hooks 必须在任何 return 之前：列表可能从空变非空，提前 return 会打乱 hook 顺序。
+  const [expanded, setExpanded] = useState(false)
+  const window = listWindow(rows.length, maxRows, expanded)
   if (!rows.length) return <Empty text={empty} />
+  const shown = expanded ? rows : rows.slice(0, window.shown)
   return (
-    <div class="-mx-4 overflow-x-auto px-4">
-      <table class="w-full border-collapse text-xs">
-        <thead>
-          <tr class="border-b border-line text-left text-muted">
-            {columns.map((column) => (
-              <th
-                key={column.key}
-                class="whitespace-nowrap px-2 py-2 font-medium"
-                style={column.width ? { width: column.width } : undefined}
-              >
-                {column.title}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, index) => (
-            <tr key={rowKey ? rowKey(row, index) : index} class="border-b border-line/60 last:border-0 align-top">
+    <ListFrame
+      total={rows.length}
+      limit={maxRows}
+      window={window}
+      expanded={expanded}
+      onToggle={() => setExpanded(!expanded)}
+    >
+      <div class={`-mx-4 overflow-x-auto px-4 ${window.scroll ? 'max-h-[30rem] overflow-y-auto' : ''}`}>
+        <table class="w-full border-collapse text-xs">
+          <thead>
+            <tr class="border-b border-line text-left text-muted">
               {columns.map((column) => (
-                <td key={column.key} class={`px-2 py-2 ${column.mono ? 'font-mono text-[11px]' : ''}`}>
-                  {column.render(row)}
-                </td>
+                <th
+                  key={column.key}
+                  class="whitespace-nowrap px-2 py-2 font-medium"
+                  style={column.width ? { width: column.width } : undefined}
+                >
+                  {column.title}
+                </th>
               ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {shown.map((row, index) => (
+              <tr key={rowKey ? rowKey(row, index) : index} class="border-b border-line/60 last:border-0 align-top">
+                {columns.map((column) => (
+                  <td key={column.key} class={`px-2 py-2 ${column.mono ? 'font-mono text-[11px]' : ''}`}>
+                    {column.render(row)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </ListFrame>
+  )
+}
+
+/* ------------------------------------------------- 长列表（折叠 + 内滚） */
+
+/** 默认折叠阈值：超过这个条数就先只显示前几条。 */
+export const DEFAULT_LIST_LIMIT = 12
+
+const LIST_SCROLL = 'max-h-[30rem] overflow-y-auto pr-1'
+
+function ListFrame({
+  total,
+  limit,
+  window,
+  expanded,
+  onToggle,
+  children,
+}: {
+  total: number
+  limit: number
+  window: ReturnType<typeof listWindow>
+  expanded: boolean
+  onToggle: () => void
+  children: ComponentChildren
+}) {
+  const summary = countLabel(total, limit)
+  if (window.hidden === 0 && !expanded) return <>{children}</>
+  return (
+    <div class="flex flex-col gap-2">
+      {children}
+      <div class="flex items-center gap-2 text-[11px] text-muted">
+        <Button icon={expanded ? 'close' : 'filter'} onClick={onToggle}>
+          {expanded ? '收起' : moreLabel(window.hidden)}
+        </Button>
+        {summary && <span>{expanded ? summary : `${summary}，先显示前 ${window.shown} 条`}</span>}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 卡片式长列表：收起时只渲染前 `limit` 条，展开后套固定高度的滚动框。
+ * 用 `render` 而不是 children，省得在调用处再 slice 一遍。
+ */
+export function LongList<T>({
+  items,
+  render,
+  limit = DEFAULT_LIST_LIMIT,
+  unit = '条',
+  class: className = 'flex flex-col gap-2',
+}: {
+  items: T[]
+  render: (item: T, index: number) => ComponentChildren
+  limit?: number
+  unit?: string
+  class?: string
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const window = listWindow(items.length, limit, expanded)
+  const shown = expanded ? items : items.slice(0, window.shown)
+  return (
+    <div class="flex flex-col gap-2">
+      <div class={`${className} ${window.scroll ? LIST_SCROLL : ''}`}>
+        {shown.map((item, index) => render(item, index))}
+      </div>
+      {(window.hidden > 0 || expanded) && (
+        <div class="flex items-center gap-2 text-[11px] text-muted">
+          <Button icon={expanded ? 'close' : 'filter'} onClick={() => setExpanded(!expanded)}>
+            {expanded ? '收起' : moreLabel(window.hidden, unit)}
+          </Button>
+          <span>{countLabel(items.length, limit, unit)}</span>
+        </div>
+      )}
     </div>
   )
 }

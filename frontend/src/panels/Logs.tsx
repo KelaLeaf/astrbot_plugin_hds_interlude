@@ -2,7 +2,7 @@ import { useState } from 'preact/hooks'
 import { useInterval, useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { LogPayload } from '../types'
-import { Badge, Button, Empty, ErrorNote, Grid, Loading, Panel, Stack, Stat } from '../components/ui'
+import { Badge, Button, Empty, ErrorNote, Grid, Loading, LongList, Panel, Stack, Stat } from '../components/ui'
 
 const LEVELS: Array<[string, string]> = [
   ['', '全部'],
@@ -77,17 +77,20 @@ export function Logs({ refreshKey }: PanelProps) {
         ) : records.length === 0 ? (
           <Empty text="缓冲里还没有日志。插件跑起来之后就会出现。" icon="logs" />
         ) : (
-          <ol class="flex flex-col gap-1 font-mono text-[11px]">
-            {records.map((record, index) => (
-              <li key={index} class="flex gap-2 rounded border border-transparent px-2 py-1 hover:border-line">
+          <LongList
+            items={records}
+            limit={12}
+            class="flex flex-col gap-1 font-mono text-[11px]"
+            render={(record, index) => (
+              <div key={index} class="flex gap-2 rounded border border-transparent px-2 py-1 hover:border-line">
                 <span class="shrink-0 text-muted">{record.at.slice(11, 19)}</span>
                 <span class="shrink-0">
                   <Badge tone={TONE[record.level] ?? 'neutral'}>{record.level}</Badge>
                 </span>
                 <span class="prose-body min-w-0 flex-1">{record.text}</span>
-              </li>
-            ))}
-          </ol>
+              </div>
+            )}
+          />
         )}
       </Panel>
     </Stack>

@@ -2,7 +2,7 @@ import { useState } from 'preact/hooks'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { ScriptPayload } from '../types'
-import { Badge, Button, Empty, ErrorNote, Grid, Icon, Loading, Panel, Stack, Stat, Table } from '../components/ui'
+import { Badge, Button, Empty, ErrorNote, Grid, Icon, Loading, LongList, Panel, Stack, Stat, Table } from '../components/ui'
 
 const ACTOR_TONE: Record<string, 'accent' | 'ok' | 'neutral'> = {
   user: 'accent',
@@ -59,8 +59,10 @@ export function Script({ storyId, onStoryChange, refreshKey }: PanelProps) {
         {entries.length === 0 ? (
           <Empty text="还没有剧本条目。" icon="script" />
         ) : (
-          <div class="flex flex-col gap-2">
-            {entries.map((entry) => (
+          <LongList
+            items={entries}
+            limit={12}
+            render={(entry) => (
               <article key={entry.id} class="rounded-lg border border-line px-3 py-2">
                 <header class="flex flex-wrap items-center gap-2 text-[11px] text-muted">
                   <Badge tone={ACTOR_TONE[entry.actor] ?? 'neutral'}>{entry.actor || '未知'}</Badge>
@@ -71,8 +73,8 @@ export function Script({ storyId, onStoryChange, refreshKey }: PanelProps) {
                 </header>
                 <p class="prose-body mt-2 text-xs">{entry.content}{entry.truncated ? ' …' : ''}</p>
               </article>
-            ))}
-          </div>
+            )}
+          />
         )}
       </Panel>
 

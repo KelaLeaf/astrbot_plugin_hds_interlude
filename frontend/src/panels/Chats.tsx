@@ -3,7 +3,7 @@ import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { ChatConversation, ChatHistoryPayload, ChatsPayload } from '../types'
 import { awaitingText, bubbleSide, clockOf, conversationOrder, sideLabel } from '../chat-log'
-import { Badge, Empty, ErrorNote, Icon, Loading, Panel, Stack } from '../components/ui'
+import { Badge, Empty, ErrorNote, Icon, Loading, LongList, Panel, Stack } from '../components/ui'
 
 const LIMITS: Array<[number, string]> = [[100, '最近 100'], [300, '最近 300'], [1000, '最近 1000']]
 
@@ -70,16 +70,19 @@ export function Chats({ storyId, refreshKey }: PanelProps) {
             {privateRows.length === 0 ? (
               <Empty text="还没有人和她私聊过。" icon="user" />
             ) : (
-              <div class="flex max-h-[28rem] flex-col gap-2 overflow-y-auto">
-                {privateRows.map((item) => (
+              <LongList
+                items={privateRows}
+                limit={6}
+                unit="个人"
+                render={(item) => (
                   <ConversationRow
                     key={item.conversation}
                     item={item}
                     active={item.conversation === selected}
                     onPick={setSelected}
                   />
-                ))}
-              </div>
+                )}
+              />
             )}
           </Panel>
 
@@ -87,16 +90,19 @@ export function Chats({ storyId, refreshKey }: PanelProps) {
             {groupRows.length === 0 ? (
               <Empty text="还没有群聊记录。" icon="link" />
             ) : (
-              <div class="flex max-h-[28rem] flex-col gap-2 overflow-y-auto">
-                {groupRows.map((item) => (
+              <LongList
+                items={groupRows}
+                limit={6}
+                unit="个群"
+                render={(item) => (
                   <ConversationRow
                     key={item.conversation}
                     item={item}
                     active={item.conversation === selected}
                     onPick={setSelected}
                   />
-                ))}
-              </div>
+                )}
+              />
             )}
           </Panel>
         </div>

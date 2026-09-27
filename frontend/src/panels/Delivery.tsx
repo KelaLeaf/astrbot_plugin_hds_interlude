@@ -2,7 +2,7 @@ import { useState } from 'preact/hooks'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { DeliveryPayload } from '../types'
-import { Badge, Empty, ErrorNote, Grid, Icon, Loading, Panel, Stack, Stat } from '../components/ui'
+import { Badge, Empty, ErrorNote, Grid, Icon, Loading, LongList, Panel, Stack, Stat } from '../components/ui'
 
 const TONE: Record<string, 'ok' | 'warn' | 'danger' | 'neutral' | 'accent'> = {
   delivered: 'ok',
@@ -78,8 +78,10 @@ export function Delivery({ storyId, refreshKey }: PanelProps) {
         {data.actions.length === 0 ? (
           <Empty text="没有符合条件的投递记录。" icon="link" />
         ) : (
-          <div class="flex flex-col gap-2">
-            {data.actions.map((action) => {
+          <LongList
+            items={data.actions}
+            limit={6}
+            render={(action) => {
               const key = `${action.entry_id}-${action.commit_id}-${action.event_id}`
               const expanded = open === key
               return (
@@ -148,8 +150,8 @@ export function Delivery({ storyId, refreshKey }: PanelProps) {
                   )}
                 </article>
               )
-            })}
-          </div>
+            }}
+          />
         )}
       </Panel>
 

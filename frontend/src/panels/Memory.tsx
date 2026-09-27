@@ -2,7 +2,7 @@ import { useState } from 'preact/hooks'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { MemoryPayload } from '../types'
-import { Badge, Empty, ErrorNote, Grid, Loading, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
+import { Badge, Empty, ErrorNote, Grid, Loading, LongList, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
 
 const KNOWLEDGE_LABEL: Record<string, string> = {
   observation: '观察',
@@ -51,8 +51,10 @@ export function Memory({ storyId, refreshKey }: PanelProps) {
         {facts.length === 0 ? (
           <Empty text="还没有提取到长期事实。压缩跑过之后才会出现。" icon="memory" />
         ) : (
-          <div class="flex flex-col gap-2">
-            {facts.map((fact) => (
+          <LongList
+            items={facts}
+            limit={5}
+            render={(fact) => (
               <article key={fact.id} class="rounded-lg border border-line px-3 py-2">
                 <header class="flex flex-wrap items-center gap-2 text-[11px] text-muted">
                   <Badge tone="accent">{KNOWLEDGE_LABEL[fact.knowledge_kind] ?? fact.knowledge_kind ?? '事实'}</Badge>
@@ -68,8 +70,8 @@ export function Memory({ storyId, refreshKey }: PanelProps) {
                   <p class="mt-1 border-l-2 border-line pl-2 text-[11px] italic text-muted">原文：{fact.quote}</p>
                 )}
               </article>
-            ))}
-          </div>
+            )}
+          />
         )}
       </Panel>
 
