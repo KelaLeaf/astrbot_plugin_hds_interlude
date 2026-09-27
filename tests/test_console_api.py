@@ -795,6 +795,136 @@ class ConfigEditorTests(unittest.TestCase):
         # 同组其它字段没被顺手改掉
         self.assertIn('providers', self._read()['model_center'])
 
+    # ---- 聊天记录（按参与者 / 按群） ----
+
+    def _chat_db(self) -> Database:
+        """造一部带私聊、群聊与两条投递失败的账。"""
+        database = Database(':memory:')
+        self.addCleanup(database.close)
+        database.register_tables()
+        database.insert('interlude_story', {
+            'id': 's1', 'platform': 'onebot', 'selfId': '20000', 'userId': '10001',
+            'channelId': 'private:10001', 'status': 'active',
+            'setting': {'character': {'name': '凌梦'}, 'user': {'displayName': '主人'}},
+            'state': {}, 'cursorAt': '2026-09-26T20:00:00.000Z',
+            'createdAt': '2026-09-26T00:00:00.000Z', 'updatedAt': '2026-09-27T00:00:00.000Z',
+        })
+        database.upsert('interlude_participant', {
+            'id': 'p-kela', 'storyId': 's1', 'platform': 'onebot', 'selfId': '20000',
+            'userId': '1000008890', 'channelId': 'private:1000008890', 'personId': 'kela',
+            'displayName': '主人', 'status': 'active',
+            'state': {'unreadMessageCount': 2, 'pendingReplyCount': 2},
+            'createdAt': '2026-09-26T00:00:00.000Z', 'updatedAt': '2026-09-27T00:00:00.000Z',
+        })
+        database.upsert('interlude_participant', {
+            'id': 'p-xishi', 'storyId': 's1', 'platform': 'onebot', 'selfId': '20000',
+            'userId': '100002551', 'channelId': 'private:100002551', 'personId': 'xishi',
+            'displayName': '汐雨.', 'status': 'active',
+            'state': {'unreadMessageCount': 0, 'pendingReplyCount': 0},
+            'createdAt': '2026-09-26T00:00:00.000Z', 'updatedAt': '2026-09-26T12:00:00.000Z',
+        })
+        entries = [
+            ('p-kela', 'user-message', '在么', '2026-09-26T14:37:49.000Z', {}),
+            ('p-kela', 'user-message', '睡了睡了，晚安', '2026-09-26T16:38:51.000Z', {}),
+            ('p-kela', 'character-message', '早～', '2026-09-26T22:19:16.000Z', {}),
+            ('p-xishi', 'user-message', '我是汐雨，交个朋友？', '2026-09-25T16:19:00.000Z', {}),
+            ('p-xishi', 'character-message', '先说清楚你怎么加的我', '2026-09-26T00:35:00.000Z', {}),
+            ('p-xishi', 'outgoing-delivery-failed', '醒了', '2026-09-26T00:36:00.000Z', {'status': 'failed'}),
+            ('', 'group-message', '在吗', '2026-09-26T10:00:00.000Z',
+             {'groupId': '100002770', 'senderId': '10002', 'senderName': '群友甲'}),
+            ('', 'character-group-message', '在的', '2026-09-26T10:00:05.000Z',
+             {'groupId': '100002770', 'channelId': 'group:100002770'}),
+            ('', 'group-message', '再来一条', '2026-09-26T10:05:00.000Z',
+             {'groupId': '100002770', 'senderId': '10002', 'senderName': '群友甲'}),
+            ('', 'script', '她合上本子。', '2026-09-26T11:00:00.000Z', {}),
+        ]
+        for participant_id, kind, content, occurred_at, metadata in entries:
+            database.insert('interlude_script_entry', {
+                'storyId': 's1', 'participantId': participant_id, 'kind': kind,
+                'actor': 'user' if kind.endswith('user-message') or kind == 'group-message' else 'character',
+                'content': content, 'occurredAt': occurred_at, 'metadata': metadata,
+                'createdAt': occurred_at,
+            })
+        return database
+
+    def test_chats_lists_every_conversation_without_narration(self):
+        self.bridge.db = self._chat_db()
+        payload = _run(self.api.chats('s1'))
+
+        private = {item['participant_id']: item for item in payload['private']}
+        self.assertEqual(sorted(private), ['p-kela', 'p-xishi'])
+        self.assertEqual(private['p-kela']['name'], '主人')
+        self.assertEqual(private['p-kela']['unread'], 2)
+        self.assertEqual(private['p-kela']['incoming'], 2)
+        self.assertEqual(private['p-kela']['outgoing'], 1)
+        self.assertEqual(private['p-kela']['last_text'], '早～')
+        self.assertEqual(private['p-xishi']['failed'], 1)
+        self.assertEqual(private['p-xishi']['awaiting'], 0)
+        # 旁白条目不属于任何一条对话
+        self.assertNotIn('script', {item.get('kind') for item in payload['private']})
+
+    def test_configured_group_without_history_still_shows_its_label(self):
+        # 配置里列着、还没说过话的群也要出现在清单里，并且用配置里的 label。
+        self.bridge.config['qq_access'] = {
+            'group_chats': [{'group_id': '100002770', 'label': '测试群'}, {'group_id': '999', 'label': '安静群'}],
+        }
+        self.bridge.db = self._chat_db()
+        payload = _run(self.api.chats('s1'))
+
+        groups = {item['group_id']: item for item in payload['groups']}
+        self.assertEqual(groups['100002770']['name'], '测试群')
+        self.assertEqual(groups['999']['configured'], True)
+        self.assertEqual(groups['999']['messages'], 0)
+        self.assertEqual(_run(self.api.chat_history('s1', 'group:999'))['title'], '安静群')
+
+    def test_group_conversation_is_its_own_row(self):
+        self.bridge.db = self._chat_db()
+        payload = _run(self.api.chats('s1'))
+
+        self.assertEqual([item['group_id'] for item in payload['groups']], ['100002770'])
+        group = payload['groups'][0]
+        self.assertEqual(group['incoming'], 2)
+        self.assertEqual(group['outgoing'], 1)
+        self.assertEqual(group['awaiting'], 1)
+        self.assertEqual(group['last_text'], '再来一条')
+
+    def test_history_is_chronological_and_paginates(self):
+        self.bridge.db = self._chat_db()
+        payload = _run(self.api.chat_history('s1', 'private:p-kela', 2))
+
+        self.assertEqual(payload['title'], '主人')
+        self.assertEqual([item['text'] for item in payload['messages']], ['睡了睡了，晚安', '早～'])
+        self.assertTrue(payload['has_more'])
+
+        older = _run(self.api.chat_history('s1', 'private:p-kela', 5, payload['messages'][0]['at']))
+        self.assertEqual([item['text'] for item in older['messages']], ['在么'])
+        self.assertFalse(older['has_more'])
+
+    def test_history_marks_who_spoke(self):
+        self.bridge.db = self._chat_db()
+        payload = _run(self.api.chat_history('s1', 'group:100002770', 10))
+
+        self.assertEqual(payload['title'], '100002770')
+        sides = [(item['side'], item['sender']) for item in payload['messages']]
+        self.assertEqual(sides, [
+            ('in', '群友甲'), ('out', '凌梦'), ('in', '群友甲'),
+        ])
+
+    def test_missing_story_or_conversation_is_an_empty_shell(self):
+        empty = Database(':memory:')
+        self.addCleanup(empty.close)
+        empty.register_tables()
+        self.bridge.db = empty
+        payload = _run(self.api.chats('nope'))
+        self.assertIsNone(payload['story'])
+        self.assertEqual((payload['private'], payload['groups']), ([], []))
+
+        self.bridge.db = self._chat_db()
+        self.assertEqual(_run(self.api.chat_history('s1', ''))['messages'], [])
+        self.assertEqual(
+            _run(self.api.chat_history('s1', 'private:不存在的'))['messages'], [],
+        )
+
     # ---- 参与者（白名单一键填入） ----
 
     def test_participants_endpoint_exposes_platform_accounts(self):

@@ -416,6 +416,10 @@ class HDSInterludePlugin(Star):
              '控制台：Agency 与日程'),
             (f'/{PLUGIN_NAME}/console/delivery', self.page_console_delivery, ['GET'],
              '控制台：投递账本'),
+            (f'/{PLUGIN_NAME}/console/chats', self.page_console_chats, ['GET'],
+             '控制台：对话清单（按参与者 / 按群）'),
+            (f'/{PLUGIN_NAME}/console/chat-history', self.page_console_chat_history, ['GET'],
+             '控制台：某条对话的往来记录'),
             # 写操作（都走白名单：开关认 FLAG_KEYS，连接行认 CONNECTION_FIELDS，
             # 配置页认 `_conf_schema.json` 里声明过的路径）
             (f'/{PLUGIN_NAME}/console/flags', self.page_console_set_flag, ['POST'],
@@ -484,6 +488,17 @@ class HDSInterludePlugin(Star):
     async def page_console_delivery(self):
         return await self._console_json(lambda api, q: api.delivery(
             q('story_id'), _to_int(q('limit'), 300), q('status'),
+        ))
+
+    async def page_console_chats(self):
+        return await self._console_json(lambda api, q: api.chats(
+            q('story_id'), _to_int(q('scan'), 2000),
+        ))
+
+    async def page_console_chat_history(self):
+        return await self._console_json(lambda api, q: api.chat_history(
+            q('story_id'), q('conversation'), _to_int(q('limit'), 200),
+            q('before'), _to_int(q('scan'), 2000),
         ))
 
     # ---- 控制台的写操作 ---- #

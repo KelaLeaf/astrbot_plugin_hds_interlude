@@ -833,6 +833,18 @@ class NormalizeDecisionTests(unittest.TestCase):
             self.normalize(raw, shared={'allowCrossConversationMessages': False})['crossConversationActions'], [],
         )
 
+    def test_cross_action_keeps_its_say_reference_under_both_spellings(self) -> None:
+        # 模型用 actionId 引用原话时，解析只重写 snake_case 那份列表；camelCase 别名
+        # 若留在旧值上，这条跨对话动作会因为"没有 content"被整条丢掉。
+        raw = {
+            'script': '她按下发送。\n\n<say id="reply">在。</say>',
+            'crossConversationActions': [
+                {'participantId': 'test:1:3', 'mode': 'immediate', 'actionId': 'reply'},
+            ],
+        }
+        decision = self.normalize(raw)
+        self.assertEqual([item['content'] for item in decision['crossConversationActions']], ['在。'])
+
     def test_proactive_cross_action_demands_willingness(self) -> None:
         raw = {
             'script': '剧本。',
@@ -1250,7 +1262,7 @@ class BackgroundReplyRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([message['participant_id'] for message in result['messages']], [PARTICIPANT_ID])
 
     @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
-    async def test_two_waiting_branches_are_left_alone(self) -> None:
+    async def test_two_waiting_branches_block_instead_of_guessing(self) -> None:
         self.add_participant(WAITING_ID, '3', '主人', unread=2)
         self.add_participant('test:1:4', '4', '第三个', unread=3)
         raw = {
@@ -1260,7 +1272,34 @@ class BackgroundReplyRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.persist(raw)
 
-        self.assertEqual([message['participant_id'] for message in result['messages']], [PARTICIPANT_ID])
+        # 不猜：不投给任何一条（投错人比不投更糟），但留下"写了没发出"的可见证据
+        self.assertEqual(result['messages'], [])
+        self.assertIn('收件人不明确', self.sink.text())
+        failed = [
+            dict(row) for row in self.db.all('interlude_script_entry', {'storyId': STORY_ID})
+            if dict(row).get('kind') == 'outgoing-delivery-failed'
+        ]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]['metadata'].get('reason'), 'reply-target-ambiguous')
+
+    @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
+    async def test_a_named_branch_wins_over_the_ambiguity(self) -> None:
+        self.add_participant(WAITING_ID, '3', '主人', unread=2)
+        self.add_participant('test:1:4', '4', '第三个', unread=3)
+        raw = {
+            'script': '她放下手机。\n\n<say id="reply">在。</say>',
+            'interaction': {'seen': False, 'reply': {'mode': 'immediate', 'actionId': 'reply'}},
+            'crossConversationActions': [{
+                'participantId': WAITING_ID, 'mode': 'immediate', 'actionId': 'reply',
+            }],
+        }
+
+        result = await self.persist(raw)
+
+        # 模型指名了主人：那句原话只发一次，且只发给他
+        self.assertEqual([message['participant_id'] for message in result['messages']], [WAITING_ID])
+        self.assertEqual([message['content'] for message in result['messages']], ['在。'])
+        self.assertNotIn('收件人不明确', self.sink.text())
 
     @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
     async def test_a_due_turn_may_answer_a_waiting_branch(self) -> None:

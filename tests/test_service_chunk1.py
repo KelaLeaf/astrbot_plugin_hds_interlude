@@ -1849,6 +1849,47 @@ class FlushGroupTurnTests(ServiceHarness):
         self.assertNotIn('key', service.buffered_group_turns)
         self.assertIn('群聊仍在冷却期', self.sink.text())
 
+    @needs('flush_group_turn')
+    async def test_each_group_turn_delivers_into_its_own_group(self) -> None:
+        """群回复永远进**本回合那个群**：两个群的缓冲回合各自带着自己的 channel_id。
+
+        群聊没有「本回合的 participant」这层间接（私聊投错对话就出在那里），投递坐标直接
+        取自缓冲回合的 `channel_id`，这里钉住"一个群一个回合、各投各的"。
+        """
+        service, ctx = self._prepare()
+        service.buffered_group_turns['key']['messages'].append({'content': 'hi'})
+        service.buffered_group_turns['other'] = {
+            'story_id': PRIVATE_STORY_ID, 'group_id': '77', 'rule': ctx['rule'],
+            'channel_id': '77', 'latest_session': group_session(),
+            'messages': [{'content': 'yo'}], 'revision': 1,
+            'mentioned_bot': False, 'quoted_bot': False,
+        }
+        sent: list[str] = []
+
+        async def decide(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'decision': {'groupReply': {'mode': 'immediate', 'content': '在的'}},
+                    'succeeded': True}
+
+        async def persist(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'messages': [], 'commit': None, 'scriptEntry': None, 'script_entry': None}
+
+        async def send(*args: Any, **_kwargs: Any) -> dict[str, Any]:
+            sent.append(str(args[1]))
+            return {'deliveredSegments': ['在的'], 'complete': True, 'segmentOutcomes': []}
+
+        service.try_decide = decide
+        service.persist_decision = persist
+        service.send_group_message = send
+        service.semantic_turn_embedding_enabled = lambda: False
+        service.sticker_catalog_for_session = _empty_list
+        service.group_chat_capabilities = lambda _session, _messages: None
+        service.schedule_compaction = ctx['compacted'].append
+
+        await service.flush_group_turn('key', 3)
+        await service.flush_group_turn('other', 1)
+
+        self.assertEqual(sent, ['9', '77'])
+
     @needs('flush_group_turn', 'group_messages', 'group_cooldown_active', 'append_entry')
     async def test_partial_delivery_is_recorded_on_the_group_entry(self) -> None:
         service, ctx = self._prepare()

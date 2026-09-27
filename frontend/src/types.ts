@@ -384,3 +384,55 @@ export interface ParticipantRow {
   status: string
   updated_at: string
 }
+
+/** 一条对话（私聊按参与者、群聊按群号）。 */
+export interface ChatConversation {
+  conversation: string
+  name: string
+  participant_id?: string
+  group_id?: string
+  account?: string
+  platform?: string
+  status?: string
+  unread?: number
+  pending?: number
+  messages: number
+  incoming: number
+  outgoing: number
+  failed: number
+  /** 她最后一次发言之后收到的来信数（"还在等她"）。 */
+  awaiting: number
+  last_at: string
+  last_text: string
+  /** 只在配置里列着、还没说过话的群。 */
+  configured?: boolean
+}
+
+export interface ChatsPayload {
+  story: StoryBrief | null
+  private: ChatConversation[]
+  groups: ChatConversation[]
+  scanned: number
+  truncated: boolean
+}
+
+export interface ChatMessage {
+  entry_id: number
+  at: string
+  side: 'in' | 'out' | 'system'
+  kind: string
+  sender: string
+  text: string
+  quote: string
+}
+
+export interface ChatHistoryPayload {
+  story: StoryBrief | null
+  conversation: string
+  title: string
+  character: string
+  messages: ChatMessage[]
+  has_more: boolean
+  scanned: number
+  truncated?: boolean
+}

@@ -1746,6 +1746,8 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/alter',
             f'/{main_module.PLUGIN_NAME}/console/agency',
             f'/{main_module.PLUGIN_NAME}/console/delivery',
+            f'/{main_module.PLUGIN_NAME}/console/chats',
+            f'/{main_module.PLUGIN_NAME}/console/chat-history',
             f'/{main_module.PLUGIN_NAME}/console/flags',
             f'/{main_module.PLUGIN_NAME}/console/connections',
             f'/{main_module.PLUGIN_NAME}/console/connections-delete',

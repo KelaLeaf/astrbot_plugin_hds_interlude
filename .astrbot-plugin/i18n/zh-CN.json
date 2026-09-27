@@ -13,7 +13,11 @@
         "memory": "记忆",
         "database": "数据库",
         "logs": "日志",
-        "config": "配置"
+        "config": "配置",
+        "delivery": "投递",
+        "alter": "情绪",
+        "agency": "日程",
+        "chats": "聊天记录"
       }
     }
   }

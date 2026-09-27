@@ -200,6 +200,30 @@ def _dual(value: Any) -> Any:
     return result
 
 
+def _resync_dual(raw: Any) -> Any:
+    """把顶层已知键的两种拼写重新指回**同一个**对象。
+
+    `resolve_authored_actions` 只重写 snake_case 那份列表（`cross_conversation_actions`、
+    `interaction`…），于是 `_dual` 早先补出来的 camelCase 别名会留在**解析前**的旧值上。
+    而本块按键名法优先读 camelCase —— 模型用 `actionId` 引用原话时，
+    跨对话动作就会因为 camel 那份没有 content 被 `_normalize_conversation_action` 丢掉。
+    解析之后调用它，两边继续指向同一份数据。
+    """
+    if not is_record(raw):
+        return raw
+    updated = dict(raw)
+    for key in (*_DUAL_ELEMENT_KEYS, *_DUAL_SINGLE_KEYS):
+        snake = _snake(key)
+        if snake in updated:
+            updated[key] = updated[snake]
+    interaction = _record(updated.get('interaction'))
+    reply = _record(interaction.get('reply'))
+    if reply and 'content' in reply:
+        # `resolve_authored_actions` 换的是 `interaction` 这个新 dict，回复内容同样要同步。
+        updated['interaction'] = interaction
+    return updated
+
+
 def _dual_decision(decision: dict[str, Any]) -> dict[str, Any]:
     """`normalize_decision()` 的收尾：顶层 + 已知跨模块字段补双拼写。"""
     result = dict(decision)
@@ -448,7 +472,7 @@ def _participant_waiting_for_reply(participant: Any) -> bool:
     return bool(state.get('unreadMessageCount') or state.get('pendingReplyCount'))
 
 
-def _redirect_background_reply(
+def _route_background_reply(
     raw: Any,
     phase: str,
     participant: Any,
@@ -456,8 +480,8 @@ def _redirect_background_reply(
     permitted_participant_ids: set[str],
     permit_messages: bool,
     shared: dict[str, Any],
-) -> tuple[Any, str]:
-    """把后台回合里「回答另一条对话的来信」挪到 `crossConversationActions`。
+) -> tuple[Any, dict[str, Any]]:
+    """给后台回合里的即时回复定收件人（返回改过的 raw 与一条路由结论）。
 
     上游语义是 `interaction.reply` 永远投给本回合的 participant。共享主剧本下，
     后台回合的 participant 来自**到期的计划**（可能只是一条关于某人的待办），
@@ -465,48 +489,69 @@ def _redirect_background_reply(
     上游那条规则会把这句回话投进错的聊天窗（用户 2026-09-27 06:19 的实测：
     她回的是主人那两条未读，三条消息却落进陌生账号「汐雨.」的对话框）。
 
-    指纹：后台回合 + 本回合分支**没有等待她的来信** + 恰好**另一条**分支有未读
-    来信。命中后本条即时回复改挂到那条分支的跨对话通道（上游已有的「发给另一条
-    对话」），本对话的回复收成 `none`。投递坐标、剧本事件与投递账本因此全部自动
-    落在正确的分支上。
+    判定顺序（全部只在「本回合没有来信」的后台回合里生效）：
 
-    只在「另一条分支唯一」时改投；有两条以上都在等她时保持原样——改投错人比
-    不改投更糟，那两种情况交给提示词，让模型自己写 `crossConversationActions`。
+    1. **模型自己指名了**（写了跨对话动作）→ 什么都不做。它已经表达清楚要发给谁，
+       同内容的那条即时回复会被去掉，免得同一句话发两次。
+    2. **恰好另一条分支在等她** → 把即时回复改挂到那条分支的跨对话通道（上游已有的
+       「发给另一条对话」）。投递坐标、剧本事件与投递账本因此全部落在正确分支上。
+    3. **两条以上分支都在等她** → 不猜。把候选报回去由调用方拦下并留一条可见记录：
+       改投错人比不投更糟。
+    4. 谁都没在等她 → 保持上游（这条即时回复就是一次主动联系）。
+
+    返回的 `route` 形如 `{'redirect_to': <参与者 id>, 'ambiguous': [<参与者 id>…]}`。
     """
+    route: dict[str, Any] = {'redirect_to': '', 'ambiguous': []}
     if phase != 'intent-due' or not permit_messages or not is_record(raw):
-        return raw, ''
+        return raw, route
     if not _cfg(shared, 'allowCrossConversationMessages', False):
-        return raw, ''
+        return raw, route
     if int(_cfg(shared, 'maxCrossConversationActions', 0) or 0) <= 0:
-        return raw, ''
+        return raw, route
     interaction = _raw_decision(raw, 'interaction')
     reply = _record(_record(interaction).get('reply'))
     content = pick(reply, 'content')
     if pick(reply, 'mode') != 'immediate' or not isinstance(content, str) or not content.strip():
-        return raw, ''
+        return raw, route
     current_id = _record(participant).get('id') or ''
     if not current_id or _participant_waiting_for_reply(participant):
-        return raw, ''
+        return raw, route
     waiting = [
         item for item in all_participants
         if _record(item).get('id') in permitted_participant_ids
         and _record(item).get('id') != current_id
         and _participant_waiting_for_reply(item)
     ]
-    if len(waiting) != 1:
-        return raw, ''
-    target_id = _record(waiting[0]).get('id')
-    if not target_id:
-        return raw, ''
+    if not waiting:
+        return raw, route
+    text = content.strip()
     existing = [
         action for action in (_raw_decision(raw, 'crossConversationActions') or [])
         if is_record(action)
     ]
-    if not any(pick(action, 'participantId', 'participant_id') == target_id for action in existing):
-        existing.insert(0, {'participantId': target_id, 'mode': 'immediate', 'content': content.strip()})
-    updated = {**raw, 'crossConversationActions': existing}
+    named = {
+        pick(action, 'participantId', 'participant_id') for action in existing
+    }
+    # 同一句话已经由跨对话动作发过一次：去掉即时回复，别发两遍。
+    if any(
+        pick(action, 'mode') == 'immediate' and pick(action, 'content') == text
+        for action in existing
+    ):
+        updated = {**raw, 'interaction': {**_record(interaction), 'reply': {**reply, 'mode': 'none'}}}
+        return updated, route
+    if len(waiting) > 1:
+        if not named & {_record(item).get('id') for item in waiting}:
+            route['ambiguous'] = [_record(item).get('id') for item in waiting]
+        return raw, route
+    target_id = _record(waiting[0]).get('id')
+    if not target_id or target_id in named:
+        return raw, route
+    updated = {**raw, 'crossConversationActions': [
+        {'participantId': target_id, 'mode': 'immediate', 'content': text}, *existing,
+    ]}
     updated['interaction'] = {**_record(interaction), 'reply': {**reply, 'mode': 'none'}}
-    return updated, target_id
+    route['redirect_to'] = target_id
+    return updated, route
 
 
 def _normalize_browser_intent_draft_loose(value: Any) -> Optional[dict[str, Any]]:
@@ -580,7 +625,7 @@ def _normalize_decision(
     """上游 `normalizeDecision`（`:7835`）：把模型输出裁成可信的决策对象。"""
     separator = str(_cfg(runtime, 'messageSeparator', '<sep/>'))
     raw = _dual(raw) if isinstance(raw, dict) else {}
-    raw = resolve_authored_actions(raw, False, separator)
+    raw = _resync_dual(resolve_authored_actions(raw, False, separator))
 
     script_raw = raw.get('script') if isinstance(raw, dict) else None
     script = (
@@ -1311,9 +1356,9 @@ class ServiceChunk4(ServiceBase):
             request['quotedMessages'] = quoted_messages
         if sticker_catalog and phase == 'user-message':
             request['stickerCatalog'] = sticker_catalog
-        return resolve_authored_actions(
+        return _resync_dual(resolve_authored_actions(
             await self.narrator.decide(request), False, separator,
-        )
+        ))
 
     # ------------------------------------------------------------------ #
     # shouldRefreshContinuity（上游 :3604）
@@ -1796,26 +1841,26 @@ class ServiceChunk4(ServiceBase):
         phase_zone = _timezone(story)
 
         # 先规范化，再写库。
-        raw = resolve_authored_actions(
+        raw = _resync_dual(resolve_authored_actions(
             _dual(raw) if isinstance(raw, dict) else {},
             immediate_reply_already_delivered,
             separator,
-        )
+        ))
         all_participants = await self.participants(story['id'])
         permitted_participant_ids = {
             item['id'] for item in all_participants if self.can_handle_participant(item)
         }
         # 受控偏离（见移植说明 §24）：后台回合里「回答另一条对话的来信」改走跨对话通道，
         # 免得上游那条「回复永远投给本回合 participant」把回话投进错的聊天窗。
-        raw, redirected_to = _redirect_background_reply(
+        raw, reply_route = _route_background_reply(
             raw, phase, participant, all_participants, permitted_participant_ids,
             permit_messages, shared,
         )
-        if redirected_to:
+        if reply_route['redirect_to']:
             self.report_operation(
                 'standard', 'warn', story, phase,
                 '即时回复的对话与本回合不一致，已改投等待来信的那条：本回合=%s 改投=%s',
-                participant_id or '(无)', redirected_to,
+                participant_id or '(无)', reply_route['redirect_to'],
             )
         refresh_continuity = self.should_refresh_continuity(story, phase)
         decision = _normalize_decision(
@@ -2123,7 +2168,7 @@ class ServiceChunk4(ServiceBase):
             participant and permit_messages and not immediate_reply_already_delivered
             and reply.get('mode') == 'immediate' and reply.get('content')
         ):
-            messages.append(attach_message_event({
+            outgoing = attach_message_event({
                 'participant_id': participant['id'],
                 'content': reply['content'],
                 'automatic_delivery': automatic_delivery,
@@ -2131,7 +2176,21 @@ class ServiceChunk4(ServiceBase):
                 'user_initiated': phase == 'user-message',
             }, find_outgoing_script_event(
                 commit, participant['id'], 'immediate', reply['content'], separator,
-            ) if commit is not None else None, (script_entry or {}).get('id')))
+            ) if commit is not None else None, (script_entry or {}).get('id'))
+            if reply_route['ambiguous']:
+                # 受控偏离（见移植说明 §24）：本回合分支没有等待来信，而两条以上分支都在
+                # 等她 —— 不猜。宁可留一条"写了没发出"的可见证据，也不把话投进错的聊天窗。
+                await self.record_outgoing_delivery_failure(
+                    story, participant['id'], outgoing, 'reply-target-ambiguous',
+                )
+                self.report_operation(
+                    'standard', 'warn', story, phase,
+                    '即时回复的收件人不明确（本回合=%s 没有等待来信，另有 %d 条分支在等她），'
+                    '已拦下不投；要她回哪一条，请让模型用 crossConversationActions 指明',
+                    participant['id'], len(reply_route['ambiguous']),
+                )
+            else:
+                messages.append(outgoing)
         if (
             participant and permit_messages and reply.get('mode') == 'delayed'
             and reply.get('content') and reply.get('sendAt')

@@ -24,10 +24,11 @@ import { Config } from './panels/Config'
 import { Alter } from './panels/Alter'
 import { Agency } from './panels/Agency'
 import { Delivery } from './panels/Delivery'
+import { Chats } from './panels/Chats'
 
 type PanelKey =
   | 'overview' | 'models' | 'script' | 'memory'
-  | 'alter' | 'agency' | 'delivery'
+  | 'alter' | 'agency' | 'delivery' | 'chats'
   | 'database' | 'logs' | 'config'
 
 const NAV: Array<{ key: PanelKey; icon: IconName; label: string; fallback: string }> = [
@@ -38,6 +39,7 @@ const NAV: Array<{ key: PanelKey; icon: IconName; label: string; fallback: strin
   { key: 'alter', icon: 'star', label: '情绪', fallback: '情绪' },
   { key: 'agency', icon: 'compass', label: '日程', fallback: '日程' },
   { key: 'delivery', icon: 'link', label: '投递', fallback: '投递' },
+  { key: 'chats', icon: 'user', label: '聊天记录', fallback: '聊天记录' },
   { key: 'database', icon: 'database', label: '数据库', fallback: '数据库' },
   { key: 'logs', icon: 'logs', label: '日志', fallback: '日志' },
   { key: 'config', icon: 'config', label: '配置', fallback: '配置' },
@@ -247,6 +249,8 @@ function App() {
             <Agency {...props} />
           ) : panel === 'delivery' ? (
             <Delivery {...props} />
+          ) : panel === 'chats' ? (
+            <Chats {...props} />
           ) : panel === 'database' ? (
             <Database {...props} />
           ) : panel === 'logs' ? (

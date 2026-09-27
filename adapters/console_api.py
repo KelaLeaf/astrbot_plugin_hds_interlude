@@ -332,6 +332,11 @@ def _text(value: Any) -> str:
     return value if isinstance(value, str) else ('' if value is None else str(value))
 
 
+def _record(value: Any) -> dict[str, Any]:
+    """dict 取值：非 dict（旧库的 null、字符串）一律当空记录，不给控制台抛异常。"""
+    return value if isinstance(value, dict) else {}
+
+
 def _int(value: Any, default: int = 0) -> int:
     if isinstance(value, bool):
         return default
@@ -349,6 +354,77 @@ def _safe_count(database: Any, table: str, where: Optional[dict[str, Any]] = Non
         return int(database.count(table, where) or 0)
     except Exception:  # noqa: BLE001
         return 0
+
+
+#: 群聊的两类条目（群号在 `metadata.groupId`，不在 `participantId`）。
+GROUP_KINDS = ('group-message', 'character-group-message')
+#: 聊天记录面板认的条目类型。旁白、场景、账本都不属于任何一条对话，因此不在表里。
+CHAT_KINDS = ('user-message', 'character-message', *GROUP_KINDS, 'outgoing-delivery-failed')
+
+
+def _chat_message(
+    row: Any,
+    character: str,
+    names: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, Any]]:
+    """把一条剧本条目翻译成聊天记录里的一行；不属于任何对话的条目返回 None。"""
+    entry = row if isinstance(row, dict) else {}
+    kind = _text(entry.get('kind'))
+    if kind not in CHAT_KINDS:
+        return None
+    metadata = entry.get('metadata') if isinstance(entry.get('metadata'), dict) else {}
+    participant_id = _text(entry.get('participantId'))
+    group_id = _text(metadata.get('groupId') or metadata.get('group_id'))
+    if kind in GROUP_KINDS:
+        if not group_id:
+            return None
+        conversation = 'group:%s' % group_id
+    elif participant_id:
+        conversation = 'private:%s' % participant_id
+    else:
+        return None
+    if kind == 'outgoing-delivery-failed':
+        side, sender = 'system', character
+    elif kind in ('user-message', 'group-message'):
+        side = 'in'
+        sender = (
+            _text(metadata.get('senderName') or metadata.get('sender_name'))
+            or _text(metadata.get('senderId') or metadata.get('sender_id'))
+            or _text((names or {}).get(participant_id))
+            or '对方'
+        )
+    else:
+        side, sender = 'out', character
+    return {
+        'entry_id': _int(entry.get('id')),
+        'at': _text(entry.get('occurredAt')),
+        'conversation': conversation,
+        'participant_id': participant_id,
+        'group_id': group_id,
+        'group_name': _text(metadata.get('groupName') or metadata.get('group_name')),
+        'side': side,
+        'kind': kind,
+        'sender': sender,
+        'text': _text(entry.get('content')),
+        'quote': _text(metadata.get('quote'))[:200],
+    }
+
+
+def _chat_counts(items: list[dict[str, Any]]) -> dict[str, int]:
+    """对话计数：未回复条数 = 她最后一次发言之后收到的来信数。"""
+    awaiting = 0
+    for item in reversed(items):
+        if item.get('side') == 'out':
+            break
+        if item.get('side') == 'in':
+            awaiting += 1
+    return {
+        'messages': len(items),
+        'incoming': len([item for item in items if item.get('side') == 'in']),
+        'outgoing': len([item for item in items if item.get('side') == 'out']),
+        'failed': len([item for item in items if item.get('side') == 'system']),
+        'awaiting': awaiting,
+    }
 
 
 def _safe_all(
@@ -1118,8 +1194,193 @@ class ConsoleApi:
         }
 
     # ------------------------------------------------------------------ #
+    # 聊天记录（按参与者 / 按群）
+    # ------------------------------------------------------------------ #
+
+    async def chats(self, story_id: str = '', scan: int = 2000) -> dict[str, Any]:
+        """一条对话一行：私聊按参与者、群聊按群号。
+
+        条目表里只有 `user-message` / `character-message` 是私聊，`group-message` /
+        `character-group-message` 是群聊，`outgoing-delivery-failed` 是没送出去的主角
+        消息。旁白（`script`）、场景与账本条目都不在这里出现：它们不属于任何一条对话。
+        """
+        story = self._current_story(story_id)
+        if not story:
+            return {'story': None, 'private': [], 'groups': [], 'scanned': 0, 'truncated': False}
+        sid = _text(story.get('id'))
+        rows, truncated = self._chat_rows(sid, scan)
+        character = self._character_name(story)
+        records = {_text(row.get('id')): row for row in self._participant_rows(sid)}
+        names = {
+            key: _text(row.get('displayName')) or key for key, row in records.items()
+        }
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            message = _chat_message(row, character, names)
+            if message is not None:
+                buckets.setdefault(message['conversation'], []).append(message)
+
+        private: list[dict[str, Any]] = []
+        groups: list[dict[str, Any]] = []
+        for conversation, items in buckets.items():
+            items.sort(key=lambda item: (_text(item.get('at')), _int(item.get('entry_id'))))
+            counts = _chat_counts(items)
+            last = items[-1]
+            if conversation.startswith('group:'):
+                group_id = conversation.split(':', 1)[1]
+                groups.append({
+                    'conversation': conversation, 'group_id': group_id,
+                    'name': _text(last.get('group_name')) or self._group_label(group_id) or group_id,
+                    **counts, 'last_at': _text(last.get('at')), 'last_text': last.get('text', '')[:200],
+                })
+                continue
+            participant_id = conversation.split(':', 1)[1]
+            record = records.get(participant_id) or {}
+            state = record.get('state') if isinstance(record.get('state'), dict) else {}
+            private.append({
+                'conversation': conversation, 'participant_id': participant_id,
+                'name': _text(record.get('displayName')) or participant_id,
+                'account': _text(record.get('userId')),
+                'platform': _text(record.get('platform')),
+                'status': _text(record.get('status')),
+                'unread': _int(state.get('unreadMessageCount')),
+                'pending': _int(state.get('pendingReplyCount')),
+                **counts, 'last_at': _text(last.get('at')), 'last_text': last.get('text', '')[:200],
+            })
+        seen = {item['group_id'] for item in groups}
+        for group_id in self._configured_groups():
+            if group_id in seen:
+                continue
+            groups.append({
+                'conversation': 'group:%s' % group_id, 'group_id': group_id,
+                'name': self._group_label(group_id) or group_id,
+                **_chat_counts([]), 'last_at': '', 'last_text': '', 'configured': True,
+            })
+
+        def order(item: dict[str, Any]) -> tuple[str, str]:
+            return (_text(item.get('last_at')), _text(item.get('name')))
+
+        return {
+            'story': self._story_brief(story),
+            'private': sorted(private, key=order, reverse=True),
+            'groups': sorted(groups, key=order, reverse=True),
+            'scanned': len(rows),
+            'truncated': truncated,
+        }
+
+    async def chat_history(
+        self,
+        story_id: str = '',
+        conversation: str = '',
+        limit: int = 200,
+        before: str = '',
+        scan: int = 2000,
+    ) -> dict[str, Any]:
+        """一条对话的往来记录（时间正序）。
+
+        `before` 传上一页最早那条的 `at` 就是"加载更早"；`limit` 只影响返回条数，
+        扫描窗口由 `scan` 控制（条目表的读取上限，页面会显示有没有被截断）。
+        """
+        story = self._current_story(story_id)
+        if not story:
+            return {'story': None, 'conversation': conversation, 'messages': [], 'has_more': False, 'scanned': 0}
+        sid = _text(story.get('id'))
+        target = _text(conversation).strip()
+        character = self._character_name(story)
+        if not target:
+            return {
+                'story': self._story_brief(story), 'conversation': '', 'title': '',
+                'character': character, 'messages': [], 'has_more': False, 'scanned': 0,
+            }
+        rows, truncated = self._chat_rows(sid, scan)
+        names = self._participant_names(sid)
+        messages = [
+            message for message in (_chat_message(row, character, names) for row in rows)
+            if message is not None and message['conversation'] == target
+        ]
+        messages.sort(key=lambda item: (_text(item.get('at')), _int(item.get('entry_id'))))
+        cutoff = _text(before)
+        if cutoff:
+            messages = [item for item in messages if _text(item.get('at')) < cutoff]
+        size = max(1, min(1000, _int(limit, 200)))
+        page = messages[-size:]
+        if target.startswith('group:'):
+            group_id = target.split(':', 1)[1]
+            group_name = _text(page[-1].get('group_name')) if page else ''
+            title = self._group_label(group_id) or group_name or group_id
+        else:
+            participant_id = target.split(':', 1)[1]
+            title = names.get(participant_id) or participant_id
+        return {
+            'story': self._story_brief(story),
+            'conversation': target,
+            'title': title,
+            'character': character,
+            'messages': page,
+            'has_more': len(messages) > len(page) or truncated,
+            'scanned': len(rows),
+            'truncated': truncated,
+        }
+
+    # ------------------------------------------------------------------ #
     # 内部
     # ------------------------------------------------------------------ #
+
+    def _chat_rows(self, story_id: str, scan: int) -> tuple[list[Any], bool]:
+        """按类型分别取最近若干条聊天条目（别把整张条目表一次拉进内存）。"""
+        size = max(50, min(20_000, _int(scan, 2000)))
+        rows: list[Any] = []
+        truncated = False
+        for kind in CHAT_KINDS:
+            found = _safe_all(
+                self.bridge.db, 'interlude_script_entry',
+                {'storyId': story_id, 'kind': kind}, 'occurredAt DESC', size,
+            )
+            if len(found) >= size:
+                truncated = True
+            rows.extend(row for row in found if isinstance(row, dict))
+        return rows, truncated
+
+    def _character_name(self, story: dict[str, Any]) -> str:
+        setting = story.get('setting') if isinstance(story.get('setting'), dict) else {}
+        character = setting.get('character') if isinstance(setting.get('character'), dict) else {}
+        return _text(character.get('name')) or '角色'
+
+    def _participant_rows(self, story_id: str) -> list[dict[str, Any]]:
+        return [
+            row for row in _safe_all(
+                self.bridge.db, 'interlude_participant', {'storyId': story_id}, 'updatedAt DESC', 200,
+            ) if isinstance(row, dict)
+        ]
+
+    def _participant_names(self, story_id: str) -> dict[str, str]:
+        return {
+            _text(row.get('id')): _text(row.get('displayName')) or _text(row.get('id'))
+            for row in self._participant_rows(story_id)
+        }
+
+    def _participant_row(self, story_id: str, participant_id: str) -> dict[str, Any]:
+        rows = _safe_all(
+            self.bridge.db, 'interlude_participant',
+            {'storyId': story_id, 'id': participant_id}, None, 1,
+        )
+        return rows[0] if rows and isinstance(rows[0], dict) else {}
+
+    def _configured_groups(self) -> list[str]:
+        section = self.bridge.section('qq_access')
+        return [
+            _text(_record(item).get('group_id') or _record(item).get('groupId'))
+            for item in (section.get('group_chats') or section.get('groupChats') or [])
+            if _text(_record(item).get('group_id') or _record(item).get('groupId'))
+        ]
+
+    def _group_label(self, group_id: str) -> str:
+        section = self.bridge.section('qq_access')
+        for item in (section.get('group_chats') or section.get('groupChats') or []):
+            record = _record(item)
+            if _text(record.get('group_id') or record.get('groupId')) == group_id:
+                return _text(record.get('label')) or ''
+        return ''
 
     def _current_story(self, story_id: str = '') -> Optional[dict[str, Any]]:
         stories = _safe_all(self.bridge.db, 'interlude_story', order='updatedAt DESC', limit=50)

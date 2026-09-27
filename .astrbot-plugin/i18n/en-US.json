@@ -13,7 +13,11 @@
         "memory": "Memory",
         "database": "Database",
         "logs": "Logs",
-        "config": "Config"
+        "config": "Config",
+        "delivery": "Delivery",
+        "alter": "Mood",
+        "agency": "Schedule",
+        "chats": "Chats"
       }
     }
   }
