@@ -68,15 +68,24 @@ from ..script.development import (
     reviewed_development_support,
 )
 from ..script.episode_index import grounded_episode_tags
+from ..memory_maintenance import (
+    MaintenanceBudget,
+    anchor_relative_times,
+    exact_duplicate_groups,
+    group_similar_facts,
+    normalize_maintenance_decision,
+)
 from ..script.knowledge_evidence import normalize_knowledge_evidence, supports_recorded_outcome
 from ..schedule_preplan import apply_schedule_preplan_proposal
 from ..story_state import decode_story_state, encode_story_state
-from ..time import calendar_day_key, dt_ms, iso, parse_dt
+from ..time import calendar_day_key, dt_ms, iso, parse_dt, utc_now
 from .base import ServiceBase, _config_section, pick
 from .config import SCHEDULE_PREPLAN_RETRY_BACKOFF
 from .helpers import (
     clamp_number,
     clip,
+    context_metrics,
+    fact_forgetting_score,
     limit_entries_by_characters,
     merge_note,
     normalize_fact,
@@ -85,6 +94,7 @@ from .helpers import (
     normalize_scene_presence_drafts,
     patch_claims_match,
     resolve_participant_id,
+    to_date,
 )
 
 try:  # pragma: no cover - helpers.py 由并行任务产出，可能还没有这几个函数
@@ -137,6 +147,20 @@ _MEMORY_DEFAULTS: dict[str, Any] = {
     'overlayMonthlyWindowDays': 10,
     'overlayWeeklySummaryCharacters': 1_600,
     'overlayMonthlySummaryCharacters': 2_400,
+    'factsDedupeEnabled': True,
+    'factsContradictionEnabled': True,
+    'temporalAnchorEnabled': True,
+    'forgettingEnabled': False,
+    'forgettingThreshold': 0.25,
+    'forgettingRetentionDays': 14,
+    'forgettingHalfLifeDays': 30,
+    'maintenanceMaxLlmCalls': 12,
+    'maintenanceMaxRuntimeMinutes': 10,
+    'maintenanceMinCallIntervalMs': 500,
+    'hybridRetrievalEnabled': True,
+    'hybridRrfK': 60,
+    'queryRewriteEnabled': True,
+    'contextMetricsEnabled': True,
 }
 
 
@@ -288,6 +312,13 @@ def _where_dt(value: Any) -> Any:
     """等值 where 里比较时间列时用 ISO 字符串（库里存的就是 `iso()` 形状）。"""
     parsed = parse_dt(value)
     return iso(parsed) if parsed is not None else value
+
+
+def _text(value: Any) -> str:
+    """把任意值压成字符串（None → 空串）。"""
+    if value is None:
+        return ''
+    return value if isinstance(value, str) else str(value)
 
 
 def _config_int(value: Any, default: int) -> int:
@@ -447,8 +478,18 @@ class ServiceChunk8(ServiceBase):
     def _memory_int(self, camel: str, snake: Optional[str] = None, default: int = 0) -> int:
         return _config_int(self._memory(camel, snake), default)
 
-    def _memory_bool(self, camel: str, snake: Optional[str] = None) -> bool:
-        return bool(self._memory(camel, snake))
+    def _memory_bool(self, camel: str, snake: Optional[str] = None, default: bool = False) -> bool:
+        value = self._memory(camel, snake)
+        if value is None:
+            return bool(default)
+        return bool(value)
+
+    def _memory_float(self, camel: str, snake: Optional[str] = None, default: float = 0.0) -> float:
+        value = self._memory(camel, snake)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
 
     def _share_participant_details(self) -> bool:
         """上游 `this.sharedStoryConfig.shareParticipantDetails`。"""
@@ -729,6 +770,12 @@ class ServiceChunk8(ServiceBase):
                 self.schedule_preplan_backoff[story.get('id')] = (
                     self.now_ms() + SCHEDULE_PREPLAN_RETRY_BACKOFF
                 )
+        # 记忆维护与压缩解耦（v1.4.0）：遗忘清洗不需要模型，不该被"本轮无需压缩"挡住。
+        # 去重 / 矛盾消解要模型调用，走同一份单轮预算。
+        try:
+            await self.run_memory_maintenance(story, now)
+        except Exception as error:  # 维护失败不影响压缩与实时回合
+            self.report('warn', story, 'advance', '记忆维护失败：%s', error)
         if not context or pick(context, 'phase') == 'skip':
             return bool(pick(context, 'overlayCompacted', 'overlay_compacted')) if context else False
         started_at = self.now_ms()
@@ -1190,6 +1237,169 @@ class ServiceChunk8(ServiceBase):
             })
 
     # ------------------------------------------------------------------ #
+    # 上轮上下文构成（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）
+    # ------------------------------------------------------------------ #
+
+    async def record_context_metrics(
+        self, story: Any, request: Any, elapsed_ms: float = 0.0,
+        phase: str = '', participant_id: str = '', now: Any = None,
+    ) -> None:
+        """把这一轮的上下文构成记进 `story.state.extensions.last_context_metrics`。
+
+        只保留**最近一轮**（不建表、不累积）：它回答的是"她刚才看到了什么"，
+        而不是历史统计。诊断性质，任何失败都只记一条 warn——绝不能因为记账把回合弄挂。
+        """
+        if not self._memory_bool('contextMetricsEnabled', default=True):
+            return
+        story_id = pick(story, 'id')
+        if not story_id or not isinstance(request, dict):
+            return
+        moment = parse_dt(now) or self.now()
+        try:
+            metrics = context_metrics(request, elapsed_ms, phase, participant_id, moment)
+            current = await self.get_story(story_id)
+            state = decode_story_state(pick(current or story, 'state'))
+            extensions = dict(state.get('extensions') or {})
+            extensions['last_context_metrics'] = metrics
+            next_state = dict(state)
+            next_state['extensions'] = extensions
+            await self.db_set('interlude_story', {'id': story_id}, {
+                'state': encode_story_state(next_state), 'updatedAt': moment,
+            })
+        except Exception as error:  # noqa: BLE001 - 记账失败不影响叙事
+            self.report('warn', story, 'advance', '上下文构成记录失败：%s', error)
+
+    # ------------------------------------------------------------------ #
+    # 设定改写候选的审批与回滚（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.3）
+    # ------------------------------------------------------------------ #
+
+    async def decide_state_patch(
+        self, story_id: str, patch_id: Any, action: str, note: str = '', now: Any = None,
+    ) -> dict[str, Any]:
+        """人工裁决一条设定改写候选：`approve` 采用、`reject` 驳回。
+
+        上游只有自动闸门（置信度 / 证据回合 / 冷却）：够保守，但没有"用户拍板"这一步。
+        这里的语义是**用户凌驾闸门**——他看过证据，认为这条对，就不用再等它攒够回合。
+        裁决留痕（`decidedAt` / `decisionNote`），行永不删除。
+        """
+        moment = parse_dt(now) or self.now()
+        if action not in ('approve', 'reject'):
+            raise ValueError('invalid-action')
+        target = 'applied' if action == 'approve' else 'rejected'
+        row = await self._find_state_patch(story_id, patch_id)
+        if row is None:
+            raise ValueError('patch-not-found')
+        if str(row.get('status') or '') == 'compacted':
+            raise ValueError('already-compacted')
+        story = await self.get_story(story_id)
+        if not story:
+            raise ValueError('story-not-found')
+        was_applied = str(row.get('status') or '') == 'applied'
+        changes: dict[str, Any] = {
+            'status': target,
+            'decidedAt': moment,
+            'decisionNote': clip(note, 4_000),
+        }
+        if target == 'applied':
+            changes['appliedAt'] = moment
+        await self.db_set('interlude_state_patch', {'id': pick(row, 'id')}, changes)
+        # 驳回一条已经生效的候选同样要把它从实时 overlay 里撤掉。
+        if action == 'reject' and was_applied:
+            await self._rebuild_overlay_without(pick(row, 'target'), story, moment)
+        elif action == 'approve':
+            await self.rebuild_live_overlay_state(story, moment)
+        self.report_operation(
+            'standard', 'info', story, 'advance',
+            '设定改写候选已%s 目标=%s/%s 备注=%s',
+            '采用' if action == 'approve' else '驳回',
+            pick(row, 'target'), pick(row, 'path'), clip(note, 200) or '（无）',
+        )
+        return {
+            'id': pick(row, 'id'),
+            'status': target,
+            'target': _text(pick(row, 'target')),
+            'path': _text(pick(row, 'path')),
+            'decided_at': iso(moment),
+            'note': clip(note, 4_000),
+        }
+
+    async def rollback_state_patch(
+        self, story_id: str, patch_id: Any, note: str = '', now: Any = None,
+    ) -> dict[str, Any]:
+        """把一条**已生效**的设定改写候选撤下来（非破坏性回滚）。
+
+        回滚不是"写回旧值"：overlay 是从**仍然生效的候选**推导出来的派生量，
+        所以把状态改成 `rolled-back` 再重算一遍就是完整、可解释的撤销。
+        候选一旦被折进周/月摘要（`compacted`）就不再支持回滚——那需要重算快照，
+        而且它已经变成"她那段时间的经历"，给用户一句实话比偷偷改历史好。
+        """
+        moment = parse_dt(now) or self.now()
+        row = await self._find_state_patch(story_id, patch_id)
+        if row is None:
+            raise ValueError('patch-not-found')
+        status = str(row.get('status') or '')
+        if status == 'compacted':
+            raise ValueError('already-compacted')
+        if status != 'applied':
+            raise ValueError('not-applied')
+        story = await self.get_story(story_id)
+        if not story:
+            raise ValueError('story-not-found')
+        await self.db_set('interlude_state_patch', {'id': pick(row, 'id')}, {
+            'status': 'rolled-back',
+            'decidedAt': moment,
+            'decisionNote': clip(note, 4_000),
+        })
+        await self._rebuild_overlay_without(pick(row, 'target'), story, moment)
+        self.report_operation(
+            'standard', 'info', story, 'advance',
+            '设定改写候选已回滚 目标=%s/%s 备注=%s',
+            pick(row, 'target'), pick(row, 'path'), clip(note, 200) or '（无）',
+        )
+        return {
+            'id': pick(row, 'id'),
+            'status': 'rolled-back',
+            'target': _text(pick(row, 'target')),
+            'path': _text(pick(row, 'path')),
+            'decided_at': iso(moment),
+            'note': clip(note, 4_000),
+        }
+
+    async def _find_state_patch(self, story_id: str, patch_id: Any) -> Optional[dict[str, Any]]:
+        if patch_id in (None, ''):
+            return None
+        rows = await self.db_get('interlude_state_patch', {
+            'id': patch_id, 'storyId': story_id,
+        })
+        return rows[0] if rows else None
+
+    async def _rebuild_overlay_without(self, target: Any, story: Any, now: Any) -> None:
+        """先清掉该目标的实时增量，再按仍然生效的候选重算（撤销就靠这一步）。
+
+        为什么要先清：`rebuild_live_overlay_state` 只在**存在快照**时才重置该目标的字段
+        （它假设写入侧是"追加"）。回滚是"减去一条"，所以这里显式给它一个干净起点。
+        """
+        field = {
+            'character': 'character_profile',
+            'perspective': 'perspective',
+            'world': 'world',
+            'relationship': 'relationship',
+        }.get(_text(target))
+        state = decode_story_state(pick(story, 'state'))
+        overlay = dict(state.get('setting_overlay') or {})
+        if field:
+            overlay.pop(field, None)
+        if _text(target) == 'character':
+            overlay['character_traits'] = []
+        next_state = dict(state)
+        next_state['setting_overlay'] = overlay
+        await self.db_set('interlude_story', {'id': pick(story, 'id')}, {
+            'state': encode_story_state(next_state), 'updatedAt': now,
+        })
+        refreshed = await self.get_story(pick(story, 'id'))
+        await self.rebuild_live_overlay_state(refreshed or story, now)
+
+    # ------------------------------------------------------------------ #
     # 压缩落库（上游 6394–6615）
     # ------------------------------------------------------------------ #
 
@@ -1477,6 +1687,24 @@ class ServiceChunk8(ServiceBase):
         participant_id = resolve_participant_id(
             pick(draft, 'participantId', 'participant_id'), draft_source_ids, _dual_entries(entries),
         )
+        # 时间锚定（v1.4.0，见 `docs/MEMORY_MAINTENANCE.md` §3）：这句话是从哪个回合抽出来的，
+        # 就用那个回合的剧情时间当锚点，否则「昨天」会跟着日历一起往后漂。
+        anchor_source = next(
+            (entry for entry in _dual_entries(entries)
+             if pick(entry, 'id') in _as_list(draft_source_ids)),
+            None,
+        )
+        anchor_at = (
+            parse_dt(pick(anchor_source, 'occurredAt', 'occurred_at'))
+            or parse_dt(now)
+            or utc_now()
+        )
+        anchored_from = ''
+        if self._memory_bool('temporalAnchorEnabled', default=True):
+            anchored = anchor_relative_times(content, anchor_at)
+            if anchored != content:
+                anchored_from = content
+                content = anchored
         existing = await self.db_get('interlude_fact', {'storyId': story_id, 'status': 'active'})
         # 当前先做完全规范化匹配的去重；更复杂的语义去重可在检索层升级时替换。
         matching = [
@@ -1559,15 +1787,25 @@ class ServiceChunk8(ServiceBase):
             await self.db_set('interlude_fact', {'id': same.get('id')}, patch)
             return resolved
         if len(existing) >= self._memory_int('maxFactsPerStory', default=200):
-            oldest = sorted(
+            # 槽位满了：让静态评分最低的一条让位（重要度 × 置信度）。
+            # 这里**不看时间**，所以变量名不能叫 oldest（v1.4.0 顺手改掉旧名字）。
+            weakest = min(
                 existing,
                 key=lambda fact: (fact.get('importance') or 0) * (fact.get('confidence') or 0),
-            )[0]
-            if oldest:
-                await self.db_set(
-                    'interlude_fact', {'id': oldest.get('id')},
-                    {'status': 'superseded', 'updatedAt': now},
+            )
+            if weakest:
+                await self._retire_fact(
+                    weakest, now, reason='capacity',
+                    score=(weakest.get('importance') or 0) * (weakest.get('confidence') or 0),
                 )
+        if anchored_from:
+            knowledge = {
+                **knowledge,
+                'anchored_at': iso(anchor_at),
+                'anchored_from': clip(
+                    anchored_from, self._memory_int('factContentCharacters', default=4_000),
+                ),
+            }
         await self.db_create('interlude_fact', {
             'storyId': story_id, 'participantId': participant_id,
             'scope': pick(draft, 'scope'), 'content': content, 'knowledge': knowledge,
@@ -1579,6 +1817,214 @@ class ServiceChunk8(ServiceBase):
             'lastSeenAt': now, 'createdAt': now, 'updatedAt': now,
         })
         return False
+
+    async def _retire_fact(self, fact: Any, now: Any, reason: str, score: float) -> None:
+        """把一条事实标成 `superseded`，并在 `knowledge` 里留下退场原因。
+
+        行不删，控制台能回答"她为什么忘了这件事"（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §4）。
+        """
+        knowledge = dict(pick(fact, 'knowledge') or {})
+        knowledge['retired'] = {
+            'reason': reason,
+            'score': round(float(score), 4),
+            'at': iso(now),
+        }
+        await self.db_set('interlude_fact', {'id': pick(fact, 'id')}, {
+            'status': 'superseded', 'knowledge': knowledge, 'updatedAt': now,
+        })
+
+    async def run_memory_maintenance(self, story: Any, now: Any) -> dict[str, Any]:
+        """后台记忆维护（v1.4.0，`docs/MEMORY_MAINTENANCE.md`）。
+
+        跟压缩共用一轮后台节拍，但**独立于压缩是否需要模型**：遗忘清洗不需要模型调用，
+        时间锚定写在写入路径上，去重与矛盾消解要模型调用、受单轮预算约束。
+        """
+        story_id = pick(story, 'id')
+        summary: dict[str, Any] = {'story_id': story_id, 'retired': 0, 'budget': {}}
+        if not self._memory_bool('enabled') or not story_id:
+            return summary
+        budget = MaintenanceBudget(
+            max_calls=self._memory_int('maintenanceMaxLlmCalls', default=12),
+            max_runtime_seconds=max(
+                1, self._memory_int('maintenanceMaxRuntimeMinutes', default=10)
+            ) * 60.0,
+            min_call_interval_ms=self._memory_int('maintenanceMinCallIntervalMs', default=500),
+        )
+        summary['retired'] = await self._prune_forgotten_facts(story_id, now)
+        deduped, contradictions, notes = await self._consolidate_facts(story_id, now, budget)
+        summary['deduped'] = deduped
+        summary['contradictions'] = contradictions
+        summary['notes'] = notes
+        summary['budget'] = budget.summary()
+        if summary['retired'] or summary['deduped'] or summary['contradictions'] or notes:
+            self.report_operation(
+                'standard', 'info', story, 'advance',
+                '记忆维护：淘汰 %d 条（遗忘）合并 %d 条（重复）取代 %d 条（矛盾）%s',
+                summary['retired'], summary['deduped'], summary['contradictions'],
+                ('；' + '；'.join(notes)) if notes else '',
+            )
+        return summary
+
+    async def _prune_forgotten_facts(self, story_id: str, now: Any) -> int:
+        """按遗忘评分淘汰长期没用上的事实；关闭开关或没到期时一条不动。"""
+        if not self._memory_bool('forgettingEnabled', default=False):
+            return 0
+        threshold = self._memory_float('forgettingThreshold', default=0.25)
+        retention_days = max(0, self._memory_int('forgettingRetentionDays', default=14))
+        half_life = self._memory_float('forgettingHalfLifeDays', default=30)
+        moment = parse_dt(now) or utc_now()
+        cutoff = moment - timedelta(days=retention_days)
+        facts = await self.db_get('interlude_fact', {'storyId': story_id, 'status': 'active'}, {
+            'limit': max(1, self._memory_int('maxFactsPerStory', default=200)),
+        })
+        retired = 0
+        for fact in facts:
+            if pick(fact, 'scope') == 'promise' and pick(fact, 'unresolved'):
+                # 还欠着的承诺不参与遗忘：那是剧情义务，不是背景知识。
+                continue
+            created = to_date(pick(fact, 'createdAt', 'created_at'))
+            if created is not None and created > cutoff:
+                continue
+            score = fact_forgetting_score(fact, moment, half_life)
+            if score >= threshold:
+                continue
+            await self._retire_fact(fact, moment, reason='forgetting', score=score)
+            retired += 1
+        return retired
+
+    async def _consolidate_facts(
+        self, story_id: str, now: Any, budget: MaintenanceBudget,
+    ) -> tuple[int, int, list[str]]:
+        """事实去重与矛盾消解（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.1）。
+
+        两段：
+
+        1. **完全重复**：归一化后内容相同的同主人事实，直接合并证据、留下一条，
+           不花模型调用；
+        2. **疑似重复 / 矛盾**：内容相似或共享证据的组交给维护模型裁决（一组一次调用），
+           受单轮预算约束，预算用尽就记一条说明并收尾。
+        """
+        notes: list[str] = []
+        if not (self._memory_bool('factsDedupeEnabled', default=True)
+                or self._memory_bool('factsContradictionEnabled', default=True)):
+            return 0, 0, notes
+        facts = await self.db_get('interlude_fact', {'storyId': story_id, 'status': 'active'}, {
+            'limit': max(1, self._memory_int('maxFactsPerStory', default=200)),
+        })
+        if len(facts) < 2:
+            return 0, 0, notes
+
+        merged_away = 0
+        for group in exact_duplicate_groups(facts):
+            if self._memory_bool('factsDedupeEnabled', default=True):
+                merged_away += await self._merge_fact_group(group, now)
+        # 合并过的行已经不在 active 集合里，重新取一次再分组，避免对同一批做两次裁决。
+        remaining = await self.db_get('interlude_fact', {'storyId': story_id, 'status': 'active'}, {
+            'limit': max(1, self._memory_int('maxFactsPerStory', default=200)),
+        })
+        groups = group_similar_facts(remaining)
+        if not groups:
+            return merged_away, 0, notes
+
+        contradictions = 0
+        for group in groups:
+            blocked = await budget.acquire()
+            if blocked:
+                notes.append('维护预算不足，还剩 %d 组未裁决' % len(groups))
+                break
+            allowed_ids = {pick(fact, 'id') for fact in group}
+            try:
+                raw = await self.maintain_memory({'groups': [{'facts': group}]})
+            except Exception as error:  # 一次裁决失败不拖垮整轮维护
+                notes.append('维护裁决失败：%s' % error)
+                continue
+            for decision in normalize_maintenance_decision(raw, allowed_ids):
+                if decision['action'] == 'keep':
+                    continue
+                if (decision['action'] == 'merge'
+                        and not self._memory_bool('factsDedupeEnabled', default=True)):
+                    continue
+                if (decision['action'] == 'supersede'
+                        and not self._memory_bool('factsContradictionEnabled', default=True)):
+                    continue
+                keep_id = decision['keepId']
+                losers = [fact for fact in group if pick(fact, 'id') != keep_id]
+                keeper = next((fact for fact in group if pick(fact, 'id') == keep_id), None)
+                if keeper is None or not losers:
+                    continue
+                if decision['action'] == 'merge':
+                    updated = await self._merge_fact_group(
+                        [keeper, *losers], now, content=decision['content'] or None,
+                        reason=decision['reason'] or 'dedupe', keep_id=keep_id,
+                    )
+                    merged_away += updated
+                    continue
+                for loser in losers:
+                    await self._retire_fact(
+                        loser, now, reason='contradiction',
+                        score=float(pick(loser, 'confidence') or 0),
+                    )
+                    contradictions += 1
+                if decision['reason']:
+                    notes.append('矛盾消解：%s' % decision['reason'])
+        return merged_away, contradictions, notes
+
+    async def _merge_fact_group(
+        self, group: list[Any], now: Any, content: Optional[str] = None,
+        reason: str = 'dedupe', keep_id: Any = None,
+    ) -> int:
+        """把一组事实合并到一条上：证据并集、评分取高、其余标记为已被合并。
+
+        保留哪条：模型点名了 `keep_id` 就用它（它给的新措辞也是冲着那条写的），
+        没有就用评分最高的那条。返回被合并掉的条数；发起方保证同组属于同一个参与者。
+        """
+        ordered = sorted(
+            group,
+            key=lambda fact: (
+                -(float(pick(fact, 'importance') or 0) * float(pick(fact, 'confidence') or 0)),
+                -(pick(fact, 'id') or 0),
+            ),
+        )
+        if keep_id is not None:
+            named = [fact for fact in ordered if pick(fact, 'id') == keep_id]
+            ordered = named + [fact for fact in ordered if pick(fact, 'id') != keep_id]
+        keeper, losers = ordered[0], ordered[1:]
+        if not losers:
+            return 0
+        knowledge = dict(pick(keeper, 'knowledge') or {})
+        merged_from = [
+            *(value for value in _as_list(knowledge.get('merged_from')) if isinstance(value, int)),
+            *(pick(fact, 'id') for fact in losers),
+        ]
+        knowledge['merged_from'] = list(dict.fromkeys(merged_from))[-20:]
+        patch: dict[str, Any] = {
+            'sourceEntryIds': list(dict.fromkeys([
+                *_as_list(pick(keeper, 'sourceEntryIds', 'source_entry_ids')),
+                *(entry_id for fact in losers
+                  for entry_id in _as_list(pick(fact, 'sourceEntryIds', 'source_entry_ids'))),
+            ]))[:20],
+            'knowledge': knowledge,
+            'importance': max(float(pick(fact, 'importance') or 0) for fact in group),
+            'confidence': max(float(pick(fact, 'confidence') or 0) for fact in group),
+            'updatedAt': now,
+        }
+        if content:
+            patch['content'] = clip(content, self._memory_int('factContentCharacters', default=4_000))
+        await self.db_set('interlude_fact', {'id': pick(keeper, 'id')}, patch)
+        for loser in losers:
+            await self._retire_fact(
+                loser, now, reason=reason,
+                score=float(pick(loser, 'importance') or 0) * float(pick(loser, 'confidence') or 0),
+            )
+        return len(losers)
+
+    async def maintain_memory(self, request: dict[str, Any]) -> Any:
+        """把裁决请求转给叙事器（拿不到可用模型时返回 None，本轮跳过）。"""
+        compactor = getattr(self, 'compactor', None)
+        caller = getattr(compactor, 'maintain_memory', None)
+        if not callable(caller):
+            return None
+        return await caller(request)
 
     async def embed_text(self, value: str) -> list[float]:
         """上游 `embedText(value)`（`src/service.ts:6582`）。

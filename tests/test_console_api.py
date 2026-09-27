@@ -562,6 +562,146 @@ class ConsoleApiTests(unittest.TestCase):
         with self.assertRaises(ConsoleError):
             _run(self.api.merge_story(''))
 
+    # ---- 上轮上下文构成（v1.4.0） ----
+
+    def test_context_metrics_are_labelled_and_sorted(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        extensions = {}
+        extensions['last_context_metrics'] = {
+            'at': '2026-09-27T02:00:00Z', 'phase': 'user-message', 'participant_id': 'p1',
+            'assembly_ms': 37, 'items': 9, 'characters': 4200, 'payload_characters': 5100,
+            'estimated_tokens': 1800,
+            'sections': {
+                'facts': {'items': 4, 'characters': 1200},
+                'recentEntries': {'items': 5, 'characters': 3000},
+                'unknownSection': {'items': 0, 'characters': 0},
+            },
+        }
+        self.bridge.db.update('interlude_story', {'id': sid}, {
+            'state': json.dumps({'extensions': extensions}),
+        })
+        payload = _run(self.api.overview(sid))
+        metrics = payload['context_metrics']
+        self.assertEqual(metrics['estimated_tokens'], 1800)
+        self.assertEqual(metrics['assembly_ms'], 37)
+        self.assertEqual(metrics['phase'], 'user-message')
+        self.assertEqual([row['key'] for row in metrics['sections']], ['recentEntries', 'facts', 'unknownSection'],
+                         '按占用字符数排序，未知段名也给出行')
+        self.assertEqual(metrics['sections'][0]['label'], '近期条目')
+        self.assertEqual(metrics['sections'][2]['label'], 'unknownSection')
+
+    def test_context_metrics_are_empty_without_a_story(self):
+        self.assertEqual(_run(self.api.overview())['context_metrics'], {})
+
+    def test_context_metrics_survive_a_broken_state(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        self.bridge.db.update('interlude_story', {'id': sid}, {'state': 'not-json'})
+        self.assertEqual(_run(self.api.overview(sid))['context_metrics'], {})
+
+    # ---- 设定改写候选：审批与回滚（v1.4.0） ----
+
+    def _patch_row(self, story_id: str, status: str = 'proposed') -> int:
+        row = self.bridge.db.insert('interlude_state_patch', {
+            'storyId': story_id, 'participantId': '', 'target': 'character',
+            'path': 'development.trait', 'proposedValue': '她把伞留在了门口',
+            'evidence': 'seen once', 'confidence': 0.83, 'impact': 'minor',
+            'status': status, 'sourceEntryIds': json.dumps([1]),
+            'createdAt': '2026-09-25T14:33:00Z', 'appliedAt': None,
+        })
+        return int(row) if isinstance(row, int) else int(row.get('id'))
+
+    class _DecisionService:
+        def __init__(self, calls: list, error: Exception | None = None):
+            self.calls = calls
+            self.error = error
+
+        async def decide_state_patch(self, story_id, patch_id, action, note=''):
+            self.calls.append(('decide', story_id, patch_id, action, note))
+            if self.error:
+                raise self.error
+            return {'id': patch_id, 'status': 'applied' if action == 'approve' else 'rejected',
+                    'target': 'character', 'path': 'development.trait',
+                    'decided_at': '2026-09-27T00:00:00Z', 'note': note}
+
+        async def rollback_state_patch(self, story_id, patch_id, note=''):
+            self.calls.append(('rollback', story_id, patch_id, note))
+            if self.error:
+                raise self.error
+            return {'id': patch_id, 'status': 'rolled-back', 'target': 'character',
+                    'path': 'development.trait', 'decided_at': '2026-09-27T00:00:00Z', 'note': note}
+
+    def test_decide_patch_requires_a_service(self):
+        self._story_row('qq:20000:10001')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.decide_patch('qq:20000:10001', 1, 'approve'))
+
+    def test_decide_patch_reports_an_unknown_action(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        self.bridge.service = self._DecisionService([])
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.decide_patch(sid, 1, 'maybe'))
+        self.assertIn('未知的操作', str(caught.exception))
+
+    def test_decide_patch_passes_the_decision_through_and_returns_the_panel(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        patch_id = self._patch_row(sid)
+        calls: list = []
+        self.bridge.service = self._DecisionService(calls)
+        payload = _run(self.api.decide_patch(sid, patch_id, 'approve', '看着像对的'))
+        self.assertEqual(calls[0][0], 'decide')
+        self.assertEqual(calls[0][3], 'approve')
+        self.assertEqual(payload['patch']['status'], 'applied')
+        self.assertEqual(payload['changed'], 'patch-approve #%d' % patch_id)
+        self.assertIn('patches', payload, '写操作回整页数据，前端不用再拉一次')
+
+    def test_decide_patch_explains_a_compacted_candidate(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        self.bridge.service = self._DecisionService([], ValueError('already-compacted'))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.decide_patch(sid, 1, 'reject'))
+        self.assertIn('周期摘要', str(caught.exception))
+
+    def test_rollback_patch_requires_a_service_and_a_story(self):
+        self.bridge.service = self._DecisionService([])
+        with self.assertRaises(ConsoleError):
+            _run(self.api.rollback_patch('qq:20000:10001', 1))
+
+    def test_rollback_patch_explains_a_non_applied_candidate(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        self.bridge.service = self._DecisionService([], ValueError('not-applied'))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.rollback_patch(sid, 1))
+        self.assertIn('已经生效', str(caught.exception))
+
+    def test_rollback_patch_returns_the_panel(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        patch_id = self._patch_row(sid, status='applied')
+        calls: list = []
+        self.bridge.service = self._DecisionService(calls)
+        payload = _run(self.api.rollback_patch(sid, patch_id, '写错了'))
+        self.assertEqual(calls[0][0], 'rollback')
+        self.assertEqual(payload['patch']['status'], 'rolled-back')
+        self.assertEqual(payload['changed'], 'patch-rollback #%d' % patch_id)
+
+    def test_patch_brief_exposes_the_decision_trail(self):
+        sid = 'qq:20000:10001'
+        self._story_row(sid)
+        patch_id = self._patch_row(sid, status='rolled-back')
+        self.bridge.db.update('interlude_state_patch', {'id': patch_id}, {
+            'decidedAt': '2026-09-27T01:02:03Z', 'decisionNote': '主人说这条不算',
+        })
+        payload = _run(self.api.memory(sid))
+        brief = next(item for item in payload['patches'] if item['id'] == patch_id)
+        self.assertTrue(brief['decided_at'].startswith('2026-09-27'), brief['decided_at'])
+        self.assertEqual(brief['decision_note'], '主人说这条不算')
+
     # ---- 承诺与意图：内部调度折叠 ----
 
     def _intent_row(self, story_id: str, kind: str, status: str = 'completed') -> None:

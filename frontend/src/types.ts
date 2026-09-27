@@ -69,6 +69,20 @@ export interface OverviewPayload {
   routing: RoutingRow[]
   capability: { image: string; audio: string }
   counts: Record<string, number>
+  /** 上轮上下文构成（v1.4.0）；没有跑过回合时是空对象。 */
+  context_metrics?: ContextMetrics
+}
+
+export interface ContextMetrics {
+  at: string
+  phase: string
+  participant_id: string
+  assembly_ms: number
+  items: number
+  characters: number
+  payload_characters: number
+  estimated_tokens: number
+  sections: Array<{ key: string; label: string; items: number; characters: number }>
 }
 
 export interface ConnectionRow {
@@ -203,6 +217,9 @@ export interface MemoryPayload {
     impact: string
     status: string
     created_at: string
+    /** 控制台审批 / 回滚的留痕（v1.4.0）。 */
+    decided_at?: string
+    decision_note?: string
   }>
   overlays: Array<{ id: number; target: string; tier: string; summary: string; period_end: string; status: string }>
   participants: Array<{

@@ -632,6 +632,39 @@
             "default": "Concise, factual, chronological, and concrete."
           }
         }
+      },
+      "governor_enabled": {
+        "type": "bool",
+        "default": false,
+        "description": "模型调用治理（并发/频率/熔断）",
+        "hint": "默认关闭。开启后按连接限并发与每分钟调用数，连续失败会短暂熔断，后台任务给实时回合让位。"
+      },
+      "governor_max_concurrency": {
+        "type": "int",
+        "default": 4,
+        "description": "单连接并发上限"
+      },
+      "governor_max_requests_per_minute": {
+        "type": "int",
+        "default": 0,
+        "description": "单连接每分钟调用上限",
+        "hint": "0 表示不限。"
+      },
+      "governor_min_call_interval_ms": {
+        "type": "int",
+        "default": 0,
+        "description": "两次调用最小间隔（毫秒）",
+        "hint": "0 表示不限。"
+      },
+      "governor_breaker_failures": {
+        "type": "int",
+        "default": 5,
+        "description": "连续失败几次后熔断"
+      },
+      "governor_breaker_cooldown_seconds": {
+        "type": "int",
+        "default": 60,
+        "description": "熔断冷却（秒）"
       }
     }
   },
@@ -1676,6 +1709,90 @@
         "type": "int",
         "description": "长期摘要字符上限",
         "default": 2400
+      },
+      "facts_dedupe_enabled": {
+        "type": "bool",
+        "description": "合并重复的长期事实",
+        "default": true,
+        "hint": "后台维护时把同义的事实并成一条，并保留双方证据回合。"
+      },
+      "facts_contradiction_enabled": {
+        "type": "bool",
+        "description": "消解矛盾的长期事实",
+        "default": true,
+        "hint": "后台维护时判断互相冲突的事实，保留置信更高的一条，另一条标记为已被取代。"
+      },
+      "temporal_anchor_enabled": {
+        "type": "bool",
+        "description": "把相对时间写成具体日期",
+        "default": true,
+        "hint": "把「昨天」「上周」这类相对时间按当时的剧情时间换成具体日期，避免记忆随时间腐烂。"
+      },
+      "forgetting_enabled": {
+        "type": "bool",
+        "description": "按使用情况淘汰长期事实",
+        "default": false,
+        "hint": "长期不用的旧事实会按遗忘评分淡出，行保留可审计。默认关闭。"
+      },
+      "forgetting_threshold": {
+        "type": "float",
+        "description": "遗忘阈值",
+        "default": 0.25,
+        "hint": "遗忘评分低于该值才淘汰，0.25 为保守值。"
+      },
+      "forgetting_retention_days": {
+        "type": "int",
+        "description": "最短保留天数",
+        "default": 14,
+        "hint": "写入不满这些天的事实永不淘汰。"
+      },
+      "forgetting_half_life_days": {
+        "type": "int",
+        "description": "遗忘半衰期天数",
+        "default": 30,
+        "hint": "遗忘评分里近因项的衰减半衰期。"
+      },
+      "maintenance_max_llm_calls": {
+        "type": "int",
+        "description": "单轮维护调用上限",
+        "default": 12,
+        "hint": "单轮后台维护最多发起的模型调用次数。"
+      },
+      "maintenance_max_runtime_minutes": {
+        "type": "int",
+        "description": "单轮维护时长上限",
+        "default": 10,
+        "hint": "单轮后台维护最长运行分钟数，超时即收尾。"
+      },
+      "maintenance_min_call_interval_ms": {
+        "type": "int",
+        "description": "维护调用最小间隔",
+        "default": 500,
+        "hint": "后台维护两次模型调用之间的最小间隔毫秒。"
+      },
+      "hybrid_retrieval_enabled": {
+        "type": "bool",
+        "description": "词法与语义融合召回",
+        "default": true,
+        "hint": "召回时把词法与语义两路的排名做融合，专名与数字也能被捞回来。"
+      },
+      "hybrid_rrf_k": {
+        "type": "int",
+        "description": "融合排名常数",
+        "default": 60,
+        "hint": "融合排序的平滑常数，越大越靠近平均排名。"
+      },
+      "query_rewrite_enabled": {
+        "type": "bool",
+        "description": "本地改写检索词",
+        "default": true,
+        "hint": "命中固定句式时不花模型调用，只用本地规则改写检索词。"
+      },
+      "context_metrics_enabled": {
+        "type": "bool",
+        "description": "记录上轮上下文构成",
+        "default": true,
+        "hint": "在剧本状态里记下上一轮上下文各段的条数与耗时，控制台可查。"
       }
     }
   },

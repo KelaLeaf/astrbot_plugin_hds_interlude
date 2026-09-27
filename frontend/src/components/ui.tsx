@@ -65,9 +65,12 @@ export function Stack({ children, class: className = '' }: { children: Component
 export function Badge({
   children,
   tone = 'neutral',
+  title,
 }: {
   children: ComponentChildren
   tone?: 'neutral' | 'accent' | 'ok' | 'warn' | 'danger'
+  /** 悬停说明：状态徽章用来挂裁决留痕这类"想查才看"的信息。 */
+  title?: string
 }) {
   const tones = {
     neutral: 'border-line bg-raised text-muted',
@@ -79,6 +82,7 @@ export function Badge({
   return (
     <span
       class={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] leading-4 ${tones[tone]}`}
+      title={title}
     >
       {children}
     </span>

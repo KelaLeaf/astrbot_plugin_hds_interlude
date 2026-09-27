@@ -174,6 +174,36 @@ export function Overview({ storyId, onStoryChange, refreshKey }: PanelProps) {
               ]}
             />
           </Panel>
+
+          <Panel title="上轮上下文构成" icon="memory">
+            {!(data.context_metrics?.sections ?? []).length ? (
+              <Empty text="还没有记录：跑过一个回合之后这里会显示她上轮看到了什么" />
+            ) : (
+              <Stack>
+                <div class="flex flex-wrap gap-4 text-[11px] text-muted">
+                  <span>装配耗时 <span class="text-text">{data.context_metrics?.assembly_ms} ms</span></span>
+                  <span>条目 <span class="text-text">{data.context_metrics?.items}</span></span>
+                  <span>字符 <span class="text-text">{data.context_metrics?.characters}</span></span>
+                  <span>约 <span class="text-text">{data.context_metrics?.estimated_tokens}</span> token</span>
+                  <span>{data.context_metrics?.phase} · {data.context_metrics?.at}</span>
+                </div>
+                <Table
+                  columns={[
+                    { key: 'label', title: '分段', render: (row) => row.label },
+                    { key: 'items', title: '条数', render: (row) => row.items },
+                    { key: 'characters', title: '字符', render: (row) => row.characters },
+                    { key: 'ratio', title: '占比', render: (row) => `${Math.round((row.characters / Math.max(1, data.context_metrics?.characters ?? 1)) * 100)}%` },
+                  ]}
+                  rows={data.context_metrics?.sections ?? []}
+                  rowKey={(row) => row.key}
+                  maxRows={8}
+                />
+                <Note>
+                  这里记的是装配侧的量（服务把哪些材料塞进了请求），不是账单——真实消耗看「模型」页的用量。
+                </Note>
+              </Stack>
+            )}
+          </Panel>
         </Stack>
       </Grid>
     </Stack>

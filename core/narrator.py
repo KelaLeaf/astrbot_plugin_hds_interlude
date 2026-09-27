@@ -719,6 +719,59 @@ class SilentCompactor:
         """不产出日程预排。"""
         return None
 
+    async def maintain_memory(self, request: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """后台记忆维护的裁决调用（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.1）。
+
+        复用 `compaction` 的连接与参数：这一步和压缩同属"后台低成本加工"，
+        单独开一条路由只会让用户在配置页多填一遍同样的东西。
+        拿不到可用模型时返回 `None`，调用方按"本轮跳过"处理。
+        """
+        compact_config = self.config.get('compaction')
+        if _is_false(_get(compact_config, 'enabled')):
+            return None
+        route = self.routing['compaction'].get('target') or {}
+        assigned = self._assigned_providers('compaction')
+        providers = assigned if assigned else self._select_route_providers(self.routing['compaction'], False)
+        if not providers:
+            return None
+        selected = [provider for provider in providers if provider.get('id') == route.get('provider_id')] \
+            if _truthy(route.get('provider_id')) else providers
+        provider = _first(selected) or providers[0]
+        model = provider.get('model') if assigned else _or(route.get('model'), provider.get('model'))
+        if not model:
+            return None
+        max_tokens = _coalesce(_get(compact_config, 'max_tokens'), _coalesce(route.get('max_tokens'), provider.get('max_tokens')))
+
+        def build_body(capped: bool) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                **parse_object(provider.get('extra_body'), 'extraBody', self.logger),
+                'model': model,
+                'temperature': _js_min(_coalesce(_get(compact_config, 'temperature'), provider.get('temperature')), 0.2),
+                'top_p': _coalesce(_get(compact_config, 'top_p'), 1),
+            }
+            if capped and _is_number(max_tokens) and max_tokens > 0:
+                body['max_tokens'] = max_tokens
+            body['response_format'] = {'type': 'json_object'}
+            body['messages'] = [
+                {'role': 'system', 'content': memory_maintenance_prompt()},
+                {'role': 'user', 'content': _stringify_json(to_memory_maintenance_payload(request))},
+            ]
+            return body
+
+        def parse(text: str) -> Any:
+            if not text:
+                raise RuntimeError('Memory maintenance provider returned an empty response.')
+            try:
+                return parse_json_response(text, 'Memory maintenance provider')
+            except Exception as error:  # noqa: BLE001 - 与压缩同一套降级语义
+                raise RuntimeError('Memory maintenance provider returned invalid JSON.') from error
+
+        return await self._side_task_json(
+            provider, model, '记忆维护',
+            _or(_or(_get(compact_config, 'timeout'), route.get('timeout')), provider.get('timeout')),
+            build_body, parse,
+        )
+
     async def plan_timeline(self, request: TimelinePlanRequest) -> Optional[TimelinePlan]:
         """不产出时间线计划。"""
         return None
@@ -807,6 +860,41 @@ class OpenAICompatibleEmbedder:
         return vector
 
 
+class _GovernedHttp:
+    """给 HTTP 客户端套一层限流与熔断（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.6）。
+
+    放在这里而不是每个调用点：本文件的五个 `post_json` 调用点（主叙事、压缩、时间导演、
+    旁路 JSON、向量化）都走这个属性，包一层就全覆盖，也不用改任何调用点。
+    """
+
+    def __init__(self, inner: Any, governor: Any) -> None:
+        self._inner = inner
+        self._governor = governor
+
+    def __getattr__(self, name: str) -> Any:
+        """其余成员原样透传（`HttpClient` 的协议不止 `post_json`）。"""
+        return getattr(self._inner, name)
+
+    async def post_json(
+        self, url: str, headers: dict[str, str], body: Any,
+        timeout: Any = None, task: Optional[str] = None,
+    ) -> Any:
+        key = str(url or '')
+        background = task not in (None, 'main')
+        blocked = await self._governor.acquire(key, background=background)
+        if blocked is not None:
+            raise RuntimeError('模型调用被治理器拦下：%s' % blocked)
+        try:
+            response = await self._inner.post_json(url, headers, body, timeout, task=task)
+        except Exception:
+            self._governor.report_failure(key)
+            raise
+        finally:
+            self._governor.release(key)
+        self._governor.report_success(key)
+        return response
+
+
 class OpenAICompatibleNarrator:
     """主写作与压缩共用的 OpenAI 兼容客户端（上游 `OpenAICompatibleNarrator`）。
 
@@ -826,6 +914,13 @@ class OpenAICompatibleNarrator:
         # 上游从这里拿 `ctx.logger('hds-interlude')`：Context 绑定的 logger 才会被
         # Console / 运行期日志目标接住，直接构造 Logger 会绕过它们。
         self.http = resolve_http(http)
+        # 模型调用治理（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.6）：只有配置里开了才包一层，
+        # 关着的时候连对象都不建——既有节奏与延迟逐值不变。
+        self.governor = None
+        limits = governor_limits_from_config(config)
+        if limits is not None:
+            self.governor = LlmGovernor(limits)
+            self.http = _GovernedHttp(self.http, self.governor)
         self.config = config
         self._on_usage = on_usage
         self.logger: Optional[LoggerLike] = None if silent_logs else (logger or SinkLogger())
@@ -2633,12 +2728,14 @@ def _prompt_payload_options(cache_first: bool) -> dict[str, Any]:
 # 上游 `src/narrator.ts` 同时定义客户端与提示词组装，调用方一律从 './narrator'
 # 导入；提示词半部分由并行的 `core/narrator_prompts.py` 移植，这里原样转出。
 
+from .llm_governor import LlmGovernor, governor_limits_from_config  # noqa: E402
 from .narrator_prompts import (  # noqa: E402  (必须在文件末尾，避免与上文定义交叉)
     RecentScriptOwnership,
     alter_analysis_prompt,
     compact_prompt_entries,
     compact_script_tag,
     compaction_prompt,
+    memory_maintenance_prompt,
     overlay_compaction_prompt,
     participant_prompt_payload,
     prompt_visible_message_content,
@@ -2648,6 +2745,7 @@ from .narrator_prompts import (  # noqa: E402  (必须在文件末尾，避免�
     system_prompt,
     timeline_director_prompt,
     to_compaction_payload,
+    to_memory_maintenance_payload,
     to_overlay_compaction_payload,
     to_prompt_payload,
     to_schedule_preplan_payload,
@@ -2661,6 +2759,7 @@ __all__ += [
     'compact_prompt_entries',
     'compact_script_tag',
     'compaction_prompt',
+    'memory_maintenance_prompt',
     'overlay_compaction_prompt',
     'participant_prompt_payload',
     'prompt_visible_message_content',
@@ -2670,6 +2769,7 @@ __all__ += [
     'system_prompt',
     'timeline_director_prompt',
     'to_compaction_payload',
+    'to_memory_maintenance_payload',
     'to_overlay_compaction_payload',
     'to_prompt_payload',
     'to_schedule_preplan_payload',

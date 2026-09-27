@@ -137,11 +137,15 @@ EXPECTED_COLUMNS = {
     'interlude_fact': [
         'knowledge', 'id', 'storyId', 'participantId', 'scope', 'content', 'importance',
         'confidence', 'unresolved', 'embedding', 'status', 'sourceEntryIds', 'lastSeenAt',
+        # 本移植版新增（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §4）：召回回写，遗忘评分用。
+        'accessCount', 'lastAccessAt',
         'createdAt', 'updatedAt',
     ],
     'interlude_state_patch': [
         'id', 'storyId', 'participantId', 'target', 'path', 'proposedValue', 'evidence',
         'confidence', 'impact', 'status', 'sourceEntryIds', 'createdAt', 'appliedAt',
+        # 本移植版新增（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.3）：审批与回滚留痕。
+        'decidedAt', 'decisionNote',
     ],
     'interlude_web_observation': [
         'id', 'storyId', 'participantId', 'intentId', 'mode', 'query', 'url', 'title',

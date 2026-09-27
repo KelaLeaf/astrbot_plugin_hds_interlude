@@ -261,6 +261,51 @@ class ServiceChunk5UpstreamTests(unittest.TestCase):
 # 本范围行为用例
 # =========================================================================== #
 
+class FactAccessWriteBackTests(unittest.IsolatedAsyncioTestCase):
+    """v1.4.0 召回回写：`note_fact_access`（`docs/MEMORY_MAINTENANCE.md` §4）。"""
+
+    async def test_access_is_counted_and_stamped(self):
+        class _Host(chunk5_module.ServiceChunk5):
+            def __init__(self) -> None:
+                self.rows = [{'id': 6, 'content': '被召回的事实', 'accessCount': 2}]
+                self.patches: list[Any] = []
+
+            async def db_get(self, table: str, query: Any, options: Any = None) -> Any:
+                return [row for row in self.rows if row.get('id') == query.get('id')]
+
+            async def db_set(self, table: str, query: Any, patch: Any) -> None:
+                self.patches.append((dict(query), dict(patch)))
+                for row in self.rows:
+                    if row.get('id') == query.get('id'):
+                        row.update(patch)
+
+            def now(self) -> Any:
+                return NOW
+
+        host = _Host()
+        await host.note_fact_access([6], NOW)
+        self.assertEqual(host.patches[0][1]['accessCount'], 3)
+        self.assertEqual(host.patches[0][1]['lastAccessAt'], NOW)
+
+    async def test_a_vanished_row_is_skipped(self):
+        class _Host(chunk5_module.ServiceChunk5):
+            def __init__(self) -> None:
+                self.patches: list[Any] = []
+
+            async def db_get(self, table: str, query: Any, options: Any = None) -> Any:
+                return []
+
+            async def db_set(self, table: str, query: Any, patch: Any) -> None:
+                self.patches.append(dict(patch))
+
+            def now(self) -> Any:
+                return NOW
+
+        host = _Host()
+        await host.note_fact_access([404], NOW)
+        self.assertEqual(host.patches, [])
+
+
 class ServiceChunk5Tests(unittest.TestCase):
     """真实 `Database` + 真实 `InterludeService` 下的 Chunk5 行为。"""
 
@@ -530,6 +575,95 @@ class ServiceChunk5Tests(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # 事实与网页观察读取
     # ------------------------------------------------------------------ #
+
+    def test_recall_fusion_prefers_a_fact_matched_by_both_lanes(self):
+        """v1.4.0 召回融合：两路都命中 > 单路命中 > 只靠重要度。"""
+        if not _has_member('facts'):
+            self.skipTest('chunk5 未组装')
+
+        def add_fact(content: str, importance: float, embedding: list[float]) -> dict[str, Any]:
+            return self.db.insert('interlude_fact', {
+                'storyId': 's', 'participantId': '', 'scope': 'world', 'content': content,
+                'importance': importance, 'confidence': 0.5, 'unresolved': False, 'status': 'active',
+                'sourceEntryIds': [], 'embedding': embedding,
+                'lastSeenAt': NOW, 'createdAt': NOW, 'updatedAt': NOW,
+            })
+
+        irrelevant = add_fact('她养了一只叫团子的猫', 0.95, [0.0, 1.0])
+        matched = add_fact('主人喜欢喝冰美式', 0.3, [1.0, 0.0])
+
+        async def scenario() -> list[Any]:
+            service = self._service(memory={
+                'factLimit': 1, 'maxFactsPerStory': 200, 'factImportanceWeight': 0.35,
+                'factConfidenceWeight': 0.2, 'factRecencyWeight': 0.2, 'semanticWeight': 1.0,
+                'unresolvedWeight': 0.2, 'hybridRetrievalEnabled': True, 'hybridRrfK': 60,
+                'queryRewriteEnabled': True,
+            })
+            return await service.facts('s', 1, '你还记得冰美式吗', None, [1.0, 0.0])
+
+        selected = asyncio.run(scenario())
+        self.assertEqual([row['id'] for row in selected], [matched['id']],
+                         '重要度高但两路都不沾边的事实不该顶掉真正相关的那条')
+        self.assertNotEqual(matched['id'], irrelevant['id'])
+
+    def test_recall_falls_back_to_the_upstream_score_when_fusion_is_off(self):
+        """关掉融合必须逐值退回上游的加权和（不是"差不多的排序"）。"""
+        if not _has_member('facts'):
+            self.skipTest('chunk5 未组装')
+
+        def add_fact(content: str, importance: float, embedding: list[float]) -> dict[str, Any]:
+            return self.db.insert('interlude_fact', {
+                'storyId': 's', 'participantId': '', 'scope': 'world', 'content': content,
+                'importance': importance, 'confidence': 0.5, 'unresolved': False, 'status': 'active',
+                'sourceEntryIds': [], 'embedding': embedding,
+                'lastSeenAt': NOW, 'createdAt': NOW, 'updatedAt': NOW,
+            })
+
+        low = add_fact('主人喜欢喝冰美式', 0.3, [1.0, 0.0])
+        high = add_fact('她养了一只叫团子的猫', 0.95, [0.0, 1.0])
+        memory = {
+            'factLimit': 1, 'maxFactsPerStory': 200, 'factImportanceWeight': 1.0,
+            'factConfidenceWeight': 0.0, 'factRecencyWeight': 0.0, 'semanticWeight': 0.0,
+            'unresolvedWeight': 0.0, 'hybridRetrievalEnabled': False,
+        }
+
+        async def scenario() -> list[Any]:
+            return await self._service(memory=memory).facts('s', 1, '毫无关系的问句', None)
+
+        selected = asyncio.run(scenario())
+        self.assertEqual([row['id'] for row in selected], [high['id']],
+                         '融合关闭时只按上游的加权和排序')
+        self.assertNotEqual(low['id'], high['id'])
+
+    def test_query_rewrite_keeps_a_scaffolded_question_on_track(self):
+        """「你还记得…吗」这类问法不该让词法通道失效。"""
+        if not _has_member('facts'):
+            self.skipTest('chunk5 未组装')
+
+        def add_fact(content: str) -> dict[str, Any]:
+            return self.db.insert('interlude_fact', {
+                'storyId': 's', 'participantId': '', 'scope': 'world', 'content': content,
+                'importance': 0.5, 'confidence': 0.5, 'unresolved': False, 'status': 'active',
+                'sourceEntryIds': [], 'embedding': [],
+                'lastSeenAt': NOW, 'createdAt': NOW, 'updatedAt': NOW,
+            })
+
+        target = add_fact('那家面包店周一不开门')
+        other = add_fact('她周一要开会')
+        memory = {
+            'factLimit': 1, 'maxFactsPerStory': 200, 'factImportanceWeight': 0.1,
+            'factConfidenceWeight': 0.1, 'factRecencyWeight': 0.1, 'semanticWeight': 0.0,
+            'unresolvedWeight': 0.0, 'hybridRetrievalEnabled': True, 'queryRewriteEnabled': True,
+        }
+
+        async def scenario() -> list[Any]:
+            return await self._service(memory=memory).facts(
+                's', 1, '你还记得我上次说的那个面包店吗', None,
+            )
+
+        selected = asyncio.run(scenario())
+        self.assertEqual([row['id'] for row in selected], [target['id']])
+        self.assertNotEqual(target['id'], other['id'])
 
     def test_facts_visibility_lanes_and_web_observation_branch_switch(self):
         if not _has_member('facts'):

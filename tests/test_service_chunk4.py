@@ -1436,6 +1436,78 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state['narrative_update_count'], 1)
 
     @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_the_turn_records_what_the_context_was_made_of(self) -> None:
+        """v1.4.0：上轮上下文构成落进 `state.extensions.last_context_metrics`。"""
+        self.db.insert('interlude_script_entry', {
+            'storyId': STORY_ID, 'kind': 'script', 'actor': 'narrator',
+            'content': '她把伞放在门口。', 'occurredAt': FROM, 'metadata': {},
+            'createdAt': FROM,
+        })
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+        )
+        self.assertTrue(result['succeeded'])
+        state = decode_story_state((await self.service.get_story(STORY_ID))['state'])
+        metrics = (state.get('extensions') or {}).get('last_context_metrics')
+        self.assertIsInstance(metrics, dict, '记账是诊断用途，但必须真的写进去')
+        self.assertEqual(metrics['phase'], 'user-message')
+        self.assertEqual(metrics['participant_id'], PARTICIPANT_ID)
+        self.assertGreaterEqual(metrics['assembly_ms'], 0)
+        self.assertGreater(metrics['estimated_tokens'], 0)
+        self.assertGreater(metrics['payload_characters'], 0)
+        # 段名用 wire 键（与请求体一一对应），文字标签留给控制台。
+        self.assertIn('recentEntries', metrics['sections'])
+        self.assertEqual(
+            metrics['sections']['recentEntries']['items'],
+            len(self.narrator.requests[0]['recentEntries']),
+        )
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_a_quote_without_content_is_backfilled_from_our_own_record(self) -> None:
+        """平台只给一个 id 时，用 `msg-<条目id>` 从剧本里补出被引正文。"""
+        entry = self.db.insert('interlude_script_entry', {
+            'storyId': STORY_ID, 'kind': 'script', 'actor': 'character',
+            'content': '她把伞放在了门口。', 'occurredAt': FROM, 'metadata': {},
+            'createdAt': FROM,
+        })
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+            quoted_messages=[{'messageId': 'msg-%s' % entry['id'], 'user': {'id': '2'}}],
+        )
+        request = self.narrator.requests[-1]
+        quote = request['quotedMessages'][0]
+        self.assertEqual(quote['content'], '她把伞放在了门口。')
+        self.assertIs(quote['backfilled'], True, '补出来的引文要能被日志区分')
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_platform_supplied_quote_content_is_left_alone(self) -> None:
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+            quoted_messages=[{'messageId': 'msg-999999', 'content': '平台给的原文'}],
+        )
+        quote = self.narrator.requests[-1]['quotedMessages'][0]
+        self.assertEqual(quote['content'], '平台给的原文')
+        self.assertNotIn('backfilled', quote)
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_context_metrics_can_be_switched_off(self) -> None:
+        self.service.config = {
+            **self.service.config,
+            'memory': {**(_config_section(self.service.config, 'memory') or {}), 'contextMetricsEnabled': False},
+        }
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        await self.service.try_decide(story, participant, 'user-message', FROM, NOW, '在吗', [])
+        state = decode_story_state((await self.service.get_story(STORY_ID))['state'])
+        self.assertNotIn('last_context_metrics', state.get('extensions') or {})
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
     async def test_a_rejected_draft_says_why_where_operators_can_see_it(self) -> None:
         """被抛弃的草稿必须**在默认 verbosity 下可见**地说出原因（AGENTS.md 坑 25）。
 

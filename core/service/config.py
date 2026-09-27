@@ -1419,6 +1419,13 @@ CONFIG_DEFAULTS: dict[str, Any] = {
             'fixed_prompt': '',
             'style_prompt': 'Concise, factual, chronological, and concrete.',
         },
+        # v1.4.0：模型调用治理（`docs/MEMORY_MAINTENANCE.md` §5.6）。默认关闭。
+        'governor_enabled': False,
+        'governor_max_concurrency': 4,
+        'governor_max_requests_per_minute': 0,
+        'governor_min_call_interval_ms': 0,
+        'governor_breaker_failures': 5,
+        'governor_breaker_cooldown_seconds': 60,
     },
     # ---- 【必填 3】onebot（index.ts OneBot） ----
     'onebot': {
@@ -1560,6 +1567,20 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         'overlay_monthly_window_days': 10,
         'overlay_weekly_summary_characters': 1_600,
         'overlay_monthly_summary_characters': 3_200,
+        'facts_dedupe_enabled': True,
+        'facts_contradiction_enabled': True,
+        'temporal_anchor_enabled': True,
+        'forgetting_enabled': False,
+        'forgetting_threshold': 0.25,
+        'forgetting_retention_days': 14,
+        'forgetting_half_life_days': 30,
+        'maintenance_max_llm_calls': 12,
+        'maintenance_max_runtime_minutes': 10,
+        'maintenance_min_call_interval_ms': 500,
+        'hybrid_retrieval_enabled': True,
+        'hybrid_rrf_k': 60,
+        'query_rewrite_enabled': True,
+        'context_metrics_enabled': True,
     },
     # ---- 【内在 13】alterSystem（index.ts AlterSystem） ----
     'alter_system': {

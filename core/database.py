@@ -319,6 +319,9 @@ FACT = TableSpec(
         'status': _spec('string(16)'),
         'sourceEntryIds': _spec('json'),
         'lastSeenAt': _spec('timestamp'),
+        # v1.4.0 新增（`docs/MEMORY_MAINTENANCE.md`）：召回回写，遗忘评分用。
+        'accessCount': _spec('unsigned'),
+        'lastAccessAt': _spec('timestamp'),
         'createdAt': _spec('timestamp'),
         'updatedAt': _spec('timestamp'),
     },
@@ -344,6 +347,9 @@ STATE_PATCH = TableSpec(
         'sourceEntryIds': _spec('json'),
         'createdAt': _spec('timestamp'),
         'appliedAt': _spec('timestamp'),
+        # v1.4.0 新增（`docs/MEMORY_MAINTENANCE.md` §5.3）：控制台审批与回滚的留痕。
+        'decidedAt': _spec('timestamp'),
+        'decisionNote': _spec('text'),
     },
     primary='id',
     auto_increment=True,

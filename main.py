@@ -437,6 +437,10 @@ class HDSInterludePlugin(Star):
              '控制台：已知参与者（白名单一键填入）'),
             (f'/{PLUGIN_NAME}/console/stories', self.page_console_stories, ['GET'],
              '控制台：剧本清单（含归档）'),
+            (f'/{PLUGIN_NAME}/console/patch-decide', self.page_console_patch_decide, ['POST'],
+             '设定候选审批'),
+            (f'/{PLUGIN_NAME}/console/patch-rollback', self.page_console_patch_rollback, ['POST'],
+             '设定候选回滚'),
             (f'/{PLUGIN_NAME}/console/story-merge', self.page_console_story_merge, ['POST'],
              '控制台：把旧剧本并入共享主剧本'),
             (f'/{PLUGIN_NAME}/console/story-promote', self.page_console_story_promote, ['POST'],
@@ -533,6 +537,16 @@ class HDSInterludePlugin(Star):
     async def page_console_story_merge(self):
         return await self._console_write(lambda api, body: api.merge_story(
             body.get('source_story_id'), body.get('target_story_id'),
+        ))
+
+    async def page_console_patch_decide(self):
+        return await self._console_write(lambda api, body: api.decide_patch(
+            body.get('story_id'), body.get('patch_id'), body.get('action'), body.get('note', ''),
+        ))
+
+    async def page_console_patch_rollback(self):
+        return await self._console_write(lambda api, body: api.rollback_patch(
+            body.get('story_id'), body.get('patch_id'), body.get('note', ''),
         ))
 
     async def page_console_story_promote(self):

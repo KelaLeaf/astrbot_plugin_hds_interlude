@@ -89,6 +89,11 @@ from ..time import format_log_time, iso, parse_dt
 from .base import ServiceBase, pick
 from .config import RECALLABLE_ENTRY_KINDS, is_trusted_image_host
 from .helpers import (
+    IMAGE_HASH_TOLERANCE,
+    hamming_distance,
+    image_perceptual_hash,
+    remember_described_hashes,
+    split_described_images,
     _turn_get,
     _turn_set,
     guess_audio_format,
@@ -139,6 +144,18 @@ DEFAULT_AUDIO_MAX_PER_MESSAGE = 1
 # =========================================================================== #
 # 通用小工具
 # =========================================================================== #
+
+
+def _image_bytes(image: Any) -> bytes:
+    """从 Data URI 里取回原始字节（算感知哈希用）；形状不对给空字节。"""
+    uri = _text(_value(image, 'data_uri'))
+    marker = ';base64,'
+    if marker not in uri:
+        return b''
+    try:
+        return base64.b64decode(uri.split(marker, 1)[1])
+    except Exception:  # noqa: BLE001 - 坏 base64 只是"算不出哈希"
+        return b''
 
 def _to_snake(name: str) -> str:
     """`camelCase` → `snake_case`（只用于生成双读的第二个键名）。"""
@@ -873,11 +890,28 @@ class ServiceChunk3(ServiceBase):
         if not _value(_vision_config(self), 'enabled', False) or not sources:
             return []
         images: list[Any] = []
+        turn_hashes: list[str] = []
         for index, source in enumerate(sources[:3]):
             try:
                 image = await self.fetch_native_image(source, _member(session, 'bot'))
                 if image:
-                    images.append({'id': 'turn-image-%d' % (index + 1), **image})
+                    entry = {'id': 'turn-image-%d' % (index + 1), **image}
+                    # 感知哈希（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）：同一条消息里
+                    # 重复贴同一张图（很常见）只留一张，识图也就不必花两次钱。
+                    digest = image_perceptual_hash(_image_bytes(entry))
+                    if digest:
+                        entry['perceptualHash'] = digest
+                        if any(
+                            hamming_distance(digest, seen) <= IMAGE_HASH_TOLERANCE
+                            for seen in turn_hashes
+                        ):
+                            self.report_operation(
+                                'diagnostic', 'debug', story, 'user-message',
+                                '同一张图在本条消息里出现了两次，只保留一张（哈希=%s）', digest,
+                            )
+                            continue
+                        turn_hashes.append(digest)
+                    images.append(entry)
             except Exception as error:
                 self.report('warn', story, 'user-message', '图片读取失败，已继续处理文字消息 错误=%s', error)
         return images
@@ -892,6 +926,22 @@ class ServiceChunk3(ServiceBase):
         """
         if not images:
             return None
+        # 同一张图最近识过就不重复识图（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。
+        registry = getattr(self, '_described_image_hashes', None)
+        if registry is None:
+            registry = {}
+            self._described_image_hashes = registry
+        skipped: list[str] = []
+        known = list(registry.get(_text(_value(story, 'id'))) or [])
+        if known:
+            images, skipped = split_described_images(images, known)
+            if skipped:
+                self.report_operation(
+                    'diagnostic', 'debug', story, 'user-message',
+                    '同一张图最近已经识过，跳过侧端识图 张数=%d', len(skipped),
+                )
+            if not images:
+                return None
         describer = self.vision_describer
         available = getattr(describer, 'available', None)
         if describer is None or not callable(available) or not available():
@@ -905,6 +955,10 @@ class ServiceChunk3(ServiceBase):
                 images, user_message or '', _value(_vision_config(self), 'detail', 'auto') or 'auto',
             )
             if observations:
+                story_id = _text(_value(story, 'id'))
+                registry[story_id] = remember_described_hashes(
+                    registry.get(story_id) or [], images,
+                )
                 self.report_operation(
                     'diagnostic', 'debug', story, 'user-message',
                     '侧端识图完成 图片=%d 观察=%d', len(images), len(observations),

@@ -96,6 +96,8 @@ from ..story_state import decode_story_state, encode_story_state
 from .base import ServiceBase, normalize_database_row, pick
 from .config import RECALLABLE_ENTRY_KINDS
 from .helpers import (
+    fact_hybrid_score,
+    fact_lane_scores,
     clamp_number,
     clip,
     fact_score,
@@ -1047,10 +1049,25 @@ class ServiceChunk5(ServiceBase):
             owner = _row(fact, 'participantId', 'participant_id') or ''
             return not owner or owner == participant_id
 
-        scored = [
-            (fact, fact_score(fact, memory_config, query_embedding, query))
-            for fact in rows if visible(fact)
-        ]
+        visible_rows = [fact for fact in rows if visible(fact)]
+        # 召回排序（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.2）：默认走"词法 / 语义两路
+        # 排名融合 + 本地查询改写"，关掉开关就退回上游的加权和，行为逐值一致。
+        if _cfg(memory_config, 'hybridRetrievalEnabled', True):
+            rewrite = _cfg(memory_config, 'queryRewriteEnabled', True) is not False
+            rrf_k = _cfg(memory_config, 'hybridRrfK', 60) or 60
+            lanes = fact_lane_scores(
+                visible_rows, memory_config, query_embedding, query,
+                rewrite=rewrite, rrf_k=float(rrf_k),
+            )
+            scored = [
+                (fact, fact_hybrid_score(fact, memory_config, lane))
+                for fact, lane in zip(visible_rows, lanes)
+            ]
+        else:
+            scored = [
+                (fact, fact_score(fact, memory_config, query_embedding, query))
+                for fact in visible_rows
+            ]
         scored.sort(key=lambda item: (
             -item[1],
             -_ms(_row(item[0], 'updatedAt', 'updated_at')),
@@ -1072,7 +1089,37 @@ class ServiceChunk5(ServiceBase):
             selected.append(fact)
             if len(selected) >= limit:
                 break
+        # 召回回写（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §4）：被选中的事实记一次访问，
+        # 遗忘评分才有"用得多就留"的依据。写库不占本回合的延迟，挂后台任务。
+        selected_ids = [fact_id for fact_id in (_row(fact, 'id') for fact in selected) if fact_id]
+        if selected_ids:
+            self._spawn(self.note_fact_access(selected_ids))
         return selected
+
+    async def note_fact_access(self, fact_ids: list[Any], now: Any = None) -> None:
+        """给这批事实的访问计数 +1 并记录最后一次召回时间。
+
+        上游没有这个动作（它的 L2 条目自带 `access_count` / `last_access_time`）；
+        本移植版把它拆成"读的时候只挑，写的时候另起一步"，避免在延迟敏感的
+        实时路径上多一次同步写。
+        """
+        stamp = now or self.now()
+        for fact_id in fact_ids:
+            try:
+                rows = await self.db_get('interlude_fact', {'id': fact_id})
+            except Exception:
+                continue
+            fact = rows[0] if rows else None
+            if not fact:
+                continue
+            count = int(clamp_number(_row(fact, 'accessCount', 'access_count'), 0, 0, 1_000_000))
+            try:
+                await self.db_set('interlude_fact', {'id': fact_id}, {
+                    'accessCount': count + 1,
+                    'lastAccessAt': stamp,
+                })
+            except Exception:
+                continue
 
     # ------------------------------------------------------------------ #
     # 网页观察读取（`src/service.ts:4449`）

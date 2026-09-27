@@ -56,6 +56,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 import math
 import re
@@ -110,6 +111,7 @@ except ImportError:  # pragma: no cover
 
 from .helpers import (
     automatic_delivery_from_payload,
+    backfilled_quote_content,
     clip,
     describe_timeline_plan_rejection,
     detect_live_script_time_overflow,
@@ -139,6 +141,27 @@ from .helpers import (
 # 上游 `normalizeVisibleMessageContent`（`service.ts` 模块级函数）在 helpers.py 里是
 # 私有名；它决定跨账号主动联系的可见文本契约（去掉括号标签等），必须与群回复同源。
 from .helpers import _normalize_visible_message_content as normalize_visible_message_content
+
+def _quote_text(value: Any, *keys: str) -> str:
+    """按 camelCase 优先从引文里读字符串（缺值给空串）。"""
+    if not isinstance(value, dict):
+        return ''
+    for key in keys:
+        found = value.get(key)
+        if found not in (None, ''):
+            return str(found)
+    return ''
+
+
+def _quote_entry_id(value: Any) -> Optional[int]:
+    """`msg-<条目id>` → 条目 id；不是这个形状就返回 None。"""
+    for key in ('messageId', 'message_id', 'messageRef', 'message_ref', 'id'):
+        raw = _quote_text(value, key).strip()
+        match = re.match(r'^msg-(\d+)$', raw)
+        if match:
+            return int(match.group(1))
+    return None
+
 
 __all__ = ['ServiceChunk4']
 
@@ -1077,6 +1100,7 @@ class ServiceChunk4(ServiceBase):
         主模型上下文的**唯一入口**。返回的 `NarrativeRequest` 是**发给模型的 wire
         format**：顶层与嵌套键全部保持上游 camelCase（见模块 docstring 第 3 条）。
         """
+        started = time.perf_counter()
         superseded_intents = superseded_intents or []
         images = images or []
         audio = audio or []
@@ -1352,13 +1376,56 @@ class ServiceChunk4(ServiceBase):
             ),
             'onEarlyReply': on_early_reply,
         }
+        quoted_messages = await self._backfill_quoted_messages(story, quoted_messages, prompt_entries)
         if quoted_messages:
             request['quotedMessages'] = quoted_messages
         if sticker_catalog and phase == 'user-message':
             request['stickerCatalog'] = sticker_catalog
+        # 上轮上下文构成（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）：只记装配侧的量，
+        # 真正的 token 账单在模型中心的用量账里。诊断记账失败不影响本回合。
+        await self.record_context_metrics(
+            story, request, (time.perf_counter() - started) * 1000.0, phase,
+            participant_id or '', now,
+        )
         return _resync_dual(resolve_authored_actions(
             await self.narrator.decide(request), False, separator,
         ))
+
+    async def _backfill_quoted_messages(
+        self, story: Any, quoted_messages: Any, entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """补出被回复消息的正文（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。
+
+        平台只给一个 id 时，模型看到的是"引用了某条看不见的消息"——比不引用更糟。
+        先在本回合的条目里找，找不到再按 `msg-<条目id>` 去库里取那一条（我们自己发出去的
+        消息用的就是这种 id）。补上的条目带 `backfilled: True`，日志里能分清
+        "平台给的引文"和"我们补出来的引文"。
+        """
+        rows = [item for item in (quoted_messages or []) if isinstance(item, dict)]
+        if not rows:
+            return []
+        resolved = list(entries or [])
+        result: list[dict[str, Any]] = []
+        for quote in rows:
+            if _quote_text(quote, 'content').strip():
+                result.append(quote)
+                continue
+            content = backfilled_quote_content(quote, resolved)
+            if not content:
+                # 合成 id 指向的条目可能不在本回合窗口里：补一次按 id 的精确查询。
+                wanted = _quote_entry_id(quote)
+                if wanted is not None:
+                    found = await self.db_get('interlude_script_entry', {
+                        'storyId': pick(story, 'id'), 'id': wanted,
+                    })
+                    if found:
+                        resolved = [*resolved, *found]
+                        content = backfilled_quote_content(quote, resolved)
+            if not content:
+                result.append(quote)
+                continue
+            result.append({**quote, 'content': content, 'backfilled': True})
+        return result
 
     # ------------------------------------------------------------------ #
     # shouldRefreshContinuity（上游 :3604）

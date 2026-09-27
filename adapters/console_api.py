@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
+from ..core.story_state import decode_story_state
 from .astrbot_bridge import (
     CONSOLE_LOG_BUFFER as CONSOLE_LOG_MAX,
     CONSOLE_USAGE_BUFFER as CONSOLE_USAGE_MAX,
@@ -31,7 +32,7 @@ from .astrbot_bridge import (
     _plugin_version,
 )
 
-__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'INTERNAL_INTENT_TYPES', 'mask_endpoint',
+__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'CONTEXT_SECTION_LABELS', 'INTERNAL_INTENT_TYPES', 'mask_endpoint',
            'load_config_schema', 'coerce_schema_value']
 
 #: 控制台「模型」页展示的任务顺序与中文名（与 `model_routing` 的任务键一致）。
@@ -49,6 +50,24 @@ CONSOLE_TASKS: tuple[tuple[str, str], ...] = (
 #: - `split-message`：拆分气泡的投递节拍（"她还在打字"），投递完就 completed；
 #: - `narrative-retry`：叙事调用失败后的自动重试排程。
 #: 控制台的「承诺与意图」默认只显示人话层面的意图，这些折叠起来（可展开）。
+#: 上下文段名的中文标签（`helpers.CONTEXT_METRIC_SECTIONS` 的 wire 键）。
+CONTEXT_SECTION_LABELS = {
+    'recentEntries': '近期条目',
+    'recalledHistory': '召回的历史原文',
+    'memories': '压缩记忆',
+    'facts': '长期事实',
+    'overlaySnapshots': '设定演化',
+    'followUpCommitments': '承诺回访',
+    'dueIntents': '到期计划',
+    'upcomingIntents': '未来计划',
+    'activeConsequences': '剧情余波',
+    'workingDetails': '临时细节',
+    'participants': '参与者摘要',
+    'webContext': '网页观察',
+    'quotedMessages': '被回复的消息',
+    'automaticDeliverySummaries': '自动投递摘要',
+}
+
 INTERNAL_INTENT_TYPES: frozenset[str] = frozenset({'split-message', 'narrative-retry'})
 
 
@@ -487,6 +506,46 @@ class ConsoleApi:
                 'audio': self._note('audio'),
             },
             'counts': counts,
+            'context_metrics': self._context_metrics(current),
+        }
+
+    def _context_metrics(self, story: Any) -> dict[str, Any]:
+        """上轮上下文构成（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）。
+
+        存在剧本 `state.extensions.last_context_metrics` 里，只保留最近一轮。
+        读的时候顺手把 wire 段名翻成人话，前端不用再维护一份映射。
+        """
+        if not story:
+            return {}
+        try:
+            state = decode_story_state(story.get('state'))
+        except Exception:  # noqa: BLE001 - 旧库的 state 可能不成形状
+            return {}
+        extensions = state.get('extensions') if isinstance(state.get('extensions'), dict) else {}
+        metrics = extensions.get('last_context_metrics')
+        if not isinstance(metrics, dict):
+            return {}
+        sections = metrics.get('sections') if isinstance(metrics.get('sections'), dict) else {}
+        rows = [
+            {
+                'key': key,
+                'label': CONTEXT_SECTION_LABELS.get(key, key),
+                'items': int((value or {}).get('items') or 0),
+                'characters': int((value or {}).get('characters') or 0),
+            }
+            for key, value in sections.items()
+        ]
+        rows.sort(key=lambda row: -row['characters'])
+        return {
+            'at': _text(metrics.get('at')),
+            'phase': _text(metrics.get('phase')),
+            'participant_id': _text(metrics.get('participant_id')),
+            'assembly_ms': int(metrics.get('assembly_ms') or 0),
+            'items': int(metrics.get('items') or 0),
+            'characters': int(metrics.get('characters') or 0),
+            'payload_characters': int(metrics.get('payload_characters') or 0),
+            'estimated_tokens': int(metrics.get('estimated_tokens') or 0),
+            'sections': rows,
         }
 
     # ------------------------------------------------------------------ #
@@ -1523,6 +1582,57 @@ class ConsoleApi:
         payload['changed'] = 'story-promote %s → %s' % (source, payload['promoted']['target'])
         return payload
 
+    async def decide_patch(
+        self, story_id: Any, patch_id: Any, action: Any, note: Any = '',
+    ) -> dict[str, Any]:
+        """审批（approve）或驳回（reject）一条设定改写候选。
+
+        与自动闸门的关系：闸门保证"没证据不上"，用户拍板允许"证据够了但还没攒够回合"
+        的那条直接生效，或者把已经生效的一条驳回撤下来。
+        """
+        service = getattr(self.bridge, 'service', None)
+        if service is None or not callable(getattr(service, 'decide_state_patch', None)):
+            raise ConsoleError('插件服务尚未就绪，稍后再试')
+        sid = await self._story_id_for_write(story_id)
+        decision = _text(action).strip().lower()
+        if decision not in ('approve', 'reject'):
+            raise ConsoleError('未知的操作：%s' % (_text(action) or '（空）'))
+        try:
+            result = await service.decide_state_patch(
+                sid, _int_or_none(patch_id), decision, _text(note),
+            )
+        except ValueError as error:
+            raise ConsoleError(_patch_error_text(_text(error))) from error
+        payload = await self.memory(sid)
+        payload['patch'] = result
+        payload['changed'] = 'patch-%s #%s' % (decision, _text(result.get('id')))
+        return payload
+
+    async def rollback_patch(
+        self, story_id: Any, patch_id: Any, note: Any = '',
+    ) -> dict[str, Any]:
+        """把一条已生效的设定改写候选撤下来（非破坏性）。"""
+        service = getattr(self.bridge, 'service', None)
+        if service is None or not callable(getattr(service, 'rollback_state_patch', None)):
+            raise ConsoleError('插件服务尚未就绪，稍后再试')
+        sid = await self._story_id_for_write(story_id)
+        try:
+            result = await service.rollback_state_patch(sid, _int_or_none(patch_id), _text(note))
+        except ValueError as error:
+            raise ConsoleError(_patch_error_text(_text(error))) from error
+        payload = await self.memory(sid)
+        payload['patch'] = result
+        payload['changed'] = 'patch-rollback #%s' % _text(result.get('id'))
+        return payload
+
+    async def _story_id_for_write(self, story_id: Any) -> str:
+        """写操作必须落在**存在的**剧本上，空 id 也要能解析成当前那部。"""
+        stories = _safe_all(self.bridge.db, 'interlude_story', order='updatedAt DESC', limit=50)
+        current = self._pick_story(stories, _text(story_id))
+        if not current:
+            raise ConsoleError('没有找到对应剧本')
+        return _text(current.get('id'))
+
     async def merge_story(self, source_story_id: Any, target_story_id: Any = '') -> dict[str, Any]:
         """把一部旧剧本并入共享主剧本（控制台「并入主剧本」）。
 
@@ -1768,6 +1878,8 @@ class ConsoleApi:
             'impact': _text(row.get('impact')),
             'status': _text(row.get('status')),
             'created_at': _text(row.get('createdAt')),
+            'decided_at': _text(row.get('decidedAt')),
+            'decision_note': _text(row.get('decisionNote'))[:200],
         }
 
     def _overlay_brief(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -1792,4 +1904,22 @@ class ConsoleApi:
             'has_state': bool(state),
         }
 
+def _int_or_none(value: Any) -> Any:
+    """把控制台传来的 id 转成 int；转不动就原样回（让服务层报"找不到"）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _patch_error_text(reason: str) -> str:
+    """把服务层的错误码翻成用户看得懂的话。"""
+    return {
+        'patch-not-found': '这条设定候选不存在或已被清理',
+        'already-compacted': '这条候选已经并进周期摘要，不能再回滚'
+                             '（它已经成了她那段时间的经历；要改设定请走新的候选）',
+        'not-applied': '只有已经生效的候选才能回滚',
+        'invalid-action': '未知的操作',
+        'story-not-found': '没有找到对应剧本',
+    }.get(reason, '操作失败：%s' % reason)
 

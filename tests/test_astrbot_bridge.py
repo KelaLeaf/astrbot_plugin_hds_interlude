@@ -1755,6 +1755,8 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/config-set',
             f'/{main_module.PLUGIN_NAME}/console/participants',
             f'/{main_module.PLUGIN_NAME}/console/stories',
+            f'/{main_module.PLUGIN_NAME}/console/patch-decide',
+            f'/{main_module.PLUGIN_NAME}/console/patch-rollback',
             f'/{main_module.PLUGIN_NAME}/console/story-merge',
             f'/{main_module.PLUGIN_NAME}/console/story-promote',
             f'/{main_module.PLUGIN_NAME}/config-export',
@@ -1794,6 +1796,8 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/connections',
             f'/{main_module.PLUGIN_NAME}/console/connections-delete',
             f'/{main_module.PLUGIN_NAME}/console/config-set',
+            f'/{main_module.PLUGIN_NAME}/console/patch-decide',
+            f'/{main_module.PLUGIN_NAME}/console/patch-rollback',
             f'/{main_module.PLUGIN_NAME}/console/story-merge',
             f'/{main_module.PLUGIN_NAME}/console/story-promote',
         ])

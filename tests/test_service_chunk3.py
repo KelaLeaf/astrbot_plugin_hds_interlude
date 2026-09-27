@@ -1243,7 +1243,10 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         host = _MediaHost(config={'model': {'vision': {'enabled': True}}})
 
         async def fetch(url: str) -> bytes:
-            return png
+            # 每条 URL 给一份**不同**的字节：v1.4.0 起完全相同的图会在回合内去重
+            # （见下面的 `test_the_same_image_in_one_message_is_only_kept_once`），
+            # 这里测的是"来源上限"，所以让三张图各不相同。
+            return png + url.encode('utf-8')
 
         host.transport = FakeTransport(fetch_image=fetch)
         images = await ServiceChunk3.load_native_images(
@@ -1255,6 +1258,34 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item['id'] for item in images], ['turn-image-1', 'turn-image-2', 'turn-image-3'])
         disabled = _MediaHost(config={'model': {'vision': {'enabled': False}}})
         self.assertEqual(await ServiceChunk3.load_native_images(disabled, {'id': 's'}, ['x'], None), [])
+
+    async def test_the_same_image_in_one_message_is_only_kept_once(self) -> None:
+        """v1.4.0：同一条消息里重复贴同一张图只留一张（识图按图计费）。"""
+        from PIL import Image  # noqa: F401 - 没有 Pillow 时下面会跳过
+
+        import io as _io
+
+        buffer = _io.BytesIO()
+        Image.new('L', (32, 32), 0).save(buffer, 'PNG')
+        pattern = Image.open(_io.BytesIO(buffer.getvalue()))
+        for x in range(0, 32, 8):
+            for y in range(32):
+                pattern.putpixel((x, y), 255)
+        buffer = _io.BytesIO()
+        pattern.save(buffer, 'PNG')
+        png = buffer.getvalue()
+        host = _MediaHost(config={'model': {'vision': {'enabled': True}}})
+
+        async def fetch(url: str) -> bytes:
+            return png
+
+        host.transport = FakeTransport(fetch_image=fetch)
+        images = await ServiceChunk3.load_native_images(
+            host, {'id': 's'}, ['https://gchat.qpic.cn/1.png', 'https://gchat.qpic.cn/2.png'], None,
+        )
+        self.assertEqual([item['id'] for item in images], ['turn-image-1'],
+                         '第二张是同一张图，应当被跳过')
+        self.assertTrue(images[0].get('perceptualHash'), '留下的那张要带哈希')
 
     async def test_describe_current_images_skips_without_a_vision_provider(self) -> None:
         host = _MediaHost(config={})

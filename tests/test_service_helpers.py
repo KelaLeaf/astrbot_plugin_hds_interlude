@@ -747,6 +747,266 @@ class LexicalScoreTests(unittest.TestCase):
 
 
 
+class RecallFusionTests(unittest.TestCase):
+    """v1.4.0 召回融合：本地查询改写 + 两路排名融合（`docs/MEMORY_MAINTENANCE.md` §5.2）。"""
+
+    CONFIG = {
+        'semanticWeight': 1.0, 'factImportanceWeight': 0.35, 'factConfidenceWeight': 0.2,
+        'factRecencyWeight': 0.2, 'unresolvedWeight': 0.2,
+    }
+
+    def _fact(self, fact_id, content, importance=0.5, embedding=None, scope='world'):
+        return {
+            'id': fact_id, 'content': content, 'importance': importance, 'confidence': 0.5,
+            'scope': scope, 'unresolved': False, 'embedding': embedding or [],
+            # 用"现在"当 lastSeenAt，让新近项确定性地取满分（评分用的是真实时钟）。
+            'lastSeenAt': h.iso(h.utc_now()),
+        }
+
+    def test_rewrite_strips_scaffolding_and_question_particles(self):
+        cases = {
+            '你还记得我上次说的那个面包店吗': '我上次说的面包店',
+            '你记不记得那本书呢': '那本书',
+            '我上次跟你说的那家店': '那家店',
+            '今天天气怎么样': '今天天气样',
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(h.rewrite_recall_query(text), expected)
+
+    def test_rewrite_keeps_short_or_unusable_queries(self):
+        for text in ('猫', '冰美式', '', '   '):
+            with self.subTest(text=text):
+                self.assertEqual(h.rewrite_recall_query(text), text.strip())
+
+    def test_ranks_share_ties(self):
+        self.assertEqual(h._ranks([1.0, 0.5, 0.5, 0.0]), [1, 2, 2, 4])
+        self.assertEqual(h._ranks([]), [])
+
+    def test_an_irrelevant_fact_earns_no_lane_credit(self):
+        facts = [self._fact(1, '主人喜欢喝冰美式', 0.3, [1.0, 0.0]),
+                 self._fact(2, '她养了一只叫团子的猫', 0.95, [0.0, 1.0])]
+        lanes = h.fact_lane_scores(facts, self.CONFIG, [1.0, 0.0], '你还记得冰美式吗')
+        self.assertAlmostEqual(lanes[0]['lexicalRrf'], 1.0, places=6)
+        self.assertAlmostEqual(lanes[0]['semanticRrf'], 1.0, places=6)
+        self.assertEqual(lanes[1]['lexicalRrf'], 0.0, '零重合不该靠"排最后一名"白拿分')
+        self.assertEqual(lanes[1]['semanticRrf'], 0.0)
+        scores = [h.fact_hybrid_score(fact, self.CONFIG, lane) for fact, lane in zip(facts, lanes)]
+        self.assertGreater(scores[0], scores[1], '重要度不该压过两路都命中的事实')
+
+    def test_rank_multiplier_rewards_the_better_ranked_lane(self):
+        facts = [self._fact(1, '面包店周一不开门'), self._fact(2, '面包店里的猫叫团子')]
+        lanes = h.fact_lane_scores(facts, self.CONFIG, [], '面包店周一')
+        self.assertEqual(lanes[0]['lexicalRank'], 1)
+        self.assertGreater(lanes[0]['lexicalRrf'], lanes[1]['lexicalRrf'])
+
+    def test_absent_lane_contributes_nothing(self):
+        facts = [self._fact(1, '主人喜欢喝冰美式')]
+        lanes = h.fact_lane_scores(facts, self.CONFIG, [], '')
+        self.assertIsNone(lanes[0]['lexicalRank'])
+        self.assertIsNone(lanes[0]['semanticRank'])
+        self.assertEqual(lanes[0]['lexicalRrf'], 0.0)
+        self.assertEqual(lanes[0]['semanticRrf'], 0.0)
+        # 没有查询可用时，排序完全由结构分决定（与上游一致）。
+        self.assertAlmostEqual(
+            h.fact_hybrid_score(facts[0], self.CONFIG, lanes[0]),
+            h.fact_structural_score(facts[0], self.CONFIG), places=9,
+        )
+
+    def test_rewritten_query_only_helps(self):
+        content = '那家面包店周一不开门'
+        plain = h.history_lexical_score('你还记得我上次说的那个面包店吗', content)
+        lanes = h.fact_lane_scores([self._fact(1, content)], self.CONFIG, [], '你还记得我上次说的那个面包店吗')
+        self.assertGreater(lanes[0]['lexicalScore'], plain)
+        self.assertGreaterEqual(lanes[0]['lexical'], 0.0)
+        with_rewrite = h.fact_lane_scores([self._fact(1, content)], self.CONFIG, [],
+                                          '你还记得我上次说的那个面包店吗', rewrite=False)
+        self.assertEqual(with_rewrite[0]['lexicalScore'], with_rewrite[0]['lexical'])
+
+    def test_structural_score_matches_upstream_when_no_relevance(self):
+        fact = self._fact(1, '任意内容', importance=0.8)
+        fact['confidence'] = 0.6
+        expected = (
+            0.8 * 0.35 + 0.6 * 0.2 + 1.0 * 0.2
+        )
+        self.assertAlmostEqual(h.fact_structural_score(fact, self.CONFIG), expected, places=9)
+
+    def test_an_open_promise_keeps_its_structural_bonus(self):
+        promise = self._fact(1, '答应回电话', importance=0.1, scope='promise')
+        promise['unresolved'] = True
+        plain = self._fact(2, '答应回电话', importance=0.1, scope='promise')
+        self.assertGreater(
+            h.fact_structural_score(promise, self.CONFIG),
+            h.fact_structural_score(plain, self.CONFIG),
+        )
+
+
+class ImageHashTests(unittest.TestCase):
+    """图片感知哈希与去重（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。"""
+
+    @staticmethod
+    def _png(kind: str) -> bytes:
+        import io as _io
+
+        from PIL import Image, ImageDraw
+
+        image = Image.new('L', (64, 64), 0)
+        draw = ImageDraw.Draw(image)
+        if kind == 'bar':
+            draw.rectangle([4, 4, 30, 60], fill=255)
+        elif kind == 'circle':
+            draw.ellipse([10, 10, 54, 54], fill=255)
+        elif kind == 'stripes':
+            for x in range(0, 64, 8):
+                draw.rectangle([x, 0, x + 3, 63], fill=255)
+        buffer = _io.BytesIO()
+        image.save(buffer, 'PNG')
+        return buffer.getvalue()
+
+    def _require_pillow(self) -> None:
+        try:
+            import PIL  # noqa: F401
+        except Exception:  # pragma: no cover - 环境没装
+            self.skipTest('未安装 Pillow')
+
+    def test_flat_images_have_no_usable_hash(self):
+        self._require_pillow()
+        import io as _io
+
+        from PIL import Image
+
+        buffer = _io.BytesIO()
+        Image.new('L', (32, 32), 7).save(buffer, 'PNG')
+        self.assertEqual(h.image_perceptual_hash(buffer.getvalue()), '',
+                         '纯色图没有结构可比，不能参与去重')
+        self.assertEqual(h.image_perceptual_hash(b'nope'), '')
+
+    def test_different_images_hash_far_apart(self):
+        self._require_pillow()
+        bar = h.image_perceptual_hash(self._png('bar'))
+        circle = h.image_perceptual_hash(self._png('circle'))
+        self.assertTrue(bar and circle)
+        self.assertGreater(h.hamming_distance(bar, circle), h.IMAGE_HASH_TOLERANCE)
+
+    def test_the_same_image_hashes_identically_even_after_recompression(self):
+        self._require_pillow()
+        import io as _io
+
+        from PIL import Image
+
+        original = self._png('stripes')
+        buffer = _io.BytesIO()
+        Image.open(_io.BytesIO(original)).convert('RGB').save(buffer, 'JPEG', quality=60)
+        first = h.image_perceptual_hash(original)
+        again = h.image_perceptual_hash(buffer.getvalue())
+        self.assertTrue(first)
+        self.assertLessEqual(h.hamming_distance(first, again), h.IMAGE_HASH_TOLERANCE)
+
+    def test_hamming_distance_rejects_malformed_input(self):
+        self.assertEqual(h.hamming_distance('', 'ff'), 64)
+        self.assertEqual(h.hamming_distance('ff', 'fff'), 64)
+        self.assertEqual(h.hamming_distance('zz', 'ff'), 64)
+        self.assertEqual(h.hamming_distance('ff', 'ff'), 0)
+
+    def test_split_and_remember_track_recent_hashes(self):
+        images = [{'id': 1, 'perceptualHash': 'ffffffffffffffff'},
+                  {'id': 2, 'perceptualHash': '0000000000000000'}]
+        fresh, skipped = h.split_described_images(images, ['ffffffffffffffff'])
+        self.assertEqual([item['id'] for item in fresh], [2])
+        self.assertEqual(skipped, ['ffffffffffffffff'])
+        merged = h.remember_described_hashes(['ffffffffffffffff'], images, limit=2)
+        self.assertEqual(len(merged), 2)
+        capped = h.remember_described_hashes([], [{'perceptualHash': '%016x' % index} for index in range(5)], limit=3)
+        self.assertEqual(len(capped), 3)
+
+    def test_images_without_a_hash_are_never_deduplicated(self):
+        images = [{'id': 1}, {'id': 2, 'perceptualHash': ''}]
+        fresh, skipped = h.split_described_images(images, ['ffffffffffffffff'])
+        self.assertEqual([item['id'] for item in fresh], [1, 2])
+        self.assertEqual(skipped, [])
+
+
+class QuoteBackfillTests(unittest.TestCase):
+    """引用回填（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。"""
+
+    ENTRIES = [
+        {'id': 7, 'content': '我把伞放门口了', 'metadata': {}},
+        {'id': 9, 'content': '群里说的那件事', 'metadata': {'messageId': 'abc-1'}},
+        {'id': 11, 'content': '空的元数据', 'metadata': None},
+    ]
+
+    def test_synthetic_ref_resolves_to_our_own_entry(self):
+        self.assertEqual(h.backfilled_quote_content({'messageId': 'msg-7'}, self.ENTRIES), '我把伞放门口了')
+
+    def test_platform_id_resolves_through_entry_metadata(self):
+        self.assertEqual(h.backfilled_quote_content({'id': 'abc-1'}, self.ENTRIES), '群里说的那件事')
+
+    def test_unknown_ids_and_garbage_stay_empty(self):
+        self.assertEqual(h.backfilled_quote_content({'messageId': 'nope'}, self.ENTRIES), '')
+        self.assertEqual(h.backfilled_quote_content({'messageId': 'msg-404'}, self.ENTRIES), '')
+        self.assertEqual(h.backfilled_quote_content(None, self.ENTRIES), '')
+        self.assertEqual(h.backfilled_quote_content({}, self.ENTRIES), '')
+        self.assertEqual(h.backfilled_quote_content({'messageId': 'msg-7'}, []), '')
+
+    def test_existing_content_is_never_overwritten(self):
+        quote = {'messageId': 'msg-7', 'content': '平台给的原文'}
+        self.assertEqual(h.backfilled_quote_content(quote, self.ENTRIES), '')
+
+    def test_a_malformed_entry_does_not_break_the_lookup(self):
+        self.assertEqual(h.backfilled_quote_content({'id': 'abc-1'}, [None, 'x', *self.ENTRIES]),
+                         '群里说的那件事')
+
+
+class ContextMetricsTests(unittest.TestCase):
+    """上轮上下文构成（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）。"""
+
+    def test_estimate_tokens_counts_cjk_per_character(self):
+        self.assertEqual(h.estimate_tokens(''), 0)
+        self.assertEqual(h.estimate_tokens('她今天去了面包店'), 8)
+        self.assertLess(h.estimate_tokens('hello world'), 9)
+
+    def test_metrics_measure_every_section_that_is_present(self):
+        request = {
+            'phase': 'user-message',
+            'recentEntries': [{'id': 1, 'content': '你好'}],
+            'facts': [{'id': 2}, {'id': 3}],
+            'followUpCommitments': [],
+            'sceneContext': {'scene': {'summary': '在厨房里'}},
+        }
+        metrics = h.context_metrics(request, 12.6, 'user-message', 'p1')
+        self.assertEqual(metrics['assembly_ms'], 12)
+        self.assertEqual(metrics['phase'], 'user-message')
+        self.assertEqual(metrics['participant_id'], 'p1')
+        self.assertEqual(metrics['sections']['recentEntries']['items'], 1)
+        self.assertEqual(metrics['sections']['facts']['items'], 2)
+        self.assertNotIn('followUpCommitments', metrics['sections'], '空段不必占一行')
+        self.assertEqual(metrics['items'], 3)
+        self.assertGreater(metrics['characters'], 0)
+        self.assertGreater(metrics['payload_characters'], metrics['characters'])
+        self.assertGreater(metrics['estimated_tokens'], 0)
+
+    def test_metrics_never_drop_the_scene_characters(self):
+        without = h.context_metrics({'phase': 'advance'}, 0, 'advance')
+        with_scene = h.context_metrics(
+            {'phase': 'advance', 'sceneContext': {'scene': {'summary': '厨房'}}}, 0, 'advance',
+        )
+        self.assertGreater(with_scene['characters'], without['characters'])
+
+    def test_metrics_survive_a_non_serializable_request(self):
+        class _Opaque:
+            def __repr__(self) -> str:
+                return '<opaque>'
+
+        metrics = h.context_metrics({'phase': 'advance', 'facts': [{'id': 1, 'x': _Opaque()}]}, 0, 'advance')
+        self.assertEqual(metrics['sections']['facts']['items'], 1)
+        self.assertGreater(metrics['payload_characters'], 0)
+
+    def test_metrics_accept_a_timestamp(self):
+        from datetime import datetime, timezone
+        moment = datetime(2026, 9, 27, 3, 0, tzinfo=timezone.utc)
+        self.assertTrue(h.context_metrics({}, 0, '', '', moment)['at'].startswith('2026-09-27'))
+
+
 class NormalizeConfigTests(unittest.TestCase):
     """`normalize_config`：camelCase → snake_case 归一 + 默认值补全。"""
 

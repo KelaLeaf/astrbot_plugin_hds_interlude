@@ -57,6 +57,11 @@ except Exception as error:  # pragma: no cover - 取决于同批任务的落地�
     CHUNK8_ERROR = error
 
 try:
+    from plugin.core.memory_maintenance import MaintenanceBudget
+except Exception:  # pragma: no cover - 取决于同批任务的落地顺序
+    MaintenanceBudget = None  # type: ignore[assignment]
+
+try:
     from plugin.core.types import empty_story_state
 except Exception:  # pragma: no cover
     empty_story_state = None  # type: ignore[assignment]
@@ -206,6 +211,354 @@ class PortedMemoryContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(host.created['sourceEntryIds'], [2])
         self.assertEqual(host.created['embedding'], [])
 
+
+# =========================================================================== #
+# 1b. v1.4.0 记忆维护：时间锚定 / 召回回写 / 遗忘淘汰 / 容量退场
+#     设计见 `docs/MEMORY_MAINTENANCE.md`
+# =========================================================================== #
+
+@unittest.skipUnless(CHUNK8_READY and SCRIPT_READY, 'chunk8 / script 依赖未就绪')
+class StatePatchDecisionTests(unittest.IsolatedAsyncioTestCase):
+    """设定改写候选的审批与回滚（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.3）。"""
+
+    class _Harness(_HarnessBase):
+        def __init__(self, patches, overlay=None, status='active'):
+            self.reports: list = []
+            self.patches = [dict(item) for item in patches]
+            self.story = story_row(status=status)
+            self.story['state'] = {'setting_overlay': dict(overlay or {})}
+            self.writes: list = []
+            self.rebuilds = 0
+
+        async def db_get(self, table, query, options=None):
+            if table != 'interlude_state_patch':
+                return []
+            rows = list(self.patches)
+            for key, value in (query or {}).items():
+                rows = [row for row in rows if row.get(key) == value]
+            return rows
+
+        async def db_set(self, table, query, value):
+            self.writes.append((table, dict(query), dict(value)))
+            if table == 'interlude_state_patch':
+                for row in self.patches:
+                    if row.get('id') == query.get('id'):
+                        row.update(value)
+            if table == 'interlude_story':
+                self.story['state'] = value.get('state', self.story.get('state'))
+
+        async def get_story(self, story_id):
+            return self.story
+
+        def now(self):
+            return NOW
+
+        async def rebuild_live_overlay_state(self, story, now):
+            self.rebuilds += 1
+
+    def _patch(self, patch_id=7, status='applied'):
+        return {
+            'id': patch_id, 'storyId': 'story', 'participantId': '', 'target': 'character',
+            'path': 'development.trait', 'proposedValue': '她把伞留在了门口',
+            'evidence': 'seen', 'confidence': 0.9, 'impact': 'minor', 'status': status,
+            'sourceEntryIds': [1], 'createdAt': NOW, 'appliedAt': NOW if status == 'applied' else None,
+        }
+
+    async def test_approve_marks_applied_and_rebuilds_the_overlay(self):
+        host = self._Harness([self._patch(status='proposed')])
+        result = await host.decide_state_patch('story', 7, 'approve', '看着对', NOW)
+        self.assertEqual(result['status'], 'applied')
+        self.assertEqual(host.patches[0]['status'], 'applied')
+        self.assertEqual(host.patches[0]['decisionNote'], '看着对')
+        self.assertEqual(host.rebuilds, 1)
+
+    async def test_reject_leaves_the_overlay_alone_when_it_was_only_proposed(self):
+        host = self._Harness([self._patch(status='proposed')])
+        await host.decide_state_patch('story', 7, 'reject', '证据不够', NOW)
+        self.assertEqual(host.patches[0]['status'], 'rejected')
+        self.assertEqual(host.rebuilds, 0, '没生效过的候选驳回时不需要重算')
+
+    async def test_rejecting_an_applied_candidate_withdraws_it(self):
+        host = self._Harness([self._patch(status='applied')], overlay={
+            'character_traits': ['她把伞留在了门口'], 'character_profile': '她把伞留在了门口',
+        })
+        await host.decide_state_patch('story', 7, 'reject', '不算', NOW)
+        self.assertEqual(host.patches[0]['status'], 'rejected')
+        self.assertEqual(host.rebuilds, 1)
+        overlay = host.story['state']['setting_overlay']
+        self.assertEqual(overlay.get('character_traits'), [])
+        # 状态信封会把缺席字段补成 None，所以这里断言"值被撤掉"而不是"键不存在"。
+        self.assertFalse(overlay.get('character_profile'))
+
+    async def test_rollback_clears_the_derived_overlay_and_keeps_the_row(self):
+        host = self._Harness([self._patch(status='applied')], overlay={
+            'character_traits': ['她把伞留在了门口'],
+        })
+        result = await host.rollback_state_patch('story', 7, '写错了', NOW)
+        self.assertEqual(result['status'], 'rolled-back')
+        self.assertEqual(host.patches[0]['status'], 'rolled-back')
+        self.assertEqual(host.story['state']['setting_overlay'].get('character_traits'), [])
+        self.assertEqual(host.rebuilds, 1)
+        self.assertEqual(len(host.patches), 1, '行保留，只是状态变了')
+
+    async def test_rollback_refuses_a_candidate_that_is_only_proposed(self):
+        host = self._Harness([self._patch(status='proposed')])
+        with self.assertRaises(ValueError) as caught:
+            await host.rollback_state_patch('story', 7)
+        self.assertEqual(str(caught.exception), 'not-applied')
+
+    async def test_rollback_refuses_a_compacted_candidate(self):
+        host = self._Harness([self._patch(status='compacted')])
+        with self.assertRaises(ValueError) as caught:
+            await host.rollback_state_patch('story', 7)
+        self.assertEqual(str(caught.exception), 'already-compacted')
+
+    async def test_unknown_patch_and_unknown_action(self):
+        host = self._Harness([])
+        with self.assertRaises(ValueError) as missing:
+            await host.decide_state_patch('story', 404, 'approve')
+        self.assertEqual(str(missing.exception), 'patch-not-found')
+        host = self._Harness([self._patch(status='proposed')])
+        with self.assertRaises(ValueError) as bad:
+            await host.decide_state_patch('story', 7, 'maybe')
+        self.assertEqual(str(bad.exception), 'invalid-action')
+
+
+class _StubCompactor:
+    """维护裁决的替身：返回预设结果，或断言"这一步不该调用模型"。"""
+
+    def __init__(self, decision=None, raise_if_called: bool = False):
+        self.decision = decision if decision is not None else {'groups': []}
+        self.raise_if_called = raise_if_called
+        self.calls = 0
+
+    async def maintain_memory(self, request):
+        self.calls += 1
+        if self.raise_if_called:
+            raise AssertionError('这一步不应该调用维护模型')
+        return self.decision
+
+
+class _MaintenanceHarness(_HarnessBase):
+    """后台记忆维护的最小替身：只带事实表读写与日志收集。"""
+
+    def __init__(self, facts, config=None):
+        self.cached_memory_config = dict(config or {})
+        self.facts = [dict(fact) for fact in facts]
+        self.patches = []
+        self.reports = []
+
+    async def db_get(self, table, query, options=None):
+        where = query or {}
+        rows = list(self.facts)
+        if where.get('status'):
+            rows = [row for row in rows if row.get('status') == where['status']]
+        if where.get('scope'):
+            rows = [row for row in rows if row.get('scope') == where['scope']]
+        return rows
+
+    async def db_set(self, table, query, value):
+        self.patches.append((dict(query), dict(value)))
+        for fact in self.facts:
+            if fact.get('id') == query.get('id'):
+                fact.update(value)
+
+    def now(self):
+        return NOW
+
+
+@unittest.skipUnless(CHUNK8_READY and SCRIPT_READY, 'chunk8 / script 依赖未就绪')
+class MemoryMaintenanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forgetting_is_off_unless_switched_on(self):
+        old = fact_row(1, 'event', False, '很久以前的一件小事')
+        old['createdAt'] = '2026-01-01T00:00:00+00:00'
+        old['lastSeenAt'] = '2026-01-01T00:00:00+00:00'
+        host = _MaintenanceHarness([old])
+        self.assertEqual(await host._prune_forgotten_facts('story', NOW), 0)
+        self.assertEqual(host.patches, [])
+
+    async def test_low_score_facts_are_retired_with_a_reason(self):
+        stale = fact_row(1, 'event', False, '很久以前的一件小事')
+        stale.update({'createdAt': '2026-01-01T00:00:00+00:00',
+                      'lastSeenAt': '2026-01-01T00:00:00+00:00',
+                      'importance': 0.1, 'confidence': 0.1, 'accessCount': 0})
+        fresh = fact_row(2, 'event', False, '昨天刚说过的事')
+        host = _MaintenanceHarness([stale, fresh], {
+            'forgettingEnabled': True, 'forgettingThreshold': 0.3,
+            'forgettingRetentionDays': 14, 'forgettingHalfLifeDays': 30,
+        })
+        retired = await host._prune_forgotten_facts('story', NOW)
+        self.assertEqual(retired, 1)
+        query, value = host.patches[0]
+        self.assertEqual(query, {'id': 1})
+        self.assertEqual(value['status'], 'superseded')
+        self.assertEqual(value['knowledge']['retired']['reason'], 'forgetting')
+        self.assertGreater(value['knowledge']['retired']['score'], 0)
+        self.assertIn('at', value['knowledge']['retired'])
+
+    async def test_recent_facts_inside_the_retention_window_are_kept(self):
+        # createdAt = NOW，比保留期新，哪怕评分低也不许淘汰。
+        recent = fact_row(3, 'event', False, '刚写下的低分事实')
+        recent.update({'importance': 0.0, 'confidence': 0.0, 'accessCount': 0})
+        host = _MaintenanceHarness([recent], {
+            'forgettingEnabled': True, 'forgettingThreshold': 0.9,
+            'forgettingRetentionDays': 14, 'forgettingHalfLifeDays': 30,
+        })
+        self.assertEqual(await host._prune_forgotten_facts('story', NOW), 0)
+
+    async def test_an_open_promise_is_never_forgotten(self):
+        promise = fact_row(4, 'promise', True, '答应过要还书')
+        promise.update({'createdAt': '2026-01-01T00:00:00+00:00',
+                        'lastSeenAt': '2026-01-01T00:00:00+00:00',
+                        'importance': 0.0, 'confidence': 0.0, 'accessCount': 0})
+        host = _MaintenanceHarness([promise], {
+            'forgettingEnabled': True, 'forgettingThreshold': 0.9,
+            'forgettingRetentionDays': 0, 'forgettingHalfLifeDays': 30,
+        })
+        self.assertEqual(await host._prune_forgotten_facts('story', NOW), 0)
+
+    async def test_exact_duplicates_merge_without_a_model_call(self):
+        first = fact_row(1, 'event', False, '主人喜欢喝冰美式', participant_id='a')
+        first.update({'sourceEntryIds': [3], 'importance': 0.6, 'confidence': 0.9})
+        second = fact_row(2, 'event', False, '主人喜欢喝冰美式。', participant_id='a')
+        second.update({'sourceEntryIds': [9], 'importance': 0.2, 'confidence': 0.2})
+        host = _MaintenanceHarness([first, second], {'factsDedupeEnabled': True})
+        host.compactor = _StubCompactor(raise_if_called=True)
+        retired = await host._consolidate_facts('story', NOW, MaintenanceBudget(max_calls=0, min_call_interval_ms=0))
+        self.assertEqual(retired[0], 1, '完全重复不需要模型裁决')
+        keeper = next(fact for fact in host.facts if fact['id'] == 1)
+        self.assertEqual(keeper['sourceEntryIds'], [3, 9], '证据取并集')
+        self.assertEqual(keeper['importance'], 0.6, '评分取高')
+        self.assertEqual(keeper['knowledge']['merged_from'], [2])
+        loser = next(fact for fact in host.facts if fact['id'] == 2)
+        self.assertEqual(loser['status'], 'superseded')
+        self.assertEqual(loser['knowledge']['retired']['reason'], 'dedupe')
+
+    async def test_similar_facts_are_decided_by_the_model(self):
+        first = fact_row(1, 'event', False, '他答应还书', participant_id='a')
+        second = fact_row(2, 'event', False, '他答应过还书这件事', participant_id='a')
+        host = _MaintenanceHarness([first, second], {'factsDedupeEnabled': True})
+        host.compactor = _StubCompactor({'groups': [
+            {'ids': [1, 2], 'action': 'merge', 'keepId': 1, 'content': '他答应还书（已合并）', 'reason': '同一件事'},
+        ]})
+        merged, contradictions, notes = await host._consolidate_facts(
+            'story', NOW, MaintenanceBudget(max_calls=4, min_call_interval_ms=0),
+        )
+        self.assertEqual((merged, contradictions), (1, 0))
+        self.assertEqual(notes, [])
+        keeper = next(fact for fact in host.facts if fact['id'] == 1)
+        self.assertEqual(keeper['content'], '他答应还书（已合并）')
+        self.assertEqual(next(fact for fact in host.facts if fact['id'] == 2)['status'], 'superseded')
+
+    async def test_a_contradiction_retires_the_loser_with_its_own_reason(self):
+        first = fact_row(1, 'event', False, '她今晚在家', participant_id='a')
+        second = fact_row(2, 'event', False, '她今晚在外面', participant_id='a')
+        second['sourceEntryIds'] = [7]
+        host = _MaintenanceHarness([first, second], {
+            'factsDedupeEnabled': True, 'factsContradictionEnabled': True,
+        })
+        host.compactor = _StubCompactor({'groups': [
+            {'ids': [1, 2], 'action': 'supersede', 'keepId': 1, 'reason': '后一条已被后续回合推翻'},
+        ]})
+        merged, contradictions, notes = await host._consolidate_facts(
+            'story', NOW, MaintenanceBudget(max_calls=4, min_call_interval_ms=0),
+        )
+        self.assertEqual((merged, contradictions), (0, 1))
+        self.assertTrue(any('矛盾消解' in note for note in notes))
+        loser = next(fact for fact in host.facts if fact['id'] == 2)
+        self.assertEqual(loser['knowledge']['retired']['reason'], 'contradiction')
+
+    async def test_keep_leaves_everything_alone(self):
+        first = fact_row(1, 'event', False, '她养了猫', participant_id='a')
+        second = fact_row(2, 'event', False, '她养了一只叫团子的猫', participant_id='a')
+        host = _MaintenanceHarness([first, second], {'factsDedupeEnabled': True})
+        host.compactor = _StubCompactor({'groups': [
+            {'ids': [1, 2], 'action': 'keep'},
+        ]})
+        self.assertEqual(
+            await host._consolidate_facts('story', NOW, MaintenanceBudget(max_calls=4, min_call_interval_ms=0)),
+            (0, 0, []),
+        )
+        self.assertTrue(all(fact['status'] == 'active' for fact in host.facts))
+
+    async def test_exhausted_budget_stops_before_calling_the_model(self):
+        first = fact_row(1, 'event', False, '他答应还书', participant_id='a')
+        second = fact_row(2, 'event', False, '他答应过还书这件事', participant_id='a')
+        host = _MaintenanceHarness([first, second], {'factsDedupeEnabled': True})
+        host.compactor = _StubCompactor(raise_if_called=True)
+        merged, contradictions, notes = await host._consolidate_facts(
+            'story', NOW, MaintenanceBudget(max_calls=0, min_call_interval_ms=0),
+        )
+        self.assertEqual((merged, contradictions), (0, 0))
+        self.assertTrue(any('预算' in note for note in notes))
+
+    async def test_consolidation_can_be_switched_off(self):
+        first = fact_row(1, 'event', False, '同一句话', participant_id='a')
+        second = fact_row(2, 'event', False, '同一句话', participant_id='a')
+        host = _MaintenanceHarness([first, second], {
+            'factsDedupeEnabled': False, 'factsContradictionEnabled': False,
+        })
+        host.compactor = _StubCompactor(raise_if_called=True)
+        self.assertEqual(
+            await host._consolidate_facts('story', NOW, MaintenanceBudget(max_calls=2, min_call_interval_ms=0)),
+            (0, 0, []),
+        )
+
+    async def test_maintenance_summary_reports_the_budget(self):
+        host = _MaintenanceHarness([], {
+            'forgettingEnabled': False,
+            'maintenanceMaxLlmCalls': 5,
+            'maintenanceMaxRuntimeMinutes': 3,
+            'maintenanceMinCallIntervalMs': 250,
+        })
+        summary = await host.run_memory_maintenance({'id': 'story'}, NOW)
+        self.assertEqual(summary['retired'], 0)
+        self.assertEqual(summary['budget']['max_calls'], 5)
+        self.assertEqual(summary['budget']['max_runtime_seconds'], 180.0)
+        self.assertEqual(summary['budget']['min_call_interval_ms'], 250)
+
+    async def test_maintenance_is_skipped_when_memory_is_disabled(self):
+        host = _MaintenanceHarness([fact_row(5, 'event', False, 'x')], {'enabled': False})
+        summary = await host.run_memory_maintenance({'id': 'story'}, NOW)
+        self.assertEqual(summary, {'story_id': 'story', 'retired': 0, 'budget': {}})
+
+    async def test_fact_content_is_anchored_to_the_source_turn(self):
+        host = _FactHarness([])
+        source = entry_row(7, 'script', '昨天她去了书店', '2026-09-27T10:00:00+00:00', '')
+        await host.persist_fact('story', {
+            'scope': 'event', 'content': '昨天她去了书店', 'sourceEntryIds': [7],
+        }, [source], NOW)
+        self.assertEqual(host.created['content'], '9月26日她去了书店')
+        self.assertTrue(host.created['knowledge']['anchored_at'].startswith('2026-09-27T10:00:00'),
+                        '锚点用来源回合的剧情时间，且写成 ISO 字符串')
+        self.assertEqual(host.created['knowledge']['anchored_from'], '昨天她去了书店')
+
+    async def test_anchoring_can_be_switched_off(self):
+        host = _FactHarness([])
+        host.cached_memory_config = {'temporalAnchorEnabled': False, 'factContentCharacters': 4_000}
+        source = entry_row(8, 'script', '昨天她去了书店', '2026-09-27T10:00:00+00:00', '')
+        await host.persist_fact('story', {
+            'scope': 'event', 'content': '昨天她去了书店', 'sourceEntryIds': [8],
+        }, [source], NOW)
+        self.assertEqual(host.created['content'], '昨天她去了书店')
+        self.assertNotIn('anchored_at', host.created['knowledge'])
+
+    async def test_capacity_eviction_records_why(self):
+        rows = [
+            fact_row(index, 'event', False, '事实 %d' % index)
+            for index in range(1, 4)
+        ]
+        rows[1]['importance'] = 0.01
+        rows[1]['confidence'] = 0.01
+        host = _FactHarness(rows)
+        host.cached_memory_config = {'factContentCharacters': 4_000, 'maxFactsPerStory': 3}
+        source = entry_row(9, 'script', '新的一件事', NOW, '')
+        await host.persist_fact('story', {
+            'scope': 'event', 'content': '新的一件事', 'sourceEntryIds': [9],
+        }, [source], NOW)
+        # 让位的是评分最低的第 2 条，而且是"容量"原因，不是时间。
+        self.assertEqual(host.patch['status'], 'superseded')
+        self.assertEqual(host.patch['knowledge']['retired']['reason'], 'capacity')
 
 # =========================================================================== #
 # 2. evidence-repair.test.ts：unclassified completion cannot close a promise

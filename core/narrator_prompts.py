@@ -1315,6 +1315,49 @@ def to_overlay_compaction_payload(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def memory_maintenance_prompt() -> str:
+    """后台记忆维护的系统提示（v1.4.0，受控偏离，见 `docs/MEMORY_MAINTENANCE.md` §5.1）。
+
+    上游没有这一步：它的压缩只负责抽取，去重与矛盾消解交给"下一次压缩"自然覆盖。
+    本移植版把同一件事显式化，成本控制靠"一组一次调用 + 单轮预算"。
+    """
+    return '\n'.join([
+        'You are the memory librarian for HDS Interlude.',
+        'You receive small groups of already-stored long-term facts that look similar because they share evidence or wording.',
+        'For each group decide exactly one action:',
+        'merge - the facts state the same thing; supply one merged content string that keeps every distinct detail and loses nothing.',
+        'supersede - the facts contradict each other; name the one to keep (keepId) and why the others are outdated or wrong.',
+        'keep - the facts are related but genuinely different; leave them all in place.',
+        'Never invent details that are not present in the supplied facts. Never merge facts about different people into one.',
+        'Prefer keep when the difference matters to the story, prefer merge when the only difference is wording or repeated evidence.',
+        'Answer with JSON only: {"groups":[{"ids":[12,13],"action":"merge|supersede|keep","keepId":12,"content":"merged content when action is merge","reason":"one short sentence"}]}',
+        'Include every group you were given, in the same order. Do not add groups that were not supplied.',
+    ])
+
+
+def to_memory_maintenance_payload(request: dict[str, Any]) -> dict[str, Any]:
+    """维护模型看到的 payload：只有事实本身，不带参与者身份与内部账。"""
+    groups = _pick(request, 'groups') or []
+    payload_groups: list[dict[str, Any]] = []
+    for index, group in enumerate(groups if isinstance(groups, list) else []):
+        facts = _pick(group, 'facts') or []
+        payload_groups.append({
+            'group': index + 1,
+            'facts': [
+                {
+                    'id': _pick(fact, 'id'),
+                    'scope': _pick(fact, 'scope'),
+                    'content': _pick(fact, 'content'),
+                    'importance': _pick(fact, 'importance'),
+                    'confidence': _pick(fact, 'confidence'),
+                    'unresolved': _pick(fact, 'unresolved'),
+                }
+                for fact in (facts if isinstance(facts, list) else [])
+            ],
+        })
+    return {'groups': payload_groups}
+
+
 def to_compaction_payload(request: dict[str, Any]) -> dict[str, Any]:
     """上游 `toCompactionPayload(request)`。"""
     story = _as_dict(_pick(request, 'story'))

@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from datetime import datetime
@@ -1889,6 +1890,434 @@ def fact_score(fact: dict[str, Any], config: dict[str, Any], query_embedding: li
         + lexical * max(1.0, semantic_weight)
         + (1.0 if fact.get('scope') == 'promise' and fact.get('unresolved') else 0.0)
         * _number(config_get(config, 'unresolved_weight', 'unresolvedWeight'))
+    )
+
+
+#: 遗忘评分的权重与参考值（`docs/MEMORY_MAINTENANCE.md`）。
+#: 评分越高越值得留：近因 / 频次 / 置信 / 重要度四项加权。
+FORGETTING_WEIGHTS: dict[str, float] = {
+    'recency': 0.35,
+    'frequency': 0.25,
+    'confidence': 0.20,
+    'importance': 0.20,
+}
+
+#: 频次项到达 0.5 分所需的召回次数。
+FORGETTING_FREQUENCY_REFERENCE = 6.0
+
+
+def fact_forgetting_score(fact: dict[str, Any], now: datetime, half_life_days: float = 30.0) -> float:
+    """事实的遗忘评分（受控偏离，`docs/MEMORY_MAINTENANCE.md` §4）。
+
+    与参考实现的差别：我们只有事实一层，没有图谱"孤立度"项，所以取
+    近因 / 频次 / 置信 / 重要度四项。近因优先看**最后一次被召回**的时间
+    （`lastAccessAt`），没有召回记录时退回写入时的 `lastSeenAt` / `createdAt`。
+
+    返回 [0, 1]，越低越接近被淘汰。
+    """
+    weights = FORGETTING_WEIGHTS
+    life = max(1.0, float(half_life_days or 30.0))
+    stamp = to_date(fact.get('lastAccessAt')) or to_date(fact.get('lastSeenAt')) or to_date(fact.get('createdAt'))
+    if stamp is None:
+        recency = 0.5
+    else:
+        age_days = max(0.0, (dt_ms(now) - dt_ms(stamp)) / (24 * 60 * 60 * 1000))
+        recency = math.exp(-age_days / life)
+    count = max(0.0, _number(fact.get('accessCount')))
+    frequency = count / (count + FORGETTING_FREQUENCY_REFERENCE) if count > 0 else 0.0
+    confidence = max(0.0, min(1.0, _number(fact.get('confidence'))))
+    importance = max(0.0, min(1.0, _number(fact.get('importance'))))
+    return (
+        recency * weights['recency']
+        + frequency * weights['frequency']
+        + confidence * weights['confidence']
+        + importance * weights['importance']
+    )
+
+
+#: 我们自己发出去的消息用 `msg-<条目id>` 当平台消息 id（见 `chunk2.group_message_ref`）。
+_SYNTHETIC_MESSAGE_REF = re.compile(r'^msg-(\d+)$')
+
+
+def backfilled_quote_content(quote: Any, entries: list[Any]) -> str:
+    """用**我们自己的记录**补出被回复消息的正文（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）。
+
+    平台给不给被引内容不一致：多数 QQ 客户端会给 `message_str`，但只给一个 id 的情况也常见
+    （尤其转发、跨端回复、部分平台适配器）。给不出正文时，模型看到的就是一条"她引用了某条
+    看不见的消息"——那比不引用更糟。
+
+    回填按两种 id 找：
+
+    1. `msg-<条目id>`（我们自己的投递账本用的合成 id）→ 直接取那条剧本条目；
+    2. 平台消息 id → 在条目 `metadata.messageId` 里找（群里收到的消息会带这个键）。
+
+    找不到就返回空串：**不编内容**，宁可保持"引用了但看不到"。
+    平台已经给了正文时也返回空串——只补空，绝不覆盖平台给的事实。
+    """
+    if not isinstance(quote, dict):
+        return ''
+    if _str(quote.get('content')).strip():
+        return ''
+    for key in ('messageId', 'message_id', 'messageRef', 'message_ref', 'id'):
+        raw = _str(quote.get(key)).strip()
+        if not raw:
+            continue
+        synthetic = _SYNTHETIC_MESSAGE_REF.match(raw)
+        if synthetic:
+            wanted = int(synthetic.group(1))
+            match = next(
+                (entry for entry in (entries or [])
+                 if isinstance(entry, dict) and entry.get('id') == wanted),
+                None,
+            )
+            content = _str((match or {}).get('content')).strip()
+            if content:
+                return content
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            metadata = entry.get('metadata') if isinstance(entry.get('metadata'), dict) else {}
+            platform_id = _str(metadata.get('messageId') or metadata.get('message_id') or '').strip()
+            if platform_id and platform_id == raw:
+                content = _str(entry.get('content')).strip()
+                if content:
+                    return content
+    return ''
+
+
+#: 图片感知哈希的去重容差：汉明距离 ≤ 该值视为同一张图。
+#: 4/64 位能容忍重新编码与轻微压缩，又不会把两张相似的图混为一谈。
+IMAGE_HASH_TOLERANCE = 4
+
+
+def image_perceptual_hash(data: Any) -> str:
+    """图片的 64 位感知哈希（aHash，十六进制字符串；算不出给空串）。
+
+    只在 `PIL` 可用时工作——`PIL` 是本插件的**可选**依赖，缺了就当没有这个能力
+    （不抛异常、不阻断投递，与降采样同一条降级路径）。用 aHash 而不是更精细的
+    pHash：识图去重只需要"这张图是不是刚发过"，aHash 够用且零依赖（PIL 自带）。
+    """
+    if not data:
+        return ''
+    try:
+        import io as _io
+
+        from PIL import Image  # type: ignore[import-not-found]
+    except Exception:  # noqa: BLE001 - 没装 Pillow 就是没有这个能力
+        return ''
+    try:
+        with Image.open(_io.BytesIO(data)) as image:
+            small = image.convert('L').resize((8, 8))
+            pixels = list(small.getdata())
+    except Exception:  # noqa: BLE001 - 坏图/不支持格式都只是"算不出哈希"
+        return ''
+    if len(pixels) != 64:
+        return ''
+    # 纯色图没有可比较的结构：aHash 会给出全 0 / 全 1，两张不同的纯色图就"相等"了。
+    # 这种图不参与去重（返回空串 = 算不出可用的哈希），宁可不省那一次识图。
+    if max(pixels) - min(pixels) < 8:
+        return ''
+    average = sum(pixels) / len(pixels)
+    bits = ''.join('1' if value >= average else '0' for value in pixels)
+    return '%016x' % int(bits, 2)
+
+
+def hamming_distance(left: str, right: str) -> int:
+    """两个十六进制哈希的汉明距离；形状不对时给一个"必然不等"的大值。"""
+    left_text, right_text = _str(left).strip(), _str(right).strip()
+    if not left_text or len(left_text) != len(right_text):
+        return 64
+    try:
+        return bin(int(left_text, 16) ^ int(right_text, 16)).count('1')
+    except ValueError:
+        return 64
+
+
+def split_described_images(
+    images: list[Any], known: list[str], tolerance: int = IMAGE_HASH_TOLERANCE,
+) -> tuple[list[Any], list[str]]:
+    """按"已经识过的图"分流：返回 `(要识的图, 被跳过的哈希列表)`。
+
+    重复贴同一张图（表情包、截图）在真机上很常见，而识图按图计费。
+    """
+    fresh: list[Any] = []
+    skipped: list[str] = []
+    for image in images or []:
+        digest = _str(_value_of(image, 'perceptualHash')).strip()
+        if digest and find_seen_image([digest], known, tolerance) >= 0:
+            skipped.append(digest)
+            continue
+        fresh.append(image)
+    return fresh, skipped
+
+
+def remember_described_hashes(
+    known: list[str], images: list[Any], limit: int = 32,
+) -> list[str]:
+    """把这一批识过的图片哈希并进"最近识过"的列表（先进先出，上限默认 32）。"""
+    merged = list(known or [])
+    for image in images or []:
+        digest = _str(_value_of(image, 'perceptualHash')).strip()
+        if digest and digest not in merged:
+            merged.append(digest)
+    return merged[-max(1, limit):]
+
+
+def _value_of(value: Any, key: str) -> Any:
+    """从 dict 或对象上读一个键（引文/图片既可能是 dict 也可能是领域对象）。"""
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def find_seen_image(hashes: list[str], known: list[str], tolerance: int = IMAGE_HASH_TOLERANCE) -> int:
+    """在 `known` 里找与 `hashes` 任一项近似的那张图，返回它的下标，找不到给 -1。
+
+    `hashes` 是这一批待判断的图片（按顺序），`known` 是已经见过的哈希。
+    返回的是 `known` 的下标，方便调用方报告"和第几张重复"。
+    """
+    for index, candidate in enumerate(known or []):
+        for value in hashes or []:
+            if hamming_distance(value, candidate) <= max(0, tolerance):
+                return index
+    return -1
+
+
+#: 上下文构成的统计范围：wire 键 → 说明它在"这一轮模型看到什么"里算什么。
+#: 只统计这几个键，因为它们才是**装配侧**真正按预算裁剪出来的量。
+CONTEXT_METRIC_SECTIONS: tuple[tuple[str, str], ...] = (
+    ('recentEntries', 'items'),
+    ('recalledHistory', 'items'),
+    ('memories', 'items'),
+    ('facts', 'items'),
+    ('overlaySnapshots', 'items'),
+    ('followUpCommitments', 'items'),
+    ('dueIntents', 'items'),
+    ('upcomingIntents', 'items'),
+    ('activeConsequences', 'items'),
+    ('workingDetails', 'items'),
+    ('participants', 'items'),
+    ('webContext', 'items'),
+    ('quotedMessages', 'items'),
+    ('automaticDeliverySummaries', 'items'),
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """粗估 token 数：CJK 一字 ≈ 一 token，其余按 4 字符 ≈ 1 token。
+
+    只用来回答"这一轮大概喂了多少"，**不是账单**——真实用量在模型中心的用量账里。
+    不要拿它做预算判断，口径不同。
+    """
+    value = _str(text)
+    if not value:
+        return 0
+    cjk = len(re.findall(r'[\u3400-\u9fff\u3040-\u30ff\uff00-\uffef]', value))
+    rest = len(value) - cjk
+    return int(cjk + (rest + 3) // 4)
+
+
+def context_metrics(
+    request: dict[str, Any], elapsed_ms: float = 0.0, phase: str = '',
+    participant_id: str = '', now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """算出"这一轮上下文由什么组成"（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）。
+
+    纯函数：只读请求体，不碰数据库。写进 `story.state.extensions.last_context_metrics`，
+    控制台总览读它，用来回答"她为什么突然变笨 / 这一轮怎么这么贵"。
+    """
+    sections: dict[str, Any] = {}
+    total_items = 0
+    total_characters = 0
+    for key, _kind in CONTEXT_METRIC_SECTIONS:
+        value = request.get(key)
+        if value in (None, '', [], {}):
+            continue
+        if isinstance(value, list):
+            items = len(value)
+        elif isinstance(value, dict):
+            items = len(value)
+        else:
+            items = 1
+        characters = len(json.dumps(value, ensure_ascii=False, default=str))
+        sections[key] = {'items': items, 'characters': characters}
+        total_items += items
+        total_characters += characters
+    scene = request.get('sceneContext') if isinstance(request.get('sceneContext'), dict) else {}
+    scene_characters = len(json.dumps(scene, ensure_ascii=False, default=str)) if scene else 0
+    other_characters = len(json.dumps(request, ensure_ascii=False, default=str))
+    return {
+        'at': iso(now or utc_now()),
+        'phase': _str(phase),
+        'participant_id': _str(participant_id),
+        'assembly_ms': int(max(0.0, elapsed_ms)),
+        'sections': sections,
+        'items': total_items,
+        'characters': total_characters + scene_characters,
+        'payload_characters': other_characters,
+        'estimated_tokens': estimate_tokens(json.dumps(request, ensure_ascii=False, default=str)),
+    }
+
+
+#: 召回查询里"问法"的固定句式：这些词对"她记不记得"没有信息量，
+#: 但会稀释双字组重合率（`history_lexical_score` 是按查询键数取平均的）。
+RECALL_QUERY_PREFIXES = (
+    '你还记得', '你还记不记得', '你还记得吗', '你记不记得', '你记得',
+    '还记得', '记不记得', '你是否记得', '你知道', '你还知道',
+    '我之前跟你说的', '我之前说过的', '我上次跟你说的', '我上次说过的',
+    '上次说的那个', '上次那个', '之前说的那个', '之前那个',
+    '我问你', '我想问', '我问一下',
+)
+
+#: 问句里的语气与疑问成分（去掉之后剩下的才是要检索的词）。
+RECALL_QUERY_NOISE = (
+    # 单字语气词：不含「么」——它是「怎么 / 什么 / 这么」的一部分，
+    # 先剥单字会把它们打断（`怎么` → `怎`），所以那类词交给下面的停用词表。
+    '吗', '呢', '吧', '啊', '呀', '嘛', '哦', '噢', '哈',
+    '请问', '告诉我', '说一下', '讲讲', '是什么', '是什么来着', '来着',
+)
+
+#: 代词与虚词：双字组检索里它们几乎只制造噪声。
+RECALL_QUERY_STOPWORDS = (
+    '我们', '你们', '他们', '她们', '它们', '这个', '那个', '这些', '那些',
+    '什么', '怎么', '为什么', '是不是', '有没有',
+)
+
+
+def rewrite_recall_query(query: str) -> str:
+    """把"问法"压成检索用关键词（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.2）。
+
+    纯本地规则，不花模型调用：只剥掉固定句式、语气词与代词，**不做同义改写**——
+    改写错一个词就会把该想起来的事挤掉，代价比收益大。
+    结果太短（< 2 个字）或没有变化时返回原查询，让调用方按原样检索。
+    """
+    text = _str(query).strip()
+    if not text:
+        return ''
+    rewritten = text
+    for prefix in RECALL_QUERY_PREFIXES:
+        if rewritten.startswith(prefix):
+            rewritten = rewritten[len(prefix):]
+    for stopword in RECALL_QUERY_STOPWORDS:
+        rewritten = rewritten.replace(stopword, '')
+    for noise in RECALL_QUERY_NOISE:
+        rewritten = rewritten.replace(noise, '')
+    rewritten = re.sub(r'[\s\u3000，。！？、；：""' + "'" + r'（）《》【】,.!?;:()\[\]{}<>"\-—…~]+', '', rewritten)
+    if len(rewritten) < 2:
+        return text
+    return rewritten
+
+
+#: 排名融合的默认常数（`docs/MEMORY_MAINTENANCE.md` §5.2）。
+DEFAULT_RRF_K = 60
+
+
+def _rrf_weight(rank: Optional[int], k: float, raw: float = 1.0) -> float:
+    """单路的"排名 × 原始相关度"：第 1 名给满，之后按 1/(k+rank) 衰减。
+
+    为什么不能照抄纯 RRF：纯 RRF 的贡献是 `1/(k+rank)`，**与原始分无关**。
+    候选池只有两三百条时，最后一名的 `1/(62)` 只比第一名的 `1/(61)` 小 1.6%——
+    于是一条**毫无字面与语义重合**的事实照样能拿到接近满额的排名分，
+    重要度高的旧事实会把真正相关的那条顶掉（实测：0 重合那条反而排前面）。
+
+    所以这里把排名当**相关系数**用：原始分为 0 的路不贡献，
+    有重合的才按名次衰减。两路都把它排前面的事实因此被顶到前面（这才是融合的意义），
+    而量纲与上游给这一路的原始权重一致（`raw × [0,1]`），不引入新的调参维度。
+    """
+    if rank is None or raw <= 0:
+        return 0.0
+    top = 1.0 / (k + 1.0)
+    return raw * ((1.0 / (k + rank)) / top) if top else 0.0
+
+
+def _ranks(values: list[float]) -> list[Optional[int]]:
+    """按分数降序给出每一名（并列同分给同一个名次，与常见 RRF 实现一致）。"""
+    order = sorted(range(len(values)), key=lambda index: -values[index])
+    ranks: list[Optional[int]] = [None] * len(values)
+    previous: Optional[float] = None
+    current_rank = 0
+    for position, index in enumerate(order, start=1):
+        if previous is None or values[index] < previous:
+            current_rank = position
+            previous = values[index]
+        ranks[index] = current_rank
+    return ranks
+
+
+def fact_lane_scores(
+    facts: list[dict[str, Any]], config: dict[str, Any],
+    query_embedding: Optional[list[float]] = None, query: str = '',
+    rewrite: bool = True, rrf_k: float = DEFAULT_RRF_K,
+) -> list[dict[str, Any]]:
+    """算两条召回通道的原始分与排名（纯函数，便于断言与调参）。
+
+    返回与 `facts` 等长的列表，每项是 `{'id', 'lexical', 'semantic', 'lexicalRank',
+    'semanticRank', 'rewritten', 'lexicalScore'}`。
+    """
+    rewritten = rewrite_recall_query(query) if rewrite else _str(query)
+    query_embedding = query_embedding or []
+    lane: list[dict[str, Any]] = []
+    for fact in facts or []:
+        content = _str(fact.get('content')) if isinstance(fact, dict) else ''
+        lexical = history_lexical_score(query, content)
+        lexical_score = lexical
+        if rewritten and rewritten != _str(query):
+            # 改写后的查询与原查询取**较高**的一条：改写只允许帮忙，不允许帮倒忙。
+            lexical_score = max(lexical, history_lexical_score(rewritten, content))
+        similarity = cosine_similarity(query_embedding, fact.get('embedding') or []) \
+            if isinstance(fact, dict) else None
+        lane.append({
+            'id': fact.get('id') if isinstance(fact, dict) else None,
+            'lexical': lexical,
+            'lexicalScore': lexical_score,
+            'semantic': 0.0 if similarity is None else max(0.0, similarity),
+            'rewritten': rewritten,
+        })
+    lexical_ranks = _ranks([item['lexicalScore'] for item in lane])
+    semantic_ranks = _ranks([item['semantic'] for item in lane])
+    has_semantic = any(item['semantic'] > 0 for item in lane)
+    has_lexical = any(item['lexicalScore'] > 0 for item in lane)
+    for index, item in enumerate(lane):
+        item['lexicalRank'] = lexical_ranks[index] if has_lexical else None
+        item['semanticRank'] = semantic_ranks[index] if has_semantic else None
+        item['lexicalRrf'] = _rrf_weight(item['lexicalRank'], rrf_k, item['lexicalScore'])
+        item['semanticRrf'] = _rrf_weight(item['semanticRank'], rrf_k, item['semantic'])
+    return lane
+
+
+def fact_structural_score(fact: dict[str, Any], config: dict[str, Any]) -> float:
+    """事实的"结构性"分数：重要度 / 置信 / 新近 / 未结承诺。
+
+    与上游 `factScore` 的区别只有一条：这里**不含**词法与语义两项，
+    那两项在融合模式下改由排名贡献（见 `fact_hybrid_score`）。
+    """
+    last_seen = to_date(fact.get('lastSeenAt'))
+    age_days = max(0.0, (dt_ms(utc_now()) - dt_ms(last_seen)) / (24 * 60 * 60 * 1000)) if last_seen else 0.0
+    recency = math.exp(-age_days / 30)
+    return (
+        _number(fact.get('importance')) * _number(config_get(config, 'fact_importance_weight', 'factImportanceWeight'))
+        + _number(fact.get('confidence')) * _number(config_get(config, 'fact_confidence_weight', 'factConfidenceWeight'))
+        + recency * _number(config_get(config, 'fact_recency_weight', 'factRecencyWeight'))
+        + (1.0 if fact.get('scope') == 'promise' and fact.get('unresolved') else 0.0)
+        * _number(config_get(config, 'unresolved_weight', 'unresolvedWeight'))
+    )
+
+
+def fact_hybrid_score(
+    fact: dict[str, Any], config: dict[str, Any], lane: dict[str, Any],
+) -> float:
+    """融合后的相关度：结构分 + 两路的倒数排名（RRF）。
+
+    权重沿用上游给这两路的量级（词法 `max(1.0, semantic_weight)`、语义 `semantic_weight`），
+    所以"只有一路可用"时排序与上游接近；两路都命中同一条事实时它会被顶到前面——
+    这正是排名融合想要的效果（两路都同意 ⇒ 比单路第一名更可信）。
+    """
+    semantic_weight = _number(config_get(config, 'semantic_weight', 'semanticWeight'))
+    relevance = max(1.0, semantic_weight)
+    return (
+        fact_structural_score(fact, config)
+        + _number(lane.get('lexicalRrf')) * relevance
+        + _number(lane.get('semanticRrf')) * semantic_weight
     )
 
 

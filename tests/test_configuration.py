@@ -840,11 +840,35 @@ class ConfigurationSchemaTest(unittest.TestCase):
     #: `embedding.provider_id` 也属本移植版新增，但它们在嵌套分组里，不计入本表。
     LOCAL_ONLY_FIELDS = {
         "story_defaults": {"persona_id", "extra_setting"},
-        "model_center": {"main_provider_id", "compaction_provider_id", "alter_provider_id"},
+        "model_center": {
+            "main_provider_id", "compaction_provider_id", "alter_provider_id",
+            # v1.4.0：模型调用治理（`docs/MEMORY_MAINTENANCE.md` §5.6）。
+            "governor_enabled", "governor_max_concurrency", "governor_max_requests_per_minute",
+            "governor_min_call_interval_ms", "governor_breaker_failures",
+            "governor_breaker_cooldown_seconds",
+        },
         "stickers": {"provider_id"},
         # v1.3.0 受控偏离：三张名单各自的"仅处理名单内"开关（上游只有一个总闸 `enabled`，
         # 本移植版删掉它、换成这三个正交开关）。见 `docs/PORTING_NOTES.md` §22。
         "qq_access": {"bot_accounts_only", "user_accounts_only", "group_chats_only"},
+        # v1.4.0：记忆维护（去重 / 矛盾 / 时间锚定 / 遗忘 / 预算 / 融合召回 / 上下文记录），
+        # 上游没有这些开关，全部由本移植版新增。见 `docs/MEMORY_MAINTENANCE.md`。
+        "memory": {
+            "facts_dedupe_enabled",
+            "facts_contradiction_enabled",
+            "temporal_anchor_enabled",
+            "forgetting_enabled",
+            "forgetting_threshold",
+            "forgetting_retention_days",
+            "forgetting_half_life_days",
+            "maintenance_max_llm_calls",
+            "maintenance_max_runtime_minutes",
+            "maintenance_min_call_interval_ms",
+            "hybrid_retrieval_enabled",
+            "hybrid_rrf_k",
+            "query_rewrite_enabled",
+            "context_metrics_enabled",
+        },
     }
 
     def test_upstream_field_count_matches(self):
