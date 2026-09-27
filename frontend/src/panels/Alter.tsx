@@ -1,7 +1,7 @@
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { AlterPayload } from '../types'
-import { Badge, Empty, ErrorNote, Grid, Icon, KeyValue, Loading, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
+import { Badge, Empty, ErrorNote, Grid, KeyValue, Loading, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
 
 /** 极简折线：只画一条序列，不引图表库（省下 40–70KB）。 */
 function Sparkline({
@@ -62,8 +62,7 @@ export function Alter({ storyId, refreshKey }: PanelProps) {
     <Stack>
       {!state && (
         <Note>
-          <Icon name="info" class="mr-1 inline h-3 w-3" />
-          这份剧本里还没有 Alter 状态。它要等第一轮叙事跑过之后才会建立。
+            这份剧本里还没有 Alter 状态。它要等第一轮叙事跑过之后才会建立。
         </Note>
       )}
 

@@ -1,7 +1,7 @@
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { AgencyPayload } from '../types'
-import { Badge, Empty, ErrorNote, Grid, Icon, KeyValue, Loading, Note, Panel, Stack, Stat, Table } from '../components/ui'
+import { Badge, Empty, ErrorNote, Grid, KeyValue, Loading, Note, Panel, Stack, Stat, Table } from '../components/ui'
 
 const LOAD_LABEL: Record<string, string> = {
   light: '轻松', normal: '一般', busy: '繁忙', overloaded: '超载',
@@ -60,8 +60,7 @@ export function Agency({ storyId, refreshKey }: PanelProps) {
     <Stack>
       {!win && (
         <Note>
-          <Icon name="info" class="mr-1 inline h-3 w-3" />
-          还没有建立行动窗口。它由后台按日程与你的近期作息推断出来，跑过一轮自动推进后就有了。
+            还没有建立行动窗口。它由后台按日程与你的近期作息推断出来，跑过一轮自动推进后就有了。
         </Note>
       )}
 

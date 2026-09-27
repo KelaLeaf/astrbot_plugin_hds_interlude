@@ -2,7 +2,7 @@ import { useState } from 'preact/hooks'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { MemoryPayload } from '../types'
-import { Badge, Empty, ErrorNote, Grid, Icon, Loading, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
+import { Badge, Empty, ErrorNote, Grid, Loading, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
 
 const KNOWLEDGE_LABEL: Record<string, string> = {
   observation: '观察',
@@ -172,7 +172,6 @@ export function Memory({ storyId, refreshKey }: PanelProps) {
       </Grid>
 
       <Note>
-        <Icon name="info" class="mr-1 inline h-3 w-3" />
         这里显示的是已经落库的记忆。压缩是后台增量的，刚聊完的内容要等一轮压缩才会出现在上面。
       </Note>
     </Stack>
