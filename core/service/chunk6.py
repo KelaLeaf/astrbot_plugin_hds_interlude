@@ -167,8 +167,29 @@ _QUOTE_PLACEHOLDER = '\u200b'
 #: 上游 `applyFollowUpResolutions` 的重排期上界（12 小时）。
 _MAX_RESCHEDULE_MS = 12 * 60 * 60 * 1000
 
-#: 上游 `deferUnresolvedDueFollowUps` 的重查延迟（20 分钟）。
+#: 上游 `deferUnresolvedDueFollowUps` 的首次重查延迟（20 分钟）。
 _DEFER_RETRY_MS = 20 * _MINUTE_MS
+
+#: 受控偏离（见移植说明 §26）：重查延迟的上限（6 小时）。
+_DEFER_RETRY_MAX_MS = 6 * 60 * _MINUTE_MS
+
+#: 从第几次重查开始把间隔告诉用户（前两次还在"再等等"的自然范围里）。
+_DEFER_NOTICE_FROM = 3
+
+
+def defer_retry_milliseconds(deferred_checks: Any) -> int:
+    """一条没被结算的承诺，下一次重查隔多久（受控偏离，见移植说明 §26）。
+
+    上游是**固定 20 分钟**、且没有次数上限：模型每次既没给出 `followUpResolutions`、又没
+    拿到完整投递确认，这条意图就再推迟 20 分钟（`deferredChecks` 只累计、不影响间隔）。
+    实测代价（用户 2026-09-27 的日志）：一条"等他先开口"这类**靠对方动作才能结清**的承诺
+    把整个推进节奏钉在 20 分钟上，一夜之间重查 67 次，用户配置的 60–90 分钟档位完全失效。
+
+    这里让间隔逐次翻倍（20 → 40 → 80 → 160 → 320 分钟），之后封顶 6 小时：承诺照样留着、
+    照样会被重查，但它不再独自决定剧本多久推进一次。
+    """
+    steps = max(0, min(5, _num(deferred_checks, 0) - 1))
+    return min(_DEFER_RETRY_MAX_MS, _DEFER_RETRY_MS * (2 ** int(steps)))
 
 #: 上游 `deliverDueSplitSegments` 未确认投递时的重试延迟（30 秒）。
 _UNCONFIRMED_RETRY_MS = 30 * _SECOND_MS
@@ -678,21 +699,31 @@ class ServiceChunk6(ServiceBase):
         for intent in due:
             if pick(intent, 'id') in resolved:
                 continue
-            retry_at = parse_dt(dt_ms(now) + _DEFER_RETRY_MS)
             payload = _record(pick(intent, 'payload'))
+            deferred = int(_num(payload.get('deferredChecks'), 0)) + 1
+            delay = defer_retry_milliseconds(deferred)
+            retry_at = parse_dt(dt_ms(now) + delay)
             await self.db_set('interlude_intent', {'id': pick(intent, 'id')}, {
                 'notBefore': retry_at,
-                'payload': {
-                    **payload,
-                    'deferredChecks': _num(payload.get('deferredChecks'), 0) + 1,
-                },
+                'payload': {**payload, 'deferredChecks': deferred},
                 'updatedAt': now,
             })
             self.schedule_due_intent_wake(story_id, retry_at)
+            story = await self.get_story(story_id)
             self.report_operation(
-                'diagnostic', 'debug', await self.get_story(story_id), 'intent-due',
-                '承诺回访等待明确结算及完整投递确认，已保留重查 参与者=%s', participant_id,
+                'diagnostic', 'debug', story, 'intent-due',
+                '承诺回访等待明确结算及完整投递确认，已保留重查 参与者=%s 第%d次 下次=%d分钟后',
+                participant_id, deferred, max(1, int(round(delay / _MINUTE_MS))),
             )
+            if deferred >= _DEFER_NOTICE_FROM:
+                # 前两次还在"再等等"的自然范围里；从第三次起这条承诺已经在替用户决定
+                # 剧本多久推进一次，必须说出来。
+                self.report_operation(
+                    'standard', 'warn', story, 'intent-due',
+                    '这条承诺第 %d 次没结算，重查间隔已放宽到 %d 分钟；它结清之前会一直占着推进节奏 '
+                    '参与者=%s',
+                    deferred, max(1, int(round(delay / _MINUTE_MS))), participant_id,
+                )
 
     # ------------------------------------------------------------------ #
     # appendProactiveCheck（上游 :5002）

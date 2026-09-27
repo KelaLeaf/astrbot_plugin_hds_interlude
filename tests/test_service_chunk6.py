@@ -49,9 +49,10 @@ from plugin.core.script.delivery_ledger import (
 from plugin.core.service import InterludeContext, NullTransport
 from plugin.core.service.base import ServiceBase, ServiceChunk0
 from plugin.core.service.chunk5 import ServiceChunk5
-from plugin.core.service.chunk6 import ServiceChunk6
+from plugin.core.service.chunk6 import ServiceChunk6, defer_retry_milliseconds
 from plugin.core.service.chunk7 import ServiceChunk7
 from plugin.core.service.chunk9 import ServiceChunk9
+from plugin.core.service.helpers import to_date
 from plugin.core.time import iso, parse_dt
 from plugin.core.turn_persistence import script_entry_draft_for_commit
 from plugin.core.types import empty_participant_state, empty_story_setting, empty_story_state
@@ -495,6 +496,50 @@ class FollowUpSettlementTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(patches[0]['notBefore'], NOW)
         # 上游同一契约的其余部分：累计 deferredChecks 并重排一次唤醒。
         self.assertEqual(patches[0]['payload']['deferredChecks'], 1)
+        self.assertEqual(len(wakes), 1)
+
+    def test_deferral_backoff_ladder(self) -> None:
+        """受控偏离（移植说明 §26）：重查间隔逐次翻倍并封顶，不再固定 20 分钟。"""
+        minutes = [
+            round(defer_retry_milliseconds(count) / 60000) for count in (0, 1, 2, 3, 4, 5, 6, 20)
+        ]
+        self.assertEqual(minutes, [20, 20, 40, 80, 160, 320, 360, 360])
+
+    async def test_a_promise_that_keeps_deferring_backs_off_and_says_so(self) -> None:
+        patches: list[Any] = []
+        wakes: list[Any] = []
+        notices: list[tuple[Any, ...]] = []
+
+        class _Stub(ServiceChunk6):
+            def __init__(self) -> None:
+                self.config = _make_config()
+
+            async def db_set(self, _table: str, _query: Any, data: Any) -> None:
+                patches.append(copy.deepcopy(data))
+
+            def schedule_due_intent_wake(self, *args: Any) -> None:
+                wakes.append(args)
+
+            def report_operation(self, *args: Any, **_kwargs: Any) -> None:
+                notices.append(args)
+
+            async def get_story(self, _story_id: str) -> dict[str, Any]:
+                return {'id': 's'}
+
+        intent = _intent(11, 'follow-up-commitment')
+        intent['payload'] = {'deferredChecks': 2}
+        await ServiceChunk6.defer_unresolved_due_follow_ups(
+            _Stub(), 's', 'alice', [intent], set(), None, NOW,
+        )
+
+        self.assertEqual(patches[0]['payload']['deferredChecks'], 3)
+        # 第三次起间隔是 80 分钟（不再是 20 分钟），且给出一条能看见的说明。
+        self.assertEqual(
+            round((to_date(patches[0]['notBefore']) - NOW).total_seconds() / 60), 80,
+        )
+        warns = [args for args in notices if args and args[0] == 'standard' and args[1] == 'warn']
+        self.assertEqual(len(warns), 1)
+        self.assertIn('第 3 次没结算', warns[0][4] % warns[0][5:])
         self.assertEqual(len(wakes), 1)
 
     async def test_a_completed_promise_cannot_be_recreated_by_replaying_its_original_delivery_callback(self) -> None:
