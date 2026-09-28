@@ -2498,7 +2498,8 @@ class AstrbotBridge:
         """向宿主列出候选平台实例 id。
 
         匹配依据是**适配器类型**（`meta().name`，如 aiocqhttp）而不是实例 id，因为
-        我们的 `onebot` 是归一化名、宿主的实例 id 是 `default` 这类值。传空平台名
+        我们的 `onebot` 是归一化名、宿主的实例 id 是配置里那个平台 ID（实测这台叫 `NapCat`）。
+        传空平台名
         就列出全部实例。
         """
         ids: list[str] = []

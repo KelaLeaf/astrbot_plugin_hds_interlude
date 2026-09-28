@@ -580,7 +580,7 @@ class DeliveryCoordinateTests(unittest.TestCase):
 
     用户报的现象：剧本与聊天记录里显示发了消息，实际一条没到。日志里宿主的原话是
     `cannot find platform for session onebot:FriendMessage:1000008890`——我们把**归一化
-    平台名**当成了 AstrBot 的平台实例 id（正确的第一段是 `default`）。
+    平台名**当成了 AstrBot 的平台实例 id（这台机器上正确的第一段是 `NapCat`）。
     """
 
     def setUp(self):
