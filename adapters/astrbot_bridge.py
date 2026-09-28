@@ -241,9 +241,13 @@ _RAW_SEGMENT_ALIASES: dict[str, str] = {
     'record': 'record', 'audio': 'record', 'voice': 'record',
     'video': 'video',
     'at': 'at',
-    'face': 'face', 'mface': 'face',
+    'face': 'face',
+    # `mface`（QQ 商城表情）**不能冒充 `face`**：它带 summary，而且 AstrBot 的
+    # `AiocqhttpMessageAdapter` 直接把 `mface` 段 `continue` 掉，结构化链里根本没有它。
+    'mface': 'mface',
     'file': 'file',
     'reply': 'reply',
+    'json': 'json',
 }
 
 
@@ -276,10 +280,9 @@ def _session_file_facts(session: Any) -> list[Any]:
         return []
 
 
-def _raw_segment_chain(event: Any) -> list[Any]:
-    """从 `message_obj.raw_message` 里取出原始段并包成组件（取不到就回空列表）。"""
-    message_obj = getattr(event, 'message_obj', None)
-    raw = getattr(message_obj, 'raw_message', None)
+def _raw_segments(event: Any) -> list[dict[str, Any]]:
+    """从 `message_obj.raw_message` 里取出 OneBot 原始段（取不到就回空列表）。"""
+    raw = getattr(getattr(event, 'message_obj', None), 'raw_message', None)
     if raw is None:
         return []
     segments = raw.get('message') if isinstance(raw, dict) else getattr(raw, 'message', None)
@@ -287,15 +290,87 @@ def _raw_segment_chain(event: Any) -> list[Any]:
         segments = raw
     if not isinstance(segments, (list, tuple)):
         return []
+    return [segment for segment in segments if isinstance(segment, dict)]
+
+
+def _raw_segment_chain(event: Any) -> list[Any]:
+    """从 `message_obj.raw_message` 里取出原始段并包成组件（取不到就回空列表）。"""
     chain: list[Any] = []
-    for segment in segments:
-        if not isinstance(segment, dict):
-            continue
+    for segment in _raw_segments(event):
         kind = _RAW_SEGMENT_ALIASES.get(_text(segment.get('type')).lower())
         if not kind:
             continue
         chain.append(_RawSegment(kind, segment.get('data')))
     return chain
+
+
+#: OneBot `image` 段的 `sub_type` → 媒体种类。0 普通图（照片/截图/网图）、
+#: 1 自定义表情（收藏的表情包）、4 商城表情。这是**唯一的机器可读信号**：
+#: AstrBot 的 `Image` 组件只留 `file`/`url`/`path`，`sub_type` 与 `summary` 都在
+#: pydantic 的 extra 里被丢掉，只能回原始段取。
+_ONEBOT_IMAGE_SUB_TYPES = {'0': 'image', '1': 'sticker', '4': 'market'}
+
+
+def _image_media_kind(data: Any) -> tuple[str, str]:
+    """从 OneBot 图片段的 data 里读出 `(kind, summary)`。
+
+    `kind` ∈ `image` / `sticker` / `market` / `animated`；取不到一律回 `image`。
+    `summary` 是平台给的原文（`[图片]` / `[动画表情]`），只在有值时保留。
+    """
+    payload = data if isinstance(data, dict) else {}
+    summary = _text(payload.get('summary'))
+    sub_type = _text(payload.get('sub_type'))
+    kind = _ONEBOT_IMAGE_SUB_TYPES.get(sub_type, 'image')
+    # NapCat 对动图给 `[动画表情]`：即便 sub_type 缺失也据此判成动图，
+    # 否则会把会动的表情包说成一张静止的照片。
+    if kind == 'image' and '动画' in summary:
+        kind = 'animated'
+    return kind, summary
+
+
+def _mface_attrs(data: Any) -> dict[str, str]:
+    """QQ 商城表情的可见属性（name 优先取 summary）。"""
+    payload = data if isinstance(data, dict) else {}
+    attrs: dict[str, str] = {}
+    for key, source in (('id', 'emoji_id'), ('package', 'emoji_package_id'), ('summary', 'summary'), ('name', 'name')):
+        value = _text(payload.get(source))
+        if value:
+            attrs[key] = value
+    return attrs
+
+
+def raw_media_hints(event: Any) -> dict[str, Any]:
+    """从 OneBot 原始段里捞出**结构化消息链丢掉**的媒体信号。
+
+    为什么必须回原始段：
+    * AstrBot 的 `Image` 组件只保留 `file`/`url`/`path`，`sub_type`（表情包与否）
+      与 `summary` 在 pydantic extra 里被丢掉 —— 于是"表情包"和"实拍照片"在下游
+      长得一模一样；
+    * `mface`（QQ 商城表情）被适配器 `continue` 掉，**整段消失**，连占位都没有。
+
+    返回：`images`（按 `file`/`url` 索引的 kind+summary）、`faces`（表情 id → 文本）、
+    `extras`（结构化链里不存在的段的元素定义，按原文顺序）。
+    """
+    hints: dict[str, Any] = {'images': {}, 'faces': {}, 'extras': []}
+    for segment in _raw_segments(event):
+        kind = _text(segment.get('type')).lower()
+        data = segment.get('data')
+        payload = data if isinstance(data, dict) else {}
+        if kind == 'image':
+            media_kind, summary = _image_media_kind(payload)
+            entry = {'kind': media_kind, 'summary': summary}
+            for key in ('file', 'url'):
+                value = _text(payload.get(key))
+                if value:
+                    hints['images']['%s:%s' % (key, value)] = entry
+        elif kind == 'face':
+            face_id = _text(payload.get('id') if payload.get('id') is not None else payload.get('faceIndex'))
+            face_text = _text(payload.get('faceText') or payload.get('text'))
+            if face_id and face_text:
+                hints['faces'][face_id] = face_text
+        elif kind == 'mface':
+            hints['extras'].append({'type': 'mface', 'attrs': _mface_attrs(payload)})
+    return hints
 
 
 #: OneBot 的非消息事件（`post_type` 不是 `message`）：通知 / 元事件 / 请求。
@@ -327,7 +402,51 @@ def is_non_message_event(event: Any) -> tuple[bool, str]:
 # AstrBot 消息链 → Koishi `session.content` / `elements`
 # =========================================================================== #
 
-def serialize_component(component: Any) -> tuple[str, Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+def _json_card_attrs(component: Any) -> dict[str, str]:
+    """QQ 小程序 / 分享卡片 → 可见属性（`app` / `title` / `desc` / `prompt`）。
+
+    卡片原先只会落成裸 `<json/>`：模型既不知道那是张卡片，也不知道卡片是什么内容，
+    只能当成"他发了点什么"含糊过去。这里把平台给的标题与描述取出来（都截断），
+    让下游能说清"他转了个农场小程序的宝箱分享"。
+    """
+    import json as _json
+
+    raw = getattr(component, 'data', None)
+    if isinstance(raw, str):
+        try:
+            raw = _json.loads(raw)
+        except Exception:  # noqa: BLE001 - 解析不了就只留类型名
+            raw = {}
+    payload = raw if isinstance(raw, dict) else {}
+    attrs: dict[str, str] = {}
+    app = _text(payload.get('app') or payload.get('appID'))
+    if app:
+        attrs['app'] = app[:60]
+    prompt = _text(payload.get('prompt'))
+    if prompt.startswith('[QQ小程序]'):
+        prompt = prompt[len('[QQ小程序]'):]
+    if prompt:
+        attrs['prompt'] = prompt[:80]
+    detail = payload.get('meta')
+    if isinstance(detail, dict):
+        for value in detail.values():
+            if not isinstance(value, dict):
+                continue
+            title = _text(value.get('title'))
+            desc = _text(value.get('desc'))
+            if title:
+                attrs['title'] = title[:60]
+            if desc:
+                attrs['desc'] = desc[:80]
+            if title or desc:
+                break
+    return attrs
+
+
+def serialize_component(
+    component: Any,
+    hints: Optional[dict[str, Any]] = None,
+) -> tuple[str, Optional[dict[str, Any]], Optional[dict[str, Any]]]:
     """把一个 AstrBot 组件翻成 `(content 片段, element, quote)`。
 
     `element` 是 `h.parse(session.content)` 的等价结构（`type` / `attrs` / `children`），
@@ -353,6 +472,24 @@ def serialize_component(component: Any) -> tuple[str, Optional[dict[str, Any]], 
             attrs = {'src': 'file://%s' % os.path.abspath(_text(path))}
         else:
             attrs = {}
+        # 媒体种类（照片 / 表情包 / 动图 / 商城表情）只能回原始段取：AstrBot 的
+        # `Image` 组件把 `sub_type` 与 `summary` 丢在 pydantic extra 里了。
+        media_kind, summary = _image_media_kind({
+            'sub_type': _attr(component, 'sub_type', 'subType'),
+            'summary': _attr(component, 'summary'),
+        })
+        lookup = hints.get('images') if isinstance(hints, dict) else None
+        if isinstance(lookup, dict):
+            for key in ('file:%s' % _text(file_value), 'url:%s' % url):
+                found = lookup.get(key)
+                if isinstance(found, dict):
+                    media_kind = _text(found.get('kind')) or media_kind
+                    summary = _text(found.get('summary')) or summary
+                    break
+        if media_kind and media_kind != 'image':
+            attrs['kind'] = media_kind
+        if summary:
+            attrs['summary'] = summary
         tag = ' '.join('%s="%s"' % (key, _escape_attr(value)) for key, value in attrs.items() if value != '')
         return ('<img %s/>' % tag) if tag else '<img/>', {'type': 'img', 'attrs': attrs, 'children': []}, None
 
@@ -385,10 +522,31 @@ def serialize_component(component: Any) -> tuple[str, Optional[dict[str, Any]], 
             attrs['name'] = _text(name)
         return '<at id="%s"/>' % _escape_attr(attrs['id']), {'type': 'at', 'attrs': attrs, 'children': []}, None
 
-    if kind in ('face', 'mface'):
-        face_id = _attr(component, 'id', 'face_id')
+    if kind == 'face':
+        face_id = _attr(component, 'id', 'face_id', 'faceIndex')
         attrs = {'id': _text(face_id)}
-        return '<face id="%s"/>' % _escape_attr(attrs['id']), {'type': 'face', 'attrs': attrs, 'children': []}, None
+        # 表里没有的新表情只能靠平台给的 faceText；有就带上，别让模型去猜 ID。
+        name = _text(_attr(component, 'faceText', 'text', 'name'))
+        if not name and isinstance(hints, dict):
+            name = _text((hints.get('faces') or {}).get(attrs['id']))
+        if name:
+            attrs['name'] = name
+        tag = ' '.join('%s="%s"' % (key, _escape_attr(value)) for key, value in attrs.items() if value != '')
+        return ('<face %s/>' % tag) if tag else '<face/>', {'type': 'face', 'attrs': attrs, 'children': []}, None
+
+    if kind == 'mface':
+        attrs = _mface_attrs(_attr(component, 'data')) if _attr(component, 'data') is not None else {}
+        for key in ('id', 'package', 'summary', 'name'):
+            value = _text(_attr(component, key))
+            if value and not attrs.get(key):
+                attrs[key] = value
+        tag = ' '.join('%s="%s"' % (key, _escape_attr(value)) for key, value in attrs.items() if value != '')
+        return ('<mface %s/>' % tag) if tag else '<mface/>', {'type': 'mface', 'attrs': attrs, 'children': []}, None
+
+    if kind == 'json':
+        attrs = _json_card_attrs(component)
+        tag = ' '.join('%s="%s"' % (key, _escape_attr(value)) for key, value in attrs.items() if value != '')
+        return ('<card %s/>' % tag) if tag else '<card/>', {'type': 'card', 'attrs': attrs, 'children': []}, None
 
     if kind == 'file':
         name = _text(_attr(component, 'name'))
@@ -446,7 +604,10 @@ def serialize_component(component: Any) -> tuple[str, Optional[dict[str, Any]], 
     return literal, {'type': kind, 'attrs': attrs, 'children': []}, None
 
 
-def serialize_message_chain(chain: Iterable[Any]) -> tuple[str, list[dict[str, Any]], Optional[dict[str, Any]]]:
+def serialize_message_chain(
+    chain: Iterable[Any],
+    hints: Optional[dict[str, Any]] = None,
+) -> tuple[str, list[dict[str, Any]], Optional[dict[str, Any]]]:
     """把整条 AstrBot 消息链翻成 `(content, elements, quote)`。
 
     `content` 是上游 `session.content` 的等价物——`core/service/helpers.py` 会按
@@ -459,7 +620,7 @@ def serialize_message_chain(chain: Iterable[Any]) -> tuple[str, list[dict[str, A
     for component in chain or []:
         if component is None:
             continue
-        fragment, element, quoted = serialize_component(component)
+        fragment, element, quoted = serialize_component(component, hints)
         if fragment:
             parts.append(fragment)
         if element is not None:
@@ -585,13 +746,26 @@ def session_view(event: AstrMessageEvent, endpoint: Optional[AstrbotEndpoint] = 
     | `event` | 原始 `AstrMessageEvent` 引用 |
     """
     resolved = endpoint if endpoint is not None else endpoint_for_event(event)
+    hints = raw_media_hints(event)
     chain = _call(event, 'get_messages', []) or []
-    content, elements, quote = serialize_message_chain(chain)
+    content, elements, quote = serialize_message_chain(chain, hints)
+    used_raw_chain = False
     if not content and not elements:
         # 结构化链是空的：退回适配器的原始段（见 `_raw_segment_chain`）。
         raw_chain = _raw_segment_chain(event)
         if raw_chain:
             content, elements, quote = serialize_message_chain(raw_chain)
+            used_raw_chain = True
+    if not used_raw_chain and hints.get('extras'):
+        # 结构化链**存在但缺段**：适配器 `continue` 掉的段（QQ 商城表情）只能在这里补。
+        # 顺序上它们落在文末——混合消息里位置会略偏，但"她确实收到一个商城表情"
+        # 这条事实比顺序精确更重要（整条消息只有一个表情时位置本来就是对的）。
+        for extra in hints['extras']:
+            fragment, element, _quoted = serialize_component(_RawSegment(extra['type'], extra['attrs']))
+            if fragment:
+                content = (content + fragment) if content else fragment
+            if element is not None:
+                elements.append(element)
     if not content:
         # 有些适配器只填 `message_str`（纯文本）而没有结构化段。
         content = _text(_call(event, 'get_message_str', ''))

@@ -377,6 +377,7 @@ from plugin.adapters.astrbot_bridge import (  # noqa: E402
     AstrbotTransport,
     looks_like_management_command,
     normalize_bridge_config,
+    raw_media_hints,
     resolve_platform_name,
     serialize_message_chain,
     session_view,
@@ -573,6 +574,86 @@ class _FakePlatform:
 
     def meta(self):
         return self._meta
+
+
+class IncomingMediaKindTests(unittest.TestCase):
+    """入站媒体种类：从 OneBot 原始段捞回 AstrBot 在解析层丢掉的信息。
+
+    `Image` 组件只留 `file`/`url`/`path`（`sub_type` 与 `summary` 落在 pydantic
+    extra 里被丢掉），`mface` 段更是被适配器直接 `continue`。没有这一步，
+    "表情包"和"实拍照片"在提示词里长得一模一样。
+    """
+
+    @staticmethod
+    def _event(segments, components=None):
+        message_obj = types.SimpleNamespace(raw_message={'message': segments}, message_id='m1')
+        event = types.SimpleNamespace(
+            message_obj=message_obj,
+            get_messages=lambda: list(components or []),
+            get_message_str=lambda: '',
+            get_platform_id=lambda: 'NapCat',
+            get_platform_name=lambda: 'aiocqhttp',
+            get_self_id=lambda: '100001357',
+            get_sender_id=lambda: '1000008890',
+            get_sender_name=lambda: '主人',
+            get_group_id=lambda: '',
+        )
+        event.is_private_chat = lambda: True
+        return event
+
+    def _content(self, event):
+        return bridge_module.session_view(event).content
+
+    def test_collected_image_keeps_its_kind(self):
+        event = self._event([{'type': 'image', 'data': {
+            'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': 1, 'summary': '[动画表情]',
+        }}], components=[bridge_module.Image(file='a.jpg', url='https://x/a.jpg')])
+        content = self._content(event)
+        # 种类是"收藏表情"，`[动画表情]` 由 summary 在标签那一层判（见 helpers）。
+        self.assertIn('kind="sticker"', content)
+        self.assertIn('summary="[动画表情]"', content)
+
+    def test_plain_photo_has_no_kind_attribute(self):
+        event = self._event([{'type': 'image', 'data': {
+            'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': 0, 'summary': '[图片]',
+        }}], components=[bridge_module.Image(file='a.jpg', url='https://x/a.jpg')])
+        content = self._content(event)
+        self.assertNotIn('kind=', content)
+
+    def test_market_face_survives_even_though_astrbot_drops_it(self):
+        """QQ 商城表情整段消失过：结构化链里没有它，只能从原始段补回来。"""
+        event = self._event([
+            {'type': 'text', 'data': {'text': '看这个'}},
+            {'type': 'mface', 'data': {'emoji_id': 'abc', 'summary': '[动画表情]'}},
+        ], components=[bridge_module.Plain('看这个')])
+        content = self._content(event)
+        self.assertIn('看这个', content)
+        self.assertIn('<mface', content)
+        self.assertIn('summary="[动画表情]"', content)
+
+    def test_face_name_from_raw_is_carried(self):
+        event = self._event([{'type': 'face', 'data': {'id': '9999', 'faceText': '新表情'}}],
+                            components=[bridge_module.Face(id=9999)])
+        self.assertIn('name="新表情"', self._content(event))
+
+    def test_mini_program_card_keeps_title(self):
+        payload = {'app': 'com.tencent.miniapp_01', 'prompt': '[QQ小程序]开门！收宝藏！',
+                   'meta': {'detail_1': {'title': 'QQ经典农场', 'desc': '快乐不独享'}}}
+        card = types.SimpleNamespace(data=payload)
+        card._hdsi_kind = 'json'
+        event = self._event([{'type': 'json', 'data': payload}], components=[card])
+        content = self._content(event)
+        self.assertIn('<card', content)
+        self.assertIn('title="QQ经典农场"', content)
+        self.assertIn('app="com.tencent.miniapp_01"', content)
+
+    def test_raw_media_hints_indexes_by_file_and_url(self):
+        event = self._event([{'type': 'image', 'data': {
+            'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': '4',
+        }}])
+        hints = bridge_module.raw_media_hints(event)
+        self.assertEqual(hints['images']['file:a.jpg']['kind'], 'market')
+        self.assertEqual(hints['images']['url:https://x/a.jpg']['kind'], 'market')
 
 
 class DeliveryCoordinateTests(unittest.TestCase):

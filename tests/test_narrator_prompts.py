@@ -115,6 +115,27 @@ class PayloadOrderTests(unittest.TestCase):
         self.assertTrue('recentExchange' in established)
         self.assertTrue('interval' in payload['authoringWindow'])
 
+    def test_current_event_exposes_attachment_kinds(self) -> None:
+        """附件种类进 wire payload（受控偏离 §29）。
+
+        没有这一项，表情包、实拍照片、小程序卡片在提示词里长得一模一样。
+        """
+        req = request([], '看我发的', overrides={
+            'images': [{'id': 'turn-image-1', 'data_uri': 'data:image/png;base64,AA'}],
+            'attachments': [
+                {'index': 1, 'kind': 'sticker', 'label': '[动画表情]', 'summary': '[动画表情]'},
+                {'index': 0, 'kind': 'card', 'label': '[QQ小程序：宝箱]', 'summary': ''},
+            ],
+        })
+        payload = to_prompt_payload(req, {'cacheFirst': True})
+        event = payload['incomingEvent']['event']
+        self.assertEqual(event['type'], 'private-message-batch')
+        self.assertEqual(event['imageCount'], 1)
+        self.assertEqual(event['attachments'][0]['kind'], 'sticker')
+        self.assertEqual(event['attachments'][0]['label'], '[动画表情]')
+        # 空 summary 不进 payload（别给模型一个空字符串当证据）
+        self.assertNotIn('summary', event['attachments'][1])
+
     def test_recent_exchange_anchors_only_transport_exchanges(self) -> None:
         req = request([
             entry(1, 'user-message', '旧的一句', 240),

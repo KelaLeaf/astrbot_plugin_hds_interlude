@@ -395,6 +395,7 @@ def system_prompt(phase: str, main_prompt: Optional[str], format_prompt: Optiona
         script_first_transport_instruction(phase, group_turn, streaming_reply_first),
         'When currentEvent.imageCount is greater than zero, the current user event includes that many attached native image inputs. They are observed material from this one event, not separate messages or historical evidence. Use only details visibly supported by them, integrate them naturally into the protagonist’s present reality, and do not invent unseen image details.',
         'currentEvent.imageCount counts native image attachments only. With visualEvidenceMode=sidecar-observations, the supplied visualObservations are this turn’s image evidence even though imageCount is zero. When both native images and current visualObservations are absent, image contents remain unknown; placeholders and older prose do not supply current visual evidence.',
+        'currentEvent.attachments says what kind of thing each attachment actually is (kind: image / sticker / animated / market / card, with a short label). This is metadata about the form of the attachment, never about what it depicts: a sticker is the correspondent reacting with a saved picture, an animated one is a moving sticker, a market sticker is a purchased QQ emote, an image is a real-world photo or screenshot, and a card is a forwarded mini-program or link share that carries its own title. Treat each kind as the act it is — a sticker or a card is not a scene you observed — and never describe the contents of an attachment no visual evidence supports.',
         'currentEvent.audioCount counts native audio attachments only; their sound arrives as audio input parts of this same user message. Treat them as the user speaking or sending an audio file. When audioCount is zero, voice-related mentions in text carry no audio evidence; do not invent spoken content.',
         'The structured intents field is the shared ledger for two kinds of continuing threads. A scheduled intent records a concrete future possibility such as a delayed reply, reminder, promise, or later contact: give it a notBefore strictly after now. An active-consequence records a present dramatic aftereffect that is already in motion: use type="active-consequence", notBefore within the supplied interval and no later than now, and payload {"lifecycle":"active","effect":"what continues to influence the protagonist","strength":0.0-1.0,"expiresAt":"future ISO-8601"}.',
         'If a dueIntents item has payload.streamRecovery=true, a matching visible private reply was already delivered before this recovery turn. Write only the missing script that reconciles that completed reply with the life interval; set interaction.reply.mode to none and do not create any other visible transport action.',
@@ -622,6 +623,19 @@ def to_prompt_payload(request: dict[str, Any], options: Optional[dict[str, Any]]
             'observedAt': iso(now_value),
             'observedAtLocal': now_local_context['local'],
         }
+        # 附件种类（受控偏离 §29）：附件本来的形式是**元数据**，不是画面内容。
+        # 没有它，表情包、实拍照片、小程序卡片在提示词里长得一样。
+        attachments = _pick(request, 'attachments') or []
+        if isinstance(attachments, list) and attachments:
+            event['attachments'] = [
+                {key: value for key, value in (
+                    ('index', _pick(item, 'index')),
+                    ('kind', _pick(item, 'kind')),
+                    ('label', _pick(item, 'label')),
+                    ('summary', _pick(item, 'summary')),
+                ) if value not in (None, '')}
+                for item in attachments if isinstance(item, dict)
+            ]
         user_reported_times = _pick(request, 'userReportedTimes', 'user_reported_times')
         if isinstance(user_reported_times, list) and user_reported_times:
             event['userReportedTimes'] = user_reported_times

@@ -1298,6 +1298,32 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await ServiceChunk3.describe_current_images(host, {'id': 's'}, [{'id': 'i'}], '看看'))
         self.assertTrue(any('侧端识图跳过' in str(entry) for entry in host.logs))
 
+    def test_extract_session_media_reads_kind_and_cards(self) -> None:
+        """媒体种类必须和图片来源对齐，并带上卡片（受控偏离 §29）。"""
+        media = chunk3._extract_session_media({
+            'content': '<img src="https://x/a.png" kind="sticker" summary="[动画表情]"/>'
+                       '<card app="com.tencent.miniapp" title="宝箱"/>',
+            'elements': [],
+        })
+        self.assertEqual(media[0]['source'], 'https://x/a.png')
+        self.assertEqual(media[0]['kind'], 'sticker')
+        self.assertEqual(media[0]['label'], '[动画表情]')
+        self.assertEqual(media[1]['kind'], 'card')
+        self.assertEqual(media[1]['label'], '[QQ小程序：宝箱]')
+
+    def test_vision_event_keeps_cards_as_text(self) -> None:
+        """卡片是可读内容，留成标签；图片标记照旧拿掉（上游语义）。"""
+        host = _MediaHost(config={})
+        event = ServiceChunk3.describe_vision_event(host, {
+            'content': '看这个<img src="https://x/a.png"/>'
+                       '<card app="com.tencent.miniapp" title="宝箱"/>',
+            'elements': [],
+        })
+        self.assertNotIn('[图片]', event['content'])
+        self.assertNotIn('<card', event['content'])
+        self.assertIn('[QQ小程序：宝箱]', event['content'])
+        self.assertEqual(event['sources'], ['https://x/a.png'])
+
     async def test_describe_current_images_returns_observations(self) -> None:
         host = _MediaHost(config={'model': {'vision': {'detail': 'low'}}})
 
@@ -1308,7 +1334,8 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
             def available(self) -> bool:
                 return True
 
-            async def describe_images(self, images: Any, user_text: str = '', detail: str = 'auto') -> Any:
+            async def describe_images(self, images: Any, user_text: str = '', detail: str = 'auto',
+                                      kinds: Any = None) -> Any:
                 self.seen = (list(images), user_text, detail)
                 return ['1. 一只橘猫。']
 
@@ -1325,7 +1352,8 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
             def available(self) -> bool:
                 return True
 
-            async def describe_images(self, images: Any, user_text: str = '', detail: str = 'auto') -> Any:
+            async def describe_images(self, images: Any, user_text: str = '', detail: str = 'auto',
+                                      kinds: Any = None) -> Any:
                 raise RuntimeError('provider down')
 
         host.vision_describer = Describer()

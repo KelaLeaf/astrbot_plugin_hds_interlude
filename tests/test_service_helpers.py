@@ -957,6 +957,57 @@ class QuoteBackfillTests(unittest.TestCase):
                          '群里说的那件事')
 
 
+class MediaLabelTests(unittest.TestCase):
+    """入站媒体标记 → 语义标签（受控偏离 §29）。
+
+    用户报的现象：她分不清 QQ 表情、表情包图片、实拍照片、网图——因为适配器把
+    `sub_type` / `summary` 丢在解析层，提示词里只剩一个 `[图片]`。
+    """
+
+    def test_plain_image_stays_the_upstream_placeholder(self):
+        self.assertEqual(h.describe_image_media('src="https://example.com/a.jpg"'), '[图片]')
+
+    def test_sticker_and_animated_are_distinguished(self):
+        self.assertEqual(h.describe_image_media('src="https://x/a.png" kind="sticker"'), '[表情包]')
+        self.assertEqual(
+            h.describe_image_media('src="https://x/a.png" kind="sticker" summary="[动画表情]"'),
+            '[动画表情]',
+        )
+        self.assertEqual(h.describe_image_media('kind="animated"'), '[动画表情]')
+
+    def test_market_and_card_labels(self):
+        self.assertEqual(h.describe_image_media('kind="market"'), '[QQ 商城表情]')
+        self.assertEqual(
+            h.describe_card_media('app="com.tencent.miniapp_01" title="QQ经典农场"'),
+            '[QQ小程序：QQ经典农场]',
+        )
+        self.assertEqual(h.describe_card_media('app="com.tencent.tuwen" title="这条新闻"'), '[分享卡片：这条新闻]')
+        self.assertEqual(h.describe_card_media(''), '[分享卡片]')
+
+    def test_normalize_media_segments_keeps_kinds_and_names_faces(self):
+        text = h.normalize_media_segments(
+            '给你看<img src="https://x/a.png" kind="sticker"/>'
+            '<face id="277"/><card app="com.tencent.miniapp" title="宝箱"/>',
+        )
+        self.assertIn('[表情包]', text)
+        self.assertIn('[QQ 原生表情：汪汪（ID: 277）]', text)
+        self.assertIn('[QQ小程序：宝箱]', text)
+
+    def test_quoted_message_content_carries_the_kind(self):
+        quoted = h.normalize_quoted_message_content(
+            '看这个<img src="https://x/a.png" kind="sticker" summary="[动画表情]"/>',
+        )
+        self.assertIn('[动画表情]', quoted)
+        self.assertNotIn('<img', quoted)
+
+    def test_group_attachments_carries_the_kind(self):
+        text = h.describe_group_attachments(
+            '<img src="https://x/a.png" kind="sticker"/><record file="v.silk"/>',
+        )
+        self.assertIn('[表情包]', text)
+        self.assertIn('[语音]', text)
+
+
 class ContextMetricsTests(unittest.TestCase):
     """上轮上下文构成（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）。"""
 

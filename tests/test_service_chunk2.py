@@ -750,6 +750,31 @@ class DescribeUserEventTests(unittest.TestCase):
         self.assertIn('用户发送了图片', event['content'])
         self.assertIn('保持未知', event['content'])
 
+    def test_sticker_placeholder_says_what_kind_it_is(self):
+        """表情包 / 实拍照片不能在事实里写成同一个东西（受控偏离 §29）。"""
+        host = self._host({
+            'content': '',
+            'sources': ['https://cdn/x.gif'],
+            'media': [{'source': 'https://cdn/x.gif', 'kind': 'sticker',
+                       'summary': '[动画表情]', 'label': '[动画表情]'}],
+        })
+        event = host.describe_user_event(host.story, {'content': ''})
+        self.assertIn('用户发送了1 [动画表情]', event['content'])
+        self.assertEqual(event['media'][0]['kind'], 'sticker')
+
+    def test_captioned_image_keeps_a_media_fact_in_the_script(self):
+        """图片带文字时也要进脚本，否则"他发了个表情包"这条事实随回合消失。"""
+        host = self._host({
+            'content': '看看',
+            'sources': ['https://cdn/x.png'],
+            'media': [{'source': 'https://cdn/x.png', 'kind': 'sticker',
+                       'summary': '', 'label': '[表情包]'}],
+        })
+        event = host.describe_user_event(host.story, {'content': '看看'})
+        self.assertTrue(event['content'].startswith('看看'))
+        self.assertIn('[用户同时发送了1 [表情包]', event['content'])
+        self.assertIn('保持未知', event['content'])
+
     def test_audio_and_file_attachments_get_distinct_placeholder_facts(self):
         host = self._host({'content': '', 'sources': []})
         voice = host.describe_user_event(host.story, {'content': '[CQ:record,file=ABC.silk]'})

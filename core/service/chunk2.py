@@ -137,6 +137,15 @@ __all__ = [
 # 本文件需要的模块级纯函数
 # =========================================================================== #
 
+def _media_phrase(media: list[dict[str, Any]]) -> str:
+    """把媒体种类折成一句人话（`1 个表情包` / `2 张图片、1 个表情包`）。"""
+    counts: dict[str, int] = {}
+    for item in media or []:
+        label = pick(item, 'label') or '[图片]'
+        counts[label] = counts.get(label, 0) + 1
+    return '、'.join('%d %s' % (count, label) for label, count in counts.items())
+
+
 def targetable_message_id(value: Any) -> Optional[str]:
     """上游 `targetableMessageId`（`src/service.ts:7300`）。
 
@@ -884,6 +893,7 @@ class ServiceChunk2(ServiceBase):
         image_sources: Optional[list[str]] = None,
         audio_sources: Optional[list[str]] = None,
         quote: Any = None,
+        media: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         """上游 `bufferUserNarrative(...)`（`src/service.ts:2189`）。
 
@@ -930,6 +940,7 @@ class ServiceChunk2(ServiceBase):
             'superseded_intents': superseded_intents,
             'image_sources': list(image_sources or []),
             'audio_sources': list(audio_sources or []),
+            'media': list(media or []),
         }
         if quote:
             message['quote'] = quote
@@ -1123,10 +1134,23 @@ class ServiceChunk2(ServiceBase):
         files = extract_session_file_facts(session)
         audio_files = [file for file in files if pick(file, 'audio')]
         plain_files = [file for file in files if not pick(file, 'audio')]
+        media = visual.get('media') if isinstance(visual.get('media'), list) else []
+        image_media = [item for item in media if pick(item, 'kind') != 'card']
         content = visual.get('content') or ''
+        if content and sources:
+            # 有文字时图片仍然进脚本：否则"他发了个表情包"这条事实会随回合消失，
+            # 等她后面再提这张图时，记忆里只剩一句没头没尾的话。
+            # 措辞与下面的音频/文件事实一致：**只报形式，不报画面**。
+            content = '%s\n[用户同时发送了%s；内容以本轮视觉输入为准，未提供视觉内容时保持未知。]' % (
+                content, _media_phrase(image_media) or '图片',
+            )
         if not content:
             if sources:
-                content = '[用户发送了图片；图片内容以本轮视觉输入为准，未提供视觉内容时保持未知。]'
+                # 种类是**元数据**，不是画面内容：说清"收到的是表情包还是照片"
+                # 不违反"没看到就别编"，反而让模型知道该用什么态度接。
+                content = '[用户发送了%s；内容以本轮视觉输入为准，未提供视觉内容时保持未知。]' % (
+                    _media_phrase(image_media) or '图片'
+                )
             elif audio_sources:
                 if audio_files:
                     names = '、'.join(str(pick(file, 'name') or '音频文件') for file in audio_files)
@@ -1152,6 +1176,7 @@ class ServiceChunk2(ServiceBase):
         return {
             'content': content,
             'sources': sources,
+            'media': media,
             'audio_sources': audio_sources,
             'quote': describe_quoted_message(session, str(character_name)),
         }

@@ -437,6 +437,85 @@ def _fallback_extract_session_image_sources(session: Any) -> list[str]:
     return sources
 
 
+def _fallback_extract_session_media(session: Any) -> list[dict[str, Any]]:
+    """入站媒体（图片 / QQ 小程序卡片）→ `[{source, kind, summary, label}]`。
+
+    与 `_fallback_extract_session_image_sources` **同源**：`source` 用同一套归一化
+    （`onebot-url:` / `onebot-file:` / `data:image/` / 本地 `file://`），所以调用方可以
+    直接拿图片来源去这张表里对齐种类，不依赖遍历顺序。
+
+    `kind` / `summary` 来自适配层从 OneBot 原始段捞回来的 `<img kind=… summary=…>`；
+    取不到就是普通图片（`[图片]`）。卡片没有可下载来源，单独按顺序列出。
+    """
+    raw = _text(_member(session, 'content'))
+    media: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    describe_image = _helper('describe_image_media')
+    describe_card = _helper('describe_card_media')
+
+    def add(source: Any, attrs: str = '') -> None:
+        value = _text(source).strip()
+        if not value or value in seen:
+            return
+        seen.add(value)
+        kind = 'image'
+        summary = ''
+        found = re.search(r'kind=["\']([^"\']*)["\']', attrs, re.IGNORECASE) if attrs else None
+        if found:
+            kind = found.group(1).strip().lower() or 'image'
+        found = re.search(r'summary=["\']([^"\']*)["\']', attrs, re.IGNORECASE) if attrs else None
+        if found:
+            summary = found.group(1).strip()
+        label = describe_image(attrs) if callable(describe_image) else '[图片]'
+        media.append({'source': value, 'kind': kind, 'summary': summary, 'label': label})
+
+    # 图片：只解析这条消息的内容（`session.elements` 归适配器所有，可能被跨回合复用）
+    for match in re.finditer(r'<(?:img|image)\b([^>]*?)/?>', raw, re.IGNORECASE):
+        attrs = match.group(1)
+        source = ''
+        for key in ('src', 'url'):
+            found = re.search(r'%s=["\']([^"\']*)["\']' % key, attrs, re.IGNORECASE)
+            if found and found.group(1).strip():
+                source = found.group(1).strip()
+                break
+        if not source:
+            found = re.search(r'file=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
+            if found:
+                source = 'onebot-file:%s' % found.group(1).strip()
+        add(source, attrs)
+    # 适配器直给的本地图片（与 `extract_session_image_sources` 的信任边界一致：
+    # 只认适配器元素，绝不给正文里手写的路径开本地读文件的口子）。
+    trusted = _member(session, 'elements')
+    if isinstance(trusted, list):
+        for element in trusted:
+            if not is_record(element) or _text(element.get('type')).lower() not in ('img', 'image'):
+                continue
+            attrs = element.get('attrs') if is_record(element.get('attrs')) else {}
+            data = element.get('data') if is_record(element.get('data')) else {}
+            merged = {**data, **attrs}
+            source = _text(merged.get('src') or merged.get('url'))
+            if source and not re.match(r'^(?:https?://|data:image/)', source, re.IGNORECASE):
+                add(_local_image_path(source), _attrs_text(merged))
+
+    # 小程序 / 分享卡片：没有可下载来源，按出现顺序列出，供文字与 payload 使用。
+    for match in re.finditer(r'<card\b([^>]*?)/?>', raw, re.IGNORECASE):
+        label = describe_card(match.group(1)) if callable(describe_card) else '[分享卡片]'
+        media.append({'source': '', 'kind': 'card', 'summary': '', 'label': label})
+    return media
+
+
+def _attrs_text(attrs: Any) -> str:
+    """把属性字典还原成 `key="value"` 串（标签解析只认字符串，统一从这里过一道）。"""
+    if not is_record(attrs):
+        return ''
+    return ' '.join('%s="%s"' % (key, value) for key, value in attrs.items() if value not in (None, ''))
+
+
+def _extract_session_media(session: Any) -> list[dict[str, Any]]:
+    """`extract_session_media`：优先 helpers.py 的移植版，缺失走本模块回退。"""
+    return (_helper('extract_session_media') or _fallback_extract_session_media)(session)
+
+
 def _format_buffered_user_messages(messages: list[Any]) -> str:
     """`format_buffered_user_messages`：优先 helpers.py 的移植版。"""
     return (_helper('format_buffered_user_messages') or _fallback_format_buffered_user_messages)(messages)
@@ -880,15 +959,44 @@ class ServiceChunk3(ServiceBase):
         """
         raw = _text(_member(session, 'content'))
         sources = _extract_session_image_sources(session)
+        media = _extract_session_media(session)
         text = normalize_qq_native_face_segments(raw)
-        text = re.sub(r'</?(?:img|image|audio|record|file)\b[^>]*>', '', text, flags=re.IGNORECASE)
+        describe_card = _helper('describe_card_media')
+        if callable(describe_card):
+            text = re.sub(
+                r'<card\b([^>]*?)/?>(?:</card>)?',
+                lambda match: describe_card(match.group(1)),
+                text, flags=re.IGNORECASE,
+            )
+        # 图片标记仍然从正文里拿掉（上游：抓不到视觉内容就必须表现为"没有视觉输入"，
+        # 而不是邀请模型编一张图）。**卡片例外**：它本身就是可读的文字内容
+        # （`[QQ小程序：QQ经典农场]`），留下比删掉更有用，也免得裸标签漏进提示词。
+        text = re.sub(r'<(?:img|image)\b[^>]*/?>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'</(?:img|image|audio|record|file)>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<(?:audio|record|file)\b[^>]*/?>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'\[CQ:(?:image|record|file),[^\]]*\]', '', text, flags=re.IGNORECASE)
-        return {'content': text.strip(), 'sources': sources}
+        return {'content': text.strip(), 'sources': sources, 'media': media}
 
-    async def load_native_images(self, story: Any, sources: list[str], session: Any = None) -> list[Any]:
-        """上游 `loadNativeImages(story, sources, session?)`（`src/service.ts:2733`）逐条移植。"""
+    async def load_native_images(
+        self,
+        story: Any,
+        sources: list[str],
+        session: Any = None,
+        media: Optional[list[dict[str, Any]]] = None,
+    ) -> list[Any]:
+        """上游 `loadNativeImages(story, sources, session?)`（`src/service.ts:2733`）逐条移植。
+
+        `media` 是本移植版追加的末位可选参数：本轮每张图的**媒体种类**
+        （照片 / 表情包 / 动画表情），随图一起带走，供提示词区分
+        「他发了张实拍照片」和「他甩了个表情包」。
+        """
         if not _value(_vision_config(self), 'enabled', False) or not sources:
             return []
+        kind_by_source: dict[str, dict[str, Any]] = {}
+        for item in media or []:
+            key = _text(pick(item, 'source'))
+            if key and key not in kind_by_source:
+                kind_by_source[key] = item
         images: list[Any] = []
         turn_hashes: list[str] = []
         for index, source in enumerate(sources[:3]):
@@ -896,6 +1004,13 @@ class ServiceChunk3(ServiceBase):
                 image = await self.fetch_native_image(source, _member(session, 'bot'))
                 if image:
                     entry = {'id': 'turn-image-%d' % (index + 1), **image}
+                    found = kind_by_source.get(_text(source))
+                    if found:
+                        entry['media_kind'] = _text(pick(found, 'kind')) or 'image'
+                        entry['media_label'] = _text(pick(found, 'label')) or '[图片]'
+                        summary = _text(pick(found, 'summary'))
+                        if summary:
+                            entry['media_summary'] = summary
                     # 感知哈希（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.5）：同一条消息里
                     # 重复贴同一张图（很常见）只留一张，识图也就不必花两次钱。
                     digest = image_perceptual_hash(_image_bytes(entry))
@@ -953,6 +1068,9 @@ class ServiceChunk3(ServiceBase):
         try:
             observations = await describer.describe_images(
                 images, user_message or '', _value(_vision_config(self), 'detail', 'auto') or 'auto',
+                # 种类一起交给识图模型：它是唯一能回答「实拍 / 截图 / 网图 / 表情包」
+                # 的那一层（元数据只能告诉我们"是不是表情包"，分不出实拍与网图）。
+                [_text(item.get('media_kind')) or 'image' for item in images if isinstance(item, dict)],
             )
             if observations:
                 story_id = _text(_value(story, 'id'))
@@ -1274,7 +1392,35 @@ class ServiceChunk3(ServiceBase):
                 source for message in batch
                 for source in (_turn_get(message, 'imageSources', 'image_sources') or [])
             ])[:3]
-            loaded_images = await self.load_native_images(snapshot['story'], image_sources, latest_session)
+            # 媒体种类按来源对齐（`extract_session_media` 与来源抽取同一套归一化），
+            # 对不上的按普通图片处理——宁可不区分，也不乱认。
+            media_by_source: dict[str, dict[str, Any]] = {}
+            media_cards: list[dict[str, Any]] = []
+            for message in batch:
+                for item in (_turn_get(message, 'media') or []):
+                    if not isinstance(item, dict):
+                        continue
+                    source = _text(item.get('source'))
+                    if source:
+                        media_by_source.setdefault(source, item)
+                    else:
+                        media_cards.append(item)
+            attachments = [
+                {
+                    'index': index + 1,
+                    'kind': _text(pick(media_by_source.get(source), 'kind')) or 'image',
+                    'label': _text(pick(media_by_source.get(source), 'label')) or '[图片]',
+                    'summary': _text(pick(media_by_source.get(source), 'summary')),
+                }
+                for index, source in enumerate(image_sources)
+            ]
+            attachments.extend(
+                {'index': 0, 'kind': 'card', 'label': _text(pick(card, 'label')) or '[分享卡片]', 'summary': ''}
+                for card in media_cards
+            )
+            loaded_images = await self.load_native_images(
+                snapshot['story'], image_sources, latest_session, list(media_by_source.values()),
+            )
             vision_mode = _value(_vision_config(self), 'mode', 'native') or 'native'
             visual_observations = (
                 await self.describe_current_images(snapshot['story'], loaded_images, user_message)
@@ -1314,7 +1460,7 @@ class ServiceChunk3(ServiceBase):
                 snapshot['story'], snapshot['participant'], 'user-message',
                 snapshot['from'], snapshot['now'], user_message, snapshot['due'], superseded,
                 None, images, audio, chat_capabilities, quoted_messages, sticker_catalog,
-                turn_query_embedding, visual_observations, on_early_reply,
+                turn_query_embedding, visual_observations, on_early_reply, attachments,
             )
             succeeded = bool(pick(narrative, 'succeeded'))
             effective_now = pick(narrative, 'effectiveNow', 'effective_now')

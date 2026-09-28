@@ -62,6 +62,9 @@ __all__ = [
     'extract_session_audio_sources',
     'extract_session_file_facts',
     'describe_group_attachments',
+    'normalize_media_segments',
+    'describe_image_media',
+    'describe_card_media',
     'guess_audio_format',
     # ---- 表情 / 表态 ----
     'calibrated_native_face_willingness',
@@ -552,16 +555,88 @@ def extract_session_file_facts(session: Any) -> list[SessionFileFact]:
     return facts
 
 
+# ---------------------------------------------------------------------------
+# 入站媒体标记 → 叙述者可见的语义标签（受控偏离，见 `docs/PORTING_NOTES.md` §29）
+#
+# 上游把一切图片都记成 `[图片]`：实拍照片、截图、收藏表情包、QQ 商城表情、
+# 小程序卡片在文本里长得一模一样，模型只能靠猜。这里把适配器从原始段里捞回来的
+# 种类（`kind` / `summary`）翻译成稳定的中文标签。**普通图片仍然是 `[图片]`**
+# （上游行为），只有确实能分出来的种类才换词。
+# ---------------------------------------------------------------------------
+
+#: `<img kind="...">` → 标签。`market` 只作为兜底（商城表情正常走 `<mface>`）。
+IMAGE_MEDIA_KIND_LABELS = {
+    'sticker': '[表情包]',
+    'animated': '[动画表情]',
+    'market': '[QQ 商城表情]',
+}
+
+
+def _media_attr(attributes: Any, key: str) -> str:
+    """从标签属性串里读一个属性（属性串来自适配器，永远当成不可信文本）。"""
+    found = re.search(r'%s=["\']([^"\']*)["\']' % re.escape(key), _str(attributes), re.IGNORECASE)
+    return found.group(1).strip() if found else ''
+
+
+def describe_image_media(attributes: Any) -> str:
+    """`<img>` → `[图片]` / `[表情包]` / `[动画表情]` / `[QQ 商城表情]`。"""
+    kind = _media_attr(attributes, 'kind').lower()
+    summary = _media_attr(attributes, 'summary')
+    # 平台给的 summary 比我们推测的 kind 更具体：`[动画表情]` 说明它还会动。
+    if '动画' in summary:
+        return '[动画表情]'
+    if kind in IMAGE_MEDIA_KIND_LABELS:
+        return IMAGE_MEDIA_KIND_LABELS[kind]
+    if '表情' in summary:
+        return '[表情包]'
+    return '[图片]'
+
+
+def describe_card_media(attributes: Any) -> str:
+    """`<card>`（QQ 小程序 / 分享卡片）→ `[QQ小程序：标题]` / `[分享卡片：标题]`。
+
+    卡片必须带上**是什么**：只有 `<card/>` 时模型只能含糊成"他发了点什么"。
+    """
+    app = _media_attr(attributes, 'app')
+    title = _media_attr(attributes, 'title') or _media_attr(attributes, 'prompt')
+    mini = app.startswith('com.tencent.miniapp') or app.startswith('110')
+    if title:
+        return ('[QQ小程序：%s]' if mini else '[分享卡片：%s]') % title[:40]
+    return '[QQ小程序]' if mini else '[分享卡片]'
+
+
+def normalize_media_segments(content: Any) -> str:
+    """把入站的图片 / 表情 / 卡片标记换成带种类的语义标签。
+
+    比上游的"全记 `[图片]`"多一层：`kind` 与 `summary` 由适配层从 OneBot 原始段里
+    捞回来（见 `astrbot_bridge.raw_media_hints`），到这里才变成模型看得懂的词。
+    原生表情仍走 `normalize_qq_native_face_segments`（唯一入口，别在这里重复处理）。
+    """
+    text = normalize_qq_native_face_segments(content)
+    text = re.sub(
+        r'<(?:img|image)\b([^>]*)/?>(?:</(?:img|image)>)?',
+        lambda match: describe_image_media(match.group(1)),
+        text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r'<card\b([^>]*)/?>(?:</card>)?',
+        lambda match: describe_card_media(match.group(1)),
+        text, flags=re.IGNORECASE,
+    )
+    # CQ 码没有 kind/summary（原始段的种类信息在适配器那层就取了），保守回落 `[图片]`。
+    text = re.sub(r'\[CQ:image,[^\]]*\]', '[图片]', text, flags=re.IGNORECASE)
+    return text
+
+
 def describe_group_attachments(content: Any) -> str:
     """上游 `describeGroupAttachments`：把群聊入站的附件标记转成事实占位。
 
     群聊入站没有原生附件通道：保留「发过什么」的信息，URL 污水不进群上下文，
     也不再被模型复述。
     """
-    text = normalize_qq_native_face_segments(_str(content))
     # 注意先替换 `<file ...>` 再删闭合标签：上游用 `name|file|title` 抽文件名。
+    text = normalize_media_segments(_str(content))
     text = re.sub(r'<(?:record|audio)\b[^>]*/?>', '[语音]', text, flags=re.IGNORECASE)
-    text = re.sub(r'<(?:img|image)\b[^>]*/?>', '[图片]', text, flags=re.IGNORECASE)
     text = re.sub(r'<video\b[^>]*/?>', '[视频]', text, flags=re.IGNORECASE)
 
     def file_replacement(match: re.Match[str]) -> str:
@@ -886,8 +961,7 @@ def describe_quoted_message(session: Any, character_name: str = '主角') -> dic
 
 def normalize_quoted_message_content(value: Any) -> str:
     """上游 `normalizeQuotedMessageContent`：引用消息的有界纯文本化。"""
-    raw = normalize_qq_native_face_segments(value)
-    content = re.sub(r'<(?:img|image)\b[^>]*/?>(?:</(?:img|image)>)?', '[图片]', raw, flags=re.IGNORECASE)
+    content = normalize_media_segments(value)
     content = re.sub(r'<(?:audio|record)\b[^>]*/?>(?:</(?:audio|record)>)?', '[语音]', content, flags=re.IGNORECASE)
     content = re.sub(r'<video\b[^>]*/?>(?:</video>)?', '[视频]', content, flags=re.IGNORECASE)
     content = re.sub(r'<(?:face|mface)\b[^>]*/?>(?:</(?:face|mface)>)?', '[表情]', content, flags=re.IGNORECASE)

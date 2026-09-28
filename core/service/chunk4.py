@@ -1094,8 +1094,14 @@ class ServiceChunk4(ServiceBase):
         visual_observations: Optional[list[str]] = None,
         timeline_plan: Any = None,
         on_early_reply: Any = None,
+        attachments: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """上游 `decide(story, participant, phase, from, now, ...)`（`:3437`）。
+
+        `attachments` 是**本移植版追加的末位可选参数**（受控偏离，见
+        `docs/PORTING_NOTES.md` §29）：本轮附带的媒体种类（照片 / 表情包 / 动画表情 /
+        QQ 商城表情 / 小程序卡片）。上游没有这个概念——它的适配器把种类信息丢在
+        解析层，模型只能一律看到 `[图片]`。追加在末尾，位置参数调用不受影响。
 
         主模型上下文的**唯一入口**。返回的 `NarrativeRequest` 是**发给模型的 wire
         format**：顶层与嵌套键全部保持上游 camelCase（见模块 docstring 第 3 条）。
@@ -1319,6 +1325,7 @@ class ServiceChunk4(ServiceBase):
             'images': images,
             'audio': audio,
             'visualObservations': visual_observations,
+            'attachments': attachments or [],
             'timelinePlan': timeline_plan,
             'developmentTendencies': development_tendencies,
             'writingOptions': {
@@ -1652,6 +1659,7 @@ class ServiceChunk4(ServiceBase):
         turn_query_embedding: Optional[list[float]] = None,
         visual_observations: Optional[list[str]] = None,
         on_early_reply: Any = None,
+        attachments: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """上游 `tryDecide(...)`（`:3720`）。
 
@@ -1723,7 +1731,7 @@ class ServiceChunk4(ServiceBase):
                 story, participant, phase, from_, effective_now, user_message, due_intents,
                 superseded_intents, group_context, images, audio, [], False, chat_capabilities,
                 quoted_messages, sticker_catalog, turn_query_embedding, visual_observations,
-                timeline_plan, early_reply if can_early_reply else None,
+                timeline_plan, early_reply if can_early_reply else None, attachments,
             )
             immediate = None
             if (
@@ -1749,6 +1757,7 @@ class ServiceChunk4(ServiceBase):
                     superseded_intents, group_context, images, audio, immediate_observations, False,
                     chat_capabilities, quoted_messages, sticker_catalog, turn_query_embedding,
                     visual_observations, timeline_plan, early_reply if can_early_reply else None,
+                    attachments,
                 )
             # 用户自报的钟点（「八点赶到」）对守卫背书：模型复述它们不是时间越界。
             # 提取是 O(消息长度) 的本地正则，只在实况用户回合发生一次。
@@ -1801,6 +1810,7 @@ class ServiceChunk4(ServiceBase):
                     superseded_intents, group_context, images, audio, immediate_observations, True,
                     chat_capabilities, quoted_messages, sticker_catalog, turn_query_embedding,
                     visual_observations, timeline_plan, early_reply if can_early_reply else None,
+                    attachments,
                 )
                 recovered_time_overflow = detect_live_script_time_overflow(
                     _raw_decision(decision, 'script'), phase, from_, effective_now, timezone, endorsed_clocks,

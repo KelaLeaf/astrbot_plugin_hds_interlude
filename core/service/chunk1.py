@@ -1151,6 +1151,7 @@ class ServiceChunk1(ServiceBase):
             pick(user_input, 'sources') or [],
             pick(user_input, 'audioSources', 'audio_sources') or [],
             pick(user_input, 'quote'),
+            pick(user_input, 'media') or [],
         )
         images = pick(user_input, 'sources') or []
         audio = pick(user_input, 'audioSources', 'audio_sources') or []
