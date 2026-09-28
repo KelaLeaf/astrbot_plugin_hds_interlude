@@ -29,11 +29,15 @@ import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 import types
 import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+#: 桥测试统一用一个进程级临时数据目录：桥会把投递坐标落盘
+#: （`delivery_endpoints.json`），指向源码树会在仓库里留垃圾文件。
+TEST_DATA_DIR = tempfile.mkdtemp(prefix='hdsi-bridge-tests-')
 PLUGIN_ROOT = os.path.dirname(HERE)
 REPO_ROOT = os.path.dirname(PLUGIN_ROOT)
 COMMANDS_DOC = os.path.join(REPO_ROOT, 'docs', 'COMMANDS.md')
@@ -366,6 +370,7 @@ def _install_astrbot_stub():
 _install_astrbot_stub()
 
 # 被测模块必须在桩装好之后再导入。
+from plugin.core import logging as interlude_logging  # noqa: E402
 from plugin.adapters import astrbot_bridge as bridge_module  # noqa: E402
 from plugin.adapters.astrbot_bridge import (  # noqa: E402
     AstrbotBridge,
@@ -554,11 +559,146 @@ class FakeDatabase:
         return []
 
 
+class _FakePlatformMeta:
+    def __init__(self, name: str, platform_id: str) -> None:
+        self.name = name
+        self.id = platform_id
+
+
+class _FakePlatform:
+    """够用的宿主平台实例桩：只提供 `meta()`。"""
+
+    def __init__(self, name: str, platform_id: str) -> None:
+        self._meta = _FakePlatformMeta(name, platform_id)
+
+    def meta(self):
+        return self._meta
+
+
+class DeliveryCoordinateTests(unittest.TestCase):
+    """出站 UMO 的解析（v1.4.1 修：重启后没有登记表也不许猜错平台 id）。
+
+    用户报的现象：剧本与聊天记录里显示发了消息，实际一条没到。日志里宿主的原话是
+    `cannot find platform for session onebot:FriendMessage:1000008890`——我们把**归一化
+    平台名**当成了 AstrBot 的平台实例 id（正确的第一段是 `default`）。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.logs: list[str] = []
+
+        def sink(level, text):  # noqa: ARG001
+            self.logs.append(text)
+
+        self._sink = sink
+        interlude_logging.set_log_sink(sink)
+        self.addCleanup(interlude_logging.set_log_sink, interlude_logging._default_sink)
+
+    def _bridge(self, instances=None):
+        context = FakeContext()
+        if instances is not None:
+            context.platform_manager = FakePlatformManager(instances)
+        fake_db = FakeDatabase(':memory:')
+        with mock.patch.object(bridge_module, 'Database', lambda path: fake_db), \
+                mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: self._tmp.name):
+            bridge = AstrbotBridge(
+                context=context, config={}, logger=sys.modules['astrbot'].logger,
+            )
+        bridge.db = fake_db
+        # `AstrbotBridge.__init__` 末尾会把 sink 换成自己的转发器：这里再装回测试用的，
+        # 否则测不到桥自己打的那几条 warn。
+        interlude_logging.set_log_sink(self._sink)
+        return bridge
+
+    def test_host_platform_id_is_used_when_nothing_is_registered(self):
+        """这条就是用户踩到的路径：进程刚重启，谁都没登记过。"""
+        bridge = self._bridge([_FakePlatform('aiocqhttp', 'default')])
+        umo = bridge.private_umo('onebot', '100001357', '1000008890')
+        self.assertEqual(umo, 'default:FriendMessage:1000008890')
+        self.assertNotIn('onebot:', umo)
+
+    def test_group_umo_also_resolves_through_the_host(self):
+        bridge = self._bridge([_FakePlatform('aiocqhttp', 'default')])
+        self.assertEqual(bridge.group_umo('100004964'), 'default:GroupMessage:100004964')
+
+    def test_an_unresolvable_platform_says_so_instead_of_guessing(self):
+        bridge = self._bridge([])
+        self.assertEqual(bridge.private_umo('onebot', '100001357', '1000008890'),
+                         'onebot:FriendMessage:1000008890')
+        self.assertTrue(any('没能把平台 onebot 翻成' in item for item in self.logs), self.logs)
+
+    def test_multiple_onebot_instances_are_not_guessed_at(self):
+        bridge = self._bridge([
+            _FakePlatform('aiocqhttp', 'default'),
+            _FakePlatform('aiocqhttp', 'second'),
+        ])
+        self.assertEqual(bridge.private_umo('onebot', '100001357', '1000008890'), '')
+        self.assertTrue(any('多个 onebot 平台实例' in str(item) for item in self.logs))
+
+    def test_coordinates_are_persisted_and_survive_a_restart(self):
+        """登记过之后就算重启、就算宿主实例换了一茬，也按登记的那份走。"""
+        first = self._bridge([_FakePlatform('aiocqhttp', 'default')])
+        endpoint = bridge_module.AstrbotEndpoint(
+            platform='onebot', platform_id='default', platform_name='aiocqhttp',
+            self_id='100001357', user_id='1000008890', group_id='', is_group=False,
+            umo='default:FriendMessage:1000008890', message_id='', session_id='1000008890',
+        )
+        first.remember_event(object(), object(), endpoint)
+        saved = json.loads((Path(self._tmp.name) / 'delivery_endpoints.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['platforms']['onebot|100001357'], 'default')
+        self.assertEqual(saved['private']['onebot|100001357'], 'default:FriendMessage:1000008890')
+
+        # 重启：新的 bridge、宿主这边一个平台实例都没有（还没连上/查询失败），仍要发得出去。
+        second = self._bridge([])
+        self.assertEqual(second.private_umo('onebot', '100001357', '1000008890'),
+                         'default:FriendMessage:1000008890')
+
+    def test_group_registration_is_persisted_too(self):
+        first = self._bridge([])
+        endpoint = bridge_module.AstrbotEndpoint(
+            platform='onebot', platform_id='default', platform_name='aiocqhttp',
+            self_id='100001357', user_id='', group_id='100004964', is_group=True,
+            umo='default:GroupMessage:100004964', message_id='', session_id='100004964',
+        )
+        first.remember_event(object(), object(), endpoint)
+        second = self._bridge([])
+        self.assertEqual(second.group_umo('100004964'), 'default:GroupMessage:100004964')
+
+    def test_background_delivery_reaches_the_host_with_the_right_umo(self):
+        """端到端：后台主动私聊投出去时，宿主拿到的 UMO 必须是 `default:...`。
+
+        这就是用户报的那条路：重启后没有任何登记，她主动发消息，剧本与聊天记录都显示
+        发了，对面一条没收到，宿主日志写 `cannot find platform for session onebot:...`。
+        """
+        bridge = self._bridge([_FakePlatform('aiocqhttp', 'default')])
+        result = asyncio.run(bridge.transport.send_private({
+            'platform': 'onebot', 'selfId': '100001357', 'userId': '1000008890',
+            'channelId': '1000008890',
+        }, '在吗'))
+        self.assertTrue(result.get('ok'), result)
+        sent = [umo for umo, _chain in bridge.context.sent]
+        self.assertEqual(sent, ['default:FriendMessage:1000008890'])
+
+    def test_background_group_delivery_reaches_the_host_with_the_right_umo(self):
+        bridge = self._bridge([_FakePlatform('aiocqhttp', 'default')])
+        result = asyncio.run(bridge.transport.send_group('100004964', '在吗'))
+        self.assertTrue(result.get('ok'), result)
+        self.assertEqual([umo for umo, _chain in bridge.context.sent],
+                         ['default:GroupMessage:100004964'])
+
+    def test_a_broken_map_file_never_blocks_startup(self):
+        (Path(self._tmp.name) / 'delivery_endpoints.json').write_text('{ not json', encoding='utf-8')
+        bridge = self._bridge([_FakePlatform('aiocqhttp', 'default')])
+        self.assertEqual(bridge.private_umo('onebot', '100001357', '1000008890'),
+                         'default:FriendMessage:1000008890')
+
+
 def _make_bridge(config=None, context=None):
     """构造一个不落盘的 `AstrbotBridge`。"""
     fake_db = FakeDatabase(':memory:')
     with mock.patch.object(bridge_module, 'Database', lambda path: fake_db), \
-            mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: HERE):
+            mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: TEST_DATA_DIR):
         bridge = AstrbotBridge(
             context=context or FakeContext(),
             config=config or {},
@@ -572,7 +712,7 @@ def _make_plugin(config=None, context=None):
     """构造一个不落盘的 `HDSInterludePlugin`。"""
     fake_db = FakeDatabase(':memory:')
     with mock.patch.object(bridge_module, 'Database', lambda path: fake_db), \
-            mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: HERE):
+            mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: TEST_DATA_DIR):
         plugin = main_module.HDSInterludePlugin(context or FakeContext(), config or {})
     plugin.bridge.db = fake_db
     return plugin
@@ -1149,7 +1289,7 @@ class BlindModeTests(unittest.TestCase):
         if persona_id:
             config['story_defaults'] = {'persona_id': persona_id}
         with mock.patch.object(bridge_module, 'Database', lambda path: FakeDatabase(path)), \
-                mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: HERE):
+                mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: TEST_DATA_DIR):
             plugin = main_module.HDSInterludePlugin(FakeContext(), config)
         return plugin, registry
 

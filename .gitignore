@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+# 运行期投递坐标（桥自动落盘，不该进仓库）
+delivery_endpoints.json

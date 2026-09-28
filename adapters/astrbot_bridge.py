@@ -1878,6 +1878,15 @@ class AstrbotBridge:
         self._channel_events: dict[str, Any] = {}
         self._message_events: dict[str, Any] = {}
         self._current_umo = ''
+        # 跨重启的投递坐标（v1.4.1）：进程内的登记表在重启后是空的，而**平台实例 id**
+        # （AstrBot 的 UMO 第一段）是部署属性、不会变。以前重启后没有登记表就退回用
+        # 归一化平台名（`onebot`）拼 UMO，宿主于是报 `cannot find platform for session
+        # onebot:FriendMessage:…`、消息静默发不出去。落盘一份就再也不会猜错。
+        self._delivery_map_path = Path(self.data_dir) / 'delivery_endpoints.json'
+        self._saved_platform_ids: dict[str, str] = {}
+        self._saved_private_umos: dict[str, str] = {}
+        self._saved_group_umos: dict[str, str] = {}
+        self._load_delivery_map()
         self._httpx_client: Any = None
         self._register_log_sink()
 
@@ -2378,28 +2387,183 @@ class AstrbotBridge:
             self._private_endpoints[(endpoint.platform, endpoint.self_id, endpoint.user_id)] = endpoint
         if endpoint.message_id:
             self._message_events[endpoint.message_id] = event
+        self._persist_endpoint(endpoint)
+
+    def _persist_endpoint(self, endpoint: AstrbotEndpoint) -> None:
+        """把这条会话的投递坐标记进落盘表（只在出现新键时写文件）。"""
+        if not endpoint.platform_id or not endpoint.umo:
+            return
+        changed = False
+        key = self._delivery_key(endpoint.platform, endpoint.self_id)
+        if self._saved_platform_ids.get(key) != endpoint.platform_id:
+            self._saved_platform_ids[key] = endpoint.platform_id
+            changed = True
+        platform_key = self._delivery_key(endpoint.platform, '')
+        if self._saved_platform_ids.get(platform_key) != endpoint.platform_id:
+            self._saved_platform_ids[platform_key] = endpoint.platform_id
+            changed = True
+        if endpoint.is_group:
+            channel = endpoint.group_id or endpoint.channel_id
+            if channel and self._saved_group_umos.get(channel) != endpoint.umo:
+                self._saved_group_umos[channel] = endpoint.umo
+                changed = True
+        elif endpoint.user_id and self._saved_private_umos.get(key) != endpoint.umo:
+            self._saved_private_umos[key] = endpoint.umo
+            changed = True
+        if changed:
+            self._save_delivery_map()
 
     def _platform_id_for(self, platform: str, self_id: str = '') -> str:
+        """归一化平台名 → 平台实例 id。
+
+        顺序：运行期登记（本次进程见过这条会话）→ 落盘登记（以前见过）→ 向宿主反查
+        （按适配器类型，只有唯一候选时才用）。三条都不成立时**返回归一化名并记一条
+        warn**：那正是 `cannot find platform for session onebot:…` 的来源，得让它可见。
+        """
         for key in ((platform, self_id), (platform, '')):
             if key in self._platform_ids:
                 return self._platform_ids[key]
+        for key in (self._delivery_key(platform, self_id), self._delivery_key(platform, '')):
+            if key in self._saved_platform_ids:
+                return self._saved_platform_ids[key]
+        host_ids = self._host_platform_ids(platform)
+        if len(host_ids) == 1:
+            resolved = host_ids[0]
+            self._platform_ids[(platform, self_id)] = resolved
+            self._platform_ids.setdefault((platform, ''), resolved)
+            return resolved
+        if len(host_ids) > 1:
+            # 有多个同类实例：**不猜**。猜错就是把消息发进另一个账号的对话框，
+            # 比发不出去严重得多（用户踩过一次：发了消息但对面什么都没收到）。
+            log_fallback(
+                'warn',
+                '有多个 %s 平台实例（%s），无法确定该用哪一个投递；'
+                '等这条会话收到一条消息后会自动登记',
+                platform, '、'.join(host_ids),
+            )
+            return ''
+        log_fallback(
+            'warn',
+            '没能把平台 %s 翻成 AstrBot 的平台实例 id，出站可能失败；'
+            '等这条会话收到一条消息后会自动登记',
+            platform,
+        )
         return platform
+
+    # ---- 投递坐标的落盘（跨重启） ----
+
+    def _delivery_key(self, platform: str, self_id: str = '') -> str:
+        return '%s|%s' % (_text(platform), _text(self_id))
+
+    def _load_delivery_map(self) -> None:
+        """读回上次运行登记的投递坐标（读失败就当没有，绝不拦住启动）。"""
+        try:
+            raw = self._delivery_map_path.read_text(encoding='utf-8')
+            data = json.loads(raw) if raw.strip() else {}
+        except FileNotFoundError:
+            return
+        except Exception as error:  # noqa: BLE001 - 坏文件不影响出站
+            log_fallback('warn', '投递坐标文件读取失败，将按运行期登记重建 错误=%s', error)
+            return
+        if not isinstance(data, dict):
+            return
+        for key, value in (data.get('platforms') or {}).items():
+            text = _text(value)
+            if text:
+                self._saved_platform_ids[_text(key)] = text
+        for key, value in (data.get('private') or {}).items():
+            text = _text(value)
+            if text:
+                self._saved_private_umos[_text(key)] = text
+        for key, value in (data.get('groups') or {}).items():
+            text = _text(value)
+            if text:
+                self._saved_group_umos[_text(key)] = text
+
+    def _save_delivery_map(self) -> None:
+        """把投递坐标写回磁盘（只在有新键时调用，不是每条消息都写）。"""
+        payload = {
+            'platforms': dict(self._saved_platform_ids),
+            'private': dict(self._saved_private_umos),
+            'groups': dict(self._saved_group_umos),
+        }
+        try:
+            tmp = self._delivery_map_path.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding='utf-8')
+            os.replace(tmp, self._delivery_map_path)
+        except Exception as error:  # noqa: BLE001 - 落盘失败只降级成"重启后要重建"
+            log_fallback('warn', '投递坐标写入失败，重启后需要重新登记 错误=%s', error)
+
+    def _host_platform_ids(self, platform: str = '') -> list[str]:
+        """向宿主列出候选平台实例 id。
+
+        匹配依据是**适配器类型**（`meta().name`，如 aiocqhttp）而不是实例 id，因为
+        我们的 `onebot` 是归一化名、宿主的实例 id 是 `default` 这类值。传空平台名
+        就列出全部实例。
+        """
+        ids: list[str] = []
+        for instance in self.list_bots():
+            try:
+                meta = instance.meta()
+            except Exception:  # noqa: BLE001 - 取不到元信息就跳过这个实例
+                continue
+            instance_id = _text(getattr(meta, 'id', ''))
+            adapter_name = _text(getattr(meta, 'name', ''))
+            if not instance_id:
+                continue
+            if platform and resolve_platform_name(adapter_name, instance_id) != platform:
+                continue
+            if instance_id not in ids:
+                ids.append(instance_id)
+        return ids
+
+    def _sole_platform_id(self) -> str:
+        """群聊用：只有唯一平台时给出它的实例 id，多个候选一律不猜。"""
+        known = [value for value in self._platform_ids.values() if value]
+        known += [value for value in self._saved_platform_ids.values() if value]
+        unique = list(dict.fromkeys(known))
+        if len(unique) == 1:
+            return unique[0]
+        if len(unique) > 1:
+            return ''
+        host_ids = self._host_platform_ids()
+        if len(host_ids) == 1:
+            return host_ids[0]
+        if len(host_ids) > 1:
+            log_fallback(
+                'warn',
+                '宿主机上有多个平台实例（%s），群聊投递无法确定用哪一个；'
+                '等这个群收到一条消息后会自动登记',
+                '、'.join(host_ids),
+            )
+        return ''
 
     def private_umo(self, platform: str, self_id: str, user_id: str) -> str:
         """私聊 UMO：`<platform_id>:FriendMessage:<user_id>`。"""
         endpoint = self._private_endpoints.get((platform, self_id, user_id))
         if endpoint is not None:
             return endpoint.build_umo()
+        saved = self._saved_private_umos.get(self._delivery_key(platform, self_id))
+        if saved:
+            return saved
         platform_id = self._platform_id_for(platform, self_id)
-        return '%s:FriendMessage:%s' % (platform_id, user_id) if user_id else ''
+        if not platform_id or not user_id:
+            return ''
+        return '%s:FriendMessage:%s' % (platform_id, user_id)
 
     def group_umo(self, channel_id: str) -> str:
         """群聊 UMO：`<platform_id>:GroupMessage:<group_id>`。"""
-        endpoint = self._group_endpoints.get(_text(channel_id))
+        channel = _text(channel_id)
+        endpoint = self._group_endpoints.get(channel)
         if endpoint is not None:
             return endpoint.build_umo()
-        platform_id = next(iter(self._platform_ids.values()), '') if len(set(self._platform_ids.values())) <= 1 else ''
-        return '%s:GroupMessage:%s' % (platform_id, channel_id) if platform_id and channel_id else ''
+        saved = self._saved_group_umos.get(channel)
+        if saved:
+            return saved
+        platform_id = self._sole_platform_id()
+        if not platform_id or not channel:
+            return ''
+        return '%s:GroupMessage:%s' % (platform_id, channel)
 
     def channel_umo(self, channel_id: str) -> str:
         """按会话 id 猜 UMO（私聊与群聊都试一遍）。"""
