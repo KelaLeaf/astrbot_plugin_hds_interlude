@@ -159,7 +159,8 @@ class _ServiceStub:
         actions = create_script_delivery_actions(self.commit)
         return [{
             'id': 42, 'story_id': 'story:1', 'storyId': 'story:1',
-            'metadata': {'commit_id': COMMIT_ID, 'commitId': COMMIT_ID,
+            'metadata': {'commit_id': self.commit['commit_id'],
+                         'commitId': self.commit['commit_id'],
                          'delivery_actions': actions, 'deliveryActions': actions},
         }]
 

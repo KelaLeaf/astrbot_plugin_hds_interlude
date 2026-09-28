@@ -28,6 +28,7 @@ from .adapters.astrbot_bridge import (
     PLUGIN_NAME,
     build_bridge,
     endpoint_for_event,
+    is_non_message_event,
     session_view,
 )
 from .adapters.console_api import ConsoleApi
@@ -161,6 +162,18 @@ CAPABILITY_CHECK_WAIT_SECONDS = 45
 
 #: 上游 `askConfirmation` 的肯定回答正则：`/^(?:y|yes)$/i`。
 CONFIRMATION_YES_RE = re.compile(r'^(?:y|yes)$', re.IGNORECASE)
+
+#: 管理命令的统一回执文案（上游 `index.ts` 逐字）。
+#: ⚠️ 这几个常量在某次重构里被连定义一起删掉、只留了引用，于是**所有**取消/无权限
+#: 分支都抛 `NameError`（用户在 `/hdsi_purge_all` 上踩到：回复 n 时崩，命令没执行成）。
+#: 测试 `test_command_guards.py` 专门钉住它们存在。
+NO_MANAGER = '当前 QQ 没有共享主剧本的管理权限。'
+NO_MANAGER_DETAIL = (
+    '当前 QQ 没有共享主剧本的管理权限。'
+    '请在 Console 的 sharedStory.managerAccounts 中添加此 QQ，或留空允许所有获授权账号。'
+)
+NO_ADMIN = '无权限：当前账号不是 HDSI 管理员。'
+CANCELLED = '操作已取消。'
 
 
 def _to_int(value: Any, default: int) -> int:
@@ -792,12 +805,25 @@ class HDSInterludePlugin(Star):
         return bool(CONFIRMATION_YES_RE.match(_text(answer).strip()))
 
     def _resolve_confirmation(self, event: AstrMessageEvent) -> bool:
-        """若该会话正在等 y/n，则消费这条回复并返回 `True`。"""
+        """若该会话正在等 y/n，则消费这条回复并返回 `True`。
+
+        **只有真正的文字消息才算回答**：NapCat 的「对方正在输入…」是 `notice`，宿主照样
+        派到消息处理器上；以前它会带着空文本进来，把等待中的 future 用 `''` 结掉 ——
+        确认被当成"取消"，用户随后真打的 `y` 反而成了普通聊天消息（用户 2026-09-28 的
+        `/hdsi_purge_all` 现场：提问后 2 秒就报"操作已取消"，然后她开始回答一个 "y"）。
+        非消息事件与空文本一律放行给别的分支，确认继续等（60 秒超时按取消处理）。
+        """
         key = _text(getattr(event, 'unified_msg_origin', ''))
         future = self._confirmations.get(key)
         if future is None or future.done():
             return False
-        future.set_result(_text(event.get_message_str()).strip())
+        non_message, _label = is_non_message_event(event)
+        if non_message:
+            return False
+        answer = _text(event.get_message_str()).strip()
+        if not answer:
+            return False
+        future.set_result(answer)
         event.stop_event()
         return True
 
