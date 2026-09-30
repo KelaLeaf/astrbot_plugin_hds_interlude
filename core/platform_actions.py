@@ -486,6 +486,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(
             _p('file_id', '文件号', required=True),
             _p('name', '新名', required=True),
+            _p('current_folder', '所在目录', note='留空 = 根目录'),
             _p('group_id', '群号'),
         ),
         risk='dangerous',
@@ -496,7 +497,8 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         '把群文件移到别的文件夹。',
         params=(
             _p('file_id', '文件号', required=True),
-            _p('folder', '文件夹号', required=True),
+            _p('folder', '目标文件夹', required=True),
+            _p('current_folder', '所在目录', note='留空 = 根目录'),
             _p('group_id', '群号'),
         ),
         risk='dangerous',
@@ -564,7 +566,8 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('content', '正文', required=True),
             _p('ugc_right', '可见性', type='int', minimum=1, maximum=128,
                note='1 所有人 / 4 好友（默认）/ 16 部分好友 / 64 仅自己 / 128 部分不可见'),
-            _p('images', '配图', type='list', note='图片路径或地址，最多 9 张'),
+            _p('images', '配图', type='list', note='图片路径/URL/base64，最多 9 张（NapCat 原生支持）'),
+            _p('target_uins', '可见性作用的 QQ', type='list', note='ugc_right 为 16/128 时必填'),
         ),
         risk='sensitive',
         returns='说说 tid + 可见性',

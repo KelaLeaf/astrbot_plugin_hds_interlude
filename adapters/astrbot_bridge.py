@@ -1045,12 +1045,17 @@ _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
         'upload_group_file',
         {'file': 'file', 'name': 'name', 'folder': 'folder', 'group_id': 'group_id'},
     ),
+    # NapCat 的 rename/move 都要求 `current_parent_directory`（文件当前所在目录）；
+    # 目录里叫 `current_folder`，缺省 `/`（根目录）。
     'rename_group_file': (
-        'rename_group_file', {'file_id': 'file_id', 'name': 'new_name', 'group_id': 'group_id'},
+        'rename_group_file',
+        {'file_id': 'file_id', 'name': 'new_name', 'current_folder': 'current_parent_directory',
+         'group_id': 'group_id'},
     ),
     'move_group_file': (
         'move_group_file',
-        {'file_id': 'file_id', 'folder': 'target_parent_directory', 'group_id': 'group_id'},
+        {'file_id': 'file_id', 'folder': 'target_parent_directory',
+         'current_folder': 'current_parent_directory', 'group_id': 'group_id'},
     ),
     'create_group_file_folder': (
         'create_group_file_folder', {'name': 'name', 'group_id': 'group_id'},
@@ -1068,9 +1073,15 @@ _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
     # ---------------- 语音（走宿主 TTS，不用 NapCat 的 AI 声聊） ----------------
     'send_voice': (_PLATFORM_ACTION_LOCAL, {'content': 'content'}),
     'list_voices': (_PLATFORM_ACTION_LOCAL, {}),
-    # ---------------- QQ 空间（SnowLuma 扩展动作） ----------------
+    # ---------------- QQ 空间 ----------------
+    # **NapCat 原生的只有发/删说说**（`send_qzone_msg` / `delete_qzone_msg`，见
+    # napcat.apifox.cn/496813058e0 / 496813059e0）；评论、点赞、看说说列表、看好友动态是
+    # **SnowLuma 扩展动作**（`comment_qzone` / `like_qzone` / `get_qzone_msg_list` /
+    # `get_qzone_feeds`）——只装 NapCat 时这四个会以平台原话失败，不会假装成功。
     'publish_qzone_post': (
-        'send_qzone_msg', {'content': 'content', 'ugc_right': 'ugc_right', 'images': 'images'},
+        'send_qzone_msg',
+        {'content': 'content', 'ugc_right': 'ugc_right', 'images': 'images',
+         'target_uins': 'target_uins'},
     ),
     'comment_qzone_post': (
         'comment_qzone', {'tid': 'tid', 'content': 'content', 'target_uin': 'target_uin'},
@@ -1163,11 +1174,10 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     'update_qq_status': {'ext_status': 0, 'battery_status': 0},
     # 目录写的是「4 好友（默认）可见」，平台的缺省是 1（所有人）——以目录为准。
     'publish_qzone_post': {'ugc_right': 4},
-    'delete_group_file': {'busid': 102},
-    'upload_group_file': {'folder': ''},
+    'upload_group_file': {'folder': '/'},
     'create_group_file_folder': {'parent_directory': '/'},
-    'move_group_file': {'current_parent_directory': ''},
-    'rename_group_file': {'current_parent_directory': ''},
+    'move_group_file': {'current_parent_directory': '/'},
+    'rename_group_file': {'current_parent_directory': '/'},
 }
 
 #: 目录动作 → 参数 → 「目录里的枚举值 → 平台取值」。
