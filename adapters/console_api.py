@@ -27,6 +27,15 @@ from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
 from ..core.token_stats import normalize_range, range_bounds, summarize_usage
 from ..core.story_state import decode_story_state
+# 作品正文 / 创作意图 / 修改理由的上限与分段长度：**单一事实源在 `core/works.py`**，
+# 控制台不另抄一套数字（上限漂移过一次就等于前端与 core 各判一次）。
+from ..core.works import (
+    BRIEF_MAX as WORK_BRIEF_MAX,
+    CONTENT_MAX as WORK_CONTENT_MAX,
+    REASON_MAX as WORK_REASON_MAX,
+    TITLE_MAX as WORK_TITLE_MAX,
+    split_dump_parts,
+)
 from .astrbot_bridge import (
     CONSOLE_LOG_BUFFER as CONSOLE_LOG_MAX,
     CONSOLE_USAGE_BUFFER as CONSOLE_USAGE_MAX,
@@ -72,6 +81,15 @@ CONTEXT_SECTION_LABELS = {
 }
 
 INTERNAL_INTENT_TYPES: frozenset[str] = frozenset({'split-message', 'narrative-retry'})
+
+#: 共同作品（`interlude_work` 表，上游 rc28 `works.ts`；入口由本移植版补）的取数下限。
+#: 服务层没就绪时控制台回这个空壳，**不抛**（§29：一个没接线的功能不该让整页打不开）。
+WORKS_UNAVAILABLE_HINT = '共同作品尚未启用或服务层未就绪'
+#: 一件作品最多取多少行（一个参与者一行；正常只有个位数，卡上限是防脏库）。
+WORK_ROW_LIMIT = 200
+#: revision 预览长度：详情里只有 head 给全文，历史版本给长度 + 预览（64 × 8000 字
+#: 全量塞进一次响应会把面板拖垮，而界面主要看的是"谁在什么时候改了什么"）。
+WORK_REVISION_PREVIEW = 200
 
 
 # ===================================================================== #
@@ -1250,6 +1268,10 @@ class ConsoleApi:
     CONNECTION_FIELDS: dict[str, str] = {
         'label': 'str', 'enabled': 'bool', 'mode': 'str', 'endpoint': 'str',
         'model': 'str', 'response_format': 'str',
+        # 协议（v1.7.0）：`chat-completions`（默认）/ `anthropic-messages`，
+        # 以及 Anthropic 的缓存标记。**漏进白名单 = 控制台保存时静默丢掉这两项**
+        # （schema 加了也没用，用户填了不生效）。
+        'protocol': 'str', 'anthropic_cache': 'bool',
         'temperature': 'float', 'top_p': 'float', 'max_tokens': 'int', 'timeout': 'int',
         'extra_headers': 'str', 'extra_body': 'str',
         'reasoning_effort': 'str', 'deepseek_thinking': 'str', 'deepseek_reasoning_effort': 'str',
@@ -1318,7 +1340,7 @@ class ConsoleApi:
 
         endpoint = _text(row.get('endpoint')).strip()
         if endpoint and not endpoint.lower().startswith(('http://', 'https://')):
-            raise ConsoleError('地址要以 http:// 或 https:// 开头（填完整的 Chat Completions 地址）')
+            raise ConsoleError('地址要以 http:// 或 https:// 开头（填完整的地址：Chat Completions 是 …/chat/completions，Anthropic 是 …/messages）')
         row['endpoint'] = endpoint
 
         label = _text(row.get('label')).strip()
@@ -1640,6 +1662,389 @@ class ConsoleApi:
             'has_more': len(messages) > len(page) or truncated,
             'scanned': len(rows),
             'truncated': truncated,
+        }
+
+    # ------------------------------------------------------------------ #
+    # 共同作品（上游 rc28 `works.ts` 的界面；面板「作品」）
+    #
+    # 上游只有纯逻辑 + 存储抽象，service 层一行都没接——配置组、payload 与这里的
+    # 面板入口都是本移植版补的。有一条语义不能含糊：**只有用户能接受 / 驳回**，
+    # 她只能"提议"（模型侧的提案在 `chunk14.apply_work_proposal` 里落成待决）。
+    # 所以这一页的写操作全是"用户动作"，没有"让模型自己接受"的入口。
+    #
+    # 取数走服务层（`chunk14` 的 `works_snapshot` / `shared_work_state`），拿不到就回
+    # 空壳 + 说明（§29），绝不 500；写操作只在**用户看得懂的事实**上给 400
+    # （未知作品 / 未知或已决提案 / 超长正文），其余异常也压成 400 文案。
+    # ------------------------------------------------------------------ #
+
+    async def works_overview(self, story_id: str = '') -> dict[str, Any]:
+        """「作品」面板的清单：这部剧本里每个参与者的共同作品各一行。
+
+        行里只放清单要用的东西（标题、当前版本号、待决提案数、运行中的写手任务数、
+        最后修改时间）；正文在 `work_detail` 里给。`broken` 那一行代表"库里有这件作品
+        但数据形状不被识别"——照实报出来，别让它静默消失。
+        """
+        config = self._works_config()
+        enabled = bool(config['enabled'])
+        service = self._works_service()
+        story = self._current_story(story_id)
+        if service is None:
+            payload = self._works_shell('works_snapshot')
+            payload['story'] = self._story_brief(story) if story else None
+            payload['works'] = []
+            return payload
+        if not story:
+            return {
+                'available': True,
+                'enabled': enabled,
+                'generation_mode': _text(config.get('generation_mode')),
+                'explain': self._works_explain(),
+                'story': None,
+                'works': [],
+                'hint': '还没有剧本：先和她聊一句，剧本会自动建起来',
+            }
+        sid = _text(story.get('id'))
+        names = self._participant_names(sid)
+        works: list[dict[str, Any]] = []
+        for row in _safe_all(self.bridge.db, 'interlude_work', {'storyId': sid}, None, WORK_ROW_LIMIT):
+            if not isinstance(row, dict):
+                continue
+            participant_id = _text(row.get('participantId'))
+            snapshot = await self._works_snapshot(service, sid, participant_id)
+            works.append(self._work_brief(
+                row, snapshot, participant_id,
+                names.get(participant_id) or participant_id, enabled,
+            ))
+        works.sort(
+            key=lambda item: (_text(item.get('updated_at')), _text(item.get('participant'))),
+            reverse=True,
+        )
+        return {
+            'available': True,
+            'enabled': enabled,
+            'generation_mode': _text(config.get('generation_mode')),
+            'explain': self._works_explain(),
+            'story': self._story_brief(story),
+            'works': works,
+            'hint': '',
+        }
+
+    async def work_detail(self, work_id: str) -> dict[str, Any]:
+        """一件作品的全貌：当前正文、版本时间线、提案、写手任务、能不能起草。
+
+        正文是**创作素材**，原样回，这里不做任何"安全改写"（上游把这条写进了提示词：
+        文本本身绝不能被当成指令）。历史版本只带 `content_chars` + `preview`，
+        只有 head 带全文——64 个版本 × 8000 字不该塞进一次面板响应。
+        """
+        config = self._works_config()
+        enabled = bool(config['enabled'])
+        service = self._works_service()
+        wid = _text(work_id).strip()
+        if service is None:
+            payload = self._works_shell('works_snapshot')
+            payload['work_id'] = wid
+            return payload
+        if not wid:
+            raise ConsoleError('请选择一件共同作品')
+        row = self._work_row(wid)
+        if row is None:
+            raise ConsoleError('找不到这件共同作品：%s' % wid)
+        sid = _text(row.get('storyId'))
+        participant_id = _text(row.get('participantId'))
+        story = self._story_by_id(sid)
+        record = self._participant_row(sid, participant_id)
+        name = _text(record.get('displayName')) or participant_id
+        snapshot = await self._works_snapshot(service, sid, participant_id)
+        if snapshot is None:
+            # 坏行：原数据一律保留、绝不覆盖（`core/works.py` 的硬校验），控制台照实说。
+            return {
+                'available': True,
+                'enabled': enabled,
+                'generation_mode': _text(config.get('generation_mode')),
+                'explain': self._works_explain(),
+                'broken': True,
+                'work_id': wid,
+                'story': self._story_brief(story) if story else None,
+                'participant_id': participant_id,
+                'participant': name,
+                'title': '',
+                'head': '',
+                'generation': _int(row.get('generation')),
+                'content': '',
+                'content_chars': 0,
+                'revision': 0,
+                'revision_count': 0,
+                'revisions': [],
+                'proposals': [],
+                'jobs': [],
+                'pending_count': 0,
+                'jobs_running': 0,
+                'job_count': 0,
+                'may_propose': False,
+                'may_propose_reason': '这件作品的数据形状不被识别，先别动它',
+                'last_failure': None,
+                'limits': self._work_limits(),
+                'hint': '这件作品的数据形状不被识别：原数据已保持原样，控制台没有做任何写入。',
+            }
+        state = self._work_state(row)
+        revisions = [item for item in (snapshot.get('revisions') or []) if isinstance(item, dict)]
+        proposals = [item for item in (snapshot.get('proposals') or []) if isinstance(item, dict)]
+        jobs = [item for item in (snapshot.get('jobs') or []) if isinstance(item, dict)]
+        head = _text(snapshot.get('head') or state.get('head'))
+        head_revision = next((item for item in revisions if _text(item.get('id')) == head), None)
+        content = _text((head_revision or {}).get('content'))
+        projection = await self._works_state(service, sid, participant_id)
+        may_propose, reason = self._work_may_propose(enabled, jobs, projection)
+        # 服务层的投影比行内 state 更权威（`running` 但进程里没有的已经改标 `interrupted`），
+        # 但它只在启用时存在；两边都拿不到就不编一条假的失败记录。
+        last_failure = _record_or_none((projection or {}).get('lastFailure'))
+        if last_failure is None:
+            last_failure = _record_or_none(state.get('lastFailure'))
+        return {
+            'available': True,
+            'enabled': enabled,
+            'generation_mode': _text(config.get('generation_mode')),
+            'explain': self._works_explain(),
+            'broken': False,
+            'work_id': wid,
+            'story': self._story_brief(story) if story else None,
+            'participant_id': participant_id,
+            'participant': name,
+            'title': _text(snapshot.get('title') or state.get('title')),
+            'head': head,
+            'generation': _int(snapshot.get('generation', row.get('generation'))),
+            'content': content,
+            'content_chars': len(content),
+            'revision': self._revision_ordinal(revisions, head),
+            'revision_count': len(revisions),
+            'revisions': [
+                self._revision_brief(item, index, head)
+                for index, item in enumerate(revisions, 1)
+            ],
+            'proposals': [
+                self._proposal_brief(item, self._revision_ordinal(revisions, _text(item.get('baseRevisionId'))))
+                for item in proposals
+            ],
+            'jobs': [self._job_brief(item) for item in jobs],
+            'pending_count': len([item for item in proposals if _text(item.get('status')) == 'pending']),
+            'jobs_running': len([item for item in jobs if _text(item.get('status')) == 'running']),
+            'job_count': len(jobs),
+            'may_propose': may_propose,
+            'may_propose_reason': reason,
+            'last_failure': last_failure,
+            'limits': self._work_limits(),
+            'hint': '',
+        }
+
+    async def accept_work_proposal(self, work_id: str, proposal_id: str) -> dict[str, Any]:
+        """接受一条提案 → 立刻多一个版本（**只有用户能做这件事**）。"""
+        return await self._resolve_work_proposal(work_id, proposal_id, accept=True)
+
+    async def reject_work_proposal(self, work_id: str, proposal_id: str) -> dict[str, Any]:
+        """驳回一条提案 → 正文不动，只留一条结论（同样只有用户能做）。"""
+        return await self._resolve_work_proposal(work_id, proposal_id, accept=False)
+
+    async def create_work(
+        self,
+        story_id: Any = '',
+        participant_id: Any = '',
+        title: Any = '',
+        content: Any = '',
+    ) -> dict[str, Any]:
+        """用户建**第一件**作品（面板「新建作品」）。
+
+        为什么必须有这个入口：上游 `SharedWorks.create` 是整条链唯一的起点——保存提案 /
+        手改 / 起草都要求作品已经存在，没有它面板就是"只能看不能开始"。
+
+        「已有共同作品」时服务层会拒（**绝不覆盖**），那条文案原样透给用户。
+        """
+        service = self._works_service()
+        member = getattr(service, 'create_work', None) if service is not None else None
+        if not callable(member):
+            return self._works_shell('create_work')
+        sid = await self._story_id_for_write(story_id)
+        pid = _text(participant_id).strip()
+        if not pid:
+            raise ConsoleError('请选择这件作品属于哪个私聊（参与者）')
+        if not self._participant_exists(sid, pid):
+            raise ConsoleError('这个参与者不在当前剧本里：%s（先让她和这个账号说过话）' % pid)
+        name = _text(title)
+        if not name.strip():
+            raise ConsoleError('给这件作品起个标题')
+        if _text_length(name) > WORK_TITLE_MAX:
+            raise ConsoleError('标题最多 %d 字（当前 %d 字）' % (WORK_TITLE_MAX, _text_length(name)))
+        text = content if isinstance(content, str) else ''
+        if not text.strip():
+            raise ConsoleError('作品正文不能为空')
+        if _text_length(text) > WORK_CONTENT_MAX:
+            raise ConsoleError('作品正文最多 %d 字（当前 %d 字）' % (WORK_CONTENT_MAX, _text_length(text)))
+        try:
+            result = await member(sid, pid, name, text)
+        except Exception as error:  # noqa: BLE001
+            raise ConsoleError('新建作品失败：%s' % error) from error
+        self._require_work_ok(result, '新建作品')
+        wid = _text((result or {}).get('workId')) if isinstance(result, dict) else ''
+        if not wid:
+            raise ConsoleError('新建作品失败：服务层没有返回 workId')
+        payload = await self.work_detail(wid)
+        payload['result'] = _work_result_brief(result)
+        payload['changed'] = 'work-create %s' % wid
+        return payload
+
+    async def cancel_work_generation(self, work_id: Any, job_id: Any) -> dict[str, Any]:
+        """取消一个还在跑的写手任务（迟到的结果会被丢弃）。
+
+        `interrupted`（插件重启过、库里还留着 `running`）的任务也允许取消——它一直压着
+        `mayPropose`，取消是把它放开的唯一入口。
+        """
+        service = self._works_service()
+        member = getattr(service, 'cancel_work_generation', None) if service is not None else None
+        if not callable(member):
+            return self._works_shell('cancel_work_generation')
+        wid, row = self._work_row_for_write(work_id)
+        jid = _text(job_id).strip()
+        if not jid:
+            raise ConsoleError('请选择要取消的写手任务')
+        sid = _text(row.get('storyId'))
+        participant_id = _text(row.get('participantId'))
+        snapshot = await self._works_snapshot(service, sid, participant_id)
+        jobs = [
+            item for item in ((snapshot or {}).get('jobs') or []) if isinstance(item, dict)
+        ] or [
+            item for item in (self._work_state(row).get('jobs') or []) if isinstance(item, dict)
+        ]
+        job = next((item for item in jobs if _text(item.get('id')) == jid), None)
+        if job is None:
+            raise ConsoleError('找不到这个写手任务：%s' % jid)
+        status = _text(job.get('status'))
+        if status not in ('running', 'interrupted'):
+            raise ConsoleError('这个任务已经结束了（%s），不需要取消' % (status or '未知状态'))
+        try:
+            result = await member(sid, participant_id, jid)
+        except Exception as error:  # noqa: BLE001
+            raise ConsoleError('取消任务失败：%s' % error) from error
+        self._require_work_ok(result, '取消任务')
+        payload = await self.work_detail(wid)
+        payload['changed'] = 'work-cancel %s' % jid
+        return payload
+
+    async def edit_work(self, work_id: str, content: Any, reason: Any = '') -> dict[str, Any]:
+        """用户手改：登记一条用户提案并立即接受 → 一条新 revision（head 前移）。
+
+        `reason` 是提案的理由（服务层要求非空、≤500 字）。界面把它当可选输入，
+        所以留空时补一句"由用户手动修改"——**不伪造**，只是把"这是谁改的"说清楚。
+        """
+        service = self._works_service()
+        member = getattr(service, 'edit_work', None) if service is not None else None
+        if not callable(member):
+            return self._works_shell('edit_work')
+        wid, row = self._work_row_for_write(work_id)
+        text = content if isinstance(content, str) else ''
+        if not text.strip():
+            raise ConsoleError('作品正文不能为空')
+        if _text_length(text) > WORK_CONTENT_MAX:
+            raise ConsoleError(
+                '作品正文最多 %d 字（当前 %d 字）' % (WORK_CONTENT_MAX, _text_length(text)),
+            )
+        note = _text(reason).strip()
+        if _text_length(note) > WORK_REASON_MAX:
+            raise ConsoleError('修改理由最多 %d 字（当前 %d 字）' % (WORK_REASON_MAX, _text_length(note)))
+        snapshot = await self._works_snapshot(service, _text(row.get('storyId')), _text(row.get('participantId')))
+        head = _text((snapshot or {}).get('head'))
+        if not head:
+            raise ConsoleError('这件作品的数据形状不被识别，先别改它')
+        edit = {
+            'baseRevisionId': head,
+            'content': text,
+            'reason': note or '由用户手动修改',
+        }
+        try:
+            result = await self._call_work_edit(
+                member, _text(row.get('storyId')), _text(row.get('participantId')), edit,
+            )
+        except Exception as error:  # noqa: BLE001 - 写失败要说出来，不能假装成功
+            raise ConsoleError('保存失败：%s' % error) from error
+        self._require_work_ok(result, '保存')
+        payload = await self.work_detail(wid)
+        payload['result'] = _work_result_brief(result)
+        payload['changed'] = 'work-edit %s' % wid
+        return payload
+
+    async def start_work_generation(self, work_id: str, brief: Any) -> dict[str, Any]:
+        """「让她起草」：起一次异步写手任务（结果会作为**待决提案**回来）。"""
+        service = self._works_service()
+        member = getattr(service, 'start_work_generation', None) if service is not None else None
+        if not callable(member):
+            return self._works_shell('start_work_generation')
+        wid, row = self._work_row_for_write(work_id)
+        text = brief if isinstance(brief, str) else ''
+        if not text.strip():
+            raise ConsoleError('起草前先写一句创作意图')
+        if _text_length(text) > WORK_BRIEF_MAX:
+            raise ConsoleError('创作意图最多 %d 字（当前 %d 字）' % (WORK_BRIEF_MAX, _text_length(text)))
+        sid = _text(row.get('storyId'))
+        participant_id = _text(row.get('participantId'))
+        snapshot = await self._works_snapshot(service, sid, participant_id)
+        head = _text((snapshot or {}).get('head'))
+        if not head:
+            raise ConsoleError('这件作品的数据形状不被识别，先别让它起草')
+        try:
+            result = await self._call_work_generate(member, sid, participant_id, {
+                'baseRevisionId': head,
+                'brief': text,
+            })
+        except Exception as error:  # noqa: BLE001
+            raise ConsoleError('起草任务没能开始：%s' % error) from error
+        self._require_work_ok(result, '起草任务')
+        payload = await self.work_detail(wid)
+        payload['job'] = (result or {}).get('job') if isinstance(result, dict) else None
+        payload['model_id'] = _text((result or {}).get('modelId')) if isinstance(result, dict) else ''
+        payload['changed'] = 'work-generate %s' % wid
+        return payload
+
+    async def export_work(self, work_id: str) -> dict[str, Any]:
+        """导出整件作品：`{parts, count}`，每段都在单条 QQ 消息的安全长度内。
+
+        分段**由服务层的 `works_dump` 做**（`split_dump_parts`），控制台不再切一遍
+        ——二次切分会把 `''.join(parts)` 的还原语义搞坏。
+        """
+        config = self._works_config()
+        service = self._works_service()
+        wid = _text(work_id).strip()
+        if service is None:
+            payload = self._works_shell('works_dump')
+            payload.update({'work_id': wid, 'title': '', 'parts': [], 'count': 0, 'chars': 0})
+            return payload
+        if not wid:
+            raise ConsoleError('请选择一件共同作品')
+        row = self._work_row(wid)
+        if row is None:
+            raise ConsoleError('找不到这件共同作品：%s' % wid)
+        sid = _text(row.get('storyId'))
+        participant_id = _text(row.get('participantId'))
+        snapshot = await self._works_snapshot(service, sid, participant_id)
+        title = _text((snapshot or {}).get('title') or self._work_state(row).get('title'))
+        parts = await self._works_dump(service, sid, participant_id)
+        if not parts:
+            return {
+                'available': True,
+                'enabled': bool(config['enabled']),
+                'work_id': wid,
+                'title': title,
+                'parts': [],
+                'count': 0,
+                'chars': 0,
+                'hint': '这件作品还没有正文，没有可导出的内容',
+            }
+        return {
+            'available': True,
+            'enabled': bool(config['enabled']),
+            'work_id': wid,
+            'title': title,
+            'parts': parts,
+            'count': len(parts),
+            'chars': sum(len(part) for part in parts),
+            'hint': '',
         }
 
     # ------------------------------------------------------------------ #
@@ -2164,6 +2569,396 @@ class ConsoleApi:
             'updated_at': _text(row.get('updatedAt')),
             'has_state': bool(state),
         }
+
+    # ---- 共同作品：取服务、读行、把 state 翻成面板要的形状 ---- #
+
+    def _works_service(self) -> Optional[Any]:
+        """能干活的作品服务层；没有（旧版本 / 还没接线）就回 `None`。
+
+        判据是**读快照这个成员在不在**：面板的取数与写操作都建立在"能读到这件作品"
+        之上，缺了它就只剩空壳可回（§29）。
+        """
+        service = getattr(self.bridge, 'service', None)
+        if service is None:
+            return None
+        if not callable(getattr(service, 'works_snapshot', None)):
+            return None
+        return service
+
+    def _works_config(self) -> dict[str, Any]:
+        """`works` 配置段（优先服务层归一化后的那份）。
+
+        语义与 `chunk14.works_config()` 一致：缺键按默认（**关闭**），键存在时只有显式
+        `false` 才算关（坑 36：别把 `0` / 缺失一律当"关闭"）。
+        """
+        service = getattr(self.bridge, 'service', None)
+        reader = getattr(service, 'works_config', None)
+        if callable(reader):
+            try:
+                data = reader()
+                if isinstance(data, dict):
+                    return data
+            except Exception:  # noqa: BLE001 - 配置坏了不该让面板打不开
+                pass
+        try:
+            section = self.bridge.section('works')
+        except Exception:  # noqa: BLE001
+            section = {}
+        section = section if isinstance(section, dict) else {}
+        value = section.get('enabled')
+        return {
+            'enabled': value is not False and value is not None,
+            'generation_mode': _text(section.get('generation_mode') or section.get('generationMode')) or 'main',
+            'model_id': _text(section.get('model_id') or section.get('modelId')),
+        }
+
+    def _works_explain(self) -> str:
+        """服务层自己那句结论（`explain_works_state`）：现在是哪个模式、没生效是为什么。
+
+        面板的空态与禁用提示直接用它，别在控制台重写一遍配置语义。
+        """
+        service = getattr(self.bridge, 'service', None)
+        reader = getattr(service, 'explain_works_state', None)
+        if not callable(reader):
+            return ''
+        try:
+            return _text(reader()).strip()
+        except Exception:  # noqa: BLE001
+            return ''
+
+    def _works_unavailable_hint(self, member: str = '') -> str:
+        """空壳的说明文案：带上服务层自己那句"为什么没生效"（`explain_works_state`）。"""
+        explain = self._works_explain()
+        suffix = '（缺少 %s）' % member if member else ''
+        return '%s%s%s' % (WORKS_UNAVAILABLE_HINT, suffix, ' ｜%s' % explain if explain else '')
+
+    def _works_shell(self, member: str = '') -> dict[str, Any]:
+        """服务层没就绪时的统一空壳（**不抛**：面板得能打开并说明原因）。"""
+        config = self._works_config()
+        return {
+            'available': False,
+            'enabled': bool(config['enabled']),
+            'generation_mode': _text(config.get('generation_mode')),
+            'explain': self._works_explain(),
+            'hint': self._works_unavailable_hint(member),
+        }
+
+    async def _works_snapshot(self, service: Any, story_id: str, participant_id: str) -> Optional[dict[str, Any]]:
+        """读一件作品的全貌；坏行 / 读取异常一律 `None`（原数据不动），不抛给前端。"""
+        reader = getattr(service, 'works_snapshot', None)
+        if not callable(reader) or not story_id or not participant_id:
+            return None
+        try:
+            # 服务层的 `_entity_id` 认得 id 字符串（不必先取出整个剧本 / 参与者对象）。
+            snapshot = await reader(story_id, participant_id)
+        except Exception:  # noqa: BLE001 - 坏行是"读不出来"，不是"控制台出错"
+            return None
+        return snapshot if isinstance(snapshot, dict) else None
+
+    async def _works_state(self, service: Any, story_id: str, participant_id: str) -> Optional[dict[str, Any]]:
+        """payload 用的那份投影（`sharedWork`）：`mayPropose` / `lastFailure` 的权威来源。
+
+        未启用 / 没有作品时服务层回 `None`，这里照收——面板不会凭空编出一个投影。
+        """
+        reader = getattr(service, 'shared_work_state', None)
+        if not callable(reader) or not story_id or not participant_id:
+            return None
+        try:
+            state = await reader(story_id, participant_id)
+        except Exception:  # noqa: BLE001
+            return None
+        return state if isinstance(state, dict) else None
+
+    async def _works_dump(self, service: Any, story_id: str, participant_id: str) -> list[str]:
+        """分段导出：`works_dump` 已经是**分好段**的列表，这里只做形状归一。"""
+        reader = getattr(service, 'works_dump', None)
+        if not callable(reader):
+            return []
+        try:
+            parts = await reader(story_id, participant_id)
+        except Exception:  # noqa: BLE001
+            return []
+        if isinstance(parts, (list, tuple)):
+            return [_text(part) for part in parts if _text(part)]
+        if isinstance(parts, str) and parts:
+            # 兜底：万一某版服务层回的是整串（不是本移植版的契约），这里补一次切分。
+            return split_dump_parts(parts)
+        return []
+
+    async def _call_work_edit(self, member: Any, story_id: str, participant_id: str, edit: dict[str, Any]) -> Any:
+        """调用户的 `edit_work`——服务层有两种可能的签字，按签名把参数放对位置。
+
+        本移植版实际是 `edit_work(story, participant, edit)`（`edit` 是
+        `{baseRevisionId, content, reason}` 对象，与上游 wire 形状一致）；契约摘要里
+        写的是 `(story, participant, content, reason)`。两种都认，别把字典塞进正文位置。
+        """
+        if 'content' in _work_signature_names(member):
+            return await member(story_id, participant_id, edit['content'], edit['reason'])
+        return await member(story_id, participant_id, edit)
+
+    async def _call_work_generate(self, member: Any, story_id: str, participant_id: str, request: dict[str, Any]) -> Any:
+        """同上：`start_work_generation(story, participant, request|brief)` 两种签字都认。"""
+        if 'brief' in _work_signature_names(member):
+            return await member(story_id, participant_id, request['brief'])
+        return await member(story_id, participant_id, request)
+
+    def _work_row(self, work_id: str) -> Optional[dict[str, Any]]:
+        """按主键读 `interlude_work` 的一行（控制台自己读行，写操作仍然交给服务层）。"""
+        rows = _safe_all(self.bridge.db, 'interlude_work', {'id': work_id}, None, 1)
+        return rows[0] if rows and isinstance(rows[0], dict) else None
+
+    def _work_row_for_write(self, work_id: Any) -> tuple[str, dict[str, Any]]:
+        """写操作的入口校验：件必须存在，且 id 不能空（未知 id 按本文件约定 400）。"""
+        wid = _text(work_id).strip()
+        if not wid:
+            raise ConsoleError('请选择一件共同作品')
+        row = self._work_row(wid)
+        if row is None:
+            raise ConsoleError('找不到这件共同作品：%s' % wid)
+        return wid, row
+
+    def _participant_exists(self, story_id: str, participant_id: str) -> bool:
+        """这个参与者在这部剧本里登记过吗（表里一行都没有时不拦，别把旧库挡在门外）。"""
+        rows = self._participant_rows(story_id)
+        if not rows:
+            return True
+        return any(_text(row.get('id')) == participant_id for row in rows)
+
+    def _story_by_id(self, story_id: str) -> Optional[dict[str, Any]]:
+        """按 id 精确取剧本（**不用** `_current_story`：它取不到会回落到最近那一部）。"""
+        if not story_id:
+            return None
+        rows = _safe_all(self.bridge.db, 'interlude_story', {'id': story_id}, None, 1)
+        return rows[0] if rows and isinstance(rows[0], dict) else None
+
+    @staticmethod
+    def _work_state(row: dict[str, Any]) -> dict[str, Any]:
+        """行里的 `state`（json 列已解码；万一拿到的是字符串就再解一次）。"""
+        state = row.get('state') if isinstance(row, dict) else None
+        if isinstance(state, str):
+            try:
+                state = json.loads(state)
+            except (TypeError, ValueError):
+                state = None
+        return state if isinstance(state, dict) else {}
+
+    @staticmethod
+    def _revision_ordinal(revisions: list[Any], revision_id: str) -> int:
+        """版本号（从 1 数）：head 在时间线里的位置；找不到就退回版本总数。"""
+        for index, item in enumerate(revisions, 1):
+            if isinstance(item, dict) and _text(item.get('id')) == revision_id:
+                return index
+        return len(revisions) if revision_id else 0
+
+    def _work_brief(
+        self,
+        row: dict[str, Any],
+        snapshot: Optional[dict[str, Any]],
+        participant_id: str,
+        name: str,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        """清单里的一行（快照拿不到也照出，`broken` 标出来）。"""
+        state = self._work_state(row)
+        source = snapshot if isinstance(snapshot, dict) else {}
+        revisions = source.get('revisions') if isinstance(source.get('revisions'), list) else [
+            item for item in (state.get('revisions') or []) if isinstance(item, dict)
+        ]
+        proposals = [
+            item for item in (source.get('proposals') or []) if isinstance(item, dict)
+        ] or [
+            item for item in (state.get('proposals') or []) if isinstance(item, dict)
+        ]
+        jobs = [item for item in (source.get('jobs') or []) if isinstance(item, dict)] or [
+            item for item in (state.get('jobs') or []) if isinstance(item, dict)
+        ]
+        head = _text(source.get('head') or state.get('head'))
+        running = len([item for item in jobs if _text(item.get('status')) == 'running'])
+        return {
+            'work_id': _text(row.get('id')),
+            'participant_id': participant_id,
+            'participant': name or participant_id,
+            'title': _text(source.get('title') or state.get('title')),
+            'head': head,
+            'revision': self._revision_ordinal(revisions, head),
+            'revision_count': len(revisions),
+            'pending_count': len([item for item in proposals if _text(item.get('status')) == 'pending']),
+            'jobs_running': running,
+            'job_count': len(jobs),
+            'generation': _int(row.get('generation')),
+            'updated_at': _work_updated_at(revisions, proposals, jobs),
+            'may_propose': bool(enabled) and running == 0,
+            'last_failure': _record_or_none(state.get('lastFailure')),
+            'broken': snapshot is None,
+        }
+
+    def _revision_brief(self, item: dict[str, Any], ordinal: int, head: str) -> dict[str, Any]:
+        """时间线里的一条版本：head 给全文，历史版本给长度 + 预览。"""
+        content = _text(item.get('content'))
+        revision_id = _text(item.get('id'))
+        is_head = bool(head) and revision_id == head
+        brief = {
+            'id': revision_id,
+            'ordinal': ordinal,
+            'parent_id': _text(item.get('parentId')),
+            'author': _text(item.get('author')),
+            'proposal_id': _text(item.get('proposalId')),
+            'created_at': _text(item.get('createdAt')),
+            'current': is_head,
+            'content_chars': len(content),
+            'preview': content[:WORK_REVISION_PREVIEW],
+        }
+        if is_head:
+            brief['content'] = content
+        return brief
+
+    def _proposal_brief(self, item: dict[str, Any], base_ordinal: int) -> dict[str, Any]:
+        """提案卡：正文原样给（用户要能看到她到底想改成什么），理由与基础版本一起给。"""
+        content = _text(item.get('content'))
+        return {
+            'id': _text(item.get('id')),
+            'status': _text(item.get('status')),
+            'pending': _text(item.get('status')) == 'pending',
+            'author': _text(item.get('author')),
+            'reason': _text(item.get('reason')),
+            'content': content,
+            'content_chars': len(content),
+            'base_revision_id': _text(item.get('baseRevisionId')),
+            'base_revision': base_ordinal,
+            'created_at': _text(item.get('createdAt')),
+            'source_entry_id': _int(item.get('sourceEntryId'), 0),
+        }
+
+    def _job_brief(self, item: dict[str, Any]) -> dict[str, Any]:
+        """写手任务的一行（`interrupted` = 进程重载过，永远不会自己重放）。"""
+        status = _text(item.get('status'))
+        return {
+            'id': _text(item.get('id')),
+            'status': status,
+            'interrupted': status == 'interrupted',
+            'model_id': _text(item.get('modelId')),
+            'brief': _text(item.get('brief')),
+            'created_at': _text(item.get('createdAt')),
+            'proposal_id': _text(item.get('proposalId')),
+            'source_entry_id': _int(item.get('sourceEntryId'), 0),
+        }
+
+    def _work_may_propose(
+        self,
+        enabled: bool,
+        jobs: list[dict[str, Any]],
+        projection: Optional[dict[str, Any]],
+    ) -> tuple[bool, str]:
+        """能不能让她起草：服务层投影优先，拿不到就按"没有在跑的任务"自己判。
+
+        返回 `(能不能, 不能的原因)`——界面明说原因，别只给一个灰按钮。
+        """
+        if not enabled:
+            return False, '共同作品没启用：去「配置」页打开「共同作品」'
+        if isinstance(projection, dict) and 'mayPropose' in projection:
+            may = bool(projection.get('mayPropose'))
+        else:
+            may = not any(_text(item.get('status')) == 'running' for item in jobs)
+        if may:
+            return True, ''
+        return False, '已有一次写手任务在跑：等她写完，或先取消那个任务'
+
+    @staticmethod
+    def _work_limits() -> dict[str, int]:
+        return {'content': WORK_CONTENT_MAX, 'brief': WORK_BRIEF_MAX, 'reason': WORK_REASON_MAX}
+
+    def _require_work_ok(self, result: Any, action: str) -> None:
+        """服务层用 `{'ok': False, 'error': …}` 表达失败（不抛），转成用户看得懂的 400。"""
+        if isinstance(result, dict) and result.get('ok') is not False:
+            return
+        reason = _text((result or {}).get('error')) if isinstance(result, dict) else ''
+        raise ConsoleError('%s失败：%s' % (action, reason or '服务层没有给出原因'))
+
+    async def _resolve_work_proposal(self, work_id: Any, proposal_id: Any, accept: bool) -> dict[str, Any]:
+        """接受 / 驳回的公共路径。
+
+        顺序刻意是"先自己看一眼，再交给服务层"：未知作品、未知提案、已经处理过的提案
+        都能立刻给 400（本文件既有约定），服务层那边的 CAS / 基础版本校验照旧再兜一次。
+        """
+        label = '接受' if accept else '驳回'
+        service = self._works_service()
+        name = 'accept_work_proposal' if accept else 'reject_work_proposal'
+        member = getattr(service, name, None) if service is not None else None
+        if not callable(member):
+            return self._works_shell(name)
+        wid, row = self._work_row_for_write(work_id)
+        pid = _text(proposal_id).strip()
+        if not pid:
+            raise ConsoleError('请选择一条提案')
+        # 提案清单以服务层快照为准（它是解码 + 校验过的那份）；坏行才回落到裸 state。
+        sid = _text(row.get('storyId'))
+        snapshot = await self._works_snapshot(service, sid, _text(row.get('participantId')))
+        proposals = [
+            item for item in ((snapshot or {}).get('proposals') or []) if isinstance(item, dict)
+        ] or [
+            item for item in (self._work_state(row).get('proposals') or []) if isinstance(item, dict)
+        ]
+        proposal = next((item for item in proposals if _text(item.get('id')) == pid), None)
+        if proposal is None:
+            raise ConsoleError('找不到这条提案：%s' % pid)
+        status = _text(proposal.get('status'))
+        if status != 'pending':
+            raise ConsoleError('这条提案已经处理过了（%s），结论不能改' % (status or '未知状态'))
+        try:
+            result = await member(wid, pid)
+        except Exception as error:  # noqa: BLE001
+            raise ConsoleError('%s提案失败：%s' % (label, error)) from error
+        self._require_work_ok(result, '%s提案' % label)
+        payload = await self.work_detail(wid)
+        payload['result'] = _work_result_brief(result)
+        payload['changed'] = 'work-%s %s' % ('accept' if accept else 'reject', pid)
+        return payload
+
+def _record_or_none(value: Any) -> Optional[dict[str, Any]]:
+    """dict 或 `None`（`lastFailure` 只可能是对象；空对象也当"没有失败记录"）。"""
+    return value if isinstance(value, dict) and value else None
+
+
+def _work_updated_at(*groups: Any) -> str:
+    """最后修改时间：版本 / 提案 / 任务里最新的那个 `createdAt`。
+
+    `interlude_work` 表只有 `id` / `storyId` / `participantId` / `generation` / `state`，
+    没有时间列（上游 `WorkRow` 也没有），所以"最后改过"只能从 state 里推。
+    ISO 8601（UTC、Z 结尾）字符串可以直接比大小。
+    """
+    stamps = [
+        _text(item.get('createdAt'))
+        for group in groups
+        for item in (group if isinstance(group, list) else [])
+        if isinstance(item, dict) and _text(item.get('createdAt'))
+    ]
+    return max(stamps) if stamps else ''
+
+
+def _text_length(value: str) -> int:
+    """与 `core/works.py::_js_length` 同口径（UTF-16 码元）：控制台和 core 别各算一套。"""
+    return len(value.encode('utf-16-le', errors='surrogatepass')) // 2
+
+
+def _work_signature_names(member: Any) -> frozenset[str]:
+    """服务层成员的参数名集合；拿不到签名就回空集（按本移植版的形状调）。"""
+    try:
+        return frozenset(inspect.signature(member).parameters)
+    except (TypeError, ValueError):  # pragma: no cover - 内建 / C 实现没有签名
+        return frozenset()
+
+
+def _work_result_brief(result: Any) -> dict[str, Any]:
+    """写操作的结果摘要：只挑几个键，别把整行塞进响应。"""
+    data = result if isinstance(result, dict) else {}
+    revision = data.get('revision') if isinstance(data.get('revision'), dict) else {}
+    return {
+        'work_id': _text(data.get('workId')),
+        'head': _text(data.get('head')),
+        'revisions': _int(data.get('revisions')),
+        'revision_id': _text(revision.get('id')),
+    }
+
 
 def _int_or_none(value: Any) -> Any:
     """把控制台传来的 id 转成 int；转不动就原样回（让服务层报"找不到"）。"""

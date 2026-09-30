@@ -560,3 +560,133 @@ export interface ActionsCatalogPayload {
   }
   risk_labels?: Record<string, string>
 }
+
+/* ---------------------------------------------------- 共同作品（`console/works`） */
+
+/** `lastFailure`：某条剧本条目的提案没保存成（服务层留的痕）。 */
+export interface WorkFailure {
+  sourceEntryId?: number
+  status?: string
+  at?: string
+}
+
+/** 清单里的一行（每个参与者一件作品）。 */
+export interface WorkListRow {
+  work_id: string
+  participant_id: string
+  participant: string
+  title: string
+  head: string
+  /** 当前版本号（head 在时间线里的位置，从 1 数）。 */
+  revision: number
+  revision_count: number
+  pending_count: number
+  jobs_running: number
+  job_count: number
+  generation: number
+  updated_at: string
+  may_propose: boolean
+  last_failure: WorkFailure | null
+  /** 库里有这件作品但数据形状不被识别（原数据保持原样）。 */
+  broken: boolean
+}
+
+export interface WorksOverviewPayload {
+  /** 服务层能不能干活；`false` 时只有 `hint` 有意义。 */
+  available: boolean
+  enabled: boolean
+  generation_mode: string
+  /** 服务层自己那句结论（`explain_works_state`）：什么模式、没生效是为什么。 */
+  explain: string
+  story: StoryBrief | null
+  works: WorkListRow[]
+  hint: string
+}
+
+export interface WorkRevisionRow {
+  id: string
+  ordinal: number
+  parent_id: string
+  author: string
+  proposal_id: string
+  created_at: string
+  current: boolean
+  content_chars: number
+  /** 历史版本只有预览；head 才带 `content` 全文。 */
+  preview: string
+  content?: string
+}
+
+export interface WorkProposalRow {
+  id: string
+  status: string
+  pending: boolean
+  author: string
+  reason: string
+  content: string
+  content_chars: number
+  base_revision_id: string
+  base_revision: number
+  created_at: string
+  source_entry_id: number
+}
+
+export interface WorkJobRow {
+  id: string
+  status: string
+  /** `running` 但进程里没有 = 中断（不会自动重跑）。 */
+  interrupted: boolean
+  model_id: string
+  brief: string
+  created_at: string
+  proposal_id: string
+  source_entry_id: number
+}
+
+export interface WorkDetailPayload {
+  available: boolean
+  enabled: boolean
+  generation_mode: string
+  /** 服务层自己那句结论（`explain_works_state`）。 */
+  explain: string
+  broken?: boolean
+  hint: string
+  work_id: string
+  story: StoryBrief | null
+  participant_id: string
+  participant: string
+  title: string
+  head: string
+  generation: number
+  /** 当前版本正文（**创作素材**，原样显示）。 */
+  content: string
+  content_chars: number
+  revision: number
+  revision_count: number
+  revisions: WorkRevisionRow[]
+  proposals: WorkProposalRow[]
+  jobs: WorkJobRow[]
+  pending_count: number
+  jobs_running: number
+  job_count: number
+  may_propose: boolean
+  may_propose_reason: string
+  last_failure: WorkFailure | null
+  limits: { content: number; brief: number; reason: number }
+  /** 仅写操作的响应里出现。 */
+  job?: { id?: string; status?: string } | null
+  model_id?: string
+  result?: { work_id: string; head: string; revisions: number; revision_id: string }
+  changed?: string
+}
+
+export interface WorkExportPayload {
+  available: boolean
+  enabled: boolean
+  work_id: string
+  title: string
+  parts: string[]
+  count: number
+  chars: number
+  hint: string
+}

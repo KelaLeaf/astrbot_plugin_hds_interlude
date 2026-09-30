@@ -594,12 +594,29 @@ SCHEDULED_COMMAND = TableSpec(
     added_later=True,
 )
 
+#: `interlude_work` —— 共同作品（上游 rc28 `works.ts` 的 WorkRow）。
+#: 主键是**字符串**（`<storyId>:<participantId>` 由 `workKey()` 生成），一代一行做 CAS：
+#: `generation` 每次替换 +1，替换失败即"别处已经改过"，绝不覆盖别人的改动。
+WORK = TableSpec(
+    name='interlude_work',
+    fields={
+        'id': _spec('string(64)'),
+        'storyId': _spec('string(255)'),
+        'participantId': _spec('string(255)'),
+        'generation': _spec('unsigned'),
+        'state': _spec('json'),
+    },
+    primary='id',
+    indexes=('storyId', 'participantId'),
+    added_later=True,
+)
+
 #: 表名 → `TableSpec`。键顺序 = 上游 `registerTables` 的注册顺序。
 TABLES: dict[str, TableSpec] = {
     spec.name: spec for spec in (
         STORY, PARTICIPANT, SCRIPT_ENTRY, MEMORY, INTENT, SCENE, ARC, FACT, STATE_PATCH,
         WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, SCHEDULE_PREPLAN, SEEDED_EVENT,
-        ENDPOINT, STORY_ALIAS, TOKEN_USAGE, QZONE_POST, SCHEDULED_COMMAND,
+        ENDPOINT, STORY_ALIAS, TOKEN_USAGE, QZONE_POST, SCHEDULED_COMMAND, WORK,
     )
 }
 

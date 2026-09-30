@@ -49,7 +49,8 @@ UPSTREAM_SECTION_ORDER = [
 
 #: 上游 1.0.1-rc23 / rc28 新增的两个扩展分组；本移植版都已转正
 #: （`qzone` 原先是隐藏兼容位 `qzone_compat`，v1.6.0 起是真分组）。
-UPSTREAM_NEW_SECTIONS = [("worldSeeder", "world_seeder"), ("qzone", "qzone")]
+UPSTREAM_NEW_SECTIONS = [("worldSeeder", "world_seeder"), ("qzone", "qzone"),
+                         ("forwardMessage", "forward_message")]
 
 #: 上游键 → 本插件顶层键（顺序与上游一致）。
 SECTION_MAP = [
@@ -88,6 +89,7 @@ UPSTREAM_FIELDS = {
         "enabled", "dailyPostCap", "dailyCommentCap", "dailyLikeCap",
         "minIntervalMinutes", "feedWindowMinutes",
     ],
+    "forward_message": ["enabled", "maxNodes", "maxCharacters", "maxDepth"],
     "story_defaults": [
         "characterName", "characterProfile", "perspective", "perspectives",
         "supplementaryFacts", "userProfile", "relationship",
@@ -178,10 +180,9 @@ UPSTREAM_FIELDS = {
 }
 
 #: 已弃用 / 隐藏的旧字段（上游 `CONFIGURATION_GUIDE.md`「隐藏的历史兼容字段」）。
-#: `qzone` 原先是这里的一员（隐藏位 `qzone_compat`），v1.6.0 起转正、移进
-#: `UPSTREAM_FIELDS` 做真分组对账——**只剩合并转发仍是 P3 隐藏位**。
+#: `qzone`（v1.6.0）与 `forward_message`（v1.7.0）都曾在这里，转正后移进
+#: `UPSTREAM_FIELDS` 做真分组对账——**只剩下面这三组**。
 UPSTREAM_COMPAT_FIELDS = {
-    "forward_message_compat": ["enabled", "maxNodes", "maxCharacters", "maxDepth"],
     "shared_story_compat": ["enabled", "participantPresets"],
     "runtime_compat": ["pauseAfterConversationMinutes", "staleNarrativeRequestWindowSeconds"],
 }

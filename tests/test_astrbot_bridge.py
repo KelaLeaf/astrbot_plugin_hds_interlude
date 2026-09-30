@@ -102,6 +102,13 @@ class Video(_StubComponent):
         super().__init__(file=file, **kwargs)
 
 
+class Forward(_StubComponent):
+    """合并转发卡片（OneBot 的 `forward` 段）。"""
+
+    def __init__(self, id='', **kwargs):  # noqa: A002 - 与 AstrBot 字段名一致
+        super().__init__(id=id, **kwargs)
+
+
 class MessageChain:
     def __init__(self, chain=None, **kwargs):
         self.chain = list(chain or [])
@@ -282,7 +289,7 @@ def _install_astrbot_stub():
     components = module('astrbot.api.message_components')
     for name, cls in (
         ('Plain', Plain), ('Image', Image), ('Record', Record), ('Face', Face),
-        ('At', At), ('Reply', Reply), ('File', File), ('Video', Video),
+        ('At', At), ('Reply', Reply), ('File', File), ('Video', Video), ('Forward', Forward),
     ):
         setattr(components, name, cls)
 
@@ -300,7 +307,7 @@ def _install_astrbot_stub():
     core = module('astrbot.core')
     core_message = module('astrbot.core.message')
     core_components = module('astrbot.core.message.components')
-    for name in ('Plain', 'Image', 'Record', 'Face', 'At', 'Reply', 'File', 'Video'):
+    for name in ('Plain', 'Image', 'Record', 'Face', 'At', 'Reply', 'File', 'Video', 'Forward'):
         setattr(core_components, name, getattr(components, name))
     core_result = module('astrbot.core.message.message_event_result')
     core_result.MessageChain = MessageChain
@@ -415,6 +422,7 @@ class FakeMessageEvent:
         session_id=None,
         message_id='m-1',
         umo=None,
+        raw_message=None,
     ):
         self._message = message
         self._components = list(components or [])
@@ -427,6 +435,8 @@ class FakeMessageEvent:
         self._session_id = session_id or (group_id or sender_id)
         self._message_id = message_id
         self.message_obj = FakeMessageObj(message_id)
+        if raw_message is not None:
+            self.message_obj.raw_message = raw_message
         self.unified_msg_origin = umo or '%s:%s:%s' % (
             platform_id,
             'GroupMessage' if group_id else 'FriendMessage',
@@ -527,6 +537,18 @@ class FakeContext:
     async def send_message(self, umo, chain):
         self.sent.append((umo, chain))
         return True
+
+    def get_platform_inst(self, platform_id):
+        """对应宿主 `Context.get_platform_inst(platform_id)`（按 `meta().id` 找实例）。
+
+        合并转发读取（`onebot_client()`）走的就是这条宿主 API——以前测试夹具没有它，
+        所以那条路径从来没被真跑过。
+        """
+        for instance in self.platform_manager.platform_insts:
+            meta = instance.meta()
+            if getattr(meta, 'id', '') == platform_id:
+                return instance
+        return None
 
     def get_using_provider(self, umo=None):  # noqa: ARG002
         return None
@@ -818,6 +840,46 @@ def _async_return(value):
         return value
 
     return fake
+
+
+class _FakeOneBotClient:
+    """`aiocqhttp` 客户端的桩：把 `call_action` 的调用记下来并按 id 回帧。
+
+    `pages` 的每条可以是一个帧（dict）、一个 `id -> 帧` 的函数，或一个要抛的异常。
+    真实宿主的 `call_action` 是协程，所以这里也是 `async def`。
+    """
+
+    def __init__(self, pages=None):
+        self.pages = dict(pages or {})
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_action(self, action, **params):
+        self.calls.append((action, dict(params)))
+        page = self.pages.get(params.get('id'))
+        if isinstance(page, BaseException):
+            raise page
+        if callable(page):
+            return page(params.get('id'))
+        if page is None:
+            return {'status': 'ok', 'retcode': 0, 'data': {'messages': []}}
+        return page
+
+    def request_ids(self):
+        return [params.get('id') for _action, params in self.calls]
+
+
+def _bridge_with_bot(config, bot):
+    """装一个"宿主的 OneBot 平台实例"的 bridge（`onebot_client()` 走得通）。"""
+
+    class _PlatformWithBot(_FakePlatform):
+        def __init__(self, name, platform_id, client):
+            super().__init__(name, platform_id)
+            self.bot = client
+
+    context = FakeContext()
+    context.platform_manager = FakePlatformManager([_PlatformWithBot('aiocqhttp', 'aiocqhttp', bot)])
+    bridge = _make_bridge(config, context=context)
+    return bridge
 
 
 # =========================================================================== #
@@ -1689,6 +1751,279 @@ class BridgeIntegrationTests(unittest.TestCase):
         self.assertEqual(bridge.group_umo('30003'), 'aiocqhttp:GroupMessage:30003')
 
 
+# =========================================================================== #
+# 6b. 合并转发读取（上游 `runtime.forwardMessage`，P3）
+# =========================================================================== #
+
+def _forward_pages():
+    """一页合并转发节点（甲说"你好" + 一张图）。"""
+    return {'status': 'ok', 'retcode': 0, 'data': {'messages': [
+        {'user_id': '100', 'nickname': '甲', 'message_type': 'group', 'message': [
+            {'type': 'text', 'data': {'text': '你好'}},
+            {'type': 'image', 'data': {'url': 'https://example.invalid/x'}},
+        ]},
+    ]}}
+
+
+class ForwardMessageReadTests(unittest.TestCase):
+    """合并转发正文读取：认得出、按预算读、失败只 warn、且**绝不吞掉整条消息**。
+
+    上游 `forward-message.ts` 的读取与归一化是纯逻辑（由 `test_forward_message.py`
+    逐条钉住），这里只测适配层那一半：id 从哪来、OneBot 客户端从哪来、读到的正文
+    怎么注入 `SessionView`、失败怎么降级。
+    """
+
+    def _event(self, bot=None, config=None, raw=None, platform='aiocqhttp', message=''):
+        event = FakeMessageEvent(
+            message=message, components=[Forward(id='res-1')], raw_message=raw,
+            platform_name=platform, platform_id=platform,
+        )
+        return _bridge_with_bot(config or {}, bot if bot is not None else _FakeOneBotClient()), event
+
+    def test_reads_the_forward_through_the_current_platform_client(self):
+        """正常路径：`get_forward_msg` 打到本会话的 OneBot 客户端，正文注入本回合。"""
+        import asyncio
+
+        bot = _FakeOneBotClient({'res-1': _forward_pages()})
+        bridge, event = self._event(bot)
+        calls = []
+
+        async def fake_receive(session):
+            calls.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        self.assertEqual(asyncio.run(bridge.handle_event(event)), [])
+        self.assertEqual(bot.calls, [('get_forward_msg', {'id': 'res-1'})])
+        self.assertEqual(len(calls), 1, '读到了正文就更要走叙事，不能被当成空消息')
+        content = calls[0].content
+        self.assertIn('<forward id="res-1"/>', content, '原卡片标记必须留着（可见线索）')
+        self.assertIn('[合并转发内容｜节点数 1]', content)
+        self.assertIn('甲（100）', content)
+        self.assertIn('你好', content)
+        self.assertIn('[图片]', content)
+        self.assertTrue(event.stopped)
+
+    def test_forward_id_is_taken_from_the_raw_onebot_segment(self):
+        """`get_message_str()` 只给 `[转发消息]`（不带 id）时，回原始段取 id 才读得到。"""
+        import asyncio
+
+        raw = {'post_type': 'message', 'message': [
+            {'type': 'forward', 'data': {'id': 'raw-9'}},
+        ]}
+        event = FakeMessageEvent(message='[转发消息]', components=[], raw_message=raw)
+        bot = _FakeOneBotClient({'raw-9': _forward_pages()})
+        bridge = _bridge_with_bot({}, bot)
+        bridge.service.receive = _async_return(True)
+        asyncio.run(bridge.handle_event(event))
+        self.assertEqual(bot.request_ids(), ['raw-9'])
+
+    def test_no_forward_means_no_request_and_no_log(self):
+        """没有合并转发：一个请求都不发，一行日志都不打（平凡路径必须零成本）。"""
+        import asyncio
+
+        bot = _FakeOneBotClient()
+        bridge = _bridge_with_bot({}, bot)
+        event = FakeMessageEvent(message='普通一句话', components=[Plain('普通一句话')])
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            result = asyncio.run(bridge.read_forward_for_event(event))
+        self.assertIsNone(result)
+        self.assertEqual(bot.calls, [])
+        self.assertEqual(logged.call_args_list, [], '没有转发就不是异常，不许留日志')
+
+    def test_cq_markup_in_the_text_is_still_recognised(self):
+        """兼容路径：别的适配器把 `[CQ:forward,id=…]` 写进了文本。"""
+        import asyncio
+
+        bot = _FakeOneBotClient({'cq-1': _forward_pages()})
+        bridge = _bridge_with_bot({}, bot)
+        event = FakeMessageEvent(message='[CQ:forward,id=cq-1]', components=[])
+        result = asyncio.run(bridge.read_forward_for_event(event))
+        self.assertIsNotNone(result)
+        self.assertFalse(result.failed)
+        self.assertEqual(bot.request_ids(), ['cq-1'])
+
+    def test_http_status_and_retcode_are_double_read(self):
+        """错误帧两种写法都认：`retcode != 0` 与 `status != ok`（缺一个也要拦住）。"""
+        import asyncio
+
+        cases = [
+            ({'retcode': 1200, 'wording': '合并转发已过期'}, True),
+            ({'status': 'failed', 'message': 'boom'}, True),
+            ({'status': 'ok', 'retcode': 0, 'data': {'messages': []}}, False),
+        ]
+        for page, failed in cases:
+            bot = _FakeOneBotClient({'res-1': page})
+            bridge = _bridge_with_bot({}, bot)
+            event = FakeMessageEvent(message='', components=[Forward(id='res-1')])
+            result = asyncio.run(bridge.read_forward_for_event(event))
+            self.assertEqual(result.failed, failed, page)
+
+    def test_missing_client_is_a_visible_failure_that_does_not_eat_the_message(self):
+        """没有可用的 OneBot 客户端：一条 warn + 只留卡片线索，**消息照常进叙事**。"""
+        import asyncio
+
+        bridge = _make_bridge()  # FakeContext 没有平台实例 → `onebot_client()` 回 None
+        calls = []
+
+        async def fake_receive(session):
+            calls.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        event = FakeMessageEvent(message='', components=[Forward(id='res-1')])
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            asyncio.run(bridge.handle_event(event))
+        levels = [item.args[0] for item in logged.call_args_list if item.args]
+        self.assertIn('warn', levels, '真正的异常路径必须让用户看得见')
+        self.assertTrue(any('没有可用的 OneBot 客户端' in str(item) for item in logged.call_args_list))
+        self.assertEqual(len(calls), 1, '读不到也要进叙事——宁可只说"有一条合并转发"')
+        self.assertIn('<forward id="res-1"/>', calls[0].content)
+        self.assertNotIn('暂时无法读取内容', calls[0].content,
+                         '失败文案不进正文：卡片标记本身就是那条可见线索')
+        self.assertTrue(event.stopped)
+
+    def test_timeout_degrades_to_a_warning_and_keeps_the_message(self):
+        import asyncio
+
+        # 客户端**直接抛超时**（core 的 `with_timeout` 到期就是这个异常形状）：
+        # 适配层必须把它收敛成失败分支，而不是让它冒到 `handle_event` 外面。
+        bot = _FakeOneBotClient({'res-1': asyncio.TimeoutError()})
+        bridge, event = self._event(bot)
+        calls = []
+
+        async def fake_receive(session):
+            calls.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            asyncio.run(bridge.handle_event(event))
+        failures = [item for item in logged.call_args_list
+                    if item.args and item.args[0] == 'warn']
+        self.assertTrue(failures, '超时是异常路径，必须留一条可见 warn')
+        self.assertTrue(any('合并转发' in str(item) for item in failures))
+        self.assertEqual(len(calls), 1)
+        self.assertIn('<forward id="res-1"/>', calls[0].content)
+        self.assertTrue(event.stopped)
+
+    def test_client_exception_degrades_to_a_warning(self):
+        import asyncio
+
+        bot = _FakeOneBotClient({'res-1': RuntimeError('连接断了')})
+        bridge, event = self._event(bot)
+        bridge.service.receive = _async_return(True)
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            asyncio.run(bridge.handle_event(event))
+        warnings = [str(item) for item in logged.call_args_list
+                    if item.args and item.args[0] == 'warn']
+        # core 会把坏帧 / 坏嵌套包成读取失败（`failure_result()`），适配层据此留一条 warn。
+        self.assertTrue(any('合并转发' in item for item in warnings), warnings)
+
+    def test_enabled_false_keeps_the_old_card_behaviour(self):
+        """`enabled: false` → 行为与历史版本逐字一致：不请求、只留卡片标记。"""
+        import asyncio
+
+        bot = _FakeOneBotClient({'res-1': _forward_pages()})
+        bridge, event = self._event(bot, config={'forward_message': {'enabled': False}})
+        calls = []
+
+        async def fake_receive(session):
+            calls.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        asyncio.run(bridge.handle_event(event))
+        self.assertEqual(bot.calls, [])
+        self.assertIn('<forward id="res-1"/>', calls[0].content)
+        self.assertNotIn('[合并转发内容', calls[0].content)
+
+    def test_legacy_compat_section_is_still_read(self):
+        """旧文件里的隐藏兼容位 `forward_message_compat` 仍要认（转正不能弄丢旧配置）。"""
+        import asyncio
+
+        bot = _FakeOneBotClient({'res-1': {'status': 'ok', 'retcode': 0, 'data': {'messages': [
+            {'nickname': '甲', 'message': [{'type': 'text', 'data': {'text': '旧段位'}}]},
+            {'nickname': '乙', 'message': [{'type': 'text', 'data': {'text': '第二条'}}]},
+        ]}}})
+        bridge, event = self._event(bot, config={'forward_message_compat': {'max_nodes': 1}})
+        result = asyncio.run(bridge.read_forward_for_event(event))
+        self.assertEqual(result.node_count, 1, '预算要从旧段位读出来并生效')
+        self.assertNotIn('第二条', result.content)
+
+        # 旧段位里的 `enabled: false` 同样要生效（开关也走同一条归一）。
+        off = _bridge_with_bot(
+            {'forward_message_compat': {'enabled': False}},
+            _FakeOneBotClient({'res-1': _forward_pages()}),
+        )
+        off_event = FakeMessageEvent(message='', components=[Forward(id='res-1')])
+        self.assertIsNone(asyncio.run(off.read_forward_for_event(off_event)))
+
+    def test_non_onebot_platform_is_not_read_and_not_consumed(self):
+        """非 OneBot 平台：一条 debug、不请求、**也不替别的平台消费事件**。"""
+        import asyncio
+
+        bot = _FakeOneBotClient({'res-1': _forward_pages()})
+        bridge, event = self._event(bot, platform='telegram')
+        # 走完整的 `handle_event`：那条路径才会先 `remember_event`（坐标 = telegram），
+        # 直接调 `read_forward_for_event` 时 `_current_endpoint` 还是空的。
+        calls = []
+
+        async def fake_receive(session):
+            calls.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            asyncio.run(bridge.handle_event(event))
+        self.assertEqual(bot.calls, [], '不是 OneBot 平台，一个请求都不该发')
+        levels = [item.args[0] for item in logged.call_args_list if item.args]
+        self.assertNotIn('warn', levels, '不是异常，别用 warn 刷屏')
+        # 消息照常进叙事（那是既有的私聊归属逻辑，与合并转发无关），只是**没有正文注入**。
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('[合并转发内容', calls[0].content)
+
+    def test_forward_read_context_shapes(self):
+        """注入形态（纯函数）：贴、只留线索、以及"正文为空"那一种边界。"""
+        from plugin.core.forward_message import ForwardReadResult, failure_result
+
+        read = ForwardReadResult(
+            content='[合并转发内容｜节点数 1]\n你好', node_count=1,
+            forward_count=0, truncated=False, failed=False,
+        )
+        self.assertEqual(bridge_module.forward_read_context('<forward id="x"/>', read),
+                         '<forward id="x"/>\n[合并转发内容｜节点数 1]\n你好')
+        self.assertEqual(bridge_module.forward_read_context('<forward id="x"/>', None), '<forward id="x"/>')
+        self.assertEqual(bridge_module.forward_read_context('<forward id="x"/>', failure_result()),
+                         '<forward id="x"/>', '失败时不把占位文案塞进正文')
+        self.assertEqual(bridge_module.forward_read_context('', failure_result()), '<forward />',
+                         '原内容为空时必须补个卡片标记：空串会被当成"没有可用内容"')
+        self.assertEqual(bridge_module.forward_read_context('', read), read.content)
+
+    def test_forward_section_normalises_both_spellings(self):
+        """配置段双拼写：schema 里的 snake_case 与上游的 camelCase 都要读出来。"""
+        bridge = _make_bridge({'forward_message': {
+            'enabled': True, 'max_nodes': 5, 'max_characters': 900, 'max_depth': 1,
+        }})
+        section = bridge.forward_section()
+        self.assertEqual(section['max_nodes'], 5)
+        self.assertEqual(section['maxNodes'], 5, 'camelCase 也要在，core 优先读它')
+        self.assertEqual(section['maxCharacters'], 900)
+        self.assertEqual(section['maxDepth'], 1)
+        self.assertTrue(section['enabled'])
+
+    def test_forward_ids_are_collected_from_both_sources(self):
+        """id 收集：原始段优先、CQ 标记与卡片组件兜底、去重保序。"""
+        raw = {'post_type': 'message', 'message': [
+            {'type': 'forward', 'data': {'id': 'raw-9'}},
+        ]}
+        event = FakeMessageEvent(
+            message='[CQ:forward,id=cq-1]', components=[Forward(id='res-1')], raw_message=raw,
+        )
+        bridge = _make_bridge()
+        self.assertEqual(bridge.forward_ids_for_event(event), ['raw-9', 'cq-1', 'res-1'])
+
+
 class ConfigTransferTests(unittest.TestCase):
     """配置导出 / 导入（本移植版新增）与它的**向后兼容**契约。
 
@@ -1987,6 +2322,16 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/patch-rollback',
             f'/{main_module.PLUGIN_NAME}/console/story-merge',
             f'/{main_module.PLUGIN_NAME}/console/story-promote',
+            # 共同作品（上游 rc28 `works.ts` 的界面；入口由本移植版补）。
+            f'/{main_module.PLUGIN_NAME}/console/works',
+            f'/{main_module.PLUGIN_NAME}/console/work',
+            f'/{main_module.PLUGIN_NAME}/console/work-create',
+            f'/{main_module.PLUGIN_NAME}/console/work-accept',
+            f'/{main_module.PLUGIN_NAME}/console/work-reject',
+            f'/{main_module.PLUGIN_NAME}/console/work-edit',
+            f'/{main_module.PLUGIN_NAME}/console/work-generate',
+            f'/{main_module.PLUGIN_NAME}/console/work-export',
+            f'/{main_module.PLUGIN_NAME}/console/work-cancel',
             f'/{main_module.PLUGIN_NAME}/config-export',
             f'/{main_module.PLUGIN_NAME}/config-import-preview',
             f'/{main_module.PLUGIN_NAME}/config-import-apply',
@@ -2031,6 +2376,14 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/patch-rollback',
             f'/{main_module.PLUGIN_NAME}/console/story-merge',
             f'/{main_module.PLUGIN_NAME}/console/story-promote',
+            # 共同作品：新建 / 接受 / 驳回 / 手改 / 让她起草 / 取消任务
+            # （接受与驳回**只有用户能做**——她只能提议）
+            f'/{main_module.PLUGIN_NAME}/console/work-create',
+            f'/{main_module.PLUGIN_NAME}/console/work-accept',
+            f'/{main_module.PLUGIN_NAME}/console/work-reject',
+            f'/{main_module.PLUGIN_NAME}/console/work-edit',
+            f'/{main_module.PLUGIN_NAME}/console/work-generate',
+            f'/{main_module.PLUGIN_NAME}/console/work-cancel',
         ])
 
     def test_every_registration_carries_a_description(self):

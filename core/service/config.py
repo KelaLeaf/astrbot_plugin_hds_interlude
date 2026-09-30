@@ -1039,6 +1039,8 @@ CONFIG_SECTION_ALIASES_REVERSE: dict[str, str] = {
 LEGACY_SECTION_ALIASES: dict[str, str] = {
     # v1.5.x 的 P3 隐藏兼容位 → v1.6.0 起 QQ 空间转正（见 PORTING_NOTES §32）。
     'qzone_compat': 'qzone',
+    # 合并转发同理：v1.7.0 起 `forward_message_compat` → `forward_message`。
+    'forward_message_compat': 'forward_message',
 }
 
 #: 「提示词四件套」的**权威分组**（`plugin/_conf_schema.json` 的顶层 `prompts` 组）。

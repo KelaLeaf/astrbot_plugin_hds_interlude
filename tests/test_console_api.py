@@ -9,13 +9,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 # 复用桥接测试里的 AstrBot 桩与夹具（导入即装桩）
-from plugin.tests.test_astrbot_bridge import FakeContext, _make_bridge, bridge_module
+from plugin.tests.test_astrbot_bridge import TEST_DATA_DIR, FakeContext, _make_bridge, bridge_module
 from plugin.adapters import console_api as console_module
 from plugin.adapters.console_api import ConsoleApi, ConsoleError, CONSOLE_TASKS, mask_endpoint
 from plugin.core import platform_actions
@@ -628,6 +629,27 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(rows[1]['api_key'], 'sk-brand-new')
         # 返回给前端的列表里没有密钥原文
         self.assertNotIn('sk-brand-new', json.dumps(result, ensure_ascii=False))
+
+    def test_save_connection_keeps_the_protocol_fields(self):
+        """协议两项必须在白名单里——不然用户填了 Anthropic 协议，**保存时被静默丢掉**。
+
+        这是 v1.7.0 加 Anthropic 时真实存在的缺口：schema 里早就有 `protocol` /
+        `anthropic_cache`，`CONNECTION_FIELDS` 却没放行，控制台连接编辑器读得到、
+        存不回。断言直接对着白名单 + 一次真实保存往返。
+        """
+        import asyncio
+
+        self.assertIn('protocol', console_module.ConsoleApi.CONNECTION_FIELDS)
+        self.assertIn('anthropic_cache', console_module.ConsoleApi.CONNECTION_FIELDS)
+        saved = self._wire_writes()
+        asyncio.run(self.api.save_connection({
+            'label': 'Claude', 'endpoint': 'https://api.anthropic.com/v1/messages',
+            'api_key': 'sk-ant', 'model': 'claude-sonnet-4-5',
+            'protocol': 'anthropic-messages', 'anthropic_cache': True,
+        }))
+        row = saved['model_center']['providers'][-1]
+        self.assertEqual(row['protocol'], 'anthropic-messages')
+        self.assertIs(row['anthropic_cache'], True)
 
     def test_save_connection_without_api_key_keeps_the_old_one(self):
         """编辑时前端拿不到旧密钥，所以"不传"必须等于"不改"。"""
@@ -1267,3 +1289,927 @@ class ConfigEditorTests(unittest.TestCase):
         payload = _run(self.api.participants())
         self.assertEqual(payload['participants'][0]['user_id'], '10001')
         self.assertEqual(payload['participants'][0]['display_name'], '主人')
+
+
+# =========================================================================== #
+# 共同作品（「作品」面板）
+# =========================================================================== #
+
+class _StubWorksService:
+    """桩服务层：只实现面板用到的成员，形状与 `core/service/chunk14.py` 一致。
+
+    用它钉住控制台**自己**的形状与空壳 / 400 路径（另一 agent 的 chunk14 还在改的时候
+    这些断言也必须能跑）；"接线真的通了"由 `WorksIntegrationTests` 用真服务层钉。
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        snapshot=None,
+        projection=None,
+        parts=None,
+        resolve_result=None,
+        edit_result=None,
+        generate_result=None,
+        create_result=None,
+        cancel_result=None,
+        calls=None,
+    ) -> None:
+        self.enabled = enabled
+        self.snapshot = snapshot
+        self.projection = projection
+        self.parts = parts
+        self.resolve_result = resolve_result if resolve_result is not None else {'ok': True, 'error': ''}
+        self.edit_result = edit_result if edit_result is not None else {'ok': True, 'error': ''}
+        self.generate_result = generate_result if generate_result is not None else {'ok': True, 'error': ''}
+        self.create_result = create_result if create_result is not None else {'ok': True, 'error': ''}
+        self.cancel_result = cancel_result if cancel_result is not None else {'ok': True, 'error': ''}
+        self.calls = calls if calls is not None else []
+
+    def works_config(self):
+        return {'enabled': self.enabled, 'generation_mode': 'main', 'model_id': ''}
+
+    def explain_works_state(self):
+        return ('共同作品已启用：主连接模式（提案由主叙事回合给出）' if self.enabled
+                else '共同作品未启用（配置 works.enabled 为 false 或缺失）')
+
+    async def works_snapshot(self, story, participant):
+        self.calls.append(('snapshot', story, participant))
+        # 可调用时按参与者给不同形状（清单里每一行都该是自己的那件作品）。
+        return self.snapshot(participant) if callable(self.snapshot) else self.snapshot
+
+    async def shared_work_state(self, story, participant):
+        self.calls.append(('state', story, participant))
+        return self.projection
+
+    async def works_dump(self, story, participant):
+        self.calls.append(('dump', story, participant))
+        return self.parts
+
+    async def create_work(self, story, participant, title, content):
+        self.calls.append(('create', story, participant, title, content))
+        return self.create_result
+
+    async def cancel_work_generation(self, story, participant, job_id):
+        self.calls.append(('cancel', story, participant, job_id))
+        return self.cancel_result
+
+    async def accept_work_proposal(self, work_id, proposal_id):
+        self.calls.append(('accept', work_id, proposal_id))
+        return self.resolve_result
+
+    async def reject_work_proposal(self, work_id, proposal_id):
+        self.calls.append(('reject', work_id, proposal_id))
+        return self.resolve_result
+
+    async def edit_work(self, story, participant, edit, source_entry_id=None, operation_key=''):
+        self.calls.append(('edit', story, participant, edit))
+        return self.edit_result
+
+    async def start_work_generation(self, story, participant, request, source_entry_id=None, operation_key=''):
+        self.calls.append(('generate', story, participant, request))
+        return self.generate_result
+
+
+class _LegacyWorksService(_StubWorksService):
+    """契约摘要里那一版签字：`edit_work(story, participant, content, reason)`。
+
+    控制台按签名挑调用形状（`_call_work_edit` / `_call_work_generate`），两种都要能跑。
+    """
+
+    async def edit_work(self, story, participant, content, reason=''):
+        self.calls.append(('edit-legacy', story, participant, content, reason))
+        return self.edit_result
+
+    async def start_work_generation(self, story, participant, brief):
+        self.calls.append(('generate-legacy', story, participant, brief))
+        return self.generate_result
+
+
+def _works_bridge(config):
+    """真库 + 真服务层的桥：控制台与 `chunk14` 读同一份数据（接线真的通了才算过）。"""
+    database = Database(':memory:')
+    with mock.patch.object(bridge_module, 'Database', lambda path: database), \
+            mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: TEST_DATA_DIR):
+        bridge = bridge_module.AstrbotBridge(
+            context=FakeContext(), config=config, logger=sys.modules['astrbot'].logger,
+        )
+    database.register_tables()
+    return bridge, database
+
+
+def _work_state(head='rev-2', *, title='海边的信', revisions=None, proposals=None, jobs=None):
+    """一份合法的 `interlude_work.state`（上游形状：camelCase）。"""
+    revisions = revisions if revisions is not None else [
+        {'id': 'rev-1', 'parentId': None, 'author': 'user', 'content': '第一版正文',
+         'createdAt': '2026-09-01T10:00:00.000Z'},
+        {'id': 'rev-2', 'parentId': 'rev-1', 'author': 'protagonist', 'proposalId': 'prop-1',
+         'content': '她改过的正文', 'createdAt': '2026-09-02T10:00:00.000Z'},
+    ]
+    state = {
+        'schemaVersion': 1,
+        'title': title,
+        'head': head,
+        'revisions': revisions,
+        'proposals': proposals if proposals is not None else [],
+    }
+    if jobs is not None:
+        state['jobs'] = jobs
+    return state
+
+
+class WorksPanelTests(unittest.TestCase):
+    """「作品」面板的后端：清单 / 详情 / 接受 / 驳回 / 手改 / 起草 / 导出。"""
+
+    SID = 'character:qq:20000'
+    PID = 'p-kela'
+    WID = 'character:qq:20000:p-kela'
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.bridge = _make_bridge({'works': {'enabled': True}})
+        self.bridge.service = None
+        self.database = Database(':memory:')
+        self.addCleanup(self.database.close)
+        self.database.register_tables()
+        self.bridge.db = self.database
+        self.api = ConsoleApi(self.bridge)
+        self._story_row()
+        self._participant_row()
+
+    def _story_row(self, story_id=None, status='active'):
+        self.database.upsert('interlude_story', {
+            'id': story_id or self.SID, 'status': status, 'platform': 'qq',
+            'setting': {'character': {'name': '凌梦'}, 'user': {'name': '主人'}},
+            'state': {}, 'createdAt': '2026-09-01T00:00:00.000Z',
+            'updatedAt': '2026-09-02T00:00:00.000Z',
+        })
+
+    def _participant_row(self, participant_id=None, name='主人', story_id=None):
+        self.database.upsert('interlude_participant', {
+            'id': participant_id or self.PID, 'storyId': story_id or self.SID,
+            'platform': 'onebot', 'selfId': '20000', 'userId': '10001',
+            'channelId': 'private:10001', 'personId': 'kela', 'displayName': name,
+            'status': 'active', 'state': {},
+            'createdAt': '2026-09-01T00:00:00.000Z', 'updatedAt': '2026-09-02T00:00:00.000Z',
+        })
+
+    @staticmethod
+    def _calls(calls, kind):
+        """按类型挑服务层调用（读详情会先调一次 `works_snapshot`，别按位置取）。"""
+        return [call for call in calls if call[0] == kind]
+
+    def _work_row(self, state=None, work_id=None, story_id=None, participant_id=None, generation=3):
+        self.database.upsert('interlude_work', {
+            'id': work_id or self.WID,
+            'storyId': story_id or self.SID,
+            'participantId': participant_id or self.PID,
+            'generation': generation,
+            'state': state if state is not None else _work_state(),
+        })
+        return work_id or self.WID
+
+    def _snapshot(self, **overrides):
+        """`works_snapshot` 的返回形状（服务层原样投影，camelCase）。"""
+        snapshot = {
+            'workId': self.WID,
+            'title': '海边的信',
+            'head': 'rev-2',
+            'generation': 3,
+            'revisions': [
+                {'id': 'rev-1', 'parentId': None, 'author': 'user', 'proposalId': None,
+                 'createdAt': '2026-09-01T10:00:00.000Z', 'content': '第一版正文'},
+                {'id': 'rev-2', 'parentId': 'rev-1', 'author': 'protagonist', 'proposalId': 'prop-1',
+                 'createdAt': '2026-09-02T10:00:00.000Z', 'content': '她改过的正文'},
+            ],
+            'proposals': [
+                {'id': 'prop-2', 'baseRevisionId': 'rev-2', 'author': 'protagonist',
+                 'content': '再补一段', 'reason': '把结尾收一下', 'status': 'pending',
+                 'operationKey': 'live', 'createdAt': '2026-09-03T10:00:00.000Z'},
+                {'id': 'prop-1', 'baseRevisionId': 'rev-1', 'author': 'protagonist',
+                 'content': '她改过的正文', 'reason': '第一处修改', 'status': 'accepted',
+                 'operationKey': 'entry:7', 'createdAt': '2026-09-02T10:00:00.000Z'},
+            ],
+            'jobs': [
+                {'id': 'job-1', 'status': 'completed', 'modelId': 'demo', 'brief': '写一版',
+                 'createdAt': '2026-09-03T09:00:00.000Z', 'baseRevisionId': 'rev-2'},
+            ],
+            'lastFailure': None,
+            'revisionLimit': 64,
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    # ---- 服务层未就绪：空壳，不是 500 ----
+
+    def test_reads_without_a_service_are_shells_not_errors(self):
+        overview = _run(self.api.works_overview(self.SID))
+        self.assertFalse(overview['available'])
+        self.assertIn('服务层未就绪', overview['hint'])
+        self.assertEqual(overview['works'], [])
+        detail = _run(self.api.work_detail(self.WID))
+        self.assertFalse(detail['available'])
+        self.assertEqual(detail['work_id'], self.WID)
+        export = _run(self.api.export_work(self.WID))
+        self.assertFalse(export['available'])
+        self.assertEqual(export['parts'], [])
+
+    def test_writes_without_a_service_report_a_shell_instead_of_pretending(self):
+        self.assertEqual(_run(self.api.accept_work_proposal(self.WID, 'prop-2'))['available'], False)
+        self.assertEqual(_run(self.api.reject_work_proposal(self.WID, 'prop-2'))['available'], False)
+        self.assertEqual(_run(self.api.edit_work(self.WID, '新正文'))['available'], False)
+        self.assertEqual(_run(self.api.start_work_generation(self.WID, '写一版'))['available'], False)
+
+    def test_the_shell_carries_the_service_explanation_when_it_can(self):
+        """拿不到 `works_snapshot` 但有 `explain_works_state` 时，说明文案要用它那句。"""
+
+        class _ConfigOnly:
+            def explain_works_state(self):
+                return '共同作品未启用（配置 works.enabled 为 false 或缺失）'
+
+        self.bridge.service = _ConfigOnly()
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertIn('works_snapshot', payload['hint'], '缺哪个成员要说出来')
+        self.assertIn('共同作品未启用', payload['hint'])
+
+    # ---- 清单 ----
+
+    def test_overview_lists_one_row_per_participant(self):
+        self._work_row()
+        self._participant_row(participant_id='p-xishi', name='汐雨.')
+        self._work_row(work_id='%s:p-xishi' % self.SID, participant_id='p-xishi', generation=1,
+                       state=_work_state(head='rev-1', title='另一件',
+                                         revisions=[{'id': 'rev-1', 'parentId': None, 'author': 'user',
+                                                     'content': 'x', 'createdAt': '2026-08-01T00:00:00.000Z'}],
+                                         proposals=[]))
+        older = self._snapshot(
+            title='另一件', head='rev-1', generation=1, proposals=[], jobs=[],
+            revisions=[{'id': 'rev-1', 'parentId': None, 'author': 'user', 'proposalId': None,
+                        'createdAt': '2026-08-01T00:00:00.000Z', 'content': 'x'}],
+        )
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=lambda participant: self._snapshot() if participant == self.PID else older,
+            calls=calls,
+        )
+
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'])
+        self.assertTrue(payload['enabled'])
+        self.assertEqual(payload['story']['character'], '凌梦')
+        rows = {item['participant_id']: item for item in payload['works']}
+        self.assertEqual(sorted(rows), ['p-kela', 'p-xishi'])
+        self.assertEqual(rows['p-kela']['participant'], '主人')
+        self.assertEqual(rows['p-kela']['title'], '海边的信')
+        self.assertEqual(rows['p-kela']['revision'], 2, '当前版本号 = head 在时间线里的位置')
+        self.assertEqual(rows['p-kela']['revision_count'], 2)
+        self.assertEqual(rows['p-kela']['pending_count'], 1)
+        self.assertEqual(rows['p-kela']['jobs_running'], 0)
+        self.assertEqual(rows['p-kela']['updated_at'], '2026-09-03T10:00:00.000Z')
+        self.assertTrue(rows['p-kela']['may_propose'])
+        self.assertNotIn('content', rows['p-kela'], '清单行不带正文（正文在详情里）')
+        self.assertEqual(rows['p-xishi']['title'], '另一件')
+        self.assertEqual(rows['p-xishi']['revision'], 1)
+        self.assertEqual(rows['p-xishi']['pending_count'], 0)
+        self.assertEqual(rows['p-xishi']['updated_at'], '2026-08-01T00:00:00.000Z')
+        # 参与者按更新时间倒序：p-kela 更新 → 排前面
+        self.assertEqual([item['participant_id'] for item in payload['works']], ['p-kela', 'p-xishi'])
+        json.dumps(payload, ensure_ascii=False)
+
+    def test_overview_marks_an_unreadable_row_instead_of_hiding_it(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=None)
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertEqual(len(payload['works']), 1)
+        self.assertTrue(payload['works'][0]['broken'])
+        self.assertEqual(payload['works'][0]['revision_count'], 2, '坏行也得把能读的读出来')
+
+    def test_overview_without_a_story_or_work_is_an_empty_shell(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        clean = Database(':memory:')
+        self.addCleanup(clean.close)
+        clean.register_tables()
+        self.bridge.db = clean
+        empty = _run(self.api.works_overview(self.SID))
+        self.assertIsNone(empty['story'])
+        self.assertEqual(empty['works'], [])
+        self.assertTrue(empty['hint'])
+
+        self.bridge.db = self.database
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'])
+        self.assertEqual(payload['works'], [], '开了但还没作品：空清单，不是空壳')
+
+    def test_works_disabled_says_so_instead_of_looking_empty(self):
+        self.bridge.service = _StubWorksService(enabled=False, snapshot=self._snapshot())
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'], '功能没开不代表面板打不开')
+        self.assertFalse(payload['enabled'], '前端据此提示"去配置页打开共同作品"')
+
+    # ---- 详情 ----
+
+    def test_detail_returns_the_head_text_and_the_version_timeline(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        payload = _run(self.api.work_detail(self.WID))
+
+        self.assertTrue(payload['available'])
+        self.assertEqual(payload['participant'], '主人')
+        self.assertEqual(payload['title'], '海边的信')
+        self.assertEqual(payload['content'], '她改过的正文', '正文原样回，不做任何安全改写')
+        self.assertEqual(payload['content_chars'], 6)
+        self.assertEqual(payload['revision'], 2)
+        self.assertEqual(payload['revision_count'], 2)
+        revisions = {item['id']: item for item in payload['revisions']}
+        self.assertEqual([item['ordinal'] for item in payload['revisions']], [1, 2])
+        self.assertTrue(revisions['rev-2']['current'])
+        self.assertFalse(revisions['rev-1']['current'])
+        self.assertEqual(revisions['rev-1']['author'], 'user')
+        self.assertEqual(revisions['rev-2']['author'], 'protagonist')
+        self.assertEqual(revisions['rev-1']['created_at'], '2026-09-01T10:00:00.000Z')
+        self.assertNotIn('content', revisions['rev-1'], '历史版本只给预览，不给全文')
+        self.assertEqual(revisions['rev-1']['preview'], '第一版正文')
+        proposals = {item['id']: item for item in payload['proposals']}
+        self.assertEqual(proposals['prop-2']['status'], 'pending')
+        self.assertTrue(proposals['prop-2']['pending'])
+        self.assertEqual(proposals['prop-2']['reason'], '把结尾收一下')
+        self.assertEqual(proposals['prop-2']['base_revision_id'], 'rev-2')
+        self.assertEqual(proposals['prop-2']['base_revision'], 2)
+        self.assertFalse(proposals['prop-1']['pending'])
+        self.assertEqual(payload['pending_count'], 1)
+        self.assertEqual(payload['jobs'][0]['status'], 'completed')
+        self.assertEqual(payload['limits']['content'], console_module.WORK_CONTENT_MAX)
+        json.dumps(payload, ensure_ascii=False)
+
+    def test_detail_uses_the_service_projection_for_may_propose(self):
+        self._work_row(state=_work_state(jobs=[{'id': 'job-9', 'status': 'running',
+                                                'createdAt': '2026-09-04T00:00:00.000Z'}]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(jobs=[{'id': 'job-9', 'status': 'running',
+                                           'createdAt': '2026-09-04T00:00:00.000Z'}]),
+            projection={'mayPropose': False, 'lastFailure': {'sourceEntryId': 7,
+                                                             'status': 'proposal-not-saved',
+                                                             'at': '2026-09-04T01:00:00.000Z'}},
+            calls=calls,
+        )
+        payload = _run(self.api.work_detail(self.WID))
+        self.assertFalse(payload['may_propose'])
+        self.assertIn('在跑', payload['may_propose_reason'])
+        self.assertEqual(payload['jobs_running'], 1)
+        self.assertEqual(payload['last_failure']['status'], 'proposal-not-saved')
+        self.assertIn(('state', self.SID, self.PID), calls)
+
+    def test_detail_explains_a_disabled_feature_instead_of_a_dead_button(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(enabled=False, snapshot=self._snapshot())
+        payload = _run(self.api.work_detail(self.WID))
+        self.assertFalse(payload['may_propose'])
+        self.assertIn('配置', payload['may_propose_reason'])
+        self.assertEqual(payload['content'], '她改过的正文', '没开也得看得到她写过什么')
+
+    def test_detail_reports_a_broken_row_without_touching_it(self):
+        self._work_row(state={'schemaVersion': 99})
+        self.bridge.service = _StubWorksService(snapshot=None)
+        payload = _run(self.api.work_detail(self.WID))
+        self.assertTrue(payload['available'])
+        self.assertTrue(payload['broken'])
+        self.assertEqual(payload['revisions'], [])
+        self.assertIn('原数据', payload['hint'])
+        still = self.database.get('interlude_work', {'id': self.WID})
+        self.assertEqual(still['state'], {'schemaVersion': 99}, '坏行必须保持原样')
+
+    def test_detail_rejects_unknown_ids_with_a_400(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.work_detail(''))
+        self.assertIn('请选择', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.work_detail('不存在'))
+        self.assertIn('找不到', str(caught.exception))
+
+    # ---- 接受 / 驳回（只有用户能做） ----
+
+    def test_accept_passes_the_ids_through_and_returns_the_panel(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            resolve_result={'ok': True, 'error': '', 'workId': self.WID, 'head': 'rev-9', 'revisions': 3},
+            calls=calls,
+        )
+        payload = _run(self.api.accept_work_proposal(self.WID, 'prop-2'))
+        self.assertIn(('accept', self.WID, 'prop-2'), calls)
+        self.assertEqual(self._calls(calls, 'reject'), [], '接受不该顺带调驳回')
+        self.assertEqual(payload['changed'], 'work-accept prop-2')
+        self.assertEqual(payload['result']['head'], 'rev-9')
+        self.assertIn('proposals', payload, '写完备回整页数据，前端不用再拉一次')
+
+    def test_reject_goes_through_the_reject_member(self):
+        self._work_row(state=_work_state(proposals=[{'id': 'prop-2', 'status': 'pending',
+                                                    'baseRevisionId': 'rev-2'}]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), calls=calls)
+        payload = _run(self.api.reject_work_proposal(self.WID, 'prop-2'))
+        self.assertIn(('reject', self.WID, 'prop-2'), calls)
+        self.assertEqual(payload['changed'], 'work-reject prop-2')
+
+    def test_unknown_work_or_proposal_is_a_400(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.accept_work_proposal('不存在的作品', 'prop-2'))
+        self.assertIn('找不到这件共同作品', str(caught.exception))
+        self._work_row()
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.accept_work_proposal(self.WID, '不存在的提案'))
+        self.assertIn('找不到这条提案', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.accept_work_proposal(self.WID, ''))
+
+    def test_a_decided_proposal_can_not_be_resolved_again(self):
+        self._work_row(state=_work_state(proposals=[{'id': 'prop-1', 'status': 'accepted',
+                                                     'baseRevisionId': 'rev-1'}]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), calls=calls)
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.reject_work_proposal(self.WID, 'prop-1'))
+        self.assertIn('已经处理过', str(caught.exception))
+        self.assertEqual(self._calls(calls, 'reject'), [], '结论已定就别再去打扰服务层')
+
+    def test_a_service_side_failure_becomes_a_400_with_the_reason(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            resolve_result={'ok': False, 'error': '提案基于旧版本；保留提案，不覆盖当前作品。'},
+        )
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.accept_work_proposal(self.WID, 'prop-2'))
+        self.assertIn('基于旧版本', str(caught.exception))
+
+    # ---- 新建作品（整条链的起点） ----
+
+    def test_create_without_a_service_is_a_shell(self):
+        self.assertEqual(_run(self.api.create_work(self.SID, self.PID, '标题', '正文'))['available'], False)
+
+    def test_create_validates_the_inputs(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, '', '标题', '正文'))
+        self.assertIn('参与者', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, 'p-不存在', '标题', '正文'))
+        self.assertIn('不在当前剧本', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '  ', '正文'))
+        self.assertIn('标题', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.create_work(self.SID, self.PID, '标' * (console_module.WORK_TITLE_MAX + 1), '正文'))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '标题', '   '))
+        self.assertIn('不能为空', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '标题', '字' * (console_module.WORK_CONTENT_MAX + 1)))
+        self.assertIn('最多', str(caught.exception))
+
+    def test_create_passes_the_fields_through_and_returns_the_new_work(self):
+        wid = 'w-new'
+        self._work_row(work_id=wid, state=_work_state(head='rev-1', revisions=[
+            {'id': 'rev-1', 'parentId': None, 'author': 'user', 'content': '第一版正文',
+             'createdAt': '2026-09-01T10:00:00.000Z'},
+        ]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(workId=wid, head='rev-1', generation=0),
+            create_result={'ok': True, 'error': '', 'workId': wid, 'head': 'rev-1'},
+            calls=calls,
+        )
+        payload = _run(self.api.create_work('', self.PID, '海边的信', '第一版正文'))
+        self.assertEqual(self._calls(calls, 'create')[0],
+                         ('create', self.SID, self.PID, '海边的信', '第一版正文'))
+        self.assertEqual(payload['work_id'], wid)
+        self.assertEqual(payload['changed'], 'work-create %s' % wid)
+        self.assertEqual(payload['result']['head'], 'rev-1')
+
+    def test_create_reports_the_duplicate_refusal_verbatim(self):
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            create_result={'ok': False, 'error': '该私聊已有共同作品；请提出修改，不覆盖旧版本。'},
+        )
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '标题', '正文'))
+        self.assertIn('已有共同作品', str(caught.exception), '服务层那条"绝不覆盖"必须原样透给用户')
+
+    def test_create_without_a_story_is_a_400(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        empty = Database(':memory:')
+        self.addCleanup(empty.close)
+        empty.register_tables()
+        self.bridge.db = empty
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work('', self.PID, '标题', '正文'))
+        self.assertIn('剧本', str(caught.exception))
+
+    # ---- 取消写手任务 ----
+
+    def test_cancel_without_a_service_is_a_shell(self):
+        self.assertEqual(_run(self.api.cancel_work_generation(self.WID, 'job-1'))['available'], False)
+
+    def test_cancel_validates_the_job(self):
+        self._work_row(state=_work_state(jobs=[
+            {'id': 'job-1', 'status': 'completed', 'createdAt': '2026-09-03T09:00:00.000Z'},
+        ]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), calls=calls)
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.cancel_work_generation(self.WID, ''))
+        self.assertIn('请选择', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.cancel_work_generation(self.WID, 'job-不存在'))
+        self.assertIn('找不到', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.cancel_work_generation(self.WID, 'job-1'))
+        self.assertIn('已经结束', str(caught.exception))
+        self.assertEqual(self._calls(calls, 'cancel'), [], '结论已定的任务别去打扰服务层')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.cancel_work_generation('不存在的作品', 'job-1'))
+
+    def test_cancel_passes_the_ids_through(self):
+        self._work_row(state=_work_state(jobs=[
+            {'id': 'job-1', 'status': 'running', 'createdAt': '2026-09-03T09:00:00.000Z'},
+        ]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(jobs=[{'id': 'job-1', 'status': 'running',
+                                           'createdAt': '2026-09-03T09:00:00.000Z'}]),
+            calls=calls,
+        )
+        payload = _run(self.api.cancel_work_generation(self.WID, 'job-1'))
+        self.assertEqual(self._calls(calls, 'cancel')[0], ('cancel', self.SID, self.PID, 'job-1'))
+        self.assertEqual(payload['changed'], 'work-cancel job-1')
+
+    def test_cancel_accepts_an_interrupted_job(self):
+        """插件重启过、库里还留着 running 的遗留任务：它一直压着 mayPropose，得能取消。"""
+        self._work_row(state=_work_state(jobs=[
+            {'id': 'job-1', 'status': 'running', 'createdAt': '2026-09-03T09:00:00.000Z'},
+        ]))
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(jobs=[{'id': 'job-1', 'status': 'interrupted',
+                                           'createdAt': '2026-09-03T09:00:00.000Z'}]),
+            calls=calls,
+        )
+        _run(self.api.cancel_work_generation(self.WID, 'job-1'))
+        self.assertEqual(self._calls(calls, 'cancel')[0][3], 'job-1')
+
+    # ---- 用户手改 ----
+
+    def test_edit_uses_the_current_head_and_keeps_the_text_verbatim(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            edit_result={'ok': True, 'error': '', 'workId': self.WID, 'head': 'rev-3',
+                         'revision': {'id': 'rev-3'}},
+            calls=calls,
+        )
+        payload = _run(self.api.edit_work(self.WID, '我重写的一段\n带换行', '改个结尾'))
+        kind, story, participant, edit = self._calls(calls, 'edit')[0]
+        self.assertEqual((kind, story, participant), ('edit', self.SID, self.PID))
+        self.assertEqual(edit['baseRevisionId'], 'rev-2', '基础版本必须是当前 head')
+        self.assertEqual(edit['content'], '我重写的一段\n带换行')
+        self.assertEqual(edit['reason'], '改个结尾')
+        self.assertEqual(payload['changed'], 'work-edit %s' % self.WID)
+        self.assertEqual(payload['result']['revision_id'], 'rev-3')
+
+    def test_edit_fills_in_a_reason_when_the_user_left_it_empty(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), calls=calls)
+        _run(self.api.edit_work(self.WID, '新正文'))
+        self.assertTrue(self._calls(calls, 'edit')[0][3]['reason'],
+                        '服务层要求理由非空，控制台别把空串塞进去')
+
+    def test_edit_rejects_empty_and_oversized_content(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.edit_work(self.WID, '   '))
+        self.assertIn('不能为空', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.edit_work(self.WID, '字' * (console_module.WORK_CONTENT_MAX + 1)))
+        self.assertIn('最多', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.edit_work(self.WID, '正文', '理由' * (console_module.WORK_REASON_MAX + 1)))
+        # 上限内照常通过
+        payload = _run(self.api.edit_work(self.WID, '字' * console_module.WORK_CONTENT_MAX))
+        self.assertTrue(payload['available'])
+
+    def test_edit_rejects_an_unknown_work(self):
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError):
+            _run(self.api.edit_work('不存在', '正文'))
+
+    # ---- 让她起草 ----
+
+    def test_generate_requires_a_brief_and_caps_it(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.start_work_generation(self.WID, '  '))
+        self.assertIn('创作意图', str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.start_work_generation(self.WID, '意' * (console_module.WORK_BRIEF_MAX + 1)))
+        self.assertIn('最多', str(caught.exception))
+
+    def test_generate_starts_a_job_with_the_current_head(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            generate_result={'ok': True, 'error': '', 'job': {'id': 'job-2', 'status': 'running'},
+                             'modelId': 'demo', 'generationMode': 'main'},
+            calls=calls,
+        )
+        payload = _run(self.api.start_work_generation(self.WID, '写一段海边的结尾'))
+        kind, story, participant, request = self._calls(calls, 'generate')[0]
+        self.assertEqual((kind, story, participant), ('generate', self.SID, self.PID))
+        self.assertEqual(request['baseRevisionId'], 'rev-2')
+        self.assertEqual(request['brief'], '写一段海边的结尾')
+        self.assertEqual(payload['job']['id'], 'job-2')
+        self.assertEqual(payload['changed'], 'work-generate %s' % self.WID)
+
+    def test_generate_reports_a_service_side_refusal(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(
+            snapshot=self._snapshot(),
+            generate_result={'ok': False, 'error': '共同作品未启用。'},
+        )
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.start_work_generation(self.WID, '写一段'))
+        self.assertIn('未启用', str(caught.exception))
+
+    # ---- 调用形状自适应（服务层两种签字） ----
+
+    def test_edit_and_generate_adapt_to_the_content_reason_signature(self):
+        self._work_row()
+        calls: list = []
+        self.bridge.service = _LegacyWorksService(snapshot=self._snapshot(), calls=calls)
+        _run(self.api.edit_work(self.WID, '新正文', '理由'))
+        self.assertEqual(self._calls(calls, 'edit-legacy')[0],
+                         ('edit-legacy', self.SID, self.PID, '新正文', '理由'))
+        _run(self.api.start_work_generation(self.WID, '写一版'))
+        self.assertEqual(self._calls(calls, 'generate-legacy')[0],
+                         ('generate-legacy', self.SID, self.PID, '写一版'))
+
+    # ---- 导出 ----
+
+    def test_export_returns_the_service_parts_without_resplitting(self):
+        self._work_row()
+        parts = ['a' * 2400, 'b' * 2400, 'c' * 10]
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), parts=parts)
+        payload = _run(self.api.export_work(self.WID))
+        self.assertEqual(payload['parts'], parts, '分段归服务层切，控制台不许再切一遍')
+        self.assertEqual(payload['count'], 3)
+        self.assertEqual(payload['chars'], sum(len(part) for part in parts))
+        self.assertEqual(payload['title'], '海边的信')
+
+    def test_export_of_a_work_without_text_says_so(self):
+        self._work_row()
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot(), parts=[])
+        payload = _run(self.api.export_work(self.WID))
+        self.assertEqual(payload['count'], 0)
+        self.assertTrue(payload['hint'])
+
+    def test_export_rejects_an_unknown_work(self):
+        self.bridge.service = _StubWorksService(parts=['x'])
+        with self.assertRaises(ConsoleError):
+            _run(self.api.export_work('不存在'))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.export_work(''))
+
+    # ---- 容错 ----
+
+    def test_works_endpoints_survive_a_broken_database(self):
+        """表被删了（旧库 / 手工改过）也不能让面板 500。"""
+
+        class _Broken:
+            path = ''
+
+            def all(self, *_args, **_kwargs):
+                raise RuntimeError('no such table')
+
+            def get(self, *_args, **_kwargs):
+                raise RuntimeError('no such table')
+
+        self.bridge.service = _StubWorksService(snapshot=self._snapshot())
+        with mock.patch.object(self.bridge, 'db', _Broken()):
+            payload = _run(self.api.works_overview(self.SID))
+            self.assertEqual(payload['works'], [])
+            with self.assertRaises(ConsoleError):
+                _run(self.api.work_detail(self.WID))
+
+
+class WorksIntegrationTests(unittest.TestCase):
+    """真的接上了才算数：控制台 ↔ `chunk14` ↔ `interlude_work` 表跑一遍完整链路。
+
+    作品主键是 `work_key()` 的 sha256（不是 `story:participant`），所以 id 一律从服务层
+    的返回值里拿——测试里手拼一个 id 就等于自己骗自己。
+    """
+
+    SID = 'character:qq:20000'
+    PID = 'p-kela'
+
+    def setUp(self):
+        self.bridge, self.database = _works_bridge({'works': {'enabled': True}})
+        self.addCleanup(self.database.close)
+        self.api = ConsoleApi(self.bridge)
+        self.database.upsert('interlude_story', {
+            'id': self.SID, 'status': 'active', 'platform': 'qq',
+            'setting': {'character': {'name': '凌梦'}, 'user': {'name': '主人'}},
+            'state': {}, 'createdAt': '2026-09-01T00:00:00.000Z',
+            'updatedAt': '2026-09-02T00:00:00.000Z',
+        })
+        self.database.upsert('interlude_participant', {
+            'id': self.PID, 'storyId': self.SID, 'platform': 'onebot', 'selfId': '20000',
+            'userId': '10001', 'channelId': 'private:10001', 'personId': 'kela',
+            'displayName': '主人', 'status': 'active', 'state': {},
+            'createdAt': '2026-09-01T00:00:00.000Z', 'updatedAt': '2026-09-02T00:00:00.000Z',
+        })
+        self.wid = ''
+
+    def _create(self, title='海边的信', content='第一版正文'):
+        """用**服务层**建一件作品（与真实写法一致），返回 workId。"""
+        created = _run(self.bridge.service.create_work(self.SID, self.PID, title, content))
+        self.assertTrue(created['ok'], created)
+        self.wid = created['workId']
+        self.assertTrue(self.wid, 'workId 是服务层生成的（sha256），不许自己拼')
+        return self.wid
+
+    def _head(self):
+        row = self.database.get('interlude_work', {'id': self.wid})
+        return row['state']['head']
+
+    def test_the_whole_panel_flow_against_the_real_service(self):
+        service = self.bridge.service
+        self.assertTrue(callable(getattr(service, 'works_snapshot', None)),
+                        '服务层没接线时这条用例要红（面板就只剩空壳了）')
+        self._create()
+
+        # 她还什么都没提议时：清单一行、0 待决、可以让她起草
+        overview = _run(self.api.works_overview(self.SID))
+        self.assertTrue(overview['available'])
+        self.assertTrue(overview['enabled'])
+        self.assertEqual([item['work_id'] for item in overview['works']], [self.wid])
+        self.assertEqual(overview['works'][0]['participant'], '主人')
+        self.assertEqual(overview['works'][0]['title'], '海边的信')
+        self.assertEqual(overview['works'][0]['revision'], 1)
+        self.assertEqual(overview['works'][0]['pending_count'], 0)
+        self.assertTrue(overview['works'][0]['may_propose'])
+
+        # 她提了一条（作者 = protagonist，待决）→ 清单的待决徽章 +1、详情看得到正文与理由
+        proposal = _run(service.apply_work_proposal(self.SID, self.PID, {
+            'baseRevisionId': self._head(), 'content': '她提议的正文', 'reason': '把结尾收一下',
+        }))
+        self.assertIsNotNone(proposal, '模型侧的提案该落成待决提案')
+        overview = _run(self.api.works_overview(self.SID))
+        self.assertEqual(overview['works'][0]['pending_count'], 1)
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '第一版正文', '待决提案不该动 head')
+        self.assertEqual(detail['pending_count'], 1)
+        self.assertEqual(detail['proposals'][0]['author'], 'protagonist')
+        self.assertEqual(detail['proposals'][0]['reason'], '把结尾收一下')
+        self.assertEqual(detail['proposals'][0]['base_revision'], 1)
+
+        # 只有用户能接受：接受后 head 前移、版本数 +1
+        accepted = _run(self.api.accept_work_proposal(self.wid, proposal['id']))
+        self.assertEqual(accepted['changed'], 'work-accept %s' % proposal['id'])
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '她提议的正文')
+        self.assertEqual(detail['revision_count'], 2)
+        self.assertEqual(detail['revision'], 2)
+        self.assertEqual(detail['pending_count'], 0)
+        self.assertEqual([item['author'] for item in detail['revisions']], ['user', 'protagonist'])
+        self.assertTrue(detail['revisions'][1]['current'])
+        self.assertNotIn('content', detail['revisions'][0], '历史版本只给预览')
+
+        # 用户手改：一条新版本，作者 = user
+        edited = _run(self.api.edit_work(self.wid, '我自己改的正文', '还是我来收尾'))
+        self.assertEqual(edited['changed'], 'work-edit %s' % self.wid)
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '我自己改的正文')
+        self.assertEqual(detail['revision_count'], 3)
+        self.assertEqual(detail['revisions'][-1]['author'], 'user')
+        self.assertEqual(detail['revisions'][-1]['ordinal'], 3)
+        self.assertEqual(detail['content_chars'], len('我自己改的正文'))
+
+        # 导出：分段由服务层切好，拼回去就是完整的一行 JSON
+        exported = _run(self.api.export_work(self.wid))
+        self.assertGreaterEqual(exported['count'], 1)
+        self.assertEqual(''.join(exported['parts']), json.dumps(
+            self.database.get('interlude_work', {'id': self.wid}),
+            ensure_ascii=False, separators=(',', ':'),
+        ))
+        json.dumps(exported, ensure_ascii=False)
+
+    def test_a_long_work_is_split_into_message_sized_parts(self):
+        """长文导出要真的分段：每段都在单条消息的安全长度内，拼回来一字不差。"""
+        from plugin.core.works import DUMP_PART_MAX_LEN
+
+        self._create(content='正文。' * 2000)
+        exported = _run(self.api.export_work(self.wid))
+        self.assertGreater(exported['count'], 1)
+        for part in exported['parts']:
+            self.assertLessEqual(len(part), DUMP_PART_MAX_LEN, '每段都要能单条消息发出去')
+        self.assertEqual(exported['chars'], sum(len(part) for part in exported['parts']))
+        self.assertEqual(json.loads(''.join(exported['parts']))['id'], self.wid)
+
+    def test_create_through_the_panel_starts_the_chain(self):
+        """整条链的起点：没有它，保存提案 / 手改 / 起草全都无从下手。"""
+        payload = _run(self.api.create_work('', self.PID, '海边的信', '第一版正文'))
+        self.assertTrue(payload['available'])
+        self.assertTrue(payload['work_id'])
+        self.assertEqual(payload['changed'], 'work-create %s' % payload['work_id'])
+        self.assertEqual(payload['title'], '海边的信')
+        self.assertEqual(payload['content'], '第一版正文')
+        self.assertEqual(payload['revision_count'], 1)
+        self.assertEqual(payload['revisions'][0]['author'], 'user')
+        overview = _run(self.api.works_overview(self.SID))
+        self.assertEqual([item['work_id'] for item in overview['works']], [payload['work_id']])
+        self.assertEqual(overview['works'][0]['participant'], '主人')
+
+        # 再建一次：服务层拒绝（**绝不覆盖**），文案原样给用户
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.create_work(self.SID, self.PID, '另一个标题', '另一份正文'))
+        self.assertIn('已有共同作品', str(caught.exception))
+        self.assertEqual(_run(self.api.work_detail(payload['work_id']))['content'], '第一版正文')
+
+    def test_create_uses_the_current_story_when_story_id_is_empty(self):
+        payload = _run(self.api.create_work('', self.PID, '海边的信', '第一版正文'))
+        row = self.database.get('interlude_work', {'id': payload['work_id']})
+        self.assertEqual(row['storyId'], self.SID)
+        self.assertEqual(row['participantId'], self.PID)
+
+    def test_cancel_frees_a_stale_running_job(self):
+        """插件重启过、库里留着 `running`：面板说成"中断"，取消是放开 mayPropose 的路。"""
+        self._create()
+        row = self.database.get('interlude_work', {'id': self.wid})
+        state = dict(row['state'])
+        state['jobs'] = [{
+            'id': 'job-stale', 'status': 'running', 'brief': '写一版结尾',
+            'baseRevisionId': state['head'], 'modelId': 'demo',
+            'createdAt': '2026-10-01T00:00:00.000Z',
+        }]
+        self.database.update('interlude_work', {'id': self.wid}, {'state': state})
+
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['jobs'][0]['status'], 'interrupted', '进程里没有的 running = 中断')
+        self.assertFalse(detail['may_propose'])
+
+        payload = _run(self.api.cancel_work_generation(self.wid, 'job-stale'))
+        self.assertEqual(payload['changed'], 'work-cancel job-stale')
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['jobs'][0]['status'], 'cancelled')
+        self.assertTrue(detail['may_propose'], '取消掉遗留任务后要能重新起草')
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.cancel_work_generation(self.wid, 'job-stale'))
+        self.assertIn('已经结束', str(caught.exception))
+
+    def test_reject_keeps_the_head_and_the_record(self):
+        service = self.bridge.service
+        self._create()
+        proposal = _run(service.apply_work_proposal(self.SID, self.PID, {
+            'baseRevisionId': self._head(), 'content': '不想要的改法', 'reason': '试试',
+        }))
+        payload = _run(self.api.reject_work_proposal(self.wid, proposal['id']))
+        self.assertEqual(payload['changed'], 'work-reject %s' % proposal['id'])
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '第一版正文', '驳回不动正文')
+        self.assertEqual(detail['revision_count'], 1)
+        self.assertEqual(detail['proposals'][0]['status'], 'rejected')
+        self.assertFalse(detail['proposals'][0]['pending'])
+
+    def test_disabled_works_still_show_what_was_written(self):
+        """关掉功能后旧作品还在库里，控制台要看得见（否则用户再也清理不掉它）。"""
+        self._create()
+        for holder in (self.bridge.config, self.bridge.service.config):
+            if isinstance(holder.get('works'), dict):
+                holder['works']['enabled'] = False
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'])
+        self.assertFalse(payload['enabled'])
+        self.assertEqual(len(payload['works']), 1, '关掉功能不等于把作品藏起来')
+        detail = _run(self.api.work_detail(self.wid))
+        self.assertEqual(detail['content'], '第一版正文')
+        self.assertFalse(detail['may_propose'])
+        self.assertIn('配置', detail['may_propose_reason'])
+
+    def test_overview_without_any_work_is_an_empty_list_not_an_error(self):
+        payload = _run(self.api.works_overview(self.SID))
+        self.assertTrue(payload['available'])
+        self.assertTrue(payload['enabled'])
+        self.assertEqual(payload['works'], [])
+        self.assertEqual(payload['hint'], '')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.work_detail('404'))

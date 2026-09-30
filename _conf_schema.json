@@ -2811,10 +2811,10 @@
       }
     }
   },
-  "forward_message_compat": {
+  "forward_message": {
     "type": "object",
-    "title": "合并转发读取（未移植）",
-    "description": "上游 1.0.1-rc28 的合并转发正文读取；本移植版暂未实现（P3），仅保留键位。",
+    "title": "合并转发",
+    "description": "QQ 合并转发（聊天记录卡片）的正文读取：把卡片里的内容读出来喂给叙事，读不到时只说明\"有一条合并转发\"。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -2823,21 +2823,48 @@
       },
       "max_nodes": {
         "type": "int",
-        "description": "最多节点数",
+        "description": "单条最多读取的节点数",
         "default": 30
       },
       "max_characters": {
         "type": "int",
-        "description": "最大注入字符数",
+        "description": "注入当前事件的最大字符数",
         "default": 8000
       },
       "max_depth": {
         "type": "int",
-        "description": "最多展开层数",
+        "description": "嵌套合并转发最多展开层数",
         "default": 3
       }
-    },
-    "invisible": true
+    }
+  },
+  "works": {
+    "type": "object",
+    "title": "共同作品",
+    "description": "和她一起写的东西：一个按版本管理的共享文本，只有你能接受或驳回她的修改提案。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用共同作品",
+        "default": false
+      },
+      "generation_mode": {
+        "type": "string",
+        "description": "她怎么起草",
+        "default": "main",
+        "options": [
+          "main",
+          "separate"
+        ],
+        "hint": "main = 主叙事回合里顺手写；separate = 另起一个写手任务慢慢写（慢但不占对话节奏）。"
+      },
+      "model_id": {
+        "type": "string",
+        "description": "写手模型",
+        "default": "",
+        "hint": "只有\"另起写手\"模式用；留空则用默认 Provider。"
+      }
+    }
   },
   "blind_mode": {
     "type": "object",

@@ -44,6 +44,15 @@
    看到的键名与上游逐字一致。
 6. 常量、超时数值、重试次数、`max_tokens` cap、`response_format` 降级、JSON 提取
    宽容度、token 单价表全部照抄，不做「优化」。
+7. **Anthropic Messages 连接**（连接行 `protocol == 'anthropic-messages'`，上游 P3）走
+   `core/anthropic.py` 的协议翻译层：非流式请求经 `_post_chat` 翻译（system 提到顶层、
+   图片转 base64/url 块、`max_tokens` 必填、缓存断点），实验性流式经
+   `request_anthropic_streaming`。**没有这个键的连接行逐字走原路径**——`_post_chat`
+   对它们就是原来的 `self.http.post_json(... with_deepseek_thinking(...))`。
+   上游在 `normalizeProvider` 里做协议/端点归一化与「向量化不认 Messages」的过滤，
+   那两步在 `core/model_routing.py`（不改动），因此本文件补了同样语义的两处：
+   `_provider_protocol` / `_provider_endpoint`（按协议对齐地址）与
+   `_embedding_capable_routing`（向量化候选剔除 Messages 连接）。
 """
 
 from __future__ import annotations
@@ -65,11 +74,19 @@ from typing import (
     TypedDict,
 )
 
+from .anthropic import (
+    anthropic_body,
+    anthropic_headers,
+    anthropic_response,
+    normalize_protocol_endpoint,
+    request_anthropic_streaming,
+)
 from .logging import log_layered
 from .model_routing import (
     ModelRoutingTable,
     ModelTask,
     effective_main_model_id,
+    preset_endpoint,
     provider_key,
     provider_reachable,
     resolve_model_routing,
@@ -94,7 +111,7 @@ from .types import (
     TimelinePlan,
     TimelinePlanRequest,
 )
-from .narrator_prompts import platform_action_instruction
+from .narrator_prompts import platform_action_instruction, work_instruction
 from .urge import urge_instruction
 
 try:  # 上游 `./script/authored-actions`；由并行的 `core/script/authored_actions.py` 移植任务落地。
@@ -119,6 +136,7 @@ __all__ = [
     'ZhipuReasoningEffort',
     'DeepSeekThinkingMode',
     'ProviderMode',
+    'ProviderProtocol',
     'StickerDescription',
     'StickerDescriber',
     'VisionDescriber',
@@ -201,6 +219,9 @@ ProviderMode = Literal[
     'deepseek-official', 'moonshot-official', 'dashscope-official',
     'siliconflow-official', 'openrouter', 'gemini-openai',
 ]
+#: 连接行的传输协议（上游 `ProviderConfig['protocol']`）。默认 `chat-completions`，
+#: 旧配置没有这个键时行为与历史版本逐字一致。
+ProviderProtocol = Literal['chat-completions', 'anthropic-messages']
 
 ZHIPU_FIRST_VISIBLE_TOKEN_TIMEOUT = 45_000
 
@@ -278,6 +299,10 @@ class ProviderConfig(TypedDict, total=False):
     extra_headers: str
     extra_body: str
     mode: ProviderMode
+    # 自定义连接的传输协议：chat-completions（默认，旧配置）或 anthropic-messages。
+    protocol: ProviderProtocol
+    # Anthropic 缓存标记（服务端需支持）：缓存 system，cache-first 时同时标记历史前缀。
+    anthropic_cache: bool
     # One model connection can be assigned directly to each HDSI task.
     use_for_main: bool
     use_for_compaction: bool
@@ -856,7 +881,7 @@ class OpenAICompatibleEmbedder:
     ) -> None:
         self.http = resolve_http(http)
         self.config = config
-        self.routing = routing if routing is not None else resolve_model_routing(config)
+        self.routing = _embedding_capable_routing(routing if routing is not None else resolve_model_routing(config))
 
     def identity(self) -> str:
         """向量化实现的身份标识（endpoint / 模型 / 维度 / 输入上限的哈希）。"""
@@ -1073,6 +1098,34 @@ class OpenAICompatibleNarrator:
 
     # ---------- 主叙事 ----------
 
+    async def _post_chat(
+        self,
+        provider: ProviderConfig,
+        body: dict[str, Any],
+        headers: dict[str, str],
+        timeout: Optional[int],
+        cache_first: bool = False,
+        task: Optional[str] = None,
+    ) -> Any:
+        """上游 `postChat()`：非流式请求的协议分流口。
+
+        `anthropic-messages` 连接走协议层翻译（system 提到顶层、图片转
+        base64 / url 块、`max_tokens` 必填、缓存断点）；其余连接**逐字保持**
+        既有 OpenAI 兼容调用——同一组参数、同一个 `with_deepseek_thinking`。
+        """
+        if _provider_protocol(provider) == 'anthropic-messages':
+            response = await self.http.post_json(
+                _provider_endpoint(provider),
+                anthropic_headers(provider, parse_object(provider.get('extra_headers'), 'extraHeaders', self.logger)),
+                anthropic_body(body, provider, cache_first),
+                timeout,
+                task=task,
+            )
+            return anthropic_response(response)
+        return await self.http.post_json(
+            provider.get('endpoint'), headers, with_deepseek_thinking(provider, body), timeout, task=task,
+        )
+
     async def decide(self, request: NarrativeRequest) -> NarrativeDecision:
         """主叙事调用：允许逐服务商重试与故障切换。"""
         # 一次失败不能让故事卡死在某个 endpoint。
@@ -1081,6 +1134,20 @@ class OpenAICompatibleNarrator:
         route = self.routing['main'].get('target') or {}
         has_main_route = bool(main_model_id) or bool(len(assigned))
         providers = assigned if assigned else self._select_route_providers(self.routing['main'], not _truthy(route.get('model')))
+        # Anthropic Messages 没有原生 input_audio 块：这一回合带了语音的连接先被
+        # **确定性能力筛选**排除，而不是进故障切换、白烧一次请求再进冷却桶。
+        # 指名的主路线里全是 Anthropic 连接时，回落到兼容的历史候选。
+        # 判据是 `request.audio?.length`（空数组在 JS 里是真值，**不能**用 `_truthy`）。
+        request_audio = request.get('audio')
+        audio_count = len(request_audio) if isinstance(request_audio, (list, tuple)) else 0
+        if audio_count:
+            compatible = [item for item in providers if _provider_protocol(item) != 'anthropic-messages']
+            if not compatible and assigned:
+                compatible = [
+                    item for item in self._select_route_providers(self.routing['main'], not _truthy(route.get('model')))
+                    if _provider_protocol(item) != 'anthropic-messages'
+                ]
+            providers = compatible
         if not providers:
             raise RuntimeError('No enabled OpenAI-compatible provider is available.')
 
@@ -1244,7 +1311,9 @@ class OpenAICompatibleNarrator:
                 ) + urge_instruction(
                     bool(_get(request, 'urgeEnabled')) or request.get('urge_enabled') is True,
                     request.get('phase'),
-                    ) + platform_action_instruction(request),
+                    # 共同作品（works）：只有这一回合真带了 `sharedWork` 才注入那一段
+                    # （主叙事 / 异步写手两段二选一，原文来自上游 `works.ts`）。
+                    ) + platform_action_instruction(request) + work_instruction(request),
             },
             {'role': 'user', 'content': user_content},
         ]
@@ -1261,7 +1330,19 @@ class OpenAICompatibleNarrator:
                 early_reply_handled = True
 
         headers = _json_headers(provider, self.logger)
-        if _truthy(provider.get('zhipu_official')):
+        if _provider_protocol(provider) == 'anthropic-messages' and streaming_early_reply:
+            # Anthropic Messages 的 SSE：同样支持"早期可见回复"（上游同一分支）。
+            text = await request_anthropic_streaming(
+                _provider_endpoint(provider),
+                anthropic_body(request_body, provider, cache_first_payload),
+                anthropic_headers(provider, parse_object(provider.get('extra_headers'), 'extraHeaders', self.logger)),
+                _coalesce(overrides.get('timeout'), provider.get('timeout')),
+                on_stream_text,
+                collect,
+                self.http,
+                task='main',
+            )
+        elif _truthy(provider.get('zhipu_official')):
             text = await request_zhipu_streaming(provider.get('endpoint'), {
                 **request_body,
                 'stream': True,
@@ -1280,12 +1361,10 @@ class OpenAICompatibleNarrator:
                 task='main',
             )
         else:
-            response = await self.http.post_json(
-                provider.get('endpoint'),
-                {**headers},
-                with_deepseek_thinking(provider, request_body),
+            response = await self._post_chat(
+                provider, request_body, headers,
                 _coalesce(overrides.get('timeout'), provider.get('timeout')),
-                task='main',
+                cache_first_payload, task='main',
             )
             collect(_get(response, 'usage'))
             text = extract_chat_text(response)
@@ -1353,7 +1432,7 @@ class OpenAICompatibleNarrator:
 
         async def run(capped: bool) -> Any:
             body = build_body(capped)
-            if _truthy(provider.get('zhipu_official')):
+            if _truthy(provider.get('zhipu_official')) and _provider_protocol(provider) != 'anthropic-messages':
                 text = await request_zhipu_streaming(provider.get('endpoint'), {
                     **body,
                     'stream': True,
@@ -1361,9 +1440,8 @@ class OpenAICompatibleNarrator:
                     'reasoning_effort': _or(provider.get('reasoning_effort'), 'high'),
                 }, headers, None, collect, self.http)
                 return parse(text)
-            response = await self.http.post_json(
-                provider.get('endpoint'), headers, with_deepseek_thinking(provider, body), timeout,
-                task=SIDE_TASK_ROUTES.get(task, 'compaction'),
+            response = await self._post_chat(
+                provider, body, headers, timeout, task=SIDE_TASK_ROUTES.get(task, 'compaction'),
             )
             collect(_get(response, 'usage'))
             last_error: Exception = RuntimeError('No textual response field found.')
@@ -1383,7 +1461,10 @@ class OpenAICompatibleNarrator:
                 return await run(True)
             except Exception as error:  # noqa: BLE001 - 只有「思考预算截断」类错误才降级重试
                 message = str(error)
-                if not _RETRYABLE_SIDE_TASK_ERROR.search(message):
+                # Anthropic Messages 的连接不参与这次降级重试（上游同）：去掉 max_tokens
+                # 会被协议层按 4096 回退补回来，重试等于白发一次请求。
+                if _provider_protocol(provider) == 'anthropic-messages' \
+                        or not _RETRYABLE_SIDE_TASK_ERROR.search(message):
                     raise
                 self._warn('%s 首次输出不可解析（疑似思考预算截断），已去掉 max_tokens 重试一次 错误=%s', task, message[:200])
                 return await run(False)
@@ -1740,9 +1821,8 @@ class OpenAICompatibleNarrator:
             self._collect_usage(usages, '贴纸描述', provider, provider.get('model'), raw)
 
         try:
-            response = await self.http.post_json(
-                provider.get('endpoint'), headers, with_deepseek_thinking(provider, request_body), provider.get('timeout'),
-                task='stickers',
+            response = await self._post_chat(
+                provider, request_body, headers, provider.get('timeout'), task='stickers',
             )
             collect(_get(response, 'usage'))
             text = extract_chat_text(response)
@@ -1829,10 +1909,8 @@ class OpenAICompatibleNarrator:
                 headers = _json_headers(provider, self.logger)
                 for attempt in range(1, 3):
                     try:
-                        response = await self.http.post_json(
-                            provider.get('endpoint'), headers,
-                            with_deepseek_thinking(provider, {**request_body, 'stream': False}),
-                            provider.get('timeout'),
+                        response = await self._post_chat(
+                            provider, {**request_body, 'stream': False}, headers, provider.get('timeout'),
                             task='vision',
                         )
                         self._collect_usage(usages, '侧端识图', provider, provider.get('model'), _get(response, 'usage'))
@@ -2845,6 +2923,58 @@ def _json_headers(provider: ProviderConfig, logger: Optional[LoggerLike] = None)
         headers['authorization'] = f'Bearer {provider["api_key"]}'
     headers.update(parse_object(provider.get('extra_headers'), 'extraHeaders', logger))
     return headers
+
+
+def _embedding_capable_routing(routing: ModelRoutingTable) -> ModelRoutingTable:
+    """向量化的候选连接里剔掉 Anthropic Messages（上游 `model-routing.ts:123`）。
+
+    `/embeddings` 是 OpenAI 形状的端点，Messages 连接不提供。上游在
+    `resolveModelRouting` 里就过滤掉了；那一步在 `core/model_routing.py`（本次改动
+    范围之外），因此本移植版在向量化客户端构造时补上同一条规则。
+
+    **只动 embedding 一段**，其余任务逐字不变；没有 Anthropic 连接时返回原对象，
+    行为与历史版本完全一致。
+    """
+    route = routing.get('embedding') if isinstance(routing, dict) else None
+    providers = route.get('providers') if isinstance(route, dict) else None
+    if not isinstance(providers, list):
+        return routing
+    compatible = [item for item in providers if _provider_protocol(item) != 'anthropic-messages']
+    if len(compatible) == len(providers):
+        return routing
+    updated: ModelRoutingTable = dict(routing)  # type: ignore[assignment]
+    updated['embedding'] = {
+        **route,
+        'providers': compatible,
+        'available': bool(compatible) and _truthy(route.get('available')),
+    }
+    return updated
+
+
+def _provider_protocol(provider: ProviderConfig) -> ProviderProtocol:
+    """连接行的传输协议（上游 `normalizeProvider` 里的同一判定）。
+
+    上游只在**没有官方预设 endpoint** 时才认 `anthropic-messages`：官方 / 托管
+    模式（zhipu / openai / deepseek …）的连接永远是 Chat Completions。旧配置没有
+    这个键 → `chat-completions`，与历史版本逐字一致。
+    """
+    if preset_endpoint(provider.get('mode'), provider.get('dashscope_region')):
+        return 'chat-completions'
+    return 'anthropic-messages' if provider.get('protocol') == 'anthropic-messages' else 'chat-completions'
+
+
+def _provider_endpoint(provider: ProviderConfig) -> Optional[str]:
+    """`anthropic-messages` 连接本次请求实际使用的地址。
+
+    上游在配置归一化（`normalizeProvider`）里就把地址按协议对齐了，那一步在
+    `core/model_routing.py`（本次改动范围之外）。这里对 Anthropic 连接在请求时
+    补上同一套改写（`…/chat/completions` → `…/messages`，网关前缀保留）；
+    **非 Anthropic 连接的地址一个字都不动**。
+    """
+    endpoint = provider.get('endpoint')
+    if _provider_protocol(provider) != 'anthropic-messages':
+        return endpoint
+    return normalize_protocol_endpoint(endpoint, 'anthropic-messages')
 
 
 def _provider_name(provider: ProviderConfig) -> str:

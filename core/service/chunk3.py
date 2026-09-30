@@ -1618,6 +1618,24 @@ class ServiceChunk3(ServiceBase):
                             'native-face', native_face,
                         ),
                     )
+                # 本移植版：共同作品（works）——模型提的修改稿 / 起草请求在**回合落库之后**才处理。
+                # 上游语义：提案只有在脚本提交后才算数；保存失败记 lastFailure，**绝不抛**
+                # （回合主链不能因为一个可选特性回滚）。
+                work_entry_id = pick(result.get('script_entry'), 'id')
+                work_saver = getattr(self, 'apply_work_proposal', None)
+                proposal = pick(decision, 'workProposal', 'work_proposal')
+                if callable(work_saver) and proposal:
+                    await work_saver(
+                        snapshot['story'], snapshot.get('participant'), proposal,
+                        source_entry_id=work_entry_id,
+                    )
+                starter = getattr(self, 'start_work_generation', None)
+                work_request = pick(decision, 'workRequest', 'work_request')
+                if callable(starter) and work_request:
+                    await starter(
+                        snapshot['story'], snapshot.get('participant'), work_request,
+                        source_entry_id=work_entry_id,
+                    )
                 # 本移植版：决策里的平台动作（戳一戳/点赞/撤回/改状态/群管理…）在投递之后执行。
                 # 只调 chunk12 的方法，**不在本文件新增成员**——Chunk3 有「上游行段铁律」。
                 dispatcher = getattr(self, 'dispatch_platform_actions', None)

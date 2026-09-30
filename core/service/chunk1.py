@@ -1610,6 +1610,22 @@ class ServiceChunk1(ServiceBase):
                 if (result['chat_actions'].get('reactions') and turn.get('latest_session'))
                 else 0
             )
+            # 共同作品（works）：模型提的修改稿 / 起草请求，回合落库之后才处理
+            # （只调 chunk14 的方法，不在本文件新增成员——Chunk1 与 Chunk3 同源）。
+            work_saver = getattr(self, 'apply_work_proposal', None)
+            proposal = pick(decision, 'workProposal', 'work_proposal')
+            if callable(work_saver) and proposal and turn.get('latest_session'):
+                await work_saver(
+                    snapshot['story'], turn.get('latest_session'), proposal,
+                    source_entry_id=platform_entry_id,
+                )
+            work_starter = getattr(self, 'start_work_generation', None)
+            work_request = pick(decision, 'workRequest', 'work_request')
+            if callable(work_starter) and work_request and turn.get('latest_session'):
+                await work_starter(
+                    snapshot['story'], turn.get('latest_session'), work_request,
+                    source_entry_id=platform_entry_id,
+                )
             dispatcher = getattr(self, 'dispatch_platform_actions', None)
             if callable(dispatcher) and turn.get('latest_session'):
                 await dispatcher(

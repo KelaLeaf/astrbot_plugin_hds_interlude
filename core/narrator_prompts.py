@@ -392,6 +392,29 @@ def chat_action_instruction(capabilities: Optional[dict[str, Any]] = None) -> st
     return '\n'.join(instructions)
 
 
+def work_instruction(request: Any) -> str:
+    """共同作品（works）的指令块；没启用或没有这份作品时返回空串。
+
+    两段文本在上游 `works.ts` 里就有（`WORK_INSTRUCTION` / `ASYNC_WORK_INSTRUCTION`），
+    但上游自己**没有接线**——本移植版把它接在这里：`worksMode` 决定用哪一段
+    （`main` = 主叙事回合里顺手写，`separate` = 另起一个写手任务），`sharedWork` 是否存在
+    决定要不要给。
+
+    延迟 import（`core.works` 由并行任务提供）：拿不到就**静默返回空串**——少一段可选
+    指令，绝不能让整条叙事链因为一个可选特性挂掉。
+    """
+    if not isinstance(request, dict):
+        return ''
+    if request.get('sharedWork') is None:
+        return ''
+    try:
+        from .works import ASYNC_WORK_INSTRUCTION, WORK_INSTRUCTION
+    except Exception:  # noqa: BLE001 - works 模块不可用时这个特性等于没开
+        return ''
+    mode = str(request.get('worksMode') or request.get('works_mode') or 'main').strip().lower()
+    return ASYNC_WORK_INSTRUCTION if mode == 'separate' else WORK_INSTRUCTION
+
+
 def platform_action_instruction(request: Any) -> str:
     """本移植版新增：把**当前可用**的平台动作目录渲染进系统提示词。
 
@@ -782,7 +805,21 @@ def to_prompt_payload(request: dict[str, Any], options: Optional[dict[str, Any]]
     if phase == 'advance' or phase == 'conversation-follow-up':
         current_event: Any = {'type': 'none'}
     elif group_context:
-        current_event = {'type': 'group-message-batch'}
+        # 上游 `narrator.ts:1885`：群回合的当前事件同样声明**内容条数与媒体证据**
+        # （`content` / `imageCount` / `audioCount`），只是不带私聊那套观察字段。
+        # 少了 `audioCount`，模型就不知道群里那条语音是真的音频证据（上游
+        # `anthropic.test.ts` 第 1 条钉的正是"群回合也要声明原生音频"）。
+        group_images = _pick(request, 'images') or []
+        group_audio = _pick(request, 'audio') or []
+        current_event = {
+            'type': 'group-message-batch',
+            'content': user_message if user_message is not None else '',
+            'imageCount': len(group_images) if isinstance(group_images, list) else 0,
+            'audioCount': len(group_audio) if isinstance(group_audio, list) else 0,
+        }
+        channel_data = _pick(request, 'channelData', 'channel_data')
+        if _pick(channel_data, 'batchMultiEndpoint', 'batch_multi_endpoint'):
+            current_event['multiEndpoint'] = True
     elif phase == 'user-message':
         images = _pick(request, 'images') or []
         audio = _pick(request, 'audio') or []

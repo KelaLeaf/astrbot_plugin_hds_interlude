@@ -497,6 +497,26 @@ class HDSInterludePlugin(Star):
              '控制台：把旧剧本并入共享主剧本'),
             (f'/{PLUGIN_NAME}/console/story-promote', self.page_console_story_promote, ['POST'],
              '控制台：把选中的剧本立为共享主剧本'),
+            # 共同作品（上游 rc28 `works.ts` 的界面；入口由本移植版补）。
+            # 「作品」面板只读 + 用户动作：**只有用户能接受 / 驳回**她的提案。
+            (f'/{PLUGIN_NAME}/console/works', self.page_console_works, ['GET'],
+             '控制台：共同作品清单'),
+            (f'/{PLUGIN_NAME}/console/work', self.page_console_work, ['GET'],
+             '控制台：一件共同作品的全貌'),
+            (f'/{PLUGIN_NAME}/console/work-create', self.page_console_work_create, ['POST'],
+             '控制台：新建一件共同作品'),
+            (f'/{PLUGIN_NAME}/console/work-accept', self.page_console_work_accept, ['POST'],
+             '控制台：接受一条作品提案'),
+            (f'/{PLUGIN_NAME}/console/work-reject', self.page_console_work_reject, ['POST'],
+             '控制台：驳回一条作品提案'),
+            (f'/{PLUGIN_NAME}/console/work-edit', self.page_console_work_edit, ['POST'],
+             '控制台：用户手改共同作品正文'),
+            (f'/{PLUGIN_NAME}/console/work-generate', self.page_console_work_generate, ['POST'],
+             '控制台：让她起草一版（异步写手任务）'),
+            (f'/{PLUGIN_NAME}/console/work-export', self.page_console_work_export, ['GET'],
+             '控制台：导出共同作品（按消息长度分段）'),
+            (f'/{PLUGIN_NAME}/console/work-cancel', self.page_console_work_cancel, ['POST'],
+             '控制台：取消一个写手任务'),
             # 配置备份（原 config-backup 页并入控制台）
             (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
              '导出 HDS Interlude 配置'),
@@ -625,6 +645,60 @@ class HDSInterludePlugin(Star):
         return await self._console_write(lambda api, body: api.promote_story(
             body.get('source_story_id'),
         ))
+
+    # ---- 控制台的「作品」面板（共同作品） ---- #
+
+    async def page_console_works(self):
+        """共同作品清单：这部剧本里每个参与者一件。"""
+        return await self._console_json(lambda api, q: api.works_overview(q('story_id')))
+
+    async def page_console_work(self):
+        """一件作品的全貌（正文原样回，面板自己决定怎么显示）。"""
+        return await self._console_json(lambda api, q: api.work_detail(q('work_id')))
+
+    async def page_console_work_create(self):
+        """新建第一件作品（`story_id` 留空 = 面板当前那部剧本）。
+
+        已有共同作品时服务层会拒（**绝不覆盖**），那条文案原样回给用户。
+        """
+        return await self._console_write(lambda api, body: api.create_work(
+            body.get('story_id'), body.get('participant_id'),
+            body.get('title'), body.get('content'),
+        ))
+
+    async def page_console_work_accept(self):
+        """接受一条提案——**只有用户能做这件事**（她只能提议）。"""
+        return await self._console_write(lambda api, body: api.accept_work_proposal(
+            body.get('work_id'), body.get('proposal_id'),
+        ))
+
+    async def page_console_work_reject(self):
+        """驳回一条提案（正文不动，只留结论）。"""
+        return await self._console_write(lambda api, body: api.reject_work_proposal(
+            body.get('work_id'), body.get('proposal_id'),
+        ))
+
+    async def page_console_work_edit(self):
+        """用户手改正文：一条新版本（`reason` 是给这条版本留的理由）。"""
+        return await self._console_write(lambda api, body: api.edit_work(
+            body.get('work_id'), body.get('content'), body.get('reason', ''),
+        ))
+
+    async def page_console_work_generate(self):
+        """让她起草一版：异步写手任务，结果作为待决提案回来。"""
+        return await self._console_write(lambda api, body: api.start_work_generation(
+            body.get('work_id'), body.get('brief'),
+        ))
+
+    async def page_console_work_cancel(self):
+        """取消一个写手任务（`interrupted` 的遗留任务也能取消）。"""
+        return await self._console_write(lambda api, body: api.cancel_work_generation(
+            body.get('work_id'), body.get('job_id'),
+        ))
+
+    async def page_console_work_export(self):
+        """导出整件作品：`{parts, count}`，每段都在单条消息的安全长度内。"""
+        return await self._console_json(lambda api, q: api.export_work(q('work_id')))
 
     async def _console_write(self, action):
         """跑一个控制台写操作。

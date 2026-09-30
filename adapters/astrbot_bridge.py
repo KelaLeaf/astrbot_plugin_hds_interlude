@@ -74,6 +74,14 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from ..core import logging as interlude_logging
 from ..core import platform_actions as platform_action_catalog
 from ..core.database import Database
+from ..core.forward_message import (
+    DEFAULT_LIMITS as FORWARD_DEFAULT_LIMITS,
+    ForwardReadResult,
+    extract_forward_ids,
+    failure_result as forward_failure_result,
+    forward_read_ids,
+    forward_read_limits,
+)
 from ..core.narrator import HttpxHttpClient
 from ..core.schedule_preplan import resolve_schedule_preplan_config, schedule_preplan_window
 from ..core.service import (
@@ -94,6 +102,7 @@ __all__ = [
     'ONEBOT_ADAPTER_NAMES',
     'PLUGIN_NAME',
     'build_bridge',
+    'forward_read_context',
     'looks_like_management_command',
     'plugin_data_dir',
     'serialize_message_chain',
@@ -350,9 +359,15 @@ def raw_media_hints(event: Any) -> dict[str, Any]:
     * `mface`（QQ 商城表情）被适配器 `continue` 掉，**整段消失**，连占位都没有。
 
     返回：`images`（按 `file`/`url` 索引的 kind+summary）、`faces`（表情 id → 文本）、
-    `extras`（结构化链里不存在的段的元素定义，按原文顺序）。
+    `extras`（结构化链里不存在的段的元素定义，按原文顺序）、`forwards`（合并转发的
+    资源 id 列表）。
+
+    **`forwards` 为什么必须回原始段取**：AstrBot 的 `Forward` 组件只有 `id`，而
+    `get_message_str()` 把它渲染成 `[转发消息]`（**不带 id**）——只按消息文本抠 id 的话
+    永远读不到正文。`message_obj.raw_message` 里的 `{'type': 'forward', 'data': {'id': …}}`
+    是唯一还带 id 的地方（和图片的 `sub_type` 是同一条路子）。
     """
-    hints: dict[str, Any] = {'images': {}, 'faces': {}, 'extras': []}
+    hints: dict[str, Any] = {'images': {}, 'faces': {}, 'extras': [], 'forwards': []}
     for segment in _raw_segments(event):
         kind = _text(segment.get('type')).lower()
         data = segment.get('data')
@@ -371,6 +386,11 @@ def raw_media_hints(event: Any) -> dict[str, Any]:
                 hints['faces'][face_id] = face_text
         elif kind == 'mface':
             hints['extras'].append({'type': 'mface', 'attrs': _mface_attrs(payload)})
+        elif kind == 'forward':
+            for key in ('id', 'res_id', 'forward_id'):
+                value = _text(payload.get(key))
+                if value and value not in hints['forwards']:
+                    hints['forwards'].append(value)
     return hints
 
 
@@ -597,6 +617,13 @@ def serialize_component(
     # 其它组件（Poke / Forward / Node / Json / …）：保留一个最小标记，
     # 让上游的附件事实路径仍然能看到它，但绝不把标记当正文喂给模型。
     attrs = {}
+    if kind == 'forward':
+        # 合并转发：**把资源 id 写进标记**。AstrBot 的 `Forward` 组件只有 `id`，而
+        # `get_message_str()` 渲染成 `[转发消息]`（id 丢失）——标记里带上 id 之后，
+        # 卡片的可见线索与"读了正文要贴在哪"都有据可依（见 `forward_read_context`）。
+        identifier = _text(_attr(component, 'id', 'res_id', 'forward_id'))
+        if identifier:
+            attrs['id'] = identifier
     url = _attr(component, 'url')
     if _downloadable(url):
         attrs['src'] = _text(url)
@@ -726,7 +753,35 @@ def _message_id_from_event(event: Any) -> str:
     return _text(getattr(obj, 'message_id', ''))
 
 
-def session_view(event: AstrMessageEvent, endpoint: Optional[AstrbotEndpoint] = None) -> SessionView:
+def forward_read_context(content: Any, read: Optional[ForwardReadResult]) -> str:
+    """把读到的合并转发正文**贴到**原有卡片文案后面（纯函数，无副作用）。
+
+    为什么要"贴"而不是"换"：`serialize_message_chain` 本来就会把 `forward` 组件写成
+    `<forward id="…"/>` 这种最小标记（下游的附件事实路径靠它），而用户要求的可见线索
+    ——"这是一条合并转发"——正是这个标记。**两边都要留**：
+
+    * 读到了 → `<forward id="x"/>\n[合并转发内容｜节点数 2]…`；
+    * 读不到（`read.failed`）→ 卡片标记原样留下，**绝不**把失败占位文案塞进消息正文：
+      适配层已经为此打了 warn，而卡片标记本身就是那句可见线索——"有一条合并转发、
+      读不到内容"（移植任务书原话）。原内容为空时补一个 `<forward />`：空串会被
+      `handle_event` 当成"没有可用内容"，整条消息就消失了——那正是要避免的结果。
+    * 压根不认（`read is None`）→ 原样返回。
+    """
+    text = '' if content is None else str(content)
+    if read is None:
+        return text
+    if read.failed:
+        return text or '<forward />'
+    if not text:
+        return read.content
+    return '%s\n%s' % (text, read.content)
+
+
+def session_view(
+    event: AstrMessageEvent,
+    endpoint: Optional[AstrbotEndpoint] = None,
+    forward_read: Optional[ForwardReadResult] = None,
+) -> SessionView:
     """把 `AstrMessageEvent` 翻成 `SessionView`（`plugin/core/service/session.py`）。
 
     字段映射（上游 `Session` → `SessionView`）：
@@ -739,12 +794,16 @@ def session_view(event: AstrMessageEvent, endpoint: Optional[AstrbotEndpoint] = 
     | `channelId` | 群 = `get_group_id()`；私聊 = `get_sender_id()`（AstrBot 的会话 id） |
     | `guildId` | 群 = `get_group_id()`；私聊 = `''` |
     | `isDirect` | 私聊判定 |
-    | `content` | `serialize_message_chain()`（Koishi mini-xml 形式） |
+    | `content` | `serialize_message_chain()`（Koishi mini-xml 形式）+ `forward_read` 的正文 |
     | `elements` | 同上，结构化段列表 |
     | `quote` | `Reply` 组件（上游 `session.quote`） |
     | `messageId` | `event.message_obj.message_id` |
     | `username` | `event.get_sender_name()` |
     | `event` | 原始 `AstrMessageEvent` 引用 |
+
+    `forward_read` 是 `AstrbotBridge.read_forward_for_event()` 已经读回来的合并转发正文
+    （读不到就别传 `None`，见那条路径的失败分支）：**只由它决定注入形态**，本函数
+    不做任何 await、也不自己发请求。
     """
     resolved = endpoint if endpoint is not None else endpoint_for_event(event)
     hints = raw_media_hints(event)
@@ -772,6 +831,12 @@ def session_view(event: AstrMessageEvent, endpoint: Optional[AstrbotEndpoint] = 
         content = _text(_call(event, 'get_message_str', ''))
         if content and not elements:
             elements = [{'type': 'text', 'attrs': {'content': content}, 'children': []}]
+    if forward_read is not None:
+        # 合并转发读取（上游 `forwardMessage` 组）：正文贴到卡片标记之后，
+        # 注入形态与失败分支见 `forward_read_context`。
+        content = forward_read_context(content, forward_read)
+        if not elements:
+            elements = [{'type': 'text', 'attrs': {'content': content}, 'children': []}]
     return SessionView(
         platform=resolved.platform,
         self_id=resolved.self_id,
@@ -788,9 +853,88 @@ def session_view(event: AstrMessageEvent, endpoint: Optional[AstrbotEndpoint] = 
     )
 
 
+def _card_markup_from_chain(event: Any) -> str:
+    """把消息链里的合并转发组件渲染成 `<forward id="…"/>`（只取 id，别的不关心）。
+
+    `Forward` 组件的 `id` 是 AstrBot 唯一给出来的资源坐标（`get_message_str()` 只渲染
+    `[转发消息]`）。这里顺手把它变成 core 认的那种标记，`extract_forward_ids` 就能复用
+    同一条解析路径——**也为后面写进注入正文的"卡片线索"做准备**。
+    """
+    chain = _call(event, 'get_messages', []) or []
+    parts: list[str] = []
+    for component in chain:
+        if component is None:
+            continue
+        if _component_kind(component) != 'forward':
+            continue
+        identifier = _text(_attr(component, 'id', 'res_id', 'forward_id'))
+        if identifier:
+            parts.append('<forward id="%s"/>' % _escape_attr(identifier))
+    return ''.join(parts)
+
+
 def looks_like_management_command(content: Any) -> bool:
     """上游 `looksLikeInterludeCommand`（`upstream/src/index.ts:915`）+ 本移植版前缀。"""
     return bool(COMMAND_WORD_RE.match(_text(content).strip()))
+
+
+# --------------------------------------------------------------------------- #
+# 合并转发读取的接缝（上游 `readForwardContent` 的适配层那一半）
+# --------------------------------------------------------------------------- #
+
+def _forward_section_keys(section: dict[str, Any]) -> dict[str, Any]:
+    """配置段里的合并转发预算 → `core/forward_message` 认的两种拼写都带上。
+
+    上游只认 camelCase（`maxNodes` …），本移植版 schema 里是 snake_case
+    （`max_nodes` …），而 core 的 `forward_read_limits` 优先读 camelCase、snake 兜底。
+    这里把两个拼写都填上（值相同），免得"配置页写 snake、代码读 camel"那类静默失效
+    （`AGENTS.md` 坑 41 / 65 的同类）。
+    """
+    keys = {
+        'enabled': ('enabled',),
+        'maxNodes': ('maxNodes', 'max_nodes'),
+        'maxCharacters': ('maxCharacters', 'max_characters'),
+        'maxDepth': ('maxDepth', 'max_depth'),
+    }
+    normalized: dict[str, Any] = {}
+    for target, names in keys.items():
+        for name in names:
+            if name in section:
+                normalized[target] = section[name]
+                break
+    for name, value in section.items():
+        normalized.setdefault(name, value)
+    normalized.setdefault('enabled', True)
+    return normalized
+
+
+def _limits_payload(limits: Any) -> dict[str, Any]:
+    """`ForwardReadLimits`（或字典）→ core 认的 camelCase 字典。"""
+    if isinstance(limits, Mapping):
+        return {key: limits.get(key) for key in ('maxNodes', 'maxCharacters', 'maxDepth')}
+    return {
+        'maxNodes': getattr(limits, 'max_nodes', FORWARD_DEFAULT_LIMITS.max_nodes),
+        'maxCharacters': getattr(limits, 'max_characters', FORWARD_DEFAULT_LIMITS.max_characters),
+        'maxDepth': getattr(limits, 'max_depth', FORWARD_DEFAULT_LIMITS.max_depth),
+    }
+
+
+def _onebot_forward_fetcher(client: Any) -> Callable[[str], Any]:
+    """`get_forward_msg` 的取一页入口（原生 OneBot 动作，非 SnowLuma）。
+
+    core 那边只认"`fetch(id)` 返回 awaitable"这一条契约，参数怎么拼是这里的事
+    （OneBot 要 `{'id': …}`）。用 `client.call_action` 直连：`get_forward_msg` 是
+    OneBot v11 标准动作，不走 `AstrbotTransport` 的动作目录（那是给**模型动作**用的，
+    见交接说明）。
+    """
+
+    async def fetch(identifier: str) -> Any:
+        frame = client.call_action('get_forward_msg', id=identifier)
+        if inspect.isawaitable(frame):
+            frame = await frame
+        return frame
+
+    return fetch
 
 
 # =========================================================================== #
@@ -3206,6 +3350,17 @@ class AstrbotBridge:
             self.db.register_tables()
             await self.apply_story_defaults_persona()
             self.service.start_background_tasks()
+            # 共同作品（works）：把库里遗留的 `running` 写手任务收成 `failed`——
+            # 进程重启后那些任务永远不会回来，留着会让界面一直显示"正在写"。
+            # **放在适配层而不是 `start_background_tasks()`**：它要碰 sqlite，
+            # 挂进 core 的定时器后在单元测试的进程退出阶段会撞上被关掉的数据库连接
+            # （实测整轮 discover 段错误，exit 139）。这里 await 完成，失败只 warn。
+            recover = getattr(self.service, 'startup_recover_works', None)
+            if callable(recover):
+                try:
+                    await recover()
+                except Exception as error:  # noqa: BLE001 - 启动路径绝不因为可选特性失败
+                    logger.warning('hds-interlude：共同作品恢复失败 %s' % error)
             self.interlude_context.emit_ready()
             self._started = True
             missing = getattr(self.service, '_missing_chunks', ())
@@ -3275,7 +3430,7 @@ class AstrbotBridge:
         """停止后台计时器、关闭 HTTP 客户端与数据库（幂等）。"""
         for attribute in (
             '_sweep_timer', '_compaction_timer', '_blind_mode_timer', '_sticker_scan_timer',
-            '_world_seeder_timer',
+            '_world_seeder_timer', '_qzone_feed_timer',
         ):
             handle = getattr(self.service, attribute, None)
             cancel = getattr(handle, 'cancel', None)
@@ -3285,6 +3440,13 @@ class AstrbotBridge:
                 except Exception:  # pragma: no cover - 已触发的计时器取消是 no-op
                     pass
         self.service.background_started = False
+        # 共同作品（works）：关掉在飞的写手任务，别让它在卸载后还往库里写。
+        stop_works = getattr(self.service, 'stop_works', None)
+        if callable(stop_works):
+            try:
+                stop_works()
+            except Exception as error:  # noqa: BLE001 - 卸载路径绝不抛回宿主
+                logger.warning('hds-interlude：关闭共同作品失败 %s' % error)
         client = self._httpx_client
         self._httpx_client = None
         if client is not None:
@@ -4105,6 +4267,110 @@ class AstrbotBridge:
     # 入站分发（上游 `ctx.middleware`）
     # ------------------------------------------------------------------ #
 
+    #: 合并转发读取读的配置段。schema 那边已把隐藏兼容位 `forward_message_compat`
+    #: 转正成真分组 `forward_message`，所以**先读新名**、旧名只作旧文件的兜底
+    #: （与 QQ 空间转正时同一条路子，见 `AGENTS.md` 坑 66）。
+    FORWARD_SECTION_NAMES: tuple[str, ...] = ('forward_message', 'forwardMessage', 'forward_message_compat')
+
+    def forward_section(self) -> dict[str, Any]:
+        """读合并转发读取的配置段（新名优先，旧隐藏位兜底，读不到就回空字典）。"""
+        for name in self.FORWARD_SECTION_NAMES:
+            data = self.section(name)
+            if isinstance(data, dict) and data:
+                return _forward_section_keys(data)
+        return {}
+
+    def forward_ids_for_event(self, event: AstrMessageEvent) -> list[str]:
+        """一条入站事件里的合并转发资源 id（按"先原始段、后消息标记"排好序）。
+
+        两个来源都收（去重、保序）：
+
+        1. `raw_media_hints(event)['forwards']` —— **主路径**。AstrBot 的 `Forward` 组件
+           带 `id`，但 `get_message_str()` 只给 `[转发消息]`，id 不进消息文本；原始段是
+           唯一还带着它的地方。
+        2. `extract_forward_ids(消息文本)` —— 兼容别的适配器、旧链路、以及真的把
+           `<forward id=…/>` / `[CQ:forward,id=…]` 写进文本的情况。
+        3. 消息链里的 `Forward` 组件本身（`_card_markup_from_chain`）—— 原始段缺失
+           （适配器没放 `raw_message`）时仍要读得到，`id` 就在组件上。
+        """
+        ids: list[str] = []
+        hints = raw_media_hints(event)
+        for value in hints.get('forwards') or []:
+            identifier = _text(value)
+            if identifier and identifier not in ids:
+                ids.append(identifier)
+        for value in extract_forward_ids(_text(_call(event, 'get_message_str', ''))):
+            if value not in ids:
+                ids.append(value)
+        for value in extract_forward_ids(_card_markup_from_chain(event)):
+            if value not in ids:
+                ids.append(value)
+        return ids
+
+    async def read_forward_for_event(self, event: AstrMessageEvent) -> Optional[ForwardReadResult]:
+        """入站时读合并转发正文（上游 `readForwardContent`，返回 `None` = 没有转发）。
+
+        契约（移植任务书）：
+
+        * **认不出合并转发** → `None`，一行日志都不打；
+        * **不是 OneBot 平台**（Telegram / WebChat…）→ 一条 `debug`，`None`。不回
+          `failed`：那会在每条含 `[CQ:forward,…]` 字面量的消息上刷一条"读不到"的 warn，
+          而这类平台本来就没有这个能力；
+        * **OneBot 但拿不到客户端**（平台实例 / 连接没就绪）→ `failure_result()` + 一条
+          `warn`（这是真正的异常路径，用户要看得到），调用方照常注入占位文案；
+        * **超时 / 平台错误帧 / 响应形状怪** → 同样走 `failure_result()`；
+        * **成功** → 归一化后的正文与计数。**任何一条失败分支都不抛异常、不阻断消息消费。**
+
+        **id 从哪来**：AstrBot 的 `get_message_str()` 把合并转发渲染成 `[转发消息]`、
+        `Forward` 组件的 `id` 又不进消息文本，所以只有两条路能拿到 id ——
+        `message_obj.raw_message` 的 `forward` 原始段（首选，`raw_media_hints()['forwards']`）
+        与消息里真正的 Koishi/CQ 标记（`extract_forward_ids`，兼容别的适配器 / 旧链路）。
+        """
+        ids = self.forward_ids_for_event(event)
+        if not ids:
+            return None
+        # 预算与开关**只读一次**：`forward_section()` 已经把新名 / camelCase / 旧隐藏位
+        # 都归一好了，`config_flag('forward_message', 'enabled')` 读不到旧段位那份。
+        section = self.forward_section()
+        if section.get('enabled') is False:
+            return None
+        if not self.platform_is_onebot(self.current_target()):
+            log_fallback(
+                'debug',
+                '消息里有合并转发（资源 %s），但当前平台不是 OneBot 家族，不读取正文',
+                ids[0][:64],
+            )
+            return None
+        endpoint = self._current_endpoint
+        client = self.onebot_client(
+            _text(getattr(endpoint, 'platform', '')), _text(getattr(endpoint, 'self_id', '')),
+        )
+        if client is None:
+            log_fallback(
+                'warn',
+                '收到一条合并转发（资源 %s），但当前平台实例没有可用的 OneBot 客户端'
+                '（不是 aiocqhttp/NapCat，或机器人连接未就绪），只保留"这是一条合并转发"的线索',
+                ids[0][:64],
+            )
+            return forward_failure_result()
+        limits = forward_read_limits(section)
+        try:
+            result = await forward_read_ids(ids, _onebot_forward_fetcher(client), _limits_payload(limits))
+        except Exception as error:  # noqa: BLE001 - 读取绝不允许打断消息消费
+            log_fallback('warn', '合并转发读取异常（资源 %s）：%s', ids[0][:64], error)
+            return forward_failure_result()
+        if result is None:
+            return None
+        if result.failed:
+            log_fallback('warn', '合并转发内容读取失败（资源 %s），只保留"这是一条合并转发"的线索', ids[0][:64])
+        else:
+            log_fallback(
+                'debug',
+                '合并转发已读取：资源=%s 节点=%s 嵌套=%s 截断=%s 字符=%s',
+                ids[0][:64], result.node_count, result.forward_count, result.truncated, len(result.content),
+            )
+        return result
+
     async def handle_event(self, event: AstrMessageEvent) -> list[str]:
         """把一条入站事件喂给 service 的入站入口，返回本回合的可见回复。
 
@@ -4122,12 +4388,18 @@ class AstrbotBridge:
 
         返回值是 `send_session` 在本回合捕获到的可见回复文本列表（顺序与上游
         `session.send` 调用顺序一致），由 `main.py` 用 `yield` 交回 AstrBot。
+
+        **合并转发（上游 `forwardMessage` 组）**：在 `non_message` 之后、判"空内容"之前
+        读一次正文（`read_forward_for_event()`）。位置有两个理由：① 事件坐标必须先登记
+        （`remember_event`），否则拿不到平台实例 / OneBot 客户端；② 读到的正文要注入
+        `SessionView.content`，否则 `[CQ:forward,id=…]` 卡片在下游只是一段认不出的标记。
+        **读取失败绝不阻断消费**：失败只留一条 warn，消息照常往下走（见那条路径的分支）。
         """
         await self.ensure_started()
         endpoint = endpoint_for_event(event)
-        session = session_view(event, endpoint)
         non_message, kind_label = is_non_message_event(event)
         if non_message:
+            session = session_view(event, endpoint)
             # OneBot 的通知 / 元事件 / 请求不是聊天内容，永远成不了回合。以前它们走的是
             # "空内容"那条路，每条都打一条 warn——NapCat 的「对方正在输入…」一分钟能来
             # 十几条，把日志里真正该看的东西全盖掉了（用户 2026-09-25 的日志就是这样）。
@@ -4140,7 +4412,12 @@ class AstrbotBridge:
             else:
                 log_fallback('debug', '忽略非消息事件 类型=%s', kind_label)
             return []
-        self.remember_event(event, session, endpoint)
+        # 登记坐标要用 `session`，而 session 的构建又要等合并转发读完——所以这里先建
+        # 一次**便宜的**视图（纯读、不发请求）交给 `remember_event`，读完正文后再建一次
+        # 带上注入内容。两次构建只差那几个字段，比让登记与读取互相依赖划算。
+        self.remember_event(event, session_view(event, endpoint), endpoint)
+        forward_read = await self.read_forward_for_event(event)
+        session = session_view(event, endpoint, forward_read)
         content = session.content
 
         if not content.strip() and not self._has_voice(session):

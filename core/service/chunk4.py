@@ -207,6 +207,8 @@ _DUAL_ELEMENT_KEYS = (
 
 _DUAL_SINGLE_KEYS = (
     'followUpCommitment', 'localMedia', 'nativeFace', 'groupReply',
+    # 共同作品：模型提出的修改稿 / 异步写手请求（上游 works.ts 的两个入口字段）。
+    'workProposal', 'workRequest',
     'automaticDeliverySummary', 'agencyWindow', 'proactiveContact', 'statePatch',
     'authoredActions', 'lifeHandoff', 'intentUpdates',
 )
@@ -1383,6 +1385,20 @@ class ServiceChunk4(ServiceBase):
                 },
                 3 if (user_message and user_message.strip()) else 1,
             )
+        # 本移植版：共同作品（works）的当前投影与工作模式；没启用/没这部作品时为 None。
+        shared_work = None
+        works_mode = None
+        works_state = getattr(self, 'shared_work_state', None)
+        if callable(works_state):
+            try:
+                shared_work = await works_state(story, participant)
+                # 工作模式从 `works` 配置组读（chunk14 的 `works_config()`），缺省 main。
+                config_reader = getattr(self, 'works_config', None)
+                config = config_reader() if callable(config_reader) else {}
+                works_mode = pick(config, 'generationMode', 'generation_mode') or 'main'
+            except Exception as error:  # noqa: BLE001 - 作品投影失败不该挡住叙事
+                self.report('warn', story, phase, '共同作品投影失败 错误=%s', error)
+                shared_work = None
         # 本移植版：把"这一回合她实际能对平台做什么"算好随请求带下去（提示词只列启用项）。
         # 权限表、配置开关、会话身份都在 chunk12 判完；这里只负责取一份结果。
         action_scopes = ('private', 'group') if group_context else ('private',)
@@ -1447,6 +1463,9 @@ class ServiceChunk4(ServiceBase):
             'facts': facts,
             'groupContext': group_context,
             'chatCapabilities': chat_capabilities,
+            # 共同作品：把当前共享文本的投影与工作模式带下去（启用时才给；内容不受信）。
+            **({} if shared_work is None else {'sharedWork': shared_work}),
+            **({} if works_mode is None else {'worksMode': works_mode}),
             # 双拼写：提示词渲染侧两种写法都认（跨 chunk 传参的既有约定，见坑 41）。
             'platformActions': platform_actions,
             'platform_actions': platform_actions,

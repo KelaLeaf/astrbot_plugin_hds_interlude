@@ -84,7 +84,7 @@ KNOWN_SECTIONS = frozenset({
     'chat_rhythm', 'black_box', 'shared_story_compat', 'runtime_compat', 'model_compat',
     # 本移植版新增：QQ 空间（v1.6.0 由隐藏兼容位转正）、输入状态、以及动作开关分组。
     # 动作分组名从目录派生，**不要手抄**——加动作时这里自动跟上。
-    'qzone', 'input_status', 'world_seeder', 'forward_message_compat',
+    'qzone', 'input_status', 'world_seeder', 'works', 'forward_message', 'forward_message_compat',
     *sorted(set(ACTION_CONFIG_GROUPS.values()) | {ACTION_RISK_GROUP}),
     # 上游 Koishi Console 的分组名（老导出文件里会出现）
     'model', 'onebot', 'storyDefaults', 'sharedStory', 'alterSystem',
