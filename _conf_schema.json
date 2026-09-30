@@ -2206,43 +2206,610 @@
       }
     }
   },
-  "qzone_compat": {
+  "qzone": {
     "type": "object",
-    "title": "QQ 空间（未移植）",
-    "description": "【扩展 16】上游 1.0.1-rc28 的 QQ 空间通道；本移植版暂未实现（P3），仅保留键位。",
+    "title": "QQ 空间",
+    "description": "【扩展 16】QQ 空间：说说与好友动态的低频维护（上游 rc28 的 qzone 组）。",
     "items": {
       "enabled": {
         "type": "bool",
-        "description": "启用 QQ 空间通道",
-        "default": false
+        "description": "启用 QQ 空间",
+        "default": false,
+        "hint": "打开后她才会发说说、看好友动态"
       },
       "daily_post_cap": {
         "type": "int",
         "description": "每日发帖上限",
-        "default": 3
+        "default": 3,
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        },
+        "hint": "0 = 不发说说"
       },
       "daily_comment_cap": {
         "type": "int",
         "description": "每日评论上限",
-        "default": 6
+        "default": 6,
+        "slider": {
+          "min": 0,
+          "max": 60,
+          "step": 1
+        },
+        "hint": "0 = 不评论"
       },
       "daily_like_cap": {
         "type": "int",
         "description": "每日点赞上限",
-        "default": 12
+        "default": 12,
+        "slider": {
+          "min": 0,
+          "max": 120,
+          "step": 1
+        },
+        "hint": "0 = 不点赞"
       },
       "min_interval_minutes": {
         "type": "int",
         "description": "动作最小间隔（分钟）",
-        "default": 90
+        "default": 90,
+        "slider": {
+          "min": 10,
+          "max": 1440,
+          "step": 10
+        },
+        "hint": "两次空间动作之间至少隔这么久"
       },
       "feed_window_minutes": {
         "type": "int",
         "description": "好友动态时间窗（分钟）",
-        "default": 120
+        "default": 120,
+        "slider": {
+          "min": 15,
+          "max": 720,
+          "step": 15
+        },
+        "hint": "只看这么久以内发的好友动态"
+      },
+      "auto_feed": {
+        "type": "bool",
+        "description": "自动浏览好友动态",
+        "default": false,
+        "hint": "允许她浏览好友动态并在合适时评论/点赞"
       }
-    },
-    "invisible": true
+    }
+  },
+  "actions_interaction": {
+    "type": "object",
+    "title": "互动动作",
+    "description": "【动作 17】互动动作：戳一戳、点赞与撤回消息的独立开关。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用互动动作",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "send_poke": {
+        "type": "bool",
+        "description": "戳一戳",
+        "default": true,
+        "hint": "戳一下对方（比发消息更轻的招呼）。"
+      },
+      "send_like": {
+        "type": "bool",
+        "description": "点赞",
+        "default": true,
+        "hint": "给对方的名片点赞。"
+      },
+      "recall_message": {
+        "type": "bool",
+        "description": "撤回消息",
+        "default": true,
+        "hint": "撤回她刚发出去的一条消息（说错了、改口、反悔）。"
+      }
+    }
+  },
+  "actions_message": {
+    "type": "object",
+    "title": "消息与定时",
+    "description": "【动作 18】消息与定时：定时消息与定时命令的排期管理。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用消息与定时",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "schedule_message": {
+        "type": "bool",
+        "description": "定时消息",
+        "default": true,
+        "hint": "把一条消息排到将来某个时刻发出（例如明天早上说早安）。"
+      },
+      "list_scheduled_messages": {
+        "type": "bool",
+        "description": "定时消息列表",
+        "default": true,
+        "hint": "看还有哪些定时消息没发出去。"
+      },
+      "cancel_scheduled_message": {
+        "type": "bool",
+        "description": "取消定时消息",
+        "default": true,
+        "hint": "取消一条（或全部）还没发出的定时消息。"
+      },
+      "schedule_command": {
+        "type": "bool",
+        "description": "定时命令",
+        "default": true,
+        "hint": "按周期重复执行一个已登记的命令（例如每天凌晨整理记忆）。"
+      },
+      "list_scheduled_commands": {
+        "type": "bool",
+        "description": "定时命令列表",
+        "default": true,
+        "hint": "看已登记的定时命令。"
+      },
+      "cancel_scheduled_command": {
+        "type": "bool",
+        "description": "取消定时命令",
+        "default": true,
+        "hint": "取消一条定时命令。"
+      }
+    }
+  },
+  "actions_history": {
+    "type": "object",
+    "title": "历史消息",
+    "description": "【动作 19】历史消息：拉取群聊与私聊的近期记录，用于补上她不在场时的事。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用历史消息",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "get_group_msg_history": {
+        "type": "bool",
+        "description": "拉群历史",
+        "default": true,
+        "hint": "拉取某个群最近的聊天记录（她不在场时发生的事也能补上）。"
+      },
+      "get_friend_msg_history": {
+        "type": "bool",
+        "description": "拉私聊历史",
+        "default": true,
+        "hint": "拉取与某个人的最近聊天记录。"
+      }
+    }
+  },
+  "actions_status": {
+    "type": "object",
+    "title": "QQ 状态",
+    "description": "【动作 20】QQ 状态：在线状态与自定义状态的读取和切换。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用QQ 状态",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "update_qq_status": {
+        "type": "bool",
+        "description": "改 QQ 状态",
+        "default": true,
+        "hint": "设置机器人账号的在线状态（在线/离开/忙碌/听歌中…）。"
+      },
+      "get_qq_status": {
+        "type": "bool",
+        "description": "查 QQ 状态",
+        "default": true,
+        "hint": "看机器人账号当前的在线状态。"
+      },
+      "get_fun_status_list": {
+        "type": "bool",
+        "description": "查可选状态",
+        "default": true,
+        "hint": "列出可用的自定义状态（供改状态时挑）。"
+      }
+    }
+  },
+  "actions_group": {
+    "type": "object",
+    "title": "群管理",
+    "description": "【动作 21】群管理：群信息只读查询与低风险的群内写入（危险操作在「风险操作」组）。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用群管理",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "get_group_members_info": {
+        "type": "bool",
+        "description": "群成员",
+        "default": true,
+        "hint": "看群成员名单（含身份、名片、入群时间）。"
+      },
+      "get_user_group_role": {
+        "type": "bool",
+        "description": "查群身份",
+        "default": true,
+        "hint": "查某人在群里的身份（群主/管理员/成员）。"
+      },
+      "get_group_honor_info": {
+        "type": "bool",
+        "description": "群荣誉",
+        "default": true,
+        "hint": "看群荣誉（龙王、群聊之火…）。"
+      },
+      "get_group_shut_list": {
+        "type": "bool",
+        "description": "禁言列表",
+        "default": true,
+        "hint": "看群里正在被禁言的人。"
+      },
+      "get_group_notice_list": {
+        "type": "bool",
+        "description": "群公告",
+        "default": true,
+        "hint": "看群公告内容（她\"知道\"群里通知了什么）。"
+      },
+      "get_group_at_all_remain": {
+        "type": "bool",
+        "description": "@全体剩余",
+        "default": true,
+        "hint": "看本群 @全体成员 还剩几次。"
+      },
+      "list_group_files": {
+        "type": "bool",
+        "description": "群文件列表",
+        "default": true,
+        "hint": "看群文件有哪些。"
+      },
+      "send_group_notice": {
+        "type": "bool",
+        "description": "发群公告",
+        "default": true,
+        "hint": "以机器人身份发一条群公告。"
+      },
+      "delete_group_notice": {
+        "type": "bool",
+        "description": "删群公告",
+        "default": true,
+        "hint": "删掉一条群公告。"
+      },
+      "set_essence_msg": {
+        "type": "bool",
+        "description": "设精华",
+        "default": true,
+        "hint": "把一条消息设为群精华。"
+      },
+      "delete_essence_msg": {
+        "type": "bool",
+        "description": "撤精华",
+        "default": true,
+        "hint": "取消一条消息的群精华。"
+      },
+      "send_group_sign": {
+        "type": "bool",
+        "description": "群打卡",
+        "default": true,
+        "hint": "在群里签到。"
+      },
+      "set_group_card": {
+        "type": "bool",
+        "description": "改群名片",
+        "default": true,
+        "hint": "改群昵称（默认改自己）。"
+      }
+    }
+  },
+  "actions_profile": {
+    "type": "object",
+    "title": "个人资料",
+    "description": "【动作 22】个人资料：机器人账号的昵称、签名与头像。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用个人资料",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "set_qq_profile": {
+        "type": "bool",
+        "description": "改资料",
+        "default": true,
+        "hint": "改机器人账号的昵称/个性签名。"
+      },
+      "set_qq_avatar": {
+        "type": "bool",
+        "description": "换头像",
+        "default": true,
+        "hint": "换机器人账号的头像。"
+      },
+      "get_qq_profile": {
+        "type": "bool",
+        "description": "查自己资料",
+        "default": true,
+        "hint": "看机器人账号当前的昵称与签名。"
+      }
+    }
+  },
+  "actions_voice": {
+    "type": "object",
+    "title": "语音与声聊",
+    "description": "【动作 23】语音与声聊：以语音回话与可用音色。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用语音与声聊",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "send_voice": {
+        "type": "bool",
+        "description": "发语音",
+        "default": true,
+        "hint": "把一段话用语音发出去（走宿主 TTS）。"
+      },
+      "list_voices": {
+        "type": "bool",
+        "description": "可用音色",
+        "default": true,
+        "hint": "列出宿主 TTS 能用的音色。"
+      },
+      "default_voice": {
+        "type": "string",
+        "description": "默认 TTS 音色",
+        "default": "",
+        "hint": "留空用宿主默认 TTS 音色"
+      }
+    }
+  },
+  "actions_contact": {
+    "type": "object",
+    "title": "联系人与群",
+    "description": "【动作 24】联系人与群：联系人查询、资料卡，以及被动同意加好友与入群邀请。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用联系人与群",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "list_contacts": {
+        "type": "bool",
+        "description": "联系人列表",
+        "default": true,
+        "hint": "列出好友与群（她可以自己决定要了解谁）。"
+      },
+      "search_contacts": {
+        "type": "bool",
+        "description": "搜联系人",
+        "default": true,
+        "hint": "按关键词搜好友/群（昵称、备注、群名、群号）。"
+      },
+      "get_user_profile": {
+        "type": "bool",
+        "description": "看资料卡片",
+        "default": true,
+        "hint": "看某个人的资料卡（昵称、签名、等级、性别等）。"
+      },
+      "get_group_info": {
+        "type": "bool",
+        "description": "看群资料",
+        "default": true,
+        "hint": "看某个群的资料（群名、人数、简介、群主等）。"
+      },
+      "handle_friend_request": {
+        "type": "bool",
+        "description": "处理加好友请求",
+        "default": true,
+        "hint": "同意或拒绝**别人加机器人**的请求（不能主动加人）。"
+      },
+      "handle_group_request": {
+        "type": "bool",
+        "description": "处理被拉群",
+        "default": true,
+        "hint": "同意或拒绝**别人拉机器人进群**的邀请/申请（不能主动加群）。"
+      },
+      "auto_learn": {
+        "type": "bool",
+        "description": "主动了解新联系人",
+        "default": false,
+        "hint": "允许她主动了解新联系人/群：看资料卡、群公告、空间动态"
+      }
+    }
+  },
+  "actions_qzone": {
+    "type": "object",
+    "title": "QQ 空间动作",
+    "description": "【动作 25】QQ 空间动作：发说说、评论与点赞的独立开关（上限在「QQ 空间」组）。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用QQ 空间动作",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "publish_qzone_post": {
+        "type": "bool",
+        "description": "发说说",
+        "default": true,
+        "hint": "以她本人身份发一条 QQ 空间说说。"
+      },
+      "comment_qzone_post": {
+        "type": "bool",
+        "description": "评论说说",
+        "default": true,
+        "hint": "评论一条空间说说（她自己的或好友的，需先由 `list_qzone_posts` / 动态感知拿到 tid）。"
+      },
+      "like_qzone_post": {
+        "type": "bool",
+        "description": "点赞说说",
+        "default": true,
+        "hint": "给一条空间说说点赞。"
+      },
+      "list_qzone_posts": {
+        "type": "bool",
+        "description": "看空间说说",
+        "default": true,
+        "hint": "看自己或好友的空间说说列表（只读；好友动态也靠它对齐正文）。"
+      }
+    }
+  },
+  "actions_risks": {
+    "type": "object",
+    "title": "风险操作",
+    "description": "以下功能包含风险操作不建议开启",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用风险操作",
+        "default": false,
+        "hint": "总开关，默认关闭：只有打开后本组动作才可能被调用"
+      },
+      "set_group_special_title": {
+        "type": "bool",
+        "description": "设专属头衔",
+        "default": false,
+        "hint": "会改动成员在群里的专属头衔；默认关闭。"
+      },
+      "set_group_add_option": {
+        "type": "bool",
+        "description": "改加群方式",
+        "default": false,
+        "hint": "会改掉全群的加群验证方式，改错可能放陌生人进群或挡住正常入群；默认关闭。"
+      },
+      "set_group_portrait": {
+        "type": "bool",
+        "description": "改群头像",
+        "default": false,
+        "hint": "会换掉全群可见的群头像；默认关闭。"
+      },
+      "set_group_name": {
+        "type": "bool",
+        "description": "改群名",
+        "default": false,
+        "hint": "会改掉全群可见的群名；默认关闭。"
+      },
+      "set_group_ban": {
+        "type": "bool",
+        "description": "禁言",
+        "default": false,
+        "hint": "会让成员在设定时长内无法发言（0 秒 = 解除禁言）；默认关闭。"
+      },
+      "set_group_whole_ban": {
+        "type": "bool",
+        "description": "全员禁言",
+        "default": false,
+        "hint": "会让整个群在一段时间里没人能发言；默认关闭。"
+      },
+      "set_group_kick": {
+        "type": "bool",
+        "description": "踢人",
+        "default": false,
+        "hint": "会把成员踢出群，不可撤销；默认关闭。"
+      },
+      "set_group_admin": {
+        "type": "bool",
+        "description": "设管理",
+        "default": false,
+        "hint": "会改变群管理权限（设或撤管理员）；默认关闭。"
+      },
+      "delete_group_file": {
+        "type": "bool",
+        "description": "删群文件",
+        "default": false,
+        "hint": "群文件会被永久删除，不可恢复；默认关闭。"
+      },
+      "upload_group_file": {
+        "type": "bool",
+        "description": "传群文件",
+        "default": false,
+        "hint": "会以机器人身份往群里上传文件；默认关闭。"
+      },
+      "rename_group_file": {
+        "type": "bool",
+        "description": "重命名群文件",
+        "default": false,
+        "hint": "会改掉群文件的名字；默认关闭。"
+      },
+      "move_group_file": {
+        "type": "bool",
+        "description": "移动群文件",
+        "default": false,
+        "hint": "会把群文件移到别的文件夹；默认关闭。"
+      },
+      "create_group_file_folder": {
+        "type": "bool",
+        "description": "建群文件夹",
+        "default": false,
+        "hint": "会在群里新建文件夹；默认关闭。"
+      },
+      "delete_group_folder": {
+        "type": "bool",
+        "description": "删群文件夹",
+        "default": false,
+        "hint": "文件夹连同里面的文件会一起消失，不可恢复；默认关闭。"
+      },
+      "trans_group_file": {
+        "type": "bool",
+        "description": "转存群文件",
+        "default": false,
+        "hint": "会把群文件转存到别处；默认关闭。"
+      },
+      "delete_qzone_post": {
+        "type": "bool",
+        "description": "删说说",
+        "default": false,
+        "hint": "说说会被永久删除，不可恢复；默认关闭。"
+      },
+      "delete_friend": {
+        "type": "bool",
+        "description": "删好友",
+        "default": false,
+        "hint": "会删掉好友关系（可选同时拉黑），不可撤销；默认关闭。"
+      }
+    }
+  },
+  "input_status": {
+    "type": "object",
+    "title": "输入状态",
+    "description": "【输入 27】输入状态：回复前先亮「正在输入」，让节奏更像真人。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用输入状态",
+        "default": true,
+        "hint": "发送正文之前先亮出「正在输入…」"
+      },
+      "min_visible_ms": {
+        "type": "int",
+        "description": "输入状态最短停留毫秒",
+        "default": 600,
+        "slider": {
+          "min": 0,
+          "max": 10000,
+          "step": 100
+        },
+        "hint": "短于此时长就不发送，避免闪一下"
+      },
+      "beat_chance": {
+        "type": "float",
+        "description": "输入状态心跳概率",
+        "default": 0.25,
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.05
+        },
+        "hint": "长回复期间续报「正在输入」的概率"
+      }
+    }
   },
   "forward_message_compat": {
     "type": "object",

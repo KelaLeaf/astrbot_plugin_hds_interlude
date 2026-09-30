@@ -22,6 +22,7 @@ import os
 from datetime import datetime
 from typing import Any, Optional
 
+from ..core import platform_actions
 from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
 from ..core.token_stats import normalize_range, range_bounds, summarize_usage
@@ -461,6 +462,33 @@ def _safe_all(
         return []
 
 
+#: 权限四档 → （中文标签，一句话说明）。顺序与 `platform_actions.PERMISSION_TIERS` 一致，
+#: 面板的下拉与统计卡都读它——档位名是**权限表里的值**，不能各写一份。
+PERMISSION_TIER_LABELS: dict[str, tuple[str, str]] = {
+    'global': ('所有人', '任何会话里都能用'),
+    'groupadmin': ('仅群主 / 管理员', '只在群里、且发言者是群主或管理员时能用'),
+    'admin': ('仅插件管理员', '只有 HDSI 管理员能用'),
+    'disabled': ('关闭', '任何会话都不能用这一条'),
+}
+
+#: 危险动作的开关组中文标签（该组在 schema 里的描述就是 `platform_actions.RISK_WARNING`，
+#: 那是**警示语**，不是分组名；面板的警示条逐字用它）。
+RISK_GROUP_LABEL = '风险操作'
+
+#: 风险级别 → 中文标签（面板的风险徽章）。
+RISK_LABELS: dict[str, str] = {
+    'safe': '安全',
+    'sensitive': '敏感',
+    'dangerous': '危险',
+}
+
+#: 与**平台动作权限表无关**的控制台只读页面。权限表只管 `platform_actions.ACTIONS`
+#: 里那些"她能对 QQ 做的事"；「Token 统计」（`tokens`）这类页面读的是本地账本与目录，
+#: 不触发任何平台动作，因此**没有**权限需求——这里把边界写下来，别把页面混进权限表
+#: （页面的取数接口在 `main.py` 注册，见 `console/token-stats`）。
+PERMISSIONLESS_PANELS: tuple[str, ...] = ('tokens',)
+
+
 class ConsoleApi:
     """控制台的数据来源。所有方法都是协程或纯同步读，返回可 JSON 序列化的 dict。"""
 
@@ -856,6 +884,192 @@ class ConsoleApi:
             'saved_via': saved_via,
             'changed': f'{label} → {"开启" if value else "关闭"}',
         }
+
+    # ------------------------------------------------------------------ #
+    # 平台动作目录与权限（唯一事实源：`core/platform_actions.py`）
+    # ------------------------------------------------------------------ #
+
+    async def actions_catalog(self) -> dict[str, Any]:
+        """「动作」面板的全部数据：动作目录 + 当前生效档位 + 统计。
+
+        三件事必须说清（与运行期**同源**，别在控制台里重算一套）：
+
+        1. `permission` = **权限表里的档位**（`effective_permission(..., None)`，
+           即用户在下拉里选的那个值；没选过就是目录声明的默认档）；
+        2. `enabled` = **实际能不能用**（`is_action_enabled(...)`）= 权限表档位
+           **与**配置开关的与关系：开关关掉时档位无论选什么都不生效；
+        3. `config_enabled` = 那个开关的原始值（`True` / `False` / `None` = 未配置）。
+
+        配置开关的分组由 `platform_actions.action_config_group()` 给出（危险动作一律进
+        `actions_risks` 风险组），子键 = 动作 id。**分组不存在 = 未配置 = 不限制**，
+        所以旧版本升级上来的用户不会因为 schema 还没落地就整页显示"全关"。
+        """
+        table = self._action_permissions()
+        switches = self._action_switches()
+        actions: list[dict[str, Any]] = []
+        risk_counts = {level: 0 for level in platform_actions.RISK_LEVELS}
+        tier_counts = {tier: 0 for tier in platform_actions.PERMISSION_TIERS}
+        enabled_total = 0
+        risky_enabled = 0
+        for item in platform_actions.ACTIONS.values():
+            switch = switches.get(item.id)
+            permission = platform_actions.effective_permission(item.id, table, None)
+            enabled = platform_actions.is_action_enabled(item.id, table, switch)
+            risk_counts[item.risk] = risk_counts.get(item.risk, 0) + 1
+            tier_counts[permission] = tier_counts.get(permission, 0) + 1
+            if enabled:
+                enabled_total += 1
+                if item.risk == 'dangerous':
+                    risky_enabled += 1
+            actions.append({
+                'id': item.id,
+                'category': item.category,
+                'category_label': platform_actions.ACTION_CATEGORIES.get(item.category, item.category),
+                'label': item.label,
+                'summary': item.summary,
+                'risk': item.risk,
+                'default_permission': item.default_permission,
+                'permission': permission,
+                'enabled': enabled,
+                'config_enabled': switch,
+                'group': platform_actions.action_config_group(item),
+                'returns': item.returns,
+                'params': [
+                    {
+                        'name': param.name,
+                        'label': param.label,
+                        'type': param.type,
+                        'required': bool(param.required),
+                        'minimum': param.minimum,
+                        'maximum': param.maximum,
+                        'choices': list(param.choices),
+                        'note': param.note,
+                    }
+                    for param in item.params
+                ],
+            })
+        return {
+            'actions': actions,
+            'tiers': [
+                {
+                    'id': tier,
+                    'label': PERMISSION_TIER_LABELS.get(tier, (tier, ''))[0],
+                    'description': PERMISSION_TIER_LABELS.get(tier, (tier, ''))[1],
+                }
+                for tier in platform_actions.PERMISSION_TIERS
+            ],
+            'groups': self._action_groups(),
+            # 逐字用 core 的常量（面板要显示的就是这句原话）。
+            'risk_warning': platform_actions.RISK_WARNING,
+            'risk_labels': dict(RISK_LABELS),
+            'risky': [item.id for item in platform_actions.risky_actions()],
+            'permissionless_panels': list(PERMISSIONLESS_PANELS),
+            'permissions_path': self._action_permissions_file(),
+            'stats': {
+                'total': len(actions),
+                'enabled': enabled_total,
+                'disabled': len(actions) - enabled_total,
+                'risky': risk_counts.get('dangerous', 0),
+                'risky_enabled': risky_enabled,
+                'risk': risk_counts,
+                'permissions': tier_counts,
+            },
+        }
+
+    async def set_action_permission(self, action_id: Any, tier: Any) -> dict[str, Any]:
+        """把某个动作写进权限表（`action_permissions.json`），返回归一化后的整表。
+
+        未知动作 / 未知档位**一律拒绝**（映射成 400）：权限表是安全边界，
+        静默接受一个拼错的动作 id 等于让用户以为"我关了它"，其实什么都没关。
+        """
+        action = platform_actions.ACTIONS.get(_text(action_id).strip())
+        if action is None:
+            raise ConsoleError('未知动作：%s' % (_text(action_id).strip() or '(空)'))
+        level = _text(tier).strip().lower()
+        if level not in platform_actions.PERMISSION_TIERS:
+            raise ConsoleError('未知权限档位：%s（可选：%s）' % (
+                _text(tier) or '(空)', ' / '.join(platform_actions.PERMISSION_TIERS),
+            ))
+        table = self._action_permissions()
+        table[action.id] = level
+        saved = self._save_action_permissions(table)
+        return {
+            'action': action.id,
+            'tier': level,
+            'permissions': saved,
+            'permissions_path': self._action_permissions_file(),
+            'changed': '%s 的权限档位 → %s' % (
+                action.label, PERMISSION_TIER_LABELS.get(level, (level, ''))[0],
+            ),
+        }
+
+    async def reset_action_permissions(self) -> dict[str, Any]:
+        """清空权限表：所有动作回到目录声明的默认档（危险动作仍然默认关闭）。"""
+        saved = self._save_action_permissions({})
+        return {
+            'permissions': saved,
+            'permissions_path': self._action_permissions_file(),
+            'changed': '动作权限表已清空（全部回到默认档位）',
+        }
+
+    def _action_permissions(self) -> dict[str, str]:
+        """当前权限表（归一化；读不到就当空表 = 全部走默认档，绝不抛）。
+
+        坏文件由桥接侧 `_load_action_permissions()` 负责 warn，这里只保证面板能打开。
+        """
+        try:
+            raw = self.bridge.action_permissions()
+        except Exception:  # noqa: BLE001 - 权限表读取失败不该让面板打不开
+            return {}
+        return platform_actions.normalize_permissions(raw)
+
+    def _save_action_permissions(self, table: dict[str, str]) -> dict[str, str]:
+        """写权限表。桥接不支持（老版本 / 测试桩）或写盘失败时给**可读的 400**。"""
+        saver = getattr(self.bridge, 'save_action_permissions', None)
+        if not callable(saver):
+            raise ConsoleError('当前桥接不支持写入动作权限表，请升级插件后重试')
+        try:
+            return platform_actions.normalize_permissions(saver(table))
+        except ConsoleError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 写不进去要说出来，不能假装成功
+            raise ConsoleError('写入动作权限表失败：%s' % error)
+
+    def _action_switches(self) -> dict[str, Any]:
+        """每个动作的配置开关值：`True` / `False` / `None`（分组或键不存在 = 未配置）。
+
+        只读 `bridge.section(分组)`，读不到就是未配置——总闸没配等于不限制，
+        与 `effective_permission(enabled=None)` 的语义一致。
+        """
+        sections: dict[str, dict[str, Any]] = {}
+        switches: dict[str, Any] = {}
+        for item in platform_actions.ACTIONS.values():
+            group = platform_actions.action_config_group(item)
+            if group not in sections:
+                try:
+                    section = self.bridge.section(group)
+                except Exception:  # noqa: BLE001 - 取配置失败按"未配置"处理
+                    section = None
+                sections[group] = section if isinstance(section, dict) else {}
+            value = sections[group].get(item.id)
+            switches[item.id] = value if isinstance(value, bool) else None
+        return switches
+
+    def _action_groups(self) -> dict[str, str]:
+        """配置分组 id → 中文标签（面板用它说明"开关在哪一组"）。"""
+        groups: dict[str, str] = {}
+        for category, label in platform_actions.ACTION_CATEGORIES.items():
+            group = platform_actions.ACTION_CONFIG_GROUPS.get(category)
+            # `group_read` / `group_write` 共用 `actions_group`：先到的类别定标签。
+            if group:
+                groups.setdefault(group, label)
+        groups[platform_actions.ACTION_RISK_GROUP] = RISK_GROUP_LABEL
+        return groups
+
+    def _action_permissions_file(self) -> str:
+        """权限表文件的实际路径（页面上写出来，用户能自己去看 / 备份）。"""
+        data_dir = _text(getattr(self.bridge, 'data_dir', ''))
+        return os.path.join(data_dir, 'action_permissions.json') if data_dir else 'action_permissions.json'
 
     # ------------------------------------------------------------------ #
     # 配置页（schema 驱动：所有可配置项都能在控制台改）

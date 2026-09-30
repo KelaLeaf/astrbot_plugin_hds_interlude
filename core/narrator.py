@@ -94,6 +94,7 @@ from .types import (
     TimelinePlan,
     TimelinePlanRequest,
 )
+from .narrator_prompts import platform_action_instruction
 from .urge import urge_instruction
 
 try:  # 上游 `./script/authored-actions`；由并行的 `core/script/authored_actions.py` 移植任务落地。
@@ -1225,22 +1226,25 @@ class OpenAICompatibleNarrator:
                     self.config.get('fixed_prompt'),
                     self.config.get('style_prompt'),
                     _get(setting, 'style'),
-                    request.get('refresh_continuity') is True,
-                    request.get('alter_enabled') is True,
-                    request.get('agency_enabled') is True,
+                    (bool(_get(request, 'refreshContinuity')) or request.get('refresh_continuity') is True),
+                    (bool(_get(request, 'alterEnabled')) or request.get('alter_enabled') is True),
+                    (bool(_get(request, 'agencyEnabled')) or request.get('agency_enabled') is True),
                     bool(_or(_trim(_get(setting, 'perspective')), _trim(_get(overlay, 'perspective')))),
-                    request.get('output_recovery') is True,
-                    request.get('chat_capabilities'),
+                    (bool(_get(request, 'outputRecovery')) or request.get('output_recovery') is True),
+                    (_get(request, 'chatCapabilities') or request.get('chat_capabilities')),
                     bool(quoted) or has_quote_in_group,
-                    request.get('sticker_catalog'),
-                    _truthy(request.get('schedule_preplan')),
+                    (_get(request, 'stickerCatalog') or request.get('sticker_catalog')),
+                    _truthy(_get(request, 'schedulePreplan') or request.get('schedule_preplan')),
                     streaming_early_reply,
                     cache_first_payload,
                     bool(_truthy(group_context)),
-                    request.get('writing_options'),
+                    (_get(request, 'writingOptions') or request.get('writing_options')),
                     specialty=self.resolve_specialty(provider),
-                    channel_selection_enabled=bool(request.get('channel_selection_enabled')),
-                ) + urge_instruction(request.get('urge_enabled') is True, request.get('phase')),
+                    channel_selection_enabled=bool(_get(request, 'channelSelectionEnabled') or request.get('channel_selection_enabled')),
+                ) + urge_instruction(
+                    bool(_get(request, 'urgeEnabled')) or request.get('urge_enabled') is True,
+                    request.get('phase'),
+                    ) + platform_action_instruction(request),
             },
             {'role': 'user', 'content': user_content},
         ]
@@ -2880,7 +2884,7 @@ def _prompt_payload_options(cache_first: bool) -> dict[str, Any]:
 # 导入；提示词半部分由并行的 `core/narrator_prompts.py` 移植，这里原样转出。
 
 from .llm_governor import LlmGovernor, governor_limits_from_config  # noqa: E402
-from .narrator_prompts import (  # noqa: E402  (必须在文件末尾，避免与上文定义交叉)
+from .narrator_prompts import (  # noqa: E402  (必须在文件末尾，避免与上文定义交叉
     RecentScriptOwnership,
     alter_analysis_prompt,
     compact_prompt_entries,

@@ -750,6 +750,7 @@ class ServiceBase:
         self._world_seeder_timer: Optional[TimerHandle] = None
         self._world_seeder_sweep_running = False
         self._compaction_timer: Optional[TimerHandle] = None
+        self._qzone_feed_timer: Optional[TimerHandle] = None
         self._blind_mode_timer: Optional[TimerHandle] = None
         self._sticker_scan_timer: Optional[TimerHandle] = None
 
@@ -1514,6 +1515,15 @@ class ServiceChunk0(ServiceBase):
             self.ctx.set_timeout(lambda: self._spawn(self.scan_sticker_library()), 0)
             self._sticker_scan_timer = self.ctx.set_interval(
                 lambda: self._spawn(self.scan_sticker_library()), 5 * 60_000,
+            )
+        # QQ 空间好友动态轮询（本移植版）：**按 `qzone.enabled` 注册**——「自动浏览」
+        # 那个开关的说明只有在这个定时器真的会跑的时候才打得出来（上游 service.ts:867
+        # 同样只判 enabled，auto_feed 由 `qzone_feed_sweep` 内部决定要不要抓）。
+        qzone_enabled = bool(getattr(self, 'qzone_runtime', None) and self.qzone_runtime().get('enabled'))
+        if qzone_enabled:
+            poll_minutes = max(5, int(self.qzone_feed_poll_minutes() or 30))
+            self._qzone_feed_timer = self.ctx.set_interval(
+                lambda: self._spawn(self.qzone_feed_sweep()), poll_minutes * 60_000,
             )
         self.report_standalone_operation(
             'standard', 'info', '后台调度已启动 剧本扫描=%d分钟 记忆扫描=%d分钟',

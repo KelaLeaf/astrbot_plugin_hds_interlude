@@ -49,6 +49,8 @@ JS `undefined` vs `null`
 
 from __future__ import annotations
 
+from .platform_actions import describe_actions
+
 import importlib
 import json
 import math
@@ -72,6 +74,9 @@ from .specialization import (
     repetition_guard_instruction,
 )
 from .time import dt_ms, iso, parse_dt, story_local_time_context, utc_now
+
+#: 一次回合允许的平台动作上限（与 service 侧同源；提示词与实践都说同一个数）。
+MAX_PLATFORM_ACTIONS_PER_TURN = 8
 
 __all__ = [
     'KNOWLEDGE_WRITING_FRAME',
@@ -385,6 +390,38 @@ def chat_action_instruction(capabilities: Optional[dict[str, Any]] = None) -> st
         threshold = _default(_pick(capabilities, 'expressionThreshold', 'expression_threshold'), 0.7)
         instructions.append('For a subtle native QQ face, return nativeFace: {"semantic":"' + '|'.join(native_faces) + '","willingness":0.0-1.0}. Omit nativeFace for routine wording: it is not a permission field and never needs to accompany a reply. Use it only when the reply text itself clearly carries the same nonverbal meaning; do not raise willingness to 1.0 to force a send. It is calibrated against reply text and is sent only when it reaches ' + _js_number(threshold) + '; at thresholds above 0.90, omit the field unless an expression is truly indispensable. Do not write bracketed face labels in reply text.')
     return '\n'.join(instructions)
+
+
+def platform_action_instruction(request: Any) -> str:
+    """本移植版新增：把**当前可用**的平台动作目录渲染进系统提示词。
+
+    与上游的 `chatActionInstruction(capabilities)` 是同一层东西（都告诉模型"你现在能做什么、
+    怎么写"），区别是这里列的是本移植版扩展出来的平台动作（戳一戳/点赞/撤回/定时/群管理/
+    空间/资料/联系人…）。目录**只列启用项**：模型看不到它其实调不动的动作，就不会去幻觉调用。
+
+    读的是请求里的 `platformActions` / `platform_actions`（跨 chunk 双拼写），内容由
+    `ServiceChunk12.available_platform_actions()` 算好——权限、开关、会话身份都在那边判完。
+    """
+    if not isinstance(request, dict):
+        return ''
+    available = request.get('platformActions')
+    if available is None:
+        available = request.get('platform_actions')
+    if not isinstance(available, (list, tuple)) or not available:
+        return ''
+    catalog = describe_actions([str(item) for item in available])
+    if not catalog:
+        return ''
+    return (
+        'PLATFORM ACTIONS AVAILABLE NOW: the protagonist may additionally act on the chat platform '
+        'itself (not just speak). Return them in the top-level "platformActions" array, each item '
+        '{"action":"<id>","params":{...}}, executed **after** the reply is delivered and in the order '
+        'given; at most %d per turn, and omit the field entirely when nothing is needed. These are real '
+        'side effects on a live account: only use them when the story itself calls for it, never as a '
+        'demonstration, and never to imitate a reply (the reply is still interaction.reply / groupReply). '
+        'A failed action is reported to you on the next turn as a script entry, so do not retry blindly.\n'
+        'Available actions:\n%s'
+    ) % (MAX_PLATFORM_ACTIONS_PER_TURN, catalog)
 
 
 def quoted_message_instruction(enabled: bool) -> str:

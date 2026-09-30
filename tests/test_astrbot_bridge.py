@@ -1979,6 +1979,10 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/stories',
             # v1.5.1：Token 用量统计（本移植版新增面板）。
             f'/{main_module.PLUGIN_NAME}/console/token-stats',
+            # 平台动作目录与权限（本移植版新增面板「动作」）。
+            f'/{main_module.PLUGIN_NAME}/console/actions',
+            f'/{main_module.PLUGIN_NAME}/console/action-permission',
+            f'/{main_module.PLUGIN_NAME}/console/action-permissions-reset',
             f'/{main_module.PLUGIN_NAME}/console/patch-decide',
             f'/{main_module.PLUGIN_NAME}/console/patch-rollback',
             f'/{main_module.PLUGIN_NAME}/console/story-merge',
@@ -2020,6 +2024,9 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/connections',
             f'/{main_module.PLUGIN_NAME}/console/connections-delete',
             f'/{main_module.PLUGIN_NAME}/console/config-set',
+            # 平台动作权限：写权限表（未知动作 / 未知档位由后端 400 拒绝）
+            f'/{main_module.PLUGIN_NAME}/console/action-permission',
+            f'/{main_module.PLUGIN_NAME}/console/action-permissions-reset',
             f'/{main_module.PLUGIN_NAME}/console/patch-decide',
             f'/{main_module.PLUGIN_NAME}/console/patch-rollback',
             f'/{main_module.PLUGIN_NAME}/console/story-merge',

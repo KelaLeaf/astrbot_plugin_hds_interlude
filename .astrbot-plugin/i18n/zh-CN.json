@@ -18,7 +18,8 @@
         "alter": "情绪",
         "agency": "日程",
         "chats": "聊天记录",
-        "tokens": "Token 统计"
+        "tokens": "Token 统计",
+        "actions": "动作"
       }
     }
   }

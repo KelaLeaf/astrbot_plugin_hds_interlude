@@ -74,6 +74,9 @@ EXPECTED_TABLES = [
     'interlude_story_alias',
     # 本移植版新增：控制台「Token 统计」页的账本。
     'interlude_token_usage',
+    # 上游 rc28 的 QQ 空间动作账本（P3 解禁后补上）与本移植版的定时命令表。
+    'interlude_qzone_post',
+    'interlude_scheduled_command',
 ]
 
 #: `(表, 主键, 是否自增)` —— 直接抄自 database.ts 的 `primary` / `autoInc`。
@@ -96,6 +99,8 @@ EXPECTED_PRIMARY = {
     'interlude_endpoint': ('id', False),
     'interlude_story_alias': ('aliasStoryId', False),
     'interlude_token_usage': ('id', True),
+    'interlude_qzone_post': ('id', True),
+    'interlude_scheduled_command': ('id', True),
 }
 
 #: `indexes` / `unique` 选项 → 期望存在的索引列（顺序照抄 database.ts）。
@@ -187,6 +192,14 @@ EXPECTED_COLUMNS = {
     'interlude_token_usage': [
         'id', 'day', 'storyId', 'task', 'model', 'provider',
         'inputTokens', 'outputTokens', 'cachedTokens', 'calls', 'createdAt', 'updatedAt',
+    ],
+    'interlude_qzone_post': [
+        'id', 'storyId', 'kind', 'tid', 'targetUin', 'content', 'ugcRight', 'endpointId',
+        'status', 'error', 'createdAt', 'postedAt',
+    ],
+    'interlude_scheduled_command': [
+        'id', 'storyId', 'command', 'params', 'cron', 'enabled', 'nextRunAt', 'lastRunAt',
+        'lastStatus', 'lastError', 'runCount', 'createdAt', 'updatedAt',
     ],
 }
 
@@ -290,12 +303,13 @@ class _DatabaseTestCase(unittest.TestCase):
 class RegisterTablesTests(_DatabaseTestCase):
     """对应上游 `registerTables(ctx)`：13 张表一次性建成。"""
 
-    def test_all_seventeen_tables_created(self):
+    def test_all_nineteen_tables_created(self):
         created = self.db.register_tables()
         self.assertEqual(sorted(created), sorted(EXPECTED_TABLES))
         self.assertEqual(sorted(self._table_names()), sorted(EXPECTED_TABLES))
-        # `TABLES` 注册表本身是 17 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表 + Token 账本）。
-        self.assertEqual(len(TABLES), 17)
+        # `TABLES` 注册表本身是 19 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表
+        # + Token 账本 + QQ 空间账本 + 定时命令表）。
+        self.assertEqual(len(TABLES), 19)
         self.assertEqual(db_mod.table_names(), EXPECTED_TABLES)
 
     def test_columns_match_upstream_declaration(self):

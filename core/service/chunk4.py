@@ -1383,6 +1383,12 @@ class ServiceChunk4(ServiceBase):
                 },
                 3 if (user_message and user_message.strip()) else 1,
             )
+        # 本移植版：把"这一回合她实际能对平台做什么"算好随请求带下去（提示词只列启用项）。
+        # 权限表、配置开关、会话身份都在 chunk12 判完；这里只负责取一份结果。
+        action_scopes = ('private', 'group') if group_context else ('private',)
+        platform_actions = self.available_platform_actions(
+            self.resolve_action_session_role(participant), action_scopes,
+        )
         # 发给模型的请求：键名逐字保持上游 camelCase。
         request: dict[str, Any] = {
             'urgeEnabled': _cfg(self.urge_config, 'enabled', False) and not any(
@@ -1441,6 +1447,9 @@ class ServiceChunk4(ServiceBase):
             'facts': facts,
             'groupContext': group_context,
             'chatCapabilities': chat_capabilities,
+            # 双拼写：提示词渲染侧两种写法都认（跨 chunk 传参的既有约定，见坑 41）。
+            'platformActions': platform_actions,
+            'platform_actions': platform_actions,
             'contactThreads': await self.contact_threads(story['id'], facts, participant_id) if memory_enabled else [],
             'sceneFrame': scene_frame,
             'dialogueBurst': dialogue_burst,

@@ -483,6 +483,12 @@ class HDSInterludePlugin(Star):
              '控制台：剧本清单（含归档）'),
             (f'/{PLUGIN_NAME}/console/token-stats', self.page_console_token_stats, ['GET'],
              '控制台：Token 用量统计（按天/周/月/自选范围）'),
+            (f'/{PLUGIN_NAME}/console/actions', self.page_console_actions, ['GET'],
+             '控制台：平台动作目录与权限档位'),
+            (f'/{PLUGIN_NAME}/console/action-permission', self.page_console_action_permission, ['POST'],
+             '控制台：设置一个平台动作的权限档位'),
+            (f'/{PLUGIN_NAME}/console/action-permissions-reset', self.page_console_action_permissions_reset, ['POST'],
+             '控制台：清空平台动作权限表（回默认档）'),
             (f'/{PLUGIN_NAME}/console/patch-decide', self.page_console_patch_decide, ['POST'],
              '设定候选审批'),
             (f'/{PLUGIN_NAME}/console/patch-rollback', self.page_console_patch_rollback, ['POST'],
@@ -585,6 +591,20 @@ class HDSInterludePlugin(Star):
         return await self._console_json(lambda api, q: api.token_stats(
             q('range'), q('from'), q('to'),
         ))
+
+    async def page_console_actions(self):
+        """平台动作目录 + 当前权限档位（面板「动作」）。"""
+        return await self._console_json(lambda api, q: api.actions_catalog())
+
+    async def page_console_action_permission(self):
+        """设置一个动作的权限档位（未知动作 / 未知档位会被 400 拒绝）。"""
+        return await self._console_write(lambda api, body: api.set_action_permission(
+            body.get('action'), body.get('tier'),
+        ))
+
+    async def page_console_action_permissions_reset(self):
+        """清空动作权限表：所有动作回目录默认档。"""
+        return await self._console_write(lambda api, body: api.reset_action_permissions())
 
     async def page_console_story_merge(self):
         return await self._console_write(lambda api, body: api.merge_story(

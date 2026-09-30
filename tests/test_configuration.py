@@ -38,17 +38,18 @@ UPSTREAM_PACKAGE_PATH = os.path.join(REPO_ROOT, "upstream", "package.json")
 #: AstrBot `_conf_schema.json` 允许的 type 集合（astrbot/core/config/default.py:DEFAULT_VALUE_MAP）。
 ALLOWED_TYPES = {"string", "text", "int", "float", "bool", "object", "list", "template_list", "file"}
 
-#: 上游 Console 的分组顺序（`upstream/test/configuration.test.ts:11-14`）。
+#: 上游 Console 的分组顺序（`upstream/test/configuration.test.ts:11-14`），
+#: 末尾补上 rc23 / rc28 新增、本移植版已转正的两个扩展分组。
 UPSTREAM_SECTION_ORDER = [
     "storyDefaults", "model", "onebot", "sharedStory", "runtime", "urge",
     "schedulePreplan", "timelineDirector", "agency",
-    "chatActions", "stickers", "memory", "alterSystem", "browser", "blindMode", "logging",
-    "chatRhythm",
+    "chatActions", "stickers", "memory", "alterSystem", "browser",
+    "worldSeeder", "qzone", "blindMode", "logging", "chatRhythm",
 ]
 
-#: 上游 1.0.1-rc23 / rc27 新增的两个扩展分组；`worldSeeder` 本移植版已移植，
-#: `qzone` 属 P3（暂缓），落在隐藏兼容位 `qzone_compat`。
-UPSTREAM_NEW_SECTIONS = [("worldSeeder", "world_seeder"), ("qzone", "qzone_compat")]
+#: 上游 1.0.1-rc23 / rc28 新增的两个扩展分组；本移植版都已转正
+#: （`qzone` 原先是隐藏兼容位 `qzone_compat`，v1.6.0 起是真分组）。
+UPSTREAM_NEW_SECTIONS = [("worldSeeder", "world_seeder"), ("qzone", "qzone")]
 
 #: 上游键 → 本插件顶层键（顺序与上游一致）。
 SECTION_MAP = [
@@ -67,6 +68,7 @@ SECTION_MAP = [
     ("alterSystem", "alter_system"),
     ("browser", "browser"),
     ("worldSeeder", "world_seeder"),
+    ("qzone", "qzone"),
     ("blindMode", "blind_mode"),
     ("logging", "logging"),
     ("chatRhythm", "chat_rhythm"),
@@ -79,6 +81,12 @@ UPSTREAM_FIELDS = {
     "world_seeder": [
         "enabled", "cadenceMinutes", "maxPending", "dailyCap", "maxHorizonHours",
         "temperature", "maxTokens", "timeout",
+    ],
+    # 上游 1.0.1-rc28【扩展 16】QQ 空间：v1.6.0 从隐藏兼容位 `qzone_compat`
+    # 转正为真分组（键名逐字不变，snake_case 走 `CAMEL_TO_SNAKE`）。
+    "qzone": [
+        "enabled", "dailyPostCap", "dailyCommentCap", "dailyLikeCap",
+        "minIntervalMinutes", "feedWindowMinutes",
     ],
     "story_defaults": [
         "characterName", "characterProfile", "perspective", "perspectives",
@@ -170,11 +178,9 @@ UPSTREAM_FIELDS = {
 }
 
 #: 已弃用 / 隐藏的旧字段（上游 `CONFIGURATION_GUIDE.md`「隐藏的历史兼容字段」）。
+#: `qzone` 原先是这里的一员（隐藏位 `qzone_compat`），v1.6.0 起转正、移进
+#: `UPSTREAM_FIELDS` 做真分组对账——**只剩合并转发仍是 P3 隐藏位**。
 UPSTREAM_COMPAT_FIELDS = {
-    "qzone_compat": [
-        "enabled", "dailyPostCap", "dailyCommentCap", "dailyLikeCap",
-        "minIntervalMinutes", "feedWindowMinutes",
-    ],
     "forward_message_compat": ["enabled", "maxNodes", "maxCharacters", "maxDepth"],
     "shared_story_compat": ["enabled", "participantPresets"],
     "runtime_compat": ["pauseAfterConversationMinutes", "staleNarrativeRequestWindowSeconds"],
@@ -245,7 +251,7 @@ UPSTREAM_PROVIDER_DEFAULT = {
 #: 上游字段名 → 本插件 snake_case 键名（配置映射表，见 `docs/CONFIG_MAP.md`）。
 CAMEL_TO_SNAKE = {
     # 上游 1.0.1-rc28：故事档案、模型特化、主动联系、意愿档位、世界播种器、
-    # QQ 空间与合并转发（后两者落在隐藏兼容位）。
+    # QQ 空间（已转正）与合并转发（仍是隐藏兼容位）。
     "perspectives": "perspectives", "supplementaryFacts": "supplementary_facts",
     "specialization": "specialization", "specializationFamily": "specialization_family",
     "contactMode": "contact_mode", "proactiveDailyCap": "proactive_daily_cap",
@@ -915,16 +921,65 @@ class ConfigurationSchemaTest(unittest.TestCase):
             "query_rewrite_enabled",
             "context_metrics_enabled",
         },
+        # v1.6.0：QQ 空间转正后多出来的那个"自动刷动态"开关（上游 qzone 只有六个键）。
+        "qzone": {"auto_feed"},
+        # v1.6.0：平台动作目录的开关（`plugin/core/platform_actions.py` 是唯一事实源，
+        # 键名逐字 = 动作 id）。上游 Console 里没有这一层，整组由本移植版新增；
+        # 逐项覆盖与落点由 `test_every_catalog_action_has_exactly_one_switch` 盯着。
+        "actions_interaction": {
+            "enabled", "send_poke", "send_like", "recall_message",
+        },
+        "actions_message": {
+            "enabled", "schedule_message", "list_scheduled_messages",
+            "cancel_scheduled_message", "schedule_command", "list_scheduled_commands",
+            "cancel_scheduled_command",
+        },
+        "actions_history": {
+            "enabled", "get_group_msg_history", "get_friend_msg_history",
+        },
+        "actions_status": {
+            "enabled", "update_qq_status", "get_qq_status", "get_fun_status_list",
+        },
+        "actions_group": {
+            "enabled", "get_group_members_info", "get_user_group_role", "get_group_honor_info",
+            "get_group_shut_list", "get_group_notice_list", "get_group_at_all_remain",
+            "list_group_files", "send_group_notice", "delete_group_notice", "set_essence_msg",
+            "delete_essence_msg", "send_group_sign", "set_group_card",
+        },
+        "actions_profile": {
+            "enabled", "set_qq_profile", "set_qq_avatar", "get_qq_profile",
+        },
+        "actions_voice": {
+            "enabled", "send_voice", "list_voices", "default_voice",
+        },
+        "actions_contact": {
+            "enabled", "list_contacts", "search_contacts", "get_user_profile", "get_group_info",
+            "handle_friend_request", "handle_group_request", "auto_learn",
+        },
+        "actions_qzone": {
+            "enabled", "publish_qzone_post", "comment_qzone_post", "like_qzone_post",
+            "list_qzone_posts",
+        },
+        "actions_risks": {
+            "enabled", "set_group_special_title", "set_group_add_option", "set_group_portrait",
+            "set_group_name", "set_group_ban", "set_group_whole_ban", "set_group_kick",
+            "set_group_admin", "delete_group_file", "upload_group_file", "rename_group_file",
+            "move_group_file", "create_group_file_folder", "delete_group_folder",
+            "trans_group_file", "delete_qzone_post", "delete_friend",
+        },
+        "input_status": {"enabled", "min_visible_ms", "beat_chance"},
     }
 
     def test_upstream_field_count_matches(self):
         expected = sum(len(v) for v in UPSTREAM_FIELDS.values())
         # 上游字段总数里含被搬到 `prompts` 组的 4 个提示词键（`UPSTREAM_FIELDS`
         # 记的是**上游的原始归属**），所以实际项数要把新组那一份也数上。
-        actual = (
-            sum(len(self.section(g)) for g in UPSTREAM_FIELDS)
-            + sum(len(self.section(g)) for g in self.RELOCATED_UPSTREAM_FIELDS)
-        )
+        # 本移植版新增的**整组**（`actions_*` / `input_status`）不进 `UPSTREAM_FIELDS`，
+        # 它们整组记在 `LOCAL_ONLY_FIELDS` 里，所以要按三张表的**并集**数一遍，
+        # 否则"新增整组"会被漏算。
+        counted = (set(UPSTREAM_FIELDS) | set(self.RELOCATED_UPSTREAM_FIELDS)
+                   | set(self.LOCAL_ONLY_FIELDS))
+        actual = sum(len(self.section(g)) for g in counted)
         local_only = sum(len(v) for v in self.LOCAL_ONLY_FIELDS.values())
         self.assertEqual(actual, expected + local_only,
                          f"上游 {expected} 项 + 本移植版新增 {local_only} 项"
@@ -967,6 +1022,71 @@ class ConfigurationSchemaTest(unittest.TestCase):
                 prompts[key]["default"], CONFIG_DEFAULTS["model"][key],
                 f"prompts.{key} 的默认值与 core 不一致",
             )
+
+    # -- v1.6.0：平台动作目录 ↔ 配置开关的对账（防漏断言） ---------------------
+
+    def test_actions_risks_group_uses_the_user_warning_verbatim(self):
+        """风险组的说明就是用户原话；每个危险开关都要写清后果 + 默认关闭。"""
+        from plugin.core import platform_actions as catalog  # noqa: PLC0415
+
+        self.assertEqual(self.schema[catalog.ACTION_RISK_GROUP]["description"],
+                         catalog.RISK_WARNING)
+        items = self.section(catalog.ACTION_RISK_GROUP)
+        for action in catalog.risky_actions():
+            with self.subTest(action=action.id):
+                switch = items[action.id]
+                self.assertIs(switch["default"], False)
+                hint = switch.get("hint", "")
+                self.assertIn("默认关闭", hint, f"{action.id} 的 hint 没写默认关闭：{hint!r}")
+                self.assertGreater(len(hint), len("默认关闭"),
+                                   f"{action.id} 的 hint 没写清后果：{hint!r}")
+
+    def test_every_catalog_action_has_exactly_one_switch(self):
+        """目录里的动作在 schema 里**恰好**有一个开关，且正好落在它该在的那个组。
+
+        动作目录是唯一事实源（`plugin/core/platform_actions.py`）。加一个动作却忘了
+        在 `_conf_schema.json` 里补开关，这里当场红——否则那个动作要么永远调不动
+        （开关读不出来），要么被塞进别的分组、被另一个总开关连坐。
+        """
+        from plugin.core import platform_actions as catalog  # noqa: PLC0415
+
+        # 1) 每个动作 id 在 schema 里出现几次、分别在哪条路径上。
+        hits: dict[str, list[str]] = {}
+        for path, key, _spec in iter_fields(self.schema):
+            if key in catalog.ACTIONS:
+                hits.setdefault(key, []).append(path)
+
+        for action_id, action in catalog.ACTIONS.items():
+            with self.subTest(action=action_id):
+                paths = hits.get(action_id, [])
+                self.assertEqual(len(paths), 1,
+                                 f"{action_id} 在 schema 里出现 {len(paths)} 次：{paths}")
+                self.assertEqual(paths[0],
+                                 f"{catalog.action_config_group(action)}.{action_id}",
+                                 f"{action_id} 的开关落点不对")
+
+        # 2) 每个 `actions_*` 分组都要有总开关；组里除白名单外的键都必须是动作 id，
+        #    而且必须是"该落在这个组"的动作。
+        extras = {"enabled", "default_voice", "auto_learn"}
+        action_groups = [key for key in self.schema if key.startswith("actions_")]
+        self.assertTrue(action_groups, "schema 里没有 actions_* 分组")
+        for group_key in action_groups:
+            with self.subTest(group=group_key):
+                items = self.section(group_key)
+                self.assertIn("enabled", items, f"{group_key} 缺少总开关 enabled")
+                self.assertIsInstance(items["enabled"]["default"], bool)
+                for key in sorted(set(items) - extras):
+                    self.assertIn(key, catalog.ACTIONS,
+                                  f"{group_key}.{key} 不是动作目录里的动作")
+                    self.assertEqual(catalog.action_config_group(catalog.ACTIONS[key]),
+                                     group_key, f"{key} 不该落在 {group_key}")
+
+        # 3) 危险动作（含风险组总开关）默认必须关着。
+        risks = self.section(catalog.ACTION_RISK_GROUP)
+        self.assertIs(risks["enabled"]["default"], False)
+        for action in catalog.risky_actions():
+            with self.subTest(risky=action.id):
+                self.assertIs(risks[action.id]["default"], False)
 
     # -- AstrBot 格式铁律（AGENTS.md 坑 1） -------------------------------------
 

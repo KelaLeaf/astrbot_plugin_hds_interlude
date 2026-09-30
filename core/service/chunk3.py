@@ -1618,6 +1618,14 @@ class ServiceChunk3(ServiceBase):
                             'native-face', native_face,
                         ),
                     )
+                # 本移植版：决策里的平台动作（戳一戳/点赞/撤回/改状态/群管理…）在投递之后执行。
+                # 只调 chunk12 的方法，**不在本文件新增成员**——Chunk3 有「上游行段铁律」。
+                dispatcher = getattr(self, 'dispatch_platform_actions', None)
+                if callable(dispatcher):
+                    await dispatcher(
+                        snapshot['story'], decision,
+                        session=snapshot.get('participant'), channel_id=str(channel_id or ''),
+                    )
             # 上游 rc28 健康指标：一次私聊主叙事回合的延迟与回复模式分桶。
             # 回复模式取自 `interaction.reply.mode`；**没有结构化 interaction 时记
             # `noDelivery`**（上游分桶的 else 分支）——"她没回"与"协议壳没写对"在面板上

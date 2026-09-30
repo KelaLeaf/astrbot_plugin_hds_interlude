@@ -18,7 +18,8 @@
         "alter": "Mood",
         "agency": "Schedule",
         "chats": "Chats",
-        "tokens": "Token usage"
+        "tokens": "Token usage",
+        "actions": "Actions"
       }
     }
   }

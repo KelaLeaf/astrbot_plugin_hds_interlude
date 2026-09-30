@@ -1610,6 +1610,12 @@ class ServiceChunk1(ServiceBase):
                 if (result['chat_actions'].get('reactions') and turn.get('latest_session'))
                 else 0
             )
+            dispatcher = getattr(self, 'dispatch_platform_actions', None)
+            if callable(dispatcher) and turn.get('latest_session'):
+                await dispatcher(
+                    snapshot['story'], decision,
+                    session=turn.get('latest_session'), channel_id=str(turn.get('channel_id') or ''),
+                )
             if result['content']:
                 group_delivery = await self.send_group_message(
                     snapshot['story'], turn.get('channel_id'), result['content'],

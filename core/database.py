@@ -544,12 +544,62 @@ TOKEN_USAGE = TableSpec(
     added_later=True,
 )
 
+#: `interlude_qzone_post` —— QQ 空间动作审计行（上游 rc28 `qzone.ts` 的账本）。
+#: 限流门（当日计数 / 最小间隔）与投递结果追溯共用；`kind` 含只读的 `feed-seen`
+#: （动态已入账标记，**不占动作配额**）。
+QZONE_POST = TableSpec(
+    name='interlude_qzone_post',
+    fields={
+        'id': _spec('unsigned autoInc'),
+        'storyId': _spec('string(255)'),
+        'kind': _spec('string(16)'),
+        'tid': _spec('string(127)'),
+        'targetUin': _spec('string(63)'),
+        'content': _spec('text'),
+        'ugcRight': _spec('unsigned'),
+        'endpointId': _spec('string(63)'),
+        'status': _spec('string(16)'),
+        'error': _spec('text'),
+        'createdAt': _spec('timestamp'),
+        'postedAt': _spec('timestamp'),
+    },
+    primary='id',
+    auto_increment=True,
+    indexes=('storyId', 'kind', 'status', 'createdAt'),
+    added_later=True,
+)
+
+#: `interlude_scheduled_command` —— 定时命令（本移植版新增，控制台与模型都能排）。
+#: `cron` 是 5 段表达式（分 时 日 月 周）；`nextRunAt` 由 sweep 推进。
+SCHEDULED_COMMAND = TableSpec(
+    name='interlude_scheduled_command',
+    fields={
+        'id': _spec('unsigned autoInc'),
+        'storyId': _spec('string(255)'),
+        'command': _spec('string(64)'),
+        'params': _spec('json'),
+        'cron': _spec('string(64)'),
+        'enabled': _spec('boolean'),
+        'nextRunAt': _spec('timestamp'),
+        'lastRunAt': _spec('timestamp'),
+        'lastStatus': _spec('string(16)'),
+        'lastError': _spec('text'),
+        'runCount': _spec('unsigned'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='id',
+    auto_increment=True,
+    indexes=('storyId', 'enabled', 'nextRunAt'),
+    added_later=True,
+)
+
 #: 表名 → `TableSpec`。键顺序 = 上游 `registerTables` 的注册顺序。
 TABLES: dict[str, TableSpec] = {
     spec.name: spec for spec in (
         STORY, PARTICIPANT, SCRIPT_ENTRY, MEMORY, INTENT, SCENE, ARC, FACT, STATE_PATCH,
         WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, SCHEDULE_PREPLAN, SEEDED_EVENT,
-        ENDPOINT, STORY_ALIAS, TOKEN_USAGE,
+        ENDPOINT, STORY_ALIAS, TOKEN_USAGE, QZONE_POST, SCHEDULED_COMMAND,
     )
 }
 

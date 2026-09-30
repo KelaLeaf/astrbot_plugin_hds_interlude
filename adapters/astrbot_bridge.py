@@ -53,7 +53,7 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Iterable, Optional
+from typing import Any, AsyncIterator, Callable, Iterable, Mapping, Optional
 from urllib.parse import unquote, urlparse
 
 from astrbot.api.event import AstrMessageEvent
@@ -72,6 +72,7 @@ except ImportError:  # pragma: no cover
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from ..core import logging as interlude_logging
+from ..core import platform_actions as platform_action_catalog
 from ..core.database import Database
 from ..core.narrator import HttpxHttpClient
 from ..core.schedule_preplan import resolve_schedule_preplan_config, schedule_preplan_window
@@ -884,6 +885,672 @@ def _build_video(attrs: dict[str, str]) -> Any:
 
 
 # =========================================================================== #
+# 宿主回执 → 消息号（「撤回最近一条」依赖它）
+# =========================================================================== #
+
+#: 回执里可能承载消息号的键（不同平台 / 不同版本形状不一样）。
+_MESSAGE_ID_KEYS = ('message_id', 'messageId', 'message_ids', 'messageIds', 'msg_id', 'msgId')
+#: 回执里可能再嵌套一层结果（`{'status': 'ok', 'data': {...}}`）。
+_MESSAGE_ID_CONTAINERS = ('data', 'result', 'ret', 'response', 'messages')
+
+
+def _dedupe_ids(values: Iterable[Any]) -> list[str]:
+    seen: list[str] = []
+    for value in values:
+        text = _text(value).strip()
+        if text and text not in seen:
+            seen.append(text)
+    return seen
+
+
+def _stringify_ids(value: Any, depth: int = 0) -> list[str]:
+    """把「消息号位置上的值」变成字符串列表（容器就再往里看一眼）。"""
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, Mapping) or isinstance(value, (list, tuple)):
+        return _extract_message_ids(value, depth + 1)
+    if isinstance(value, (str, int)):
+        text = _text(value).strip()
+        return [text] if text else []
+    return []
+
+
+def _extract_message_ids(value: Any, depth: int = 0) -> list[str]:
+    """尽力从宿主 `send_message` 的返回值里取出消息号。
+
+    宿主的公开契约是 `-> bool`（4.28 实测：`context.send_message()` 只回答
+    "找到平台了吗"），所以**正常情况下这里返回空列表**；但不同平台适配器 /
+    未来版本可能回消息号（dict / list / 带属性的对象），照原样丢掉就等于
+    "撤回"永远没得撤——于是逐层取值、取不到就空列表，形状再变也不抛。
+    """
+    if value is None or isinstance(value, bool) or depth > 4:
+        return []
+    ids: list[str] = []
+    if isinstance(value, Mapping):
+        for key in _MESSAGE_ID_KEYS:
+            if key in value:
+                ids += _stringify_ids(value[key], depth)
+        for key in _MESSAGE_ID_CONTAINERS:
+            if key in value:
+                ids += _extract_message_ids(value[key], depth + 1)
+        return _dedupe_ids(ids)
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            ids += _stringify_ids(item, depth)
+        return _dedupe_ids(ids)
+    for key in _MESSAGE_ID_KEYS:
+        item = getattr(value, key, None)
+        if item is not None:
+            ids += _stringify_ids(item, depth)
+    for key in _MESSAGE_ID_CONTAINERS:
+        item = getattr(value, key, None)
+        if item is not None:
+            ids += _extract_message_ids(item, depth + 1)
+    return _dedupe_ids(ids)
+
+
+# =========================================================================== #
+# 平台动作执行层（`plugin/core/platform_actions.py` 的目录 → 平台调用）
+# =========================================================================== #
+#
+# 目录（`ACTIONS`，59 条）是唯一事实源：动作 id、参数、风险、开关分组都在那边。
+# 这里只回答两个问题：
+#
+#   1. **这个动作在平台上叫什么、参数怎么改名**（`_PLATFORM_CALLS`）；
+#   2. **目录里没写、但平台需要的东西从哪来**（会话坐标缺省 `_SESSION_FILLS`、
+#      平台固定参数 `_PLATFORM_DEFAULTS`、枚举取值翻译 `_PLATFORM_VALUE_MAPS`）。
+#
+# 动作 id 用 snake_case 且与 NapCat 的 API 名一致（见 `platform_actions` 的模块
+# 注释），所以映射表里**同名参数也照写一遍**：这张表要能一眼看出"这个动作到底
+# 打给谁、带哪些参数"，而不是靠"没写就是同名"去脑补。改 NapCat / SnowLuma 的
+# 拼写时只动这一处。
+
+#: 值 = `@local`：由适配层自己实现（宿主 TTS / 组合多个平台调用），不经 OneBot 直通。
+_PLATFORM_ACTION_LOCAL = '@local'
+#: 值 = `@unsupported`：当前宿主没有这条能力（调用方拿到 `unsupported-platform-action: <id>`）。
+_PLATFORM_ACTION_UNSUPPORTED = '@unsupported'
+
+#: 目录动作 id → `(平台动作名, 参数名映射)`；参数名映射是「目录里的 snake_case → 平台要的拼写」。
+_PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
+    # ---------------- 互动 ----------------
+    # 戳一戳：SnowLuma 有自动路由的 `send_poke`，NapCat 只有 `group_poke` / `friend_poke`。
+    # 这里的 `@poke` 只是**占位标记**（不是说要把 `@poke` 发出去）：真正的动作名在
+    # `_resolve_platform_call` 里按会话类型挑，两个协议端都能用。
+    'send_poke': ('@poke', {'user_id': 'user_id', 'group_id': 'group_id'}),
+    'send_like': ('send_like', {'user_id': 'user_id', 'times': 'times'}),
+    'recall_message': ('delete_msg', {'message_id': 'message_id'}),
+    # ---------------- 消息与定时 ----------------
+    # 定时排程是**插件自己的账**（`interlude_intent` / `interlude_scheduled_command`），
+    # 平台侧没有对应动作：放在这里显式拒绝，而不是打一个不存在的 OneBot 动作。
+    'schedule_message': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    'list_scheduled_messages': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    'cancel_scheduled_message': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    'schedule_command': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    'list_scheduled_commands': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    'cancel_scheduled_command': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    # ---------------- 历史消息 ----------------
+    'get_group_msg_history': (
+        'get_group_msg_history', {'group_id': 'group_id', 'count': 'count', 'before': 'message_seq'},
+    ),
+    'get_friend_msg_history': (
+        'get_friend_msg_history', {'user_id': 'user_id', 'count': 'count', 'before': 'message_seq'},
+    ),
+    # ---------------- QQ 状态 ----------------
+    'update_qq_status': ('set_online_status', {'status': 'status'}),
+    # 目录里 `get_qq_status` 没有参数（"查自己的状态"），而 `nc_get_user_status`
+    # 要一个 user_id：由 `_PLATFORM_SESSION_PARAMS` 从会话坐标补机器人自己。
+    'get_qq_status': ('nc_get_user_status', {}),
+    # NapCat / SnowLuma 的公开动作表里都没有这一条；按目录 id 原样试一次，
+    # 平台不认识时会带着它的错误文案失败（不静默、也不假装成功）。
+    'get_fun_status_list': ('get_fun_status_list', {}),
+    # ---------------- 群信息（只读） ----------------
+    'get_group_members_info': ('get_group_member_list', {'group_id': 'group_id'}),
+    'get_user_group_role': ('get_group_member_info', {'group_id': 'group_id', 'user_id': 'user_id'}),
+    'get_group_honor_info': ('get_group_honor_info', {'group_id': 'group_id', 'type': 'type'}),
+    'get_group_shut_list': ('get_group_shut_list', {'group_id': 'group_id'}),
+    'get_group_notice_list': ('_get_group_notice', {'group_id': 'group_id'}),
+    'get_group_at_all_remain': ('get_group_at_all_remain', {'group_id': 'group_id'}),
+    'list_group_files': ('get_group_root_files', {'group_id': 'group_id'}),
+    # ---------------- 群管理（写入） ----------------
+    'send_group_notice': (
+        '_send_group_notice', {'content': 'content', 'group_id': 'group_id', 'image': 'image'},
+    ),
+    'delete_group_notice': (
+        '_del_group_notice', {'notice_id': 'notice_id', 'group_id': 'group_id'},
+    ),
+    'set_essence_msg': ('set_essence_msg', {'message_id': 'message_id'}),
+    'delete_essence_msg': ('delete_essence_msg', {'message_id': 'message_id'}),
+    # NapCat 的 go-cqhttp 兼容名是 `send_group_sign`，SnowLuma 是 `set_group_sign`；
+    # 目录 id 取的是前者（目录 id 与 NapCat 的 API 名一致）。
+    'send_group_sign': ('send_group_sign', {'group_id': 'group_id'}),
+    'set_group_card': ('set_group_card', {'user_id': 'user_id', 'card': 'card', 'group_id': 'group_id'}),
+    'set_group_special_title': (
+        'set_group_special_title', {'user_id': 'user_id', 'title': 'special_title'},
+    ),
+    'set_group_add_option': ('set_group_add_option', {'option': 'add_type'}),
+    'set_group_portrait': ('set_group_portrait', {'file': 'file', 'group_id': 'group_id'}),
+    'set_group_name': ('set_group_name', {'name': 'group_name', 'group_id': 'group_id'}),
+    'set_group_ban': (
+        'set_group_ban', {'user_id': 'user_id', 'duration': 'duration', 'group_id': 'group_id'},
+    ),
+    'set_group_whole_ban': ('set_group_whole_ban', {'enable': 'enable', 'group_id': 'group_id'}),
+    'set_group_kick': (
+        'set_group_kick', {'user_id': 'user_id', 'reject_add': 'reject_add', 'group_id': 'group_id'},
+    ),
+    'set_group_admin': (
+        'set_group_admin', {'user_id': 'user_id', 'enable': 'enable', 'group_id': 'group_id'},
+    ),
+    'delete_group_file': ('delete_group_file', {'file_id': 'file_id', 'group_id': 'group_id'}),
+    'upload_group_file': (
+        'upload_group_file',
+        {'file': 'file', 'name': 'name', 'folder': 'folder', 'group_id': 'group_id'},
+    ),
+    'rename_group_file': (
+        'rename_group_file', {'file_id': 'file_id', 'name': 'new_name', 'group_id': 'group_id'},
+    ),
+    'move_group_file': (
+        'move_group_file',
+        {'file_id': 'file_id', 'folder': 'target_parent_directory', 'group_id': 'group_id'},
+    ),
+    'create_group_file_folder': (
+        'create_group_file_folder', {'name': 'name', 'group_id': 'group_id'},
+    ),
+    'delete_group_folder': ('delete_group_folder', {'folder': 'folder_id', 'group_id': 'group_id'}),
+    'trans_group_file': ('trans_group_file', {'file_id': 'file_id', 'group_id': 'group_id'}),
+    # ---------------- 个人资料 ----------------
+    'set_qq_profile': (
+        'set_qq_profile', {'nickname': 'nickname', 'personal_note': 'personal_note'},
+    ),
+    'set_qq_avatar': ('set_qq_avatar', {'file': 'file'}),
+    # 自己的昵称 + 个性签名：`get_stranger_info` 带 `long_nick`（个性签名），
+    # 而 `get_login_info` 只有昵称；user_id 由 `_PLATFORM_SESSION_PARAMS` 补机器人自己。
+    'get_qq_profile': ('get_stranger_info', {}),
+    # ---------------- 语音（走宿主 TTS，不用 NapCat 的 AI 声聊） ----------------
+    'send_voice': (_PLATFORM_ACTION_LOCAL, {'content': 'content'}),
+    'list_voices': (_PLATFORM_ACTION_LOCAL, {}),
+    # ---------------- QQ 空间（SnowLuma 扩展动作） ----------------
+    'publish_qzone_post': (
+        'send_qzone_msg', {'content': 'content', 'ugc_right': 'ugc_right', 'images': 'images'},
+    ),
+    'comment_qzone_post': (
+        'comment_qzone', {'tid': 'tid', 'content': 'content', 'target_uin': 'target_uin'},
+    ),
+    'like_qzone_post': ('like_qzone', {'tid': 'tid', 'target_uin': 'target_uin'}),
+    # 指了归属 QQ = 看那个人的说说列表；没指 = 看好友动态（见 `_resolve_platform_call`）。
+    'list_qzone_posts': ('get_qzone_msg_list', {'target_uin': 'target_uin', 'count': 'num'}),
+    'delete_qzone_post': ('delete_qzone_msg', {'tid': 'tid'}),
+    # ---------------- 联系人与群 ----------------
+    'list_contacts': (_PLATFORM_ACTION_LOCAL, {'type': 'type', 'limit': 'limit'}),
+    'search_contacts': (_PLATFORM_ACTION_LOCAL, {'keyword': 'keyword', 'limit': 'limit'}),
+    'get_user_profile': ('get_stranger_info', {'user_id': 'user_id'}),
+    'get_group_info': ('get_group_info', {'group_id': 'group_id'}),
+    'handle_friend_request': (
+        'set_friend_add_request', {'flag': 'flag', 'approve': 'approve', 'remark': 'remark'},
+    ),
+    'handle_group_request': (
+        'set_group_add_request',
+        {'flag': 'flag', 'approve': 'approve', 'sub_type': 'sub_type', 'reason': 'reason'},
+    ),
+    'delete_friend': ('delete_friend', {'user_id': 'user_id', 'block': 'temp_block'}),
+}
+
+#: `list_qzone_posts` 在「没指归属 QQ」时的映射：好友动态用 `get_qzone_feeds`。
+_QZONE_FEEDS_CALLS: dict[str, str] = {'count': 'count'}
+
+#: 目录动作 → 「目录参数 ← 会话坐标」的缺省补全表。
+#: 目录里标了「留空＝本回合对话对象」的参数都在这里补；`set_group_card.user_id`
+#: **刻意不补**——目录写的是「留空＝改机器人自己」。
+_SESSION_FILLS: dict[str, dict[str, str]] = {
+    'send_poke': {'user_id': 'user_id', 'group_id': 'group_id'},
+    'send_like': {'user_id': 'user_id'},
+    'recall_message': {},
+    'schedule_message': {},
+    'get_group_msg_history': {'group_id': 'group_id'},
+    'get_friend_msg_history': {'user_id': 'user_id'},
+    'update_qq_status': {},
+    'get_group_members_info': {'group_id': 'group_id'},
+    'get_user_group_role': {'group_id': 'group_id'},
+    'get_group_honor_info': {'group_id': 'group_id'},
+    'get_group_shut_list': {'group_id': 'group_id'},
+    'get_group_notice_list': {'group_id': 'group_id'},
+    'get_group_at_all_remain': {'group_id': 'group_id'},
+    'list_group_files': {'group_id': 'group_id'},
+    'send_group_notice': {'group_id': 'group_id'},
+    'delete_group_notice': {'group_id': 'group_id'},
+    'send_group_sign': {'group_id': 'group_id'},
+    'set_group_card': {'group_id': 'group_id'},
+    'set_group_portrait': {'group_id': 'group_id'},
+    'set_group_name': {'group_id': 'group_id'},
+    'set_group_ban': {'group_id': 'group_id'},
+    'set_group_whole_ban': {'group_id': 'group_id'},
+    'set_group_kick': {'group_id': 'group_id'},
+    'set_group_admin': {'group_id': 'group_id'},
+    'delete_group_file': {'group_id': 'group_id'},
+    'upload_group_file': {'group_id': 'group_id'},
+    'rename_group_file': {'group_id': 'group_id'},
+    'move_group_file': {'group_id': 'group_id'},
+    'create_group_file_folder': {'group_id': 'group_id'},
+    'delete_group_folder': {'group_id': 'group_id'},
+    'trans_group_file': {'group_id': 'group_id'},
+    'get_group_info': {'group_id': 'group_id'},
+    'send_voice': {},
+    'list_voices': {},
+    'list_contacts': {},
+    'search_contacts': {},
+}
+
+#: 目录**没有**声明、但平台要的参数：平台参数名 ← 会话坐标键（在目录校验之后补）。
+#:
+#: 与 `_SESSION_FILLS` 分开是因为它不能进 `validate_action` —— 目录里没有的键一律
+#: 按"未知参数"拒绝（模型乱写参数名是最常见的错），所以这几个只能在校验之后、
+#: 发给平台之前注入。
+_PLATFORM_SESSION_PARAMS: dict[str, dict[str, str]] = {
+    # 查自己的状态 / 资料：平台要 user_id，目录没这个参数。
+    'get_qq_status': {'user_id': 'self_id'},
+    'get_qq_profile': {'user_id': 'self_id'},
+    # 目录里这两个动作没写 group_id（就是"当前的群"），平台却要。
+    'set_group_special_title': {'group_id': 'group_id'},
+    'set_group_add_option': {'group_id': 'group_id'},
+}
+
+#: 目录动作 → 平台侧**固定**参数（目录没声明、平台却要的）。
+_PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
+    'get_group_msg_history': {'count': 20},
+    'get_friend_msg_history': {'count': 20},
+    'get_group_honor_info': {'type': 'all'},
+    'get_user_profile': {'no_cache': False},
+    'get_qq_profile': {'no_cache': False},
+    'update_qq_status': {'ext_status': 0, 'battery_status': 0},
+    # 目录写的是「4 好友（默认）可见」，平台的缺省是 1（所有人）——以目录为准。
+    'publish_qzone_post': {'ugc_right': 4},
+    'delete_group_file': {'busid': 102},
+    'upload_group_file': {'folder': ''},
+    'create_group_file_folder': {'parent_directory': '/'},
+    'move_group_file': {'current_parent_directory': ''},
+    'rename_group_file': {'current_parent_directory': ''},
+}
+
+#: 目录动作 → 参数 → 「目录里的枚举值 → 平台取值」。
+_PLATFORM_VALUE_MAPS: dict[str, dict[str, dict[str, Any]]] = {
+    # NapCat 的加群方式是个数字：1 允许所有人 / 2 需要审核 / 3 禁止。
+    'set_group_add_option': {'option': {'allow': 1, 'audit': 2, 'refuse': 3}},
+}
+
+#: **调度层混在动作参数里传下来的会话坐标**（`chunk12._resolve_action_target` 会把它
+#: 们并进 params：`user_id` / `group_id` / `channel_id` / `platform` / `self_id` /
+#: `is_group`）。它们不是模型写的动作参数、目录里也没有，但必须接受：这些坐标是
+#: 「本回合的对话对象」，既用来补缺省，也用来定位平台实例。**不接受它们 = 生产里
+#: 每一条动作都会被自己的"未知参数"闸门拒掉**。
+#:
+#: 值 = 规范键名（camelCase 拼写也认）。
+_TARGET_PARAMS: dict[str, str] = {
+    'platform': 'platform',
+    'self_id': 'self_id', 'selfId': 'self_id',
+    'user_id': 'user_id', 'userId': 'user_id',
+    'group_id': 'group_id', 'groupId': 'group_id',
+    'channel_id': 'channel_id', 'channelId': 'channel_id',
+    'is_group': 'is_group', 'isGroup': 'is_group',
+    'participant_id': 'participant_id', 'participantId': 'participant_id',
+}
+
+#: 列表类回执的限幅（提示词与账本都不该被一整页群成员灌爆）。
+_HISTORY_LIMIT = 50
+_CONTACT_LIMIT = 200
+_SEARCH_CONTACT_LIMIT = 50
+_MEMBER_LIMIT = 100
+
+#: 传输异常固定结尾：调用方据此判 `ambiguous`（动作可能已在平台侧生效）。
+_AMBIGUOUS_TAIL = '结果未知，请勿自动重试'
+
+
+def _camel_param(name: str) -> str:
+    """`user_id` → `userId`（模型偶尔写 camelCase，校验时双读）。"""
+    head, *rest = str(name).split('_')
+    return head + ''.join(part.title() for part in rest)
+
+
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, Mapping):
+        return [value]
+    return []
+
+
+def _clean(value: Any) -> str:
+    return _text(value).strip()
+
+
+def _segments_text(value: Any) -> str:
+    """把 OneBot 的 `message` 段数组压成一行人读文本（只保留必要信息）。"""
+    if isinstance(value, str):
+        return value.strip()[:600]
+    if not isinstance(value, (list, tuple)):
+        return ''
+    parts: list[str] = []
+    for segment in value:
+        if not isinstance(segment, Mapping):
+            continue
+        kind = _text(segment.get('type'))
+        data = segment.get('data') if isinstance(segment.get('data'), Mapping) else {}
+        if kind == 'text':
+            parts.append(_text(data.get('text')))
+        elif kind == 'image':
+            parts.append('[图片]')
+        elif kind in ('record', 'audio', 'voice'):
+            parts.append('[语音]')
+        elif kind == 'video':
+            parts.append('[视频]')
+        elif kind == 'face':
+            parts.append('[表情]')
+        elif kind == 'mface':
+            parts.append('[表情包]')
+        elif kind == 'at':
+            parts.append('@%s' % _text(data.get('qq')))
+        elif kind == 'reply':
+            continue
+        elif kind:
+            parts.append('[%s]' % kind)
+    return ''.join(parts).strip()[:600]
+
+
+def _brief_message(row: Any) -> dict[str, Any]:
+    """历史消息：只留发送者 / 时间 / 文本。"""
+    if not isinstance(row, Mapping):
+        return {'text': _text(row)[:600]}
+    sender = row.get('sender') if isinstance(row.get('sender'), Mapping) else {}
+    return {
+        'message_id': _text(row.get('message_id') or row.get('messageId')),
+        'user_id': _text(sender.get('user_id') or row.get('user_id') or row.get('sender_id')),
+        'nickname': _text(sender.get('card') or sender.get('nickname') or row.get('sender_name')),
+        'time': row.get('time') or row.get('timestamp') or 0,
+        'text': _segments_text(row.get('message') or row.get('raw_message') or row.get('message_str')),
+    }
+
+
+def _brief_member(row: Any) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        return {'raw': _text(row)[:200]}
+    return {
+        'user_id': _text(row.get('user_id')),
+        'nickname': _text(row.get('nickname')),
+        'card': _text(row.get('card')),
+        'role': _text(row.get('role')),
+        'join_time': row.get('join_time') or 0,
+    }
+
+
+def _brief_notice(row: Any) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        return {'text': _text(row)[:600]}
+    message = row.get('message') if isinstance(row.get('message'), Mapping) else {}
+    return {
+        'notice_id': _text(row.get('notice_id')),
+        'sender_id': _text(row.get('sender_id')),
+        'publish_time': row.get('publish_time') or 0,
+        'text': _text(message.get('text') or row.get('text'))[:600],
+    }
+
+
+def _brief_group_file(row: Any) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        return {'name': _text(row)[:200]}
+    return {
+        'file_id': _text(row.get('file_id')),
+        'file_name': _text(row.get('file_name')),
+        'file_size': row.get('file_size') or 0,
+        'upload_time': row.get('upload_time') or 0,
+        'uploader_name': _text(row.get('uploader_name')),
+    }
+
+
+def _brief_folder(row: Any) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        return {'name': _text(row)[:200]}
+    return {
+        'folder_id': _text(row.get('folder_id')),
+        'folder_name': _text(row.get('folder_name')),
+        'total_file_count': row.get('total_file_count') or 0,
+    }
+
+
+def _brief_qzone_entry(row: Any) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        return {'content': _text(row)[:600]}
+    return {
+        'tid': _text(row.get('tid') or row.get('id')),
+        'content': _text(row.get('content') or row.get('text'))[:600],
+        'create_time': row.get('create_time') or row.get('createTime') or row.get('time') or 0,
+        'uin': _text(row.get('uin') or row.get('target_uin')),
+        'nickname': _text(row.get('nickname') or row.get('name')),
+    }
+
+
+def _brief_friend(row: Any) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        return {'nickname': _text(row)[:200]}
+    return {
+        'user_id': _text(row.get('user_id')),
+        'nickname': _text(row.get('nickname')),
+        'remark': _text(row.get('remark')),
+    }
+
+
+def _brief_group(row: Any) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        return {'group_name': _text(row)[:200]}
+    return {
+        'group_id': _text(row.get('group_id')),
+        'group_name': _text(row.get('group_name')),
+        'member_count': row.get('member_count') or 0,
+        'max_member_count': row.get('max_member_count') or 0,
+    }
+
+
+def _project_action_data(action_id: str, data: Any) -> Any:
+    """裁剪平台回执：只留必要字段 + 限幅（原样塞回去就是一堆提示词噪声）。"""
+    if action_id in ('get_group_msg_history', 'get_friend_msg_history'):
+        rows = data.get('messages') if isinstance(data, Mapping) else data
+        return {'messages': [_brief_message(row) for row in _as_list(rows)[:_HISTORY_LIMIT]]}
+    if action_id == 'get_group_members_info':
+        rows = data.get('members') if isinstance(data, Mapping) else data
+        return {'members': [_brief_member(row) for row in _as_list(rows)[:_MEMBER_LIMIT]]}
+    if action_id == 'get_group_notice_list':
+        rows = data.get('notices') if isinstance(data, Mapping) else data
+        return {'notices': [_brief_notice(row) for row in _as_list(rows)[:20]]}
+    if action_id == 'list_group_files':
+        files = data.get('files') if isinstance(data, Mapping) else None
+        folders = data.get('folders') if isinstance(data, Mapping) else None
+        return {
+            'files': [_brief_group_file(row) for row in _as_list(files)[:_CONTACT_LIMIT]],
+            'folders': [_brief_folder(row) for row in _as_list(folders)[:_MEMBER_LIMIT]],
+        }
+    if action_id == 'list_qzone_posts':
+        rows = data
+        if isinstance(data, Mapping):
+            for key in ('msglist', 'feeds', 'posts', 'messages'):
+                if key in data:
+                    rows = data[key]
+                    break
+        return {'posts': [_brief_qzone_entry(row) for row in _as_list(rows)[:_HISTORY_LIMIT]]}
+    return data
+
+
+def _validate_platform_action(
+    action_id: str,
+    params: Mapping[str, Any],
+) -> tuple[Optional[dict[str, Any]], str]:
+    """目录校验 + **未知参数拒绝**。
+
+    目录自带的 `validate_action` 只遍历**已声明**的参数（未知键被静默忽略），
+    而模型乱写参数名是最常见的一种错——这里先按声明把未知键挑出来拒掉。
+    """
+    action = platform_action_catalog.ACTIONS.get(action_id)
+    if action is None:
+        return None, '未知动作：%s' % action_id
+    allowed: set[str] = set(_TARGET_PARAMS)
+    for param in action.params:
+        allowed.add(param.name)
+        allowed.add(_camel_param(param.name))
+    unknown = sorted(str(key) for key in params if str(key) not in allowed)
+    if unknown:
+        return None, '动作 %s 不支持参数 %s' % (action_id, '、'.join(unknown))
+    normalized, reason = platform_action_catalog.validate_action(action_id, params)
+    if normalized is None:
+        return None, reason
+    return dict(normalized.get('params') or {}), ''
+
+
+def _session_target(params: Mapping[str, Any], base: Mapping[str, Any]) -> dict[str, Any]:
+    """本回合的会话坐标 = 桥登记的坐标 + 调度层随参数带下来的坐标（后者优先）。
+
+    调度层给的才是"这一回合正在跟谁说话"的权威值（桥的登记表在后台回合里可能是
+    上一条消息的），所以它覆盖而不是被覆盖。
+    """
+    target: dict[str, Any] = dict(base)
+    for key, canonical in _TARGET_PARAMS.items():
+        value = params.get(key)
+        if value not in (None, ''):
+            target[canonical] = value
+    if target.get('is_group') in (None, ''):
+        target['is_group'] = bool(_clean(target.get('group_id')))
+    if not _clean(target.get('channel_id')):
+        target['channel_id'] = _clean(target.get('group_id')) or _clean(target.get('user_id'))
+    return target
+
+
+def _session_value(key: str, target: Mapping[str, Any]) -> str:
+    if key == 'self_id':
+        return _clean(target.get('self_id'))
+    if key == 'user_id':
+        return _clean(target.get('user_id'))
+    if key == 'group_id':
+        return _clean(target.get('group_id'))
+    if key == 'channel_id':
+        return _clean(target.get('channel_id'))
+    return ''
+
+
+def _apply_session_defaults(
+    action_id: str,
+    params: Mapping[str, Any],
+    target: Mapping[str, Any],
+) -> dict[str, Any]:
+    """按 `_SESSION_FILLS` 把「本回合的对话对象」补进缺省的参数里。
+
+    在目录校验**之前**跑：群聊里 `get_group_info` 这类「目录标了必填、实际就是
+    当前群」的参数，靠这一步满足必填；用户显式给了值就一律不动。
+    """
+    filled: dict[str, Any] = dict(params)
+    for param_name, session_key in (_SESSION_FILLS.get(action_id) or {}).items():
+        # 两种拼写都算"给了值"：模型写 camelCase 时不能被会话缺省顶掉。
+        if _clean(filled.get(param_name)) or _clean(filled.get(_camel_param(param_name))):
+            continue
+        value = _session_value(session_key, target)
+        if value:
+            filled[param_name] = value
+    return filled
+
+
+def _translate_value(action_id: str, param_name: str, value: Any) -> Any:
+    table = (_PLATFORM_VALUE_MAPS.get(action_id) or {}).get(param_name)
+    if not table:
+        return value
+    if isinstance(value, str) and value.strip() in table:
+        return table[value.strip()]
+    return value
+
+
+def _resolve_platform_call(
+    action_id: str,
+    params: Mapping[str, Any],
+    target: Mapping[str, Any],
+) -> tuple[str, dict[str, Any], list[str]]:
+    """把一条目录动作翻成「平台动作名 + 平台参数 + 给调用方的说明」。"""
+    action_name, mapping = _PLATFORM_CALLS[action_id]
+    notes: list[str] = []
+    if action_id == 'send_poke':
+        # 群聊打 `group_poke`，私聊打 `friend_poke`：这两个名字 NapCat / SnowLuma 都有。
+        action_name = 'group_poke' if _clean(params.get('group_id')) else 'friend_poke'
+    elif action_id == 'list_qzone_posts' and not _clean(params.get('target_uin')):
+        # 没指归属 QQ = 看好友动态；SnowLuma 的 `get_qzone_msg_list` 只吃目标 QQ。
+        action_name = 'get_qzone_feeds'
+        mapping = _QZONE_FEEDS_CALLS
+        notes.append('未指定 target_uin：按好友动态读取（get_qzone_feeds）')
+    mapped: dict[str, Any] = {}
+    for param_name, platform_name in mapping.items():
+        if param_name not in params:
+            continue
+        value = params[param_name]
+        if value is None or value == '':
+            continue
+        mapped[platform_name] = _translate_value(action_id, param_name, value)
+    for platform_name, value in (_PLATFORM_DEFAULTS.get(action_id) or {}).items():
+        mapped.setdefault(platform_name, value)
+    for platform_param, session_key in (_PLATFORM_SESSION_PARAMS.get(action_id) or {}).items():
+        if _clean(mapped.get(platform_param)):
+            continue
+        value = _session_value(session_key, target)
+        if value:
+            mapped[platform_param] = value
+    if action_name == 'get_qzone_feeds':
+        mapped.setdefault('page_num', 1)
+    if action_id == 'update_qq_status':
+        dropped = [name for name in ('minutes', 'text') if _clean(params.get(name))]
+        if dropped:
+            # NapCat / SnowLuma 的 `set_online_status` 只有 status/ext_status/battery_status：
+            # 状态能改，但「到点自动恢复」「自定义文本」没有落点。
+            notes.append('%s 在当前平台没有对应字段，已忽略（状态不会到点自动恢复）' % '、'.join(dropped))
+    return action_name, mapped, notes
+
+
+def _frame_ok(frame: Any) -> bool:
+    """OneBot / SnowLuma 的回执是不是成功（`status == 'ok'` 或 `retcode == 0`）。"""
+    if not isinstance(frame, Mapping):
+        return False
+    return frame.get('status') == 'ok' or frame.get('retcode') == 0
+
+
+def _frame_error_text(action_name: str, frame: Any) -> str:
+    """失败回执 → 带 status / retcode / message 的中文错误串。"""
+    row = frame if isinstance(frame, Mapping) else {}
+    status = row.get('status')
+    retcode = row.get('retcode')
+    message = row.get('message') or row.get('msg') or row.get('wording') or ''
+    if status is None and retcode is None and not message:
+        return '%s 失败：平台没有回执（%s）' % (action_name, type(frame).__name__)
+    head = _text(status) if status is not None else _text(retcode)
+    parts = [head]
+    if retcode is not None and status is not None:
+        parts.append('retcode=%s' % retcode)
+    detail = ' '.join(part for part in (_text(message),) if part).strip()
+    if detail:
+        parts.append(detail)
+    return '%s 失败：%s' % (action_name, ' '.join(part for part in parts if part))
+
+
+def _action_result(result: Any, action_id: str, notes: Optional[list[str]] = None) -> dict[str, Any]:
+    """统一 `platform_action` 的回执形状：一定有 `ok` / `error` / `data`。"""
+    payload = dict(result) if isinstance(result, Mapping) else {}
+    payload.setdefault('ok', False)
+    payload.setdefault('error', '')
+    payload.setdefault('data', None)
+    payload['action'] = action_id
+    merged = list(dict.fromkeys(list(notes or []) + list(payload.get('notes') or [])))
+    if merged:
+        payload['notes'] = merged
+    return payload
+
+
+def _contact_matches(entry: Mapping[str, Any], keyword: str) -> bool:
+    """联系人条目是否命中关键词（昵称 / 备注 / 群名 / 号码都要能搜到）。"""
+    for value in entry.values():
+        if isinstance(value, str) and keyword in value.lower():
+            return True
+    return False
+
+
+# =========================================================================== #
 # Transport：平台出站能力
 # =========================================================================== #
 
@@ -915,11 +1582,17 @@ class AstrbotTransport:
         if not components:
             return {'ok': False, 'error': 'empty-message'}
         try:
-            await self.context.send_message(umo, MessageChain(chain=components))
+            response = await self.context.send_message(umo, MessageChain(chain=components))
         except Exception as error:  # noqa: BLE001 - 投递失败必须走降级分支
             log_fallback('warn', 'AstrBot 消息投递失败 会话=%s 错误=%s', umo, error)
             return {'ok': False, 'error': str(error)}
-        return self._result([], umo)
+        # 宿主 4.28 只回 `bool`（找不到平台就 False），但别的平台适配器 / 以后
+        # 可能回消息号：能取就取出来，撤回动作（`recall_message target=last`）
+        # 才有"最近一条已投递消息"可定位。取不到就是空列表（形状再变也不抛）。
+        message_ids = _extract_message_ids(response)
+        if message_ids:
+            self.bridge.remember_outbound_message_ids(message_ids, umo)
+        return self._result(message_ids, umo)
 
     @staticmethod
     def _result(message_ids: list[str], umo: str = '', **extra: Any) -> dict[str, Any]:
@@ -1227,6 +1900,441 @@ class AstrbotTransport:
                 _text(quote_id) or None,
             )
         return await self.send_private(participant, content, _text(quote_id) or None)
+
+    # ---- 平台动作执行层（`plugin/core/platform_actions.py` 的目录） ----
+
+    def _client_for(self, target: Mapping[str, Any]) -> Any:
+        """按会话坐标取 OneBot 客户端（拿不到返回 `None`，绝不抛）。"""
+        return self.bridge.onebot_client(_clean(target.get('platform')), _clean(target.get('self_id')))
+
+    async def _call_onebot_on(self, client: Any, action: str, params: Any) -> dict[str, Any]:
+        """在对外的 `call_onebot` 与 `set_input_status` 之间复用的一段。"""
+        name = _clean(action)
+        if not name:
+            return {'ok': False, 'error': 'OneBot 动作名为空', 'data': None}
+        if client is None:
+            log_fallback(
+                'warn',
+                '没有可用的 OneBot 客户端，动作 %s 未执行'
+                '（平台不是 aiocqhttp/NapCat，或平台实例 / 机器人连接未就绪）',
+                name,
+            )
+            return {
+                'ok': False,
+                'error': '当前平台实例没有可用的 OneBot 客户端（aiocqhttp/NapCat 才有），%s 未执行' % name,
+                'data': None,
+            }
+        call = getattr(client, 'call_action', None)
+        if not callable(call):
+            log_fallback('warn', 'OneBot 客户端没有 call_action，动作 %s 未执行', name)
+            return {'ok': False, 'error': 'OneBot 客户端不支持 call_action，%s 未执行' % name, 'data': None}
+        payload = dict(params) if isinstance(params, Mapping) else {}
+        try:
+            frame = call(name, **payload)
+            if inspect.isawaitable(frame):
+                frame = await frame
+        except Exception as error:  # noqa: BLE001 - 传输异常可能已在平台侧生效
+            # 超时 / 断连时请求可能已经被服务端执行：**不能**让调用方自动重试。
+            log_fallback('warn', 'OneBot 动作 %s 传输异常（%s）：%s', name, _AMBIGUOUS_TAIL, error)
+            return {
+                'ok': False,
+                'error': '%s 调用异常：%s；%s' % (name, error, _AMBIGUOUS_TAIL),
+                'data': None,
+                'ambiguous': True,
+            }
+        if _frame_ok(frame):
+            return {'ok': True, 'error': '', 'data': frame.get('data') if isinstance(frame, Mapping) else None}
+        error_text = _frame_error_text(name, frame)
+        log_fallback('warn', 'OneBot 动作执行失败：%s', error_text)
+        result: dict[str, Any] = {'ok': False, 'error': error_text, 'data': None}
+        if isinstance(frame, Mapping) and frame.get('retcode') is not None:
+            result['retcode'] = frame.get('retcode')
+        return result
+
+    async def call_onebot(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        """原生 OneBot / SnowLuma 动作直通（QQ 空间等扩展动作走这里）。"""
+        return await self._call_onebot_on(self._client_for(self.bridge.current_target()), action, params)
+
+    async def platform_action(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        """执行一条目录动作（`platform_actions.ACTIONS` 里的 id）。
+
+        流程：**会话坐标缺省**（`_SESSION_FILLS`）→ **目录校验**（类型 / 范围 / 枚举 /
+        未知参数，全部按目录，见 `_validate_platform_action`）→ **翻成平台调用**
+        （`_PLATFORM_CALLS` + `_PLATFORM_DEFAULTS` + `_PLATFORM_VALUE_MAPS`）→
+        走 `call_onebot` 或适配层的本地实现（宿主 TTS / 好友群列表）→ **回执裁剪**
+        （历史 ≤50、联系人 ≤200、群成员 ≤100，且每条只留必要字段）。
+
+        任何一步失败都返回 `{'ok': False, 'error': <中文原因>, 'data': None}`：
+        未知动作 `unknown-platform-action: …`、平台没有这条能力
+        `unsupported-platform-action: <id>`（并记一条 warn）；**绝不抛异常**，
+        也绝不假装成功。
+        """
+        name = _clean(action)
+        if name not in _PLATFORM_CALLS:
+            log_fallback('warn', '未知平台动作：%s（不在 platform_actions.ACTIONS 里）', name or '(空)')
+            return _action_result(
+                {'ok': False, 'error': 'unknown-platform-action: %s（动作不在平台动作目录里）' % (name or '(空)')},
+                name,
+            )
+        raw = dict(params) if isinstance(params, Mapping) else {}
+        # 会话坐标：桥登记的 + 调度层随参数带下来的（见 `_TARGET_PARAMS`）。
+        target = _session_target(raw, self.bridge.current_target())
+        # 会话坐标缺省先补（群号 / 用户号 / 机器人自己），再用目录校验类型与范围。
+        filled = _apply_session_defaults(name, raw, target)
+        normalized, reason = _validate_platform_action(name, filled)
+        if normalized is None:
+            log_fallback('warn', '平台动作参数不合法：%s', reason)
+            return _action_result({'ok': False, 'error': reason}, name)
+        # 之后一律用目录归一化后的参数：camelCase 已翻成 snake_case，越界值已被拒。
+        filled = normalized
+        platform_name, mapped, notes = _resolve_platform_call(name, filled, target)
+        if platform_name == _PLATFORM_ACTION_UNSUPPORTED:
+            log_fallback(
+                'warn',
+                '平台动作 %s 在当前宿主没有对应能力（排程由插件自己的意图 / 定时命令账本处理），已拒绝',
+                name,
+            )
+            return _action_result({'ok': False, 'error': 'unsupported-platform-action: %s' % name}, name)
+        if name == 'recall_message':
+            message_id, note, error = await self._resolve_recall_message_id(filled, target)
+            if error:
+                log_fallback('warn', '%s', error)
+                return _action_result({'ok': False, 'error': error}, name)
+            mapped['message_id'] = message_id
+            if note:
+                notes.append(note)
+        if platform_name == _PLATFORM_ACTION_LOCAL:
+            result = await self._run_local_action(name, filled, target)
+        elif not self.bridge.platform_is_onebot(target):
+            log_fallback(
+                'warn',
+                '平台 %s 不支持 QQ/OneBot 动作，%s 已拒绝',
+                _clean(target.get('platform')) or '(未知)', name,
+            )
+            return _action_result({'ok': False, 'error': 'unsupported-platform-action: %s' % name}, name)
+        else:
+            result = await self.call_onebot(platform_name, mapped)
+            if result.get('ok'):
+                result['data'] = _project_action_data(name, result.get('data'))
+        return _action_result(result, name, notes)
+
+    async def is_super_admin(self, user_id: str) -> bool:
+        """宿主管理员名单判定（`admins_id`）；用于动作权限表的 `admin` 档。
+
+        逐层判空：拿不到配置 / 名单不是 list / 用户号为空 → **False**。
+        这是危险动作的唯一闸门，"读不到"只能等价于"没权限"。
+        """
+        target = _text(user_id)
+        if not target:
+            return False
+        try:
+            config = self.context.get_config() or {}
+        except Exception:  # noqa: BLE001 - 宿主没这个 API 就当没有管理员名单
+            return False
+        admins = config.get('admins_id') if isinstance(config, dict) else None
+        if not isinstance(admins, (list, tuple, set)):
+            return False
+        return any(_text(item) == target for item in admins)
+
+    async def set_input_status(self, target: dict[str, Any], typing: bool) -> dict[str, Any]:
+        """设置「正在输入」状态（NapCat `set_input_status`，`event_type` 1=开始 / 2=结束）。"""
+        coordinates = target if isinstance(target, Mapping) else {}
+        user_id = _clean(pick(coordinates, 'userId', 'user_id'))
+        if not user_id:
+            log_fallback('warn', '设置输入状态失败：会话坐标里没有 user_id')
+            return {'ok': False, 'error': '缺少 user_id，无法设置输入状态', 'data': None}
+        client = self._client_for(coordinates)
+        result = await self._call_onebot_on(
+            client, 'set_input_status', {'user_id': user_id, 'event_type': 1 if typing else 2},
+        )
+        if not result.get('ok'):
+            # 群聊不一定支持输入状态：失败就是失败，但要说清是哪种情形。
+            log_fallback(
+                'warn', '输入状态设置失败（部分平台 / 群聊不支持） 目标=%s 输入中=%s 错误=%s',
+                user_id, bool(typing), result.get('error'),
+            )
+        return result
+
+    async def _resolve_recall_message_id(
+        self,
+        params: Mapping[str, Any],
+        target: Mapping[str, Any],
+    ) -> tuple[str, str, str]:
+        """定位要撤回的平台消息号：返回 `(message_id, 说明, 错误)`。"""
+        explicit = _clean(params.get('message_id'))
+        if explicit:
+            return explicit, '', ''
+        choice = _clean(pick(params, 'target')).lower() or 'last'
+        if choice == 'entry':
+            return '', '', (
+                '撤回失败：按条目编号（entry_id=%s）撤回需要「剧本条目 → 平台消息号」的映射表，'
+                '当前宿主不提供；请改用 target=last 或直接给 message_id'
+                % (_clean(params.get('entry_id')) or '?')
+            )
+        recorded = self.bridge.last_delivered_message_id()
+        if recorded:
+            return recorded, '撤回的是最近一条已投递消息（%s）' % recorded, ''
+        found, reason = await self._last_self_message_id(target)
+        if found:
+            return found, '撤回的是历史里最近一条机器人自己发的消息（%s）' % found, ''
+        return '', '', '撤回失败：拿不到要撤回的平台消息号（%s）' % (reason or '最近没有已投递记录')
+
+    async def _last_self_message_id(self, target: Mapping[str, Any]) -> tuple[str, str]:
+        """宿主不回传消息号时的兜底：翻最近 20 条历史，找机器人自己发的那条。
+
+        只读动作（`get_group_msg_history` / `get_friend_msg_history`），不改任何东西。
+        """
+        self_id = _clean(target.get('self_id'))
+        if target.get('is_group'):
+            group_id = _clean(target.get('group_id'))
+            if not group_id:
+                return '', '当前会话没有群号'
+            result = await self.call_onebot('get_group_msg_history', {'group_id': group_id, 'count': 20})
+        else:
+            user_id = _clean(target.get('user_id'))
+            if not user_id:
+                return '', '当前会话没有对话对象'
+            result = await self.call_onebot('get_friend_msg_history', {'user_id': user_id, 'count': 20})
+        if not result.get('ok'):
+            return '', _text(result.get('error')) or '拉历史消息失败'
+        data = result.get('data')
+        rows = data.get('messages') if isinstance(data, Mapping) else data
+        for row in reversed(_as_list(rows)):
+            if not isinstance(row, Mapping):
+                continue
+            sender = row.get('sender') if isinstance(row.get('sender'), Mapping) else {}
+            uid = _clean(sender.get('user_id') or row.get('user_id') or row.get('sender_id'))
+            message_id = _clean(row.get('message_id') or row.get('messageId'))
+            if message_id and uid and (not self_id or uid == self_id):
+                return message_id, ''
+        return '', '最近 20 条历史里没有机器人自己发的消息'
+
+    # ---- `@local` 动作：适配层自己实现 ----
+
+    async def _run_local_action(
+        self,
+        action_id: str,
+        params: Mapping[str, Any],
+        target: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if action_id == 'send_voice':
+            return await self._action_send_voice(params, target)
+        if action_id == 'list_voices':
+            return self._action_list_voices()
+        if action_id in ('list_contacts', 'search_contacts'):
+            return await self._action_contacts(action_id, params)
+        log_fallback('warn', '平台动作 %s 标记为本地实现，但适配层没有对应分支', action_id)
+        return {'ok': False, 'error': 'unsupported-platform-action: %s' % action_id}
+
+    def _target_umo(self, target_text: str, target: Mapping[str, Any]) -> str:
+        """`send_voice` 的目标：完整 UMO / 用户号 / 空（=本回合对话对象）。"""
+        value = _clean(target_text)
+        if value and ':' in value:
+            return value
+        if value:
+            platform = _clean(target.get('platform'))
+            self_id = _clean(target.get('self_id'))
+            if platform and self_id:
+                umo = self.bridge.private_umo(platform, self_id, value)
+                if umo:
+                    return umo
+        return _clean(target.get('umo'))
+
+    async def _action_send_voice(
+        self,
+        params: Mapping[str, Any],
+        target: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """`send_voice`：走**宿主 TTS**（不是 NapCat 的 AI 声聊），再发 `Record`。"""
+        text = _clean(params.get('content'))
+        if not text:
+            return {'ok': False, 'error': 'send_voice 需要非空文本'}
+        umo = self._target_umo(_clean(params.get('target')), target)
+        if not umo:
+            return {'ok': False, 'error': 'send_voice 找不到投递会话（当前没有可用的回合对象）'}
+        provider, provider_error = await self._tts_provider(umo, _clean(params.get('voice')))
+        if provider is None:
+            log_fallback('warn', '发语音失败：%s', provider_error)
+            return {'ok': False, 'error': provider_error}
+        getter = getattr(provider, 'get_audio', None)
+        if not callable(getter):
+            log_fallback('warn', 'TTS 提供者 %s 没有 get_audio，发不了语音', self._provider_label(provider))
+            return {'ok': False, 'error': '宿主的 TTS 提供者不支持合成音频（没有 get_audio）'}
+        try:
+            audio = getter(text)
+            if inspect.isawaitable(audio):
+                audio = await audio
+        except Exception as error:  # noqa: BLE001 - 合成失败按投递失败处理
+            log_fallback('warn', 'TTS 合成失败 提供者=%s 错误=%s', self._provider_label(provider), error)
+            return {'ok': False, 'error': 'TTS 合成失败：%s' % error}
+        path = _clean(audio)
+        if not path or not os.path.exists(path):
+            log_fallback('warn', 'TTS 没有产出音频文件（%s）', path or '(空)')
+            return {'ok': False, 'error': 'TTS 没有产出可用的音频文件'}
+        result = await self._send_chain(umo, [_build_record({'file': path})])
+        if result.get('ok'):
+            result['data'] = {'umo': umo, 'voice': self._provider_label(provider), 'file': path}
+        return result
+
+    def _tts_providers(self) -> list[Any]:
+        """宿主里所有 TTS 提供者（拿不到就是空列表）。"""
+        for attribute in ('get_all_tts_providers',):
+            getter = getattr(self.context, attribute, None)
+            if callable(getter):
+                try:
+                    return list(getter() or [])
+                except Exception as error:  # noqa: BLE001
+                    log_fallback('debug', '取 TTS 提供者列表失败（%s）：%s', attribute, error)
+        manager = getattr(self.context, 'provider_manager', None)
+        for attribute in ('tts_provider_insts',):
+            instances = getattr(manager, attribute, None)
+            if isinstance(instances, (list, tuple)):
+                return list(instances)
+        return []
+
+    def _provider_from_manager(self) -> Any:
+        manager = getattr(self.context, 'provider_manager', None)
+        current = getattr(manager, 'curr_tts_provider_inst', None)
+        if current is not None:
+            return current
+        providers = self._tts_providers()
+        return providers[0] if providers else None
+
+    @staticmethod
+    def _provider_config(provider: Any) -> Mapping[str, Any]:
+        config = getattr(provider, 'provider_config', None)
+        if isinstance(config, Mapping):
+            return config
+        config = getattr(provider, 'config', None)
+        return config if isinstance(config, Mapping) else {}
+
+    def _provider_id(self, provider: Any) -> str:
+        config = self._provider_config(provider)
+        for key in ('id', 'provider_id', 'providerId'):
+            value = _clean(config.get(key))
+            if value:
+                return value
+        return type(provider).__name__
+
+    def _provider_label(self, provider: Any) -> str:
+        config = self._provider_config(provider)
+        model = _clean(config.get('model') or config.get('voice'))
+        identifier = self._provider_id(provider)
+        return '%s(%s)' % (identifier, model) if model and model != identifier else identifier
+
+    @staticmethod
+    def _voice_hint(config: Mapping[str, Any]) -> str:
+        for key, value in (config or {}).items():
+            if 'voice' in str(key).lower() and isinstance(value, str) and value.strip():
+                return value.strip()
+        return ''
+
+    def _pick_voice_provider(self, voice: str) -> Any:
+        wanted = _clean(voice).lower()
+        if not wanted:
+            return None
+        for provider in self._tts_providers():
+            config = self._provider_config(provider)
+            candidates = {
+                self._provider_id(provider).lower(),
+                _clean(config.get('model')).lower(),
+                _clean(config.get('name')).lower(),
+                self._voice_hint(config).lower(),
+            }
+            if wanted in {item for item in candidates if item}:
+                return provider
+        return None
+
+    async def _tts_provider(self, umo: str, voice: str = '') -> tuple[Any, str]:
+        """取宿主 TTS 提供者：返回 `(provider, 错误文案)`。"""
+        provider: Any = None
+        for attribute in ('get_using_tts_provider_async', 'get_using_tts_provider'):
+            getter = getattr(self.context, attribute, None)
+            if not callable(getter):
+                continue
+            try:
+                result = getter(umo)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as error:  # noqa: BLE001 - 取不到就换下一条路
+                log_fallback('debug', '取宿主 TTS 提供者失败（%s）：%s', attribute, error)
+                result = None
+            if result is not None:
+                provider = result
+                break
+        if provider is None:
+            provider = self._provider_from_manager()
+        if provider is None:
+            return None, '宿主没有可用的 TTS 提供者：发语音需要先在 AstrBot 里配置一个 TTS 服务商'
+        if voice:
+            chosen = self._pick_voice_provider(voice)
+            if chosen is not None:
+                provider = chosen
+            else:
+                log_fallback(
+                    'debug', '音色 %s 没有匹配到 TTS 提供者，改用默认提供者（可用音色见 list_voices）', voice,
+                )
+        return provider, ''
+
+    def _action_list_voices(self) -> dict[str, Any]:
+        providers = self._tts_providers()
+        if not providers:
+            log_fallback('warn', '列音色失败：宿主没有配置 TTS 提供者')
+            return {'ok': False, 'error': '宿主没有可用的 TTS 提供者，列不出音色'}
+        voices = [
+            {
+                'id': self._provider_id(provider),
+                'provider': type(provider).__name__,
+                'voice': self._voice_hint(self._provider_config(provider)),
+            }
+            for provider in providers
+        ][:20]
+        return {
+            'ok': True,
+            'error': '',
+            'data': {'voices': voices, 'note': 'send_voice 的 voice 参数填这里的 id（音色由该提供者的配置决定）'},
+        }
+
+    async def _action_contacts(self, action_id: str, params: Mapping[str, Any]) -> dict[str, Any]:
+        """`list_contacts` / `search_contacts`：好友 + 群列表（宿主 / 平台取，逐条裁剪）。"""
+        keyword = _clean(params.get('keyword')).lower()
+        kind = _clean(params.get('type')).lower() or ('friends' if keyword else 'all')
+        default_limit = _SEARCH_CONTACT_LIMIT if keyword else _CONTACT_LIMIT
+        try:
+            limit = int(params.get('limit') or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        limit = min(limit if limit > 0 else default_limit, default_limit)
+        wanted = {
+            'friends': ('friends',), 'groups': ('groups',), 'all': ('friends', 'groups'),
+        }.get(kind, ('friends', 'groups'))
+        results: dict[str, dict[str, Any]] = {}
+        if 'friends' in wanted:
+            results['friends'] = await self.call_onebot('get_friend_list', {})
+        if 'groups' in wanted:
+            results['groups'] = await self.call_onebot('get_group_list', {})
+        if not any(item.get('ok') for item in results.values()):
+            error = next((_text(item.get('error')) for item in results.values() if item.get('error')), '平台没有回执')
+            log_fallback('warn', '取联系人失败：%s', error)
+            return {'ok': False, 'error': '取联系人失败：%s' % error}
+        entries: list[dict[str, Any]] = []
+        if results.get('friends', {}).get('ok'):
+            entries += [_brief_friend(row) for row in _as_list(results['friends'].get('data'))]
+        if results.get('groups', {}).get('ok'):
+            entries += [_brief_group(row) for row in _as_list(results['groups'].get('data'))]
+        if keyword:
+            entries = [entry for entry in entries if _contact_matches(entry, keyword)]
+        total = len(entries)
+        notes = [
+            '%s列表没取到：%s' % ('好友' if key == 'friends' else '群', item.get('error'))
+            for key, item in results.items() if not item.get('ok')
+        ]
+        return {
+            'ok': True,
+            'error': '',
+            'data': {'contacts': entries[:limit], 'total': total, 'type': kind, 'truncated': total > limit},
+            'notes': notes,
+        }
 
 
 def _pick_any(value: Any, *names: str) -> Any:
@@ -2052,11 +3160,21 @@ class AstrbotBridge:
         self._channel_events: dict[str, Any] = {}
         self._message_events: dict[str, Any] = {}
         self._current_umo = ''
+        #: 最近一次入站事件的坐标：`platform_action` 的「本回合对话对象」读它。
+        self._current_endpoint: Optional[AstrbotEndpoint] = None
+        #: 宿主回执里取到的消息号（`(umo, message_id)`，撤回「最近一条」用）。
+        self._outbound_message_ids: deque[tuple[str, str]] = deque(maxlen=64)
         # 跨重启的投递坐标（v1.4.1）：进程内的登记表在重启后是空的，而**平台实例 id**
         # （AstrBot 的 UMO 第一段）是部署属性、不会变。以前重启后没有登记表就退回用
         # 归一化平台名（`onebot`）拼 UMO，宿主于是报 `cannot find platform for session
         # onebot:FriendMessage:…`、消息静默发不出去。落盘一份就再也不会猜错。
         self._delivery_map_path = Path(self.data_dir) / 'delivery_endpoints.json'
+        # 平台动作权限表（本移植版新增）：**独立 JSON**，不进 `_conf_schema.json`。
+        # 理由与参考插件同源（他们 v5.2.2 踩过）：宿主每次加载都按 schema 重建配置，
+        # schema 里没有的键会被删掉；而空 object 的子键尤其容易被清理，权限表会"保存即失效"。
+        self._action_permissions_path = Path(self.data_dir) / 'action_permissions.json'
+        self._action_permissions: dict[str, str] = {}
+        self._load_action_permissions()
         self._saved_platform_ids: dict[str, str] = {}
         self._saved_private_umos: dict[str, str] = {}
         self._saved_group_umos: dict[str, str] = {}
@@ -2559,6 +3677,7 @@ class AstrbotBridge:
         self._platform_ids[(endpoint.platform, endpoint.self_id)] = endpoint.platform_id
         self._platform_ids.setdefault((endpoint.platform, ''), endpoint.platform_id)
         self._current_umo = endpoint.umo
+        self._current_endpoint = endpoint
         if endpoint.is_group:
             self._group_endpoints[endpoint.group_id or endpoint.channel_id] = endpoint
             if endpoint.group_id:
@@ -2673,6 +3792,48 @@ class AstrbotBridge:
             os.replace(tmp, self._delivery_map_path)
         except Exception as error:  # noqa: BLE001 - 落盘失败只降级成"重启后要重建"
             log_fallback('warn', '投递坐标写入失败，重启后需要重新登记 错误=%s', error)
+
+    # ---- 平台动作权限表（独立 JSON；动作目录是唯一事实源） ---- #
+
+    def _load_action_permissions(self) -> None:
+        """读权限表；坏文件只 warn 并回落空表（空表 = 全部用目录默认档）。"""
+        try:
+            raw = self._action_permissions_path.read_text(encoding='utf-8')
+            data = json.loads(raw) if raw.strip() else {}
+        except FileNotFoundError:
+            self._action_permissions = {}
+            return
+        except Exception as error:  # noqa: BLE001 - 坏文件不该让插件起不来
+            log_fallback('warn', '动作权限表读取失败，按默认档运行 路径=%s 错误=%s',
+                         self._action_permissions_path, error)
+            self._action_permissions = {}
+            return
+        from ..core.platform_actions import normalize_permissions
+
+        self._action_permissions = normalize_permissions(data)
+
+    def action_permissions(self) -> dict[str, str]:
+        """当前权限表（已归一化；控制台与运行期都读它）。"""
+        return dict(self._action_permissions)
+
+    def save_action_permissions(self, table: Any) -> dict[str, str]:
+        """覆盖写入权限表并返回归一化后的结果（坏行丢弃，不写盘）。
+
+        原子写（临时文件 + `os.replace`）：权限表写坏等于所有动作回默认档，
+        而默认档里有 17 个危险动作是关的、其余是全开的，行为会突变。
+        """
+        from ..core.platform_actions import normalize_permissions
+
+        normalized = normalize_permissions(table)
+        try:
+            self._action_permissions_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._action_permissions_path.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(normalized, ensure_ascii=False, indent=1), encoding='utf-8')
+            os.replace(tmp, self._action_permissions_path)
+        except Exception as error:  # noqa: BLE001
+            log_fallback('warn', '动作权限表写入失败，本次修改只在内存生效 错误=%s', error)
+        self._action_permissions = normalized
+        return dict(normalized)
 
     def _host_platform_ids(self, platform: str = '') -> list[str]:
         """向宿主列出候选平台实例 id。
@@ -2792,6 +3953,100 @@ class AstrbotBridge:
     def event_for_channel(self, channel_id: str) -> Any:
         """按群号找最近的入站事件（群成员查询要挂在原生事件上）。"""
         return self._channel_events.get(_text(channel_id))
+
+    # ------------------------------------------------------------------ #
+    # 平台动作执行层要用的会话坐标 / 平台实例
+    # ------------------------------------------------------------------ #
+
+    def current_target(self) -> dict[str, Any]:
+        """本回合的会话坐标（`platform_action` 的「留空＝本回合对话对象」读它）。
+
+        优先用最近一次入站事件的坐标；进程刚重启、还没有事件时退回最近登记过的
+        端点；一个都没有就返回空 dict（调用方据此报"缺少必填参数 / 没有回合对象"）。
+        """
+        endpoint = self._current_endpoint
+        if endpoint is None:
+            recent = list(self._private_endpoints.values()) or list(self._group_endpoints.values())
+            endpoint = recent[-1] if recent else None
+        if endpoint is None:
+            return {}
+        return {
+            'platform': endpoint.platform,
+            'platform_id': endpoint.platform_id,
+            'platform_name': endpoint.platform_name,
+            'self_id': endpoint.self_id,
+            'user_id': endpoint.user_id,
+            'group_id': endpoint.group_id,
+            'channel_id': endpoint.session_id or endpoint.scope,
+            'is_group': endpoint.is_group,
+            'message_id': endpoint.message_id,
+            'umo': endpoint.umo,
+        }
+
+    def platform_instance(self, platform: str = '', self_id: str = '') -> Any:
+        """按归一化平台名取宿主平台实例（取不到返回 `None`）。"""
+        getter = getattr(self.context, 'get_platform_inst', None)
+        if not callable(getter):
+            return None
+        platform_id = self._platform_id_for(platform, self_id) if platform else self._sole_platform_id()
+        if not platform_id:
+            return None
+        try:
+            return getter(platform_id)
+        except Exception as error:  # noqa: BLE001 - 宿主 API 变了也不该炸
+            log_fallback('debug', '取平台实例失败 平台 id=%s 错误=%s', platform_id, error)
+            return None
+
+    def onebot_client(self, platform: str = '', self_id: str = '') -> Any:
+        """取 OneBot（aiocqhttp）客户端，逐层 `getattr` 判空。
+
+        宿主把 `aiocqhttp` 的 `CQHttp` 实例挂在平台实例的 `bot` 上（`getattr` 链
+        一路判空：平台换了实现、或不是 aiocqhttp 时返回 `None`，由调用方降级）。
+        """
+        instance = self.platform_instance(platform, self_id)
+        if instance is None:
+            return None
+        client = getattr(instance, 'bot', None)
+        if client is None:
+            getter = getattr(instance, 'get_client', None)
+            if callable(getter):
+                try:
+                    client = getter()
+                except Exception as error:  # noqa: BLE001
+                    log_fallback('debug', '取 OneBot 客户端失败 错误=%s', error)
+                    client = None
+        if client is None or not callable(getattr(client, 'call_action', None)):
+            return None
+        return client
+
+    @staticmethod
+    def platform_is_onebot(target: Any = None) -> bool:
+        """这个会话坐标所在的平台是不是 OneBot 家族（只有它认 QQ 动作）。
+
+        **判不出来时返回 True**：没有会话坐标（后台回合）不是"平台不支持"，
+        交给客户端那一层报一条说明更准确。
+        """
+        platform = _text(pick(target, 'platform')).strip() if isinstance(target, Mapping) else ''
+        if not platform:
+            return True
+        return platform == 'onebot' or _is_onebot_adapter(platform, platform)
+
+    # ---- 已投递消息号（撤回动作定位「最近一条」） ---- #
+
+    def remember_outbound_message_ids(self, message_ids: Any, umo: str = '') -> None:
+        """把宿主回执里取到的消息号记下来（取不到就不记，不影响投递）。"""
+        for value in _extract_message_ids(message_ids):
+            self._outbound_message_ids.append((_text(umo), value))
+
+    def last_delivered_message_id(self, umo: str = '') -> str:
+        """最近一条已投递消息的平台消息号；`umo` 非空时只认该会话。"""
+        wanted = _text(umo)
+        for recorded_umo, message_id in reversed(self._outbound_message_ids):
+            if wanted and recorded_umo != wanted:
+                continue
+            if message_id:
+                return message_id
+        return ''
 
     async def load_participant(self, participant_id: str) -> Optional[dict[str, Any]]:
         """按 id 读参与者行（后台投递需要它的 platform/selfId/userId）。"""

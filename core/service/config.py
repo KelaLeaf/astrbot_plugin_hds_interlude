@@ -107,6 +107,7 @@ __all__ = [
     'CONFIG_DEFAULTS',
     'CONFIG_SECTION_ALIASES',
     'CONFIG_SECTION_ALIASES_REVERSE',
+    'LEGACY_SECTION_ALIASES',
     'apply_section_aliases',
     'to_schema_shape',
     'PROMPT_SECTION',
@@ -1030,6 +1031,16 @@ CONFIG_SECTION_ALIASES_REVERSE: dict[str, str] = {
     upstream: schema for schema, upstream in CONFIG_SECTION_ALIASES.items()
 }
 
+#: **只用于读取**的历史别名：旧版本里这些键存在过，老导出文件/老配置文件里有值。
+#:
+#: 与 `CONFIG_SECTION_ALIASES` 分开是刻意的：那张表会被**反向**用于持久化，
+#: 若把 `qzone_compat → qzone` 混进去，用户配好的 QQ 空间会被写回那个已经作废的
+#: 隐藏键（下次宿主按 schema 重建配置就清掉）——读得对、写回错，比不迁移更糟。
+LEGACY_SECTION_ALIASES: dict[str, str] = {
+    # v1.5.x 的 P3 隐藏兼容位 → v1.6.0 起 QQ 空间转正（见 PORTING_NOTES §32）。
+    'qzone_compat': 'qzone',
+}
+
 #: 「提示词四件套」的**权威分组**（`plugin/_conf_schema.json` 的顶层 `prompts` 组）。
 #:
 #: 上游把四个提示词放在 `model` 组里（`src/index.ts` 的 `ModelConfig`），本移植版
@@ -1201,9 +1212,10 @@ def apply_section_aliases(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
     source = dict(raw)
-    for alias, target in CONFIG_SECTION_ALIASES.items():
-        if alias in source and target not in source:
-            source[target] = source[alias]
+    for table in (CONFIG_SECTION_ALIASES, LEGACY_SECTION_ALIASES):
+        for alias, target in table.items():
+            if alias in source and target not in source:
+                source[target] = source[alias]
     return source
 
 

@@ -11,12 +11,14 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 # 复用桥接测试里的 AstrBot 桩与夹具（导入即装桩）
 from plugin.tests.test_astrbot_bridge import FakeContext, _make_bridge, bridge_module
 from plugin.adapters import console_api as console_module
 from plugin.adapters.console_api import ConsoleApi, ConsoleError, CONSOLE_TASKS, mask_endpoint
+from plugin.core import platform_actions
 from plugin.core.database import Database
 
 
@@ -101,6 +103,156 @@ class ConsoleApiTests(unittest.TestCase):
         custom = _run(self.api.token_stats('custom', '2026-09-30', '2026-09-30'))
         self.assertEqual(custom['totals']['inputTokens'], 1200)
         self.assertEqual(custom['from'], '2026-09-30')
+
+    # ---- 平台动作目录与权限（面板「动作」） ----
+
+    def _temp_permissions(self) -> str:
+        """把权限表指到本用例自己的临时目录：验证真的落成 JSON，且不污染别的用例。"""
+        path = os.path.join(self._tmp.name, 'action_permissions.json')
+        self.bridge._action_permissions_path = Path(path)
+        self.bridge._action_permissions = {}
+        return path
+
+    def test_actions_catalog_mirrors_the_core_directory(self):
+        """面板的目录必须与 `core/platform_actions.ACTIONS` 逐条一致（不许在控制台重算）。"""
+        payload = _run(self.api.actions_catalog())
+        rows = payload['actions']
+        self.assertEqual([row['id'] for row in rows], list(platform_actions.ACTIONS))
+        self.assertEqual(payload['stats']['total'], len(platform_actions.ACTIONS))
+        json.dumps(payload, ensure_ascii=False)  # 面板直接吃它，必须可序列化
+        for row in rows:
+            action = platform_actions.ACTIONS[row['id']]
+            with self.subTest(action=row['id']):
+                self.assertEqual(row['label'], action.label)
+                self.assertEqual(row['summary'], action.summary)
+                self.assertEqual(row['risk'], action.risk)
+                self.assertEqual(row['category'], action.category)
+                self.assertEqual(row['category_label'],
+                                 platform_actions.ACTION_CATEGORIES[action.category])
+                self.assertEqual(row['default_permission'], action.default_permission)
+                self.assertEqual(row['group'], platform_actions.action_config_group(action))
+                self.assertEqual([param['name'] for param in row['params']],
+                                 [param.name for param in action.params])
+                for param in row['params']:
+                    self.assertEqual(sorted(param), sorted(
+                        ['name', 'label', 'type', 'required', 'minimum', 'maximum', 'choices', 'note'],
+                    ))
+        # 四档 + 中文说明；分组表覆盖风险组（面板要说明"开关在哪一组"）
+        self.assertEqual([tier['id'] for tier in payload['tiers']],
+                         list(platform_actions.PERMISSION_TIERS))
+        self.assertTrue(all(tier['label'] and tier['description'] for tier in payload['tiers']))
+        self.assertEqual(payload['groups'][platform_actions.ACTION_RISK_GROUP],
+                         console_module.RISK_GROUP_LABEL)
+        for row in rows:
+            self.assertIn(row['group'], payload['groups'])
+        # 各 risk 计数与档位分布都要对得上
+        counts = {}
+        for row in rows:
+            counts[row['risk']] = counts.get(row['risk'], 0) + 1
+        for level in platform_actions.RISK_LEVELS:
+            self.assertEqual(payload['stats']['risk'][level], counts.get(level, 0), level)
+        self.assertEqual(
+            sum(payload['stats']['permissions'].values()), len(rows),
+            '档位分布必须覆盖每一个动作',
+        )
+
+    def test_dangerous_actions_default_to_disabled_and_the_warning_is_verbatim(self):
+        payload = _run(self.api.actions_catalog())
+        risky = [row for row in payload['actions'] if row['risk'] == 'dangerous']
+        self.assertTrue(risky)
+        self.assertEqual(payload['risky'], [row['id'] for row in risky])
+        for row in risky:
+            with self.subTest(action=row['id']):
+                self.assertEqual(row['default_permission'], 'disabled')
+                self.assertEqual(row['permission'], 'disabled')
+                self.assertFalse(row['enabled'])
+        self.assertEqual(payload['stats']['risky'], len(risky))
+        self.assertEqual(payload['stats']['risky_enabled'], 0, '默认没有任何危险动作在跑')
+        # 警示语必须是 core 里那一句原文，不许在控制台另写一句
+        self.assertEqual(platform_actions.RISK_WARNING, '以下功能包含风险操作不建议开启')
+        self.assertEqual(payload['risk_warning'], platform_actions.RISK_WARNING)
+
+    def test_catalog_survives_an_unconfigured_empty_plugin(self):
+        """没有配置 / 没有数据库 / 没有任何剧本时也要回完整目录（§29 的控制台取数约定）。"""
+        bare = _make_bridge({})
+        bare.db = None
+        payload = _run(ConsoleApi(bare).actions_catalog())
+        self.assertEqual(len(payload['actions']), len(platform_actions.ACTIONS))
+        self.assertEqual(payload['stats']['enabled'], len(platform_actions.ACTIONS)
+                         - payload['stats']['risky'])
+        self.assertTrue(all(row['config_enabled'] is None for row in payload['actions']),
+                        '分组不存在 = 未配置 = 不限制')
+        self.assertTrue(payload['permissions_path'].endswith('action_permissions.json'))
+
+    def test_config_switch_is_the_master_switch(self):
+        """配置开关关掉时档位无论选什么都不生效（与关系），但档位本身照原样显示。"""
+        self.bridge.config['actions_interaction'] = {'send_poke': False}
+        payload = _run(self.api.actions_catalog())
+        row = next(item for item in payload['actions'] if item['id'] == 'send_poke')
+        self.assertIs(row['config_enabled'], False)
+        self.assertEqual(row['permission'], 'global', '档位是权限表的值，不因开关而改写')
+        self.assertFalse(row['enabled'], '开关是总闸，关掉就不生效')
+        self.assertEqual(payload['stats']['enabled'],
+                         len(payload['actions']) - payload['stats']['risky'] - 1)
+
+    def test_enabling_a_dangerous_action_drives_the_warning_counter(self):
+        self.bridge.config['actions_risks'] = {'set_group_kick': True}
+        _run(self.api.set_action_permission('set_group_kick', 'admin'))
+        payload = _run(self.api.actions_catalog())
+        row = next(item for item in payload['actions'] if item['id'] == 'set_group_kick')
+        self.assertEqual(row['permission'], 'admin')
+        self.assertTrue(row['enabled'])
+        self.assertEqual(payload['stats']['risky_enabled'], 1)
+
+    def test_permission_write_round_trips_to_the_temp_data_dir(self):
+        path = self._temp_permissions()
+        result = _run(self.api.set_action_permission('send_poke', 'admin'))
+        self.assertEqual(result['action'], 'send_poke')
+        self.assertEqual(result['tier'], 'admin')
+        self.assertEqual(result['permissions'], {'send_poke': 'admin'})
+        # 面板显示的是"插件数据目录 / action_permissions.json"（生产路径与桥接的写入
+        # 目标同源；用例里把桥接的写入位置改到了临时目录，所以只对文件名做断言）。
+        self.assertTrue(result['permissions_path'].endswith('action_permissions.json'))
+        # 落成 JSON 文件（独立表，不进 `_conf_schema.json`）
+        self.assertTrue(os.path.isfile(path))
+        with open(path, encoding='utf-8') as handle:
+            self.assertEqual(json.load(handle), {'send_poke': 'admin'})
+        # 读回：目录里的档位跟着变
+        payload = _run(self.api.actions_catalog())
+        row = next(item for item in payload['actions'] if item['id'] == 'send_poke')
+        self.assertEqual(row['permission'], 'admin')
+        self.assertEqual(payload['stats']['permissions']['admin'], 1)
+
+    def test_permission_write_rejects_unknown_action_and_tier(self):
+        path = self._temp_permissions()
+        for action, tier in (('send_poke', 'owner'), ('send_poke', ''), ('nope', 'global'), ('', 'global')):
+            with self.subTest(action=action, tier=tier):
+                with self.assertRaises(ConsoleError):
+                    _run(self.api.set_action_permission(action, tier))
+        self.assertFalse(os.path.exists(path), '被拒绝的写入不能碰权限表')
+
+    def test_permission_reset_clears_the_table(self):
+        path = self._temp_permissions()
+        _run(self.api.set_action_permission('send_poke', 'disabled'))
+        result = _run(self.api.reset_action_permissions())
+        self.assertEqual(result['permissions'], {})
+        with open(path, encoding='utf-8') as handle:
+            self.assertEqual(json.load(handle), {})
+        payload = _run(self.api.actions_catalog())
+        row = next(item for item in payload['actions'] if item['id'] == 'send_poke')
+        self.assertEqual(row['permission'], 'global', '清空后回目录默认档')
+
+    def test_read_only_console_pages_have_no_permission_entry(self):
+        """「Token 统计」这类只读页面不属于权限表：目录里没有它，写入也会被拒。"""
+        payload = _run(self.api.actions_catalog())
+        self.assertIn('tokens', payload['permissionless_panels'])
+        for name in ('tokens', 'token-stats', 'token_stats'):
+            with self.subTest(name=name):
+                self.assertNotIn(name, platform_actions.ACTIONS)
+                with self.assertRaises(ConsoleError):
+                    _run(self.api.set_action_permission(name, 'global'))
+        blob = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn('console/token-stats', blob)
 
     # ---- overview ----
 
@@ -875,7 +1027,9 @@ class ConfigEditorTests(unittest.TestCase):
 
     def test_schema_payload_covers_every_group_and_field(self):
         payload = _run(self.api.config_schema())
-        self.assertEqual(len(payload['groups']), 25, '25 个顶层分组都要下发给配置页')
+        # 与 schema 文件对账（而不是写死数字）：平台动作的开关组（`actions_*`）会随动作目录
+        # 增长，写死 25 每加一组都要来改这里；这里只钉"schema 里每个顶层分组都下发了"。
+        self.assertEqual(len(payload['groups']), len(console_module.load_config_schema()))
         qa = next(group for group in payload['groups'] if group['key'] == 'qq_access')
         fields = {field['key']: field for field in qa['fields']}
         self.assertEqual(fields['user_accounts']['value'], [])

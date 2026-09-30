@@ -18,6 +18,9 @@
 | 表情包投递（Chunk1/Chunk2 `sendSticker`） | `session.bot.sendMessage(channelId, h('img'))` | `send_sticker` |
 | 网页观察（Chunk5，上游 Puppeteer） | `ctx.puppeteer.page()` | `search_web` / `visit_web` |
 | typ-0 后台投递出口（Chunk0 `desktop_delivery_handler`） | bridge handler | `deliver_background` |
+| 平台动作目录（本移植版新增，`core/platform_actions.py`） | 参考插件的 `bot.internal._request(action, params)` | `platform_action` |
+| QQ 空间等 SnowLuma 扩展动作直通 | 同上 | `call_onebot` |
+| 「正在输入」状态（NapCat `set_input_status`） | 同上 | `set_input_status` |
 
 **降级原则**（移植约定）：确实无法在 AstrBot 复现的能力
 （Puppeteer 截图、sharp 抽帧、Satori 原生表情）必须返回失败而不是抛异常，
@@ -144,6 +147,49 @@ class Transport(Protocol):
         """后台（无实时 Session）投递。上游 `desktopDeliveryHandler`（`:712-715`）。"""
         ...
 
+    # ---- 平台动作执行层（`core/platform_actions.py` 的动作目录） ----
+
+    async def platform_action(self, action: str, params: dict[str, Any]) -> SendResult:
+        """执行一条**目录动作**（`platform_actions.ACTIONS` 里的 id）。
+
+        返回 `{'ok': bool, 'error': str, 'data': Any}`：
+
+        * 未知 action / 参数缺失或越界 / 平台不支持 / 传输异常 → `ok=False`，
+          `error` 是给日志与调用方看的中文短语；平台不支持的稳定前缀是
+          `unsupported-platform-action: <id>`，调用方可以据此分类；
+        * 参数校验与「会话缺省坐标」由实现方补齐（目录是唯一事实源，见
+          `core/platform_actions.validate_action`）；
+        * 传输层异常（超时 / 断连）时 `error` **以「结果未知，请勿自动重试」结尾**，
+          此时动作可能已经在平台侧生效，调用方按 `ambiguous` 处理、不得自动重试。
+        """
+        ...
+
+    async def call_onebot(self, action: str, params: dict[str, Any]) -> SendResult:
+        """原生 OneBot / SnowLuma 动作直通（QQ 空间的 `send_qzone_msg` 等走这里）。
+
+        回执校验：帧里 `status == 'ok'` 或 `retcode == 0` → `ok=True` 且
+        `data=帧里的 data`；否则 `ok=False`，`error` 带上 status/retcode/message。
+        传输异常（超时 / 断连）时 `error` 以「结果未知，请勿自动重试」结尾。
+        """
+        ...
+
+    async def is_super_admin(self, user_id: str) -> bool:
+        """宿主管理员判定（用于动作权限表里的 `admin` 档）。
+
+        取不到（没实现、读不到管理员名单）一律返回 **False**——这个返回值是多条
+        `dangerous` 动作的唯一闸门，"读不到"必须等价于"没有权限"，不能反过来。
+        """
+        return False
+
+    async def set_input_status(self, target: dict[str, Any], typing: bool) -> SendResult:
+        """设置「正在输入」状态（NapCat `set_input_status`）。
+
+        `target` 是会话坐标 `{'platform','self_id','user_id','group_id','channel_id',
+        'is_group'}`；`typing=True` → `event_type=1`（开始输入），`False` → `2`。
+        群聊可能不支持：失败就是 `ok=False`，绝不抛。
+        """
+        ...
+
 
 class NullTransport:
     """全部方法安全降级的 `Transport`。
@@ -226,3 +272,21 @@ class NullTransport:
     async def deliver_background(self, delivery: dict[str, Any]) -> SendResult:
         log_fallback('debug', 'Transport 未安装：后台投递已跳过')
         return {'ok': False, 'error': 'transport-unavailable'}
+
+    # ---- 平台动作执行层 ----
+
+    async def platform_action(self, action: str, params: dict[str, Any]) -> SendResult:
+        log_fallback('debug', 'Transport 未安装：平台动作已跳过 动作=%s', action)
+        return {'ok': False, 'error': 'transport-unavailable', 'data': None}
+
+    async def call_onebot(self, action: str, params: dict[str, Any]) -> SendResult:
+        log_fallback('debug', 'Transport 未安装：OneBot 动作已跳过 动作=%s', action)
+        return {'ok': False, 'error': 'transport-unavailable', 'data': None}
+
+    async def set_input_status(self, target: dict[str, Any], typing: bool) -> SendResult:
+        log_fallback('debug', 'Transport 未安装：输入状态已跳过')
+        return {'ok': False, 'error': 'transport-unavailable', 'data': None}
+
+    async def is_super_admin(self, user_id: str) -> bool:
+        # 没有宿主就谈不上"宿主管理员"：一律 False（权限判定宁可从严）。
+        return False

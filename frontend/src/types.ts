@@ -493,3 +493,70 @@ export interface TokenStatsPayload {
   byTask: TokenUsageBucket[]
   series: TokenUsageDay[]
 }
+
+/* ----------------------------------------------- 平台动作目录（`console/actions`） */
+
+/** 权限四档。与后端 `platform_actions.PERMISSION_TIERS` 同序同值。 */
+export type PermissionTier = 'global' | 'groupadmin' | 'admin' | 'disabled'
+
+/** 风险分级。`dangerous` 默认档位就是 `disabled`。 */
+export type ActionRisk = 'safe' | 'sensitive' | 'dangerous'
+
+export interface ActionParamBrief {
+  name: string
+  label: string
+  type: string
+  required: boolean
+  minimum: number | null
+  maximum: number | null
+  choices: string[]
+  note?: string
+}
+
+/** 目录里的一行动作。`permission` 是权限表里的档位，`enabled` 才是"实际能不能用"。 */
+export interface PlatformActionRow {
+  id: string
+  category: string
+  category_label: string
+  label: string
+  summary: string
+  risk: ActionRisk | string
+  default_permission: PermissionTier | string
+  permission: PermissionTier | string
+  enabled: boolean
+  /** 配置开关的原始值；`null` = 该分组/键不存在（未配置 = 不限制）。 */
+  config_enabled: boolean | null
+  group: string
+  returns?: string
+  params: ActionParamBrief[]
+}
+
+export interface PermissionTierBrief {
+  id: PermissionTier | string
+  label: string
+  description: string
+}
+
+export interface ActionsCatalogPayload {
+  actions: PlatformActionRow[]
+  tiers: PermissionTierBrief[]
+  /** 配置分组 id → 中文标签（说明每个开关在哪一组）。 */
+  groups: Record<string, string>
+  /** 危险动作的警示语（core 里的原文，逐字）。 */
+  risk_warning: string
+  /** 全部危险动作 id。 */
+  risky: string[]
+  /** 与权限表无关的只读页面（例如 「Token 统计」）。 */
+  permissionless_panels: string[]
+  permissions_path: string
+  stats: {
+    total: number
+    enabled: number
+    disabled: number
+    risky: number
+    risky_enabled: number
+    risk: Record<string, number>
+    permissions: Record<string, number>
+  }
+  risk_labels?: Record<string, string>
+}

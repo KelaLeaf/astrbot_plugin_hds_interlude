@@ -475,6 +475,10 @@ class ServiceChunk6(ServiceBase):
                             story_id, pick(participant, 'id'), automatic_delivery, now,
                         )
                     await self.record_character_message(participant, now)
+                    # 本移植版：这一条分段气泡已经投出去了，熄灭"正在输入"（下一条会再点亮）。
+                    ender = getattr(self, 'end_typing', None)
+                    if callable(ender):
+                        await ender(participant)
                     await self.db_set(
                         'interlude_intent', {'id': pick(next_intent, 'id')},
                         {'status': 'completed', 'updatedAt': now},
@@ -923,6 +927,7 @@ class ServiceChunk6(ServiceBase):
             if participant:
                 by_id[pick(participant, 'id')] = participant
         typing_floor_applied = False
+        typing_waited_ms = 0
         for message in messages:
             message_participant_id = pick(message, 'participantId', 'participant_id')
             target = by_id.get(message_participant_id)
@@ -960,7 +965,17 @@ class ServiceChunk6(ServiceBase):
                         'diagnostic', 'debug', story, 'user-message',
                         '首条消息按打字时间补足等待 参与者=%s 等待=%dms', target_id, hold,
                     )
-                    await asyncio.sleep(hold / 1000)
+                    # 本移植版：这段等待**就是**"她在打字"的时间——点亮输入状态再等，
+                    # 对方这才看得见"正在输入…"（一条气泡一次点亮/熄灭）。
+                    indicator = getattr(self, 'typing_indicator', None)
+                    if callable(indicator):
+                        waited = await indicator(
+                            target, pick(message, 'content') or '', extra_delay_ms=hold,
+                        )
+                        typing_waited_ms = max(typing_waited_ms, waited)
+                    else:
+                        await asyncio.sleep(hold / 1000)
+                        typing_waited_ms = max(typing_waited_ms, hold)
             if should_cancel is not None and should_cancel(target):
                 self.report_operation(
                     'standard', 'info', story, 'user-message',
@@ -1132,6 +1147,11 @@ class ServiceChunk6(ServiceBase):
                 later_segments = pick(message, 'laterSegments', 'later_segments') or []
                 for index, segment in enumerate(later_segments):
                     delay += self.typing_delay_milliseconds(segment)
+                    # 本移植版：分段的等待 = 她在打这一条 → 非阻塞点亮输入状态，
+                    # 真正投递那一条时再熄灭（"分气泡投送就是多次点亮"）。
+                    starter = getattr(self, 'begin_typing', None)
+                    if callable(starter):
+                        await starter(participant, self.typing_delay_milliseconds(segment))
                     send_at = parse_dt(dt_ms(now) + delay)
                     payload: dict[str, Any] = {
                         'content': segment,
