@@ -31,11 +31,11 @@ SAMPLE = {
 
 class BuildExportTests(unittest.TestCase):
     def test_envelope_carries_format_version_and_sections(self):
-        env = build_export(SAMPLE, plugin_version='v1.1.0', upstream_version='1.0.1-beta6-rebuild')
+        env = build_export(SAMPLE, plugin_version='v1.1.0', upstream_version='1.0.1-rc28')
         self.assertEqual(env['format'], CONFIG_EXPORT_FORMAT)
         self.assertEqual(env['formatVersion'], CONFIG_EXPORT_VERSION)
         self.assertEqual(env['pluginVersion'], 'v1.1.0')
-        self.assertEqual(env['upstreamVersion'], '1.0.1-beta6-rebuild')
+        self.assertEqual(env['upstreamVersion'], '1.0.1-rc28')
         self.assertEqual(env['sections'], ['model_center', 'runtime', 'story_defaults'])
         self.assertIn('exportedAt', env)
 

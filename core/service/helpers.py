@@ -1320,7 +1320,12 @@ def _has_structured_group_reply_field(value: Any) -> bool:
 
 
 def _has_structured_interaction(value: Any) -> bool:
-    if not is_record(value) or not isinstance(value.get('seen'), bool) or not is_record(value.get('reply')):
+    # `seen` 与 `normalize_interaction` 保持一致地宽容：这是恢复检查（读的是**归一化
+    # 之前**的 decision），漏 seen 的 DeepSeek V4.1 回复如果在这里被否掉，就会白烧一次
+    # 重写。见 `PORTING_NOTES.md` 的 rc28 条目。
+    if not is_record(value) or not is_record(value.get('reply')):
+        return False
+    if value.get('seen') is not None and not isinstance(value.get('seen'), bool):
         return False
     reply = value['reply']
     mode = reply.get('mode')
@@ -1340,6 +1345,71 @@ def _has_structured_interaction(value: Any) -> bool:
     if mode == 'immediate':
         return True
     return isinstance(reply.get('sendAt'), str) and bool(reply['sendAt'].strip())
+
+
+#: 上游 `detectMessageRepetition`：最多看 8 批、触发要求 bubbles>=2 且连续 >=2 批。
+_REPETITION_MAX_BATCHES = 8
+
+
+def _safe_bubble_count(value: Any) -> Optional[int]:
+    """上游 `safeCount`：非负安全整数才算数（bool 不算）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
+def detect_message_repetition(entries: Any) -> Optional[dict[str, int]]:
+    """上游 1.0.1-rc18 `detectMessageRepetition(entries)`：条数锚定检测。
+
+    倒序把 `character-message` 归批：**批次首领的投递元数据是权威**
+    （`bubbleIndex == 0` 且 `bubbleCount` 合法），其余 `character-message` 累计成
+    回退批次；任何其它 kind 的条目都会截断当前批次。尾部连续 >=2 批同为 x 条（x>=2）
+    时返回 `{'bubbles': x, 'consecutive': n}`，否则 `None`（单条习惯 x=1 永不触发）。
+
+    我方把气泡元数据**平铺**在 `script_entry.metadata` 里（见 `delivery.py` 的
+    `message_event_reference`），而上游是 `metadata.scriptEvent.bubbleIndex/bubbleCount`；
+    这里两种形状都读（优先上游嵌套形态）。
+    """
+    if not isinstance(entries, list):
+        return None
+    batches: list[int] = []
+    pending = 0
+    for entry in reversed(entries):
+        if len(batches) >= _REPETITION_MAX_BATCHES:
+            break
+        if not isinstance(entry, dict) or entry.get('kind') != 'character-message':
+            if pending:
+                batches.append(pending)
+                pending = 0
+            continue
+        metadata = entry.get('metadata')
+        metadata = metadata if isinstance(metadata, dict) else {}
+        nested = metadata.get('scriptEvent', metadata.get('script_event'))
+        nested = nested if isinstance(nested, dict) else {}
+        bubble_count = _safe_bubble_count(
+            nested.get('bubbleCount', nested.get('bubble_count')) if nested
+            else metadata.get('bubbleCount', metadata.get('bubble_count'))
+        )
+        bubble_index = _safe_bubble_count(
+            nested.get('bubbleIndex', nested.get('bubble_index')) if nested
+            else metadata.get('bubbleIndex', metadata.get('bubble_index'))
+        )
+        if bubble_count is not None and bubble_index == 0:
+            batches.append(bubble_count)
+            pending = 0
+            continue
+        pending += 1
+    if pending and len(batches) < _REPETITION_MAX_BATCHES:
+        batches.append(pending)
+    if not batches:
+        return None
+    bubbles = batches[0]
+    if not isinstance(bubbles, int) or isinstance(bubbles, bool) or bubbles < 2:
+        return None
+    consecutive = 1
+    while consecutive < len(batches) and batches[consecutive] == bubbles:
+        consecutive += 1
+    return {'bubbles': bubbles, 'consecutive': consecutive} if consecutive >= 2 else None
 
 
 def safe_json_preview(value: Any) -> str:
@@ -1607,12 +1677,25 @@ def normalize_interaction(value: Any, now: datetime, runtime: dict[str, Any]) ->
     输出键名 camelCase（`seen` / `reply` / `mode` / `content` / `sendAt`）：wire format；
     读取侧同时接受 snake_case（`send_at`）。
     """
-    if not is_record(value) or not isinstance(value.get('seen'), bool) or not is_record(value.get('reply')):
+    if not is_record(value) or not is_record(value.get('reply')):
         return None
     reply = value['reply']
     mode = reply.get('mode')
+    if not isinstance(mode, str):
+        mode = None
+    raw_content = reply.get('content')
+    # 上游 1.0.1-rc15：`mode` 的宽容归一。弱模型（Gemini Flash 等）常把 mode 写成
+    # text/send/reply/message；只要带了 content 就按 immediate 处理，整条丢掉等于
+    # 白扔一条有效回复。缺失 mode 且没有 content 才算 none；其它任何词、或者
+    # 缺 mode 却带 content 之外的情形，才丢整条。
     if mode not in ('none', 'immediate', 'delayed'):
-        return None
+        has_content = isinstance(raw_content, str) and bool(raw_content.strip())
+        if has_content and mode in (None, 'text', 'send', 'reply', 'message'):
+            mode = 'immediate'
+        elif mode is None and not has_content:
+            mode = 'none'
+        else:
+            return None
     content = (
         _normalize_visible_message_content(
             reply.get('content'),
@@ -1622,7 +1705,12 @@ def normalize_interaction(value: Any, now: datetime, runtime: dict[str, Any]) ->
         if isinstance(reply.get('content'), str) else None
     )
     send_at = to_date(reply.get('sendAt', reply.get('send_at')))
-    seen = value.get('seen') is True
+    # 上游 1.0.1-rc28（DeepSeek V4.1 修复）：`seen` 非布尔时**不再丢弃整条**。
+    # V4.1 偶发漏 seen，旧写法会把一条有效的 immediate 回复打成 none，并正好落进
+    # 「结构化可见回复缺失 → 重写一次」的环里（用户实测重写无效、只会烧调用）。
+    # reply 本身有效时按已读处理；seen 只是"是否读了这条消息"的信息性字段。
+    raw_seen = value.get('seen')
+    seen = raw_seen if isinstance(raw_seen, bool) else True
     if mode == 'none':
         return {'seen': seen, 'reply': {'mode': 'none'}}
     if not content:
@@ -1947,8 +2035,16 @@ def fact_score(fact: dict[str, Any], config: dict[str, Any], query_embedding: li
                query: str = '') -> float:
     """上游 `factScore`：事实相关度打分（重要性 / 置信 / 新近 / 语义 / 词法 / 未结）。"""
     embedding = query_embedding or []
-    last_seen = to_date(fact.get('lastSeenAt'))
-    age_days = max(0.0, (dt_ms(utc_now()) - dt_ms(last_seen)) / (24 * 60 * 60 * 1000)) if last_seen else 0.0
+    # 上游 1.0.1-rc4：`lastSeenAt` 可能为空（rc2/rc3 写入的补充事实、更老的自由写入行），
+    # 回退到 updatedAt → createdAt → now——检索排序不能因为一个空时间戳崩掉，也不能
+    # 把一条旧事实当成"刚刚见过"（那会让它白拿满分近因）。
+    last_seen = (
+        to_date(fact.get('lastSeenAt') or fact.get('last_seen_at'))
+        or to_date(fact.get('updatedAt') or fact.get('updated_at'))
+        or to_date(fact.get('createdAt') or fact.get('created_at'))
+        or utc_now()
+    )
+    age_days = max(0.0, (dt_ms(utc_now()) - dt_ms(last_seen)) / (24 * 60 * 60 * 1000))
     recency = math.exp(-age_days / 30)
     similarity = cosine_similarity(embedding, fact.get('embedding') or [])
     # 负相似度视为无语义支撑：避免一条无关事实仅因为余弦值数学上落在

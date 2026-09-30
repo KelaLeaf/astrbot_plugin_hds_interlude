@@ -61,7 +61,7 @@ import asyncio
 from typing import Any, Optional
 
 from ..time import dt_ms, format_log_time, iso, parse_dt
-from ..group_willingness import consume_group_willingness, evaluate_group_willingness
+from ..group_willingness import consume_willingness_gate, evaluate_willingness_gate
 from ..script.commit_builder import find_group_script_event
 from ..script.contract import message_event_reference
 from ..script.delivery_ledger import platform_action_reference
@@ -102,6 +102,8 @@ _CLEAR_DATABASE_TABLES = (
     'interlude_scene', 'interlude_arc', 'interlude_fact', 'interlude_state_patch',
     'interlude_overlay_snapshot', 'interlude_web_observation', 'interlude_schedule_preplan',
     'interlude_participant', 'interlude_story',
+    # 上游 1.0.1-rc23：世界播种事件表也随清库/清剧本一起清。
+    'interlude_seeded_event',
 )
 
 _MISSING = object()
@@ -262,6 +264,11 @@ def _clear_database_fallback(table: str) -> dict[str, Any]:
             'regimes': [], 'exceptions': [], 'materializedDays': [],
             'validFrom': '1970-01-01', 'validThrough': '1970-01-01',
             'lastReviewedLocalDate': '', 'reviewReason': '[HDSI 数据库已清空]',
+        }
+    if table == 'interlude_seeded_event':
+        return {
+            'status': 'expired', 'summary': '[HDSI 数据库已清空]',
+            'sourcePayload': {}, 'subjects': [],
         }
     return {'status': 'rejected', 'proposedValue': '[HDSI 数据库已清空]', 'evidence': ''}
 
@@ -695,6 +702,7 @@ class ServiceChunk1(ServiceBase):
         破坏性管理操作（调用方必须先校验确认短语）。全量清除后还会用**当前 Console
         配置**重建 Canon，旧档案因此不可能在后续 prompt 里复活。
         """
+        self.invalidate_story_tasks(story_id)
         self.invalidate_buffered_narratives(story_id)
         await self.purge_table('interlude_script_entry', {'storyId': story_id}, {
             'kind': 'redacted', 'actor': 'system', 'content': '[管理员已删除剧本内容]',
@@ -730,6 +738,10 @@ class ServiceChunk1(ServiceBase):
             'regimes': [], 'exceptions': [], 'materializedDays': [],
             'validFrom': '1970-01-01', 'validThrough': '1970-01-01',
             'lastReviewedLocalDate': '', 'reviewReason': '[管理员已删除 Schedule Preplan]',
+        })
+        await self.purge_table('interlude_seeded_event', {'storyId': story_id}, {
+            'status': 'expired', 'summary': '[管理员已删除世界事件]',
+            'sourcePayload': {}, 'subjects': [],
         })
         now = self.now()
         story = await self.get_story(story_id)
@@ -797,6 +809,10 @@ class ServiceChunk1(ServiceBase):
         if self.database_resetting:
             raise RuntimeError('HDSI 数据库清空已经在进行中。')
         self.database_resetting = True
+        # 上游 1.0.1-rc26：先让全局代际失效，再等在途回合（最多 30 秒/每个 key）。
+        # 迟到的模型结果会因代际失配被丢弃，所以超时也照常继续清库。
+        self.invalidate_story_tasks()
+        await self.await_inflight_turns()
         self.invalidate_buffered_narratives()
         self.invalidate_history_vectors()
         try:
@@ -837,11 +853,50 @@ class ServiceChunk1(ServiceBase):
         finally:
             self.database_resetting = False
 
+    async def await_inflight_turns(self, timeout_ms: int = 30_000, poll_ms: int = 500) -> int:
+        """上游 `clearDatabase` 的 30 秒在途屏障。
+
+        等待的是"某个回合的 `inFlightRequestId` 不再是当初那个"（模型回来了、或换成了新
+        请求）；**每个 key 各自一个 deadline**，超时不报错、不中断——代际与
+        `database_resetting` 已经保证了迟到结果被判废。返回仍在途的 key 数（排障用）。
+        """
+        turns = getattr(self, 'buffered_narrative_turns', None)
+        if not isinstance(turns, dict):
+            return 0
+        pending: list[tuple[str, Any]] = [
+            (key, _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id'))
+            for key, turn in list(turns.items())
+            if isinstance(turn, dict)
+            and _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id') is not None
+        ]
+        for key, request_id in pending:
+            self.report_operation(
+                'standard', 'warn', None, 'advance',
+                '清空前等待在途回合完成 参与者=%s 请求=%s', key, request_id,
+            )
+            deadline = self.now_ms() + timeout_ms
+            while self.now_ms() < deadline:
+                current = turns.get(key)
+                if not isinstance(current, dict) or _turn_get(
+                    current, 'inFlightRequestId', 'in_flight_request_id',
+                ) != request_id:
+                    break
+                await asyncio.sleep(poll_ms / 1000)
+        remaining = 0
+        for key, request_id in pending:
+            current = turns.get(key)
+            if isinstance(current, dict) and _turn_get(
+                current, 'inFlightRequestId', 'in_flight_request_id',
+            ) == request_id:
+                remaining += 1
+        return remaining
+
     async def purge_story_range(self, story_id: str, from_value: Any, to_value: Any) -> None:
         """上游 `purgeStoryRange(storyId, from, to)`（`src/service.ts:1543`）。
 
         删除时间戳与区间重叠的剧本行与派生记忆记录（共同退化为软删墓碑）。
         """
+        self.invalidate_story_tasks(story_id)
         start = parse_dt(from_value)
         end = parse_dt(to_value)
         self.invalidate_buffered_narratives(story_id)
@@ -932,6 +987,14 @@ class ServiceChunk1(ServiceBase):
                 await self.purge_table('interlude_web_observation', {'id': pick(observation, 'id')}, {
                     'status': 'deleted', 'url': '', 'title': '', 'excerpt': '',
                     'summary': '[管理员已删除网页观察]',
+                })
+
+        # 上游 1.0.1-rc23：区间清剧本时，落在区间内的世界事件一并作废（事件表按 occursAt 计时）。
+        for row in await self.db_get('interlude_seeded_event', {'storyId': story_id}):
+            if in_range(pick(row, 'occursAt', 'occurs_at')):
+                await self.purge_table('interlude_seeded_event', {'id': pick(row, 'id')}, {
+                    'status': 'expired', 'summary': '[管理员已删除世界事件]',
+                    'sourcePayload': {}, 'subjects': [],
                 })
 
         if entry_ids:
@@ -1119,11 +1182,26 @@ class ServiceChunk1(ServiceBase):
             images = pick(user_input, 'sources') or []
             audio = pick(user_input, 'audioSources', 'audio_sources') or []
             quote = pick(user_input, 'quote')
+            # 通道上下文在下面的条目 metadata 里解析；buffer 调用在更外层也要用它，
+            # 因此先绑定到 None（`receive` 的分支很多，别让名字只在某个分支里存在）。
+            channel_metadata: Any = None
             metadata: dict[str, Any] = {
                 'platform': _session_read(session, 'platform'),
                 'messageId': _session_read(session, 'messageId', 'message_id'),
                 'personId': pick(incoming_participant, 'personId', 'person_id'),
             }
+            # 上游 1.0.1-rc28（M4 §十）：给条目打上通道上下文（注册表命中才打）。
+            # 它是 `lastEntryChannel` 的来源——没有它，私↔群与同人异端两条标注规则
+            # 在真实运行里永远比较不到真正的"前一条"。单平台/未迁移时返回 None。
+            resolve_channel = getattr(self, 'channel_metadata_for', None)
+            if callable(resolve_channel):
+                channel_metadata = await resolve_channel({
+                    'platform': _session_read(session, 'platform'),
+                    'selfId': _session_read(session, 'selfId', 'self_id'),
+                    'userId': _session_read(session, 'userId', 'user_id'),
+                })
+                if channel_metadata:
+                    metadata['channel_context'] = channel_metadata
             if images:
                 metadata['imageCount'] = len(images)
             if audio:
@@ -1145,6 +1223,25 @@ class ServiceChunk1(ServiceBase):
         accepted = await self.serial(story_id, task)
         if not accepted:
             return False
+        # 上游 1.0.1-rc28：逐条消息记住入站端点（M4 规则 1/2 的唯一依据）。
+        # 这里单独解析一次通道上下文——它必须在 buffer 调用点可见（条目 metadata
+        # 那份在另一个分支里解析），注册表未命中时返回 None → 不记端点。
+        resolve_channel = getattr(self, 'channel_metadata_for', None)
+        buffer_channel: Any = None
+        # 入站触达端点状态：连接在线 + 可投递（v3 §四；注册表未命中时是 no-op）。
+        touch_inbound = getattr(self, 'touch_endpoint_state_inbound', None)
+        if callable(touch_inbound):
+            await touch_inbound({
+                'platform': _session_read(session, 'platform'),
+                'selfId': _session_read(session, 'selfId', 'self_id'),
+                'userId': _session_read(session, 'userId', 'user_id'),
+            })
+        if callable(resolve_channel):
+            buffer_channel = await resolve_channel({
+                'platform': _session_read(session, 'platform'),
+                'selfId': _session_read(session, 'selfId', 'self_id'),
+                'userId': _session_read(session, 'userId', 'user_id'),
+            })
         self.buffer_user_narrative(
             accepted['story'], accepted['participant'], session, accepted['now'],
             accepted['superseded'], pick(user_input, 'content'),
@@ -1152,6 +1249,7 @@ class ServiceChunk1(ServiceBase):
             pick(user_input, 'audioSources', 'audio_sources') or [],
             pick(user_input, 'quote'),
             pick(user_input, 'media') or [],
+            pick(buffer_channel or {}, 'endpoint_id', 'endpointId') or '',
         )
         images = pick(user_input, 'sources') or []
         audio = pick(user_input, 'audioSources', 'audio_sources') or []
@@ -1328,8 +1426,13 @@ class ServiceChunk1(ServiceBase):
 
         rule = turn.get('rule') or {}
         group_id = turn.get('group_id')
-        willingness = evaluate_group_willingness(
+        # 上游 1.0.1-rc23：走档位解析层（五档 / auto 按生活状态 / 旧数值门按 custom）。
+        life_status = decode_story_state(pick(story, 'state')).get('life_status')
+        willingness = evaluate_willingness_gate(
             self.group_willingness.get(key),
+            pick(rule, 'willingnessPreset', 'willingness_preset'),
+            pick(rule, 'willingnessAuto', 'willingness_auto'),
+            life_status,
             pick(rule, 'willingness'),
             {
                 'now': self.now_ms(),
@@ -1580,8 +1683,13 @@ class ServiceChunk1(ServiceBase):
                     ),
                 )
             if delivered_segments or completed_reactions or sticker_delivered or native_face_delivered:
-                self.group_willingness[key] = consume_group_willingness(
-                    self.group_willingness.get(key), pick(rule, 'willingness'), self.now_ms(),
+                self.group_willingness[key] = consume_willingness_gate(
+                    self.group_willingness.get(key),
+                    pick(rule, 'willingnessPreset', 'willingness_preset'),
+                    pick(rule, 'willingnessAuto', 'willingness_auto'),
+                    life_status,
+                    pick(rule, 'willingness'),
+                    self.now_ms(),
                 )
             self.schedule_compaction(story_id)
         except Exception as error:

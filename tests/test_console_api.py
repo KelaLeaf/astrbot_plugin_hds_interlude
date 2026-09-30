@@ -843,7 +843,7 @@ class ConfigEditorTests(unittest.TestCase):
 
     def test_schema_payload_covers_every_group_and_field(self):
         payload = _run(self.api.config_schema())
-        self.assertEqual(len(payload['groups']), 22, '22 个顶层分组都要下发给配置页')
+        self.assertEqual(len(payload['groups']), 25, '25 个顶层分组都要下发给配置页')
         qa = next(group for group in payload['groups'] if group['key'] == 'qq_access')
         fields = {field['key']: field for field in qa['fields']}
         self.assertEqual(fields['user_accounts']['value'], [])

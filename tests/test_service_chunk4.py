@@ -445,8 +445,13 @@ class TryDecideTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result[camel], result[snake])
 
     @unittest.skipUnless(CHUNK4_READY, 'Chunk4 未就绪')
-    async def test_invisible_reply_recovery_rewrites_once_then_raises(self) -> None:
-        """实况用户回合缺结构化可见回复：重写一次，仍缺失则抛错（上游 :3785）。"""
+    async def test_invisible_reply_recovery_rewrites_once_then_degrades(self) -> None:
+        """实况用户回合缺结构化可见回复：重写一次；仍缺失则**降级提交**（上游 1.0.1-rc24+）。
+
+        rc24/rc28 把原来的 `throw` 改成降级：剧本是好的，一个传输字段缺失不该让整个
+        回合失败并进 60 秒重试队列（弱模型下那是失败循环）。断言随之改成"两稿都试过、
+        剧本保留、没有可见回复、警告可见"。
+        """
         host = Chunk4Host()
         calls: list[bool] = []
 
@@ -458,13 +463,13 @@ class TryDecideTests(unittest.IsolatedAsyncioTestCase):
         host.decide = decide  # type: ignore[assignment]
         participant = {'id': PARTICIPANT_ID, 'storyId': STORY_ID, 'platform': 'test', 'status': 'active'}
         result = await host.try_decide(_story(), participant, 'user-message', FROM, NOW, '在？', [])
-        # 上游把重写守卫的 throw 放在自己的 try 里，因此对外表现为一次失败的回合。
-        self.assertFalse(result['succeeded'])
+        self.assertTrue(result['succeeded'])
+        self.assertEqual(result['decision'].get('script'), '她在窗边。')
+        self.assertIsNone(result['decision'].get('interaction'))
         self.assertEqual(calls, [False, True])
-        self.assertTrue(
-            any('visible-reply structure' in str(item) or '结构化可见回复缺失' in str(item) for item in host.reports),
-            host.reports,
-        )
+        # `report_operation` 落在 `operations`（`report` 才是 `reports`），两个 sink 都扫。
+        seen = [str(item) for item in (list(host.operations) + list(host.reports))]
+        self.assertTrue(any('结构化回复两稿均缺失' in item for item in seen), seen)
 
     @unittest.skipUnless(CHUNK4_READY, 'Chunk4 未就绪')
     async def test_script_less_model_turn_is_a_provider_failure(self) -> None:
@@ -1526,8 +1531,10 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service.try_decide(
             story, participant, 'user-message', FROM, NOW, '晚安', [],
         )
-        # 重写还是不合格 → 整回合失败（上游语义），但**原因**必须留在默认可见的日志里。
-        self.assertFalse(result['succeeded'])
+        # 重写还是不合格 → 降级为无可见回复提交（上游 1.0.1-rc24+），但**原因**必须留在
+        # 默认可见的日志里：草稿被抛弃这件事本身照旧要可见（AGENTS.md 坑 25）。
+        self.assertTrue(result['succeeded'])
+        self.assertIsNone(result['decision'].get('interaction'))
         reasons = [text for level, text in self.sink.records if level == 'warn']
         diagnostics = [text for text in reasons if '被抛弃草稿的结构化回复字段' in text]
         self.assertEqual(len(diagnostics), 1, reasons)

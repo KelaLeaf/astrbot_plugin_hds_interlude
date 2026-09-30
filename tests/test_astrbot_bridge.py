@@ -1226,10 +1226,10 @@ class CommandTableTests(unittest.TestCase):
                 self.assertEqual(getattr(handler, '__astrbot_command__', None), spec.command)
 
     def test_command_count_matches_upstream_index(self):
-        # 上游 `registerCommands` 注册 32 条命令（`upstream/command.md` 的指令总览表）。
+        # 上游 `registerCommands` 注册 38 条命令（32 条原有 + rc28 的 6 条端点/别名/重置）。
         # 配置导出/导入**不占命令**——它是 WebUI 插件页面（`pages/config-backup/`）。
-        self.assertEqual(len(main_module.COMMANDS), 32)
-        self.assertEqual(len(set(main_module.COMMAND_HANDLERS)), 32)
+        self.assertEqual(len(main_module.COMMANDS), 38)
+        self.assertEqual(len(set(main_module.COMMAND_HANDLERS)), 38)
 
     def test_permissions_match_upstream_roles(self):
         admin = {spec.command for spec in main_module.COMMANDS if spec.permission == 'admin'}
@@ -1386,9 +1386,10 @@ class BlindModeTests(unittest.TestCase):
         plugin, registry = self._plugin(False)
         self.assertFalse(plugin.blind_mode)
         self.assertEqual(plugin.suppressed_commands, ())
-        self.assertEqual(len(plugin.active_commands()), 32)
+        self.assertEqual(len(plugin.active_commands()), 38)
         self.assertEqual(
-            len(registry.get_handlers_by_module_name(main_module.HDSInterludePlugin.__module__)), 33,
+            # 32 条原有命令 + 6 条 rc28 端点/别名/重置 + 入站消息处理器。
+            len(registry.get_handlers_by_module_name(main_module.HDSInterludePlugin.__module__)), 39,
         )
 
 
@@ -1951,7 +1952,7 @@ class ConfigPageRegistrationTests(unittest.TestCase):
         for name in commands:
             self.assertNotIn('config_export', name)
             self.assertNotIn('config_import', name)
-        self.assertEqual(len(main_module.COMMANDS), 32, '上游 32 条命令不应被配置功能污染')
+        self.assertEqual(len(main_module.COMMANDS), 38, '上游 38 条命令不应被配置功能污染')
 
     def test_every_route_is_registered_under_the_plugin_prefix(self):
         context = FakeContext()

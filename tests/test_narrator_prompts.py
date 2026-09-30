@@ -27,11 +27,37 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from plugin.core.narrator_prompts import (
+    compact_prompt_entries,
     prompt_visible_message_content,
     recent_script_ownership,
     story_state_for_prompt,
     system_prompt,
     to_prompt_payload,
+)
+from plugin.core.specialization import (
+    ADMIN_NOTES_FULL,
+    CHANNEL_CONTEXT_FULL,
+    CHANNEL_CONTEXT_LITE,
+    CHANNELS_FULL,
+    CHANNELS_LITE,
+    CONTENT_ONLY_TRANSPORT,
+    EXTRA_CLAUDE,
+    EXTRA_DEEPSEEK,
+    EXTRA_GEMINI_FLASH,
+    LENGTH_CLAUDE,
+    LENGTH_DEEPSEEK,
+    LENGTH_GEMINI_FLASH,
+    LITE_ADMIN_NOTES,
+    LITE_WORLD_EVENTS,
+    LIVED_LENGTH_PROMPT,
+    LIVED_WRITING_PROMPT,
+    MULTI_PLATFORM_TRANSPORT_SELECTION,
+    REPETITION_GUARD_TAIL,
+    TYPED_MESSAGES_BASE,
+    TYPED_MESSAGES_GEMINI_FLASH,
+    TYPED_MESSAGES_KIMI,
+    WORLD_EVENTS_FULL,
+    lite_blocks,
 )
 from plugin.core.types import empty_story_setting, empty_story_state
 
@@ -46,6 +72,11 @@ def stringify(value: object) -> str:
 def system_prompt_6(phase: str, *extra: object) -> str:
     """上游测试反复使用的 `systemPrompt(phase, '', '', '', '', '', ...)` 形式。"""
     return system_prompt(phase, '', '', '', '', '', *extra)  # type: ignore[arg-type]
+
+
+def system_prompt_specialty(phase: str, specialty: dict | None, **kwargs: object) -> str:
+    """上游 `systemPrompt(...)` + 尾部关键字（特化档 / 多平台开关 / 写作选项）。"""
+    return system_prompt(phase, '', '', '', '', '', specialty=specialty, **kwargs)  # type: ignore[arg-type]
 
 
 def story() -> dict:
@@ -324,17 +355,18 @@ class NarrativePromptTests(unittest.TestCase):
         follow_up = system_prompt_6('conversation-follow-up', False, False)
         due = system_prompt_6('intent-due', False, False)
         self.assertRegex(user, r'CURRENT PHASE: USER MESSAGE')
-        self.assertRegex(user, r'SCRIPT-FIRST TRANSPORT MIRROR')
-        self.assertRegex(user, r'For this private turn, return interaction')
+        # rc16 起非流式的传输协议句是 0.1.x 的简洁形态（不再是 SCRIPT-FIRST 镜像）。
+        self.assertRegex(user, r'When interaction is permitted, its shape is')
+        self.assertRegex(user, r'For this private turn, interaction describes ONLY messages to the current private participant')
         self.assertNotRegex(user, r'return groupReply as')
         self.assertNotRegex(user, r'INDEPENDENT LIFE ADVANCE')
         self.assertRegex(advance, r'CURRENT PHASE: INDEPENDENT LIFE ADVANCE')
         self.assertRegex(advance, r'This independent-life phase has no current reply channel')
-        self.assertNotRegex(advance, r'For this private turn, return interaction')
+        self.assertNotRegex(advance, r'For this private turn, interaction describes ONLY')
         self.assertNotRegex(advance, r'interruptedOutgoingDrafts')
         self.assertRegex(follow_up, r'place its exact words at the sending action in script')
         self.assertRegex(due, r'CURRENT PHASE: DUE INTENT')
-        self.assertRegex(due, r'For this private turn, return interaction')
+        self.assertRegex(due, r'For this private turn, interaction describes ONLY messages to the current private participant')
 
     def test_private_interaction_protocol_is_neutral_about_reading_and_explicit_about_read_but_silent(self) -> None:
         user = system_prompt_6('user-message', False, False)
@@ -344,8 +376,11 @@ class NarrativePromptTests(unittest.TestCase):
         self.assertRegex(user, r'seen and reply are independent fields')
         # 已读不回是明确合法的普通状态。
         self.assertRegex(user, r'seen=true with reply\.mode=none is the ordinary read-but-does-not-answer state')
-        # 无 say 标记时允许 content 直传，堵住"只教 actionId"的静默丢弃悬崖。
-        self.assertRegex(user, r'supply reply\.content directly instead of an id')
+        # rc16 起 immediate 回复写成 content（不再教 actionId 引用）；剧本里写了发送就必须 immediate。
+        self.assertRegex(user, r'The content must be exactly the words the script shows her sending')
+        self.assertRegex(user, r'Whenever the script shows her actually sending words to the current private participant, reply\.mode must be immediate')
+        # 气泡边界：rc17 的负向规则（换行永远不分条）。
+        self.assertRegex(user, r'line breaks never separate bubbles')
         # 未读计数是客观到达记录，不是注意力或义务。
         self.assertRegex(user, r'unreadMessageCount is the registered count of arrived messages not yet marked read')
         # 跟进/到期回合：seen=false 不得再暗示回复必须为 none。
@@ -386,7 +421,11 @@ class NarrativePromptTests(unittest.TestCase):
         enabled = system_prompt_6('user-message', False, False, False, True)
         self.assertNotRegex(absent, r'INDIVIDUAL VALUES AND WAY OF SEEING THE WORLD')
         self.assertRegex(enabled, r'INDIVIDUAL VALUES AND WAY OF SEEING THE WORLD')
-        self.assertRegex(enabled, r'separate outer personality layer, distinct from the character canon')
+        # 上游 1.0.1-rc25：单条 `perspective` 是总述，`perspectives` 是一组**独立且同等权威**
+        # 的条目（可以互相冲突），overlay 在冲突处优先。
+        self.assertRegex(enabled, r'is a general statement')
+        self.assertRegex(enabled, r'array of independent, equally authoritative entries')
+        self.assertRegex(enabled, r'each stays its own lens and they may be in tension')
         self.assertRegex(enabled, r'not a story theme, moral review')
 
         state = {**empty_story_state(), 'setting_overlay': {'character_traits': [], 'perspective': '更愿意先理解人的处境。'}}
@@ -431,9 +470,13 @@ class PositiveNarrativePromptTests(unittest.TestCase):
 
     def test_live_writing_is_guided_by_event_density_instead_of_elapsed_time_length_quotas(self) -> None:
         prompt = system_prompt_6('user-message')
-        self.assertRegex(prompt, r'Length and detail follow what actually happens')
+        # rc16 起第 1 块是 LIVED_WRITING_PROMPT，第 2 块是长度块（LIVED_LENGTH_PROMPT）。
+        self.assertTrue(prompt.startswith(LIVED_WRITING_PROMPT))
+        self.assertRegex(prompt, r'Write this as a living stage script in prose')
+        self.assertRegex(prompt, r'Length follows what actually happens')
+        self.assertIn(LIVED_LENGTH_PROMPT, prompt)
+        self.assertRegex(prompt, r'a quiet interval has its own occupation, pace and texture')
         self.assertRegex(prompt, r'including during a rapid exchange')
-        self.assertRegex(prompt, r'quiet interval also has its own occupation')
         self.assertRegex(prompt, r'length of the sent words does not set the depth or length')
         self.assertRegex(prompt, r'When no prior original passage is available')
         self.assertNotRegex(prompt, r'may consist mainly of dialogue|interval can pass lightly')
@@ -442,7 +485,9 @@ class PositiveNarrativePromptTests(unittest.TestCase):
     def test_the_visible_reply_remains_an_event_inside_one_causal_script(self) -> None:
         prompt = system_prompt_6('user-message')
         self.assertRegex(prompt, r'next passage AFTER the last completed original')
-        self.assertRegex(prompt, r'write speech once, inside the living script')
+        # 上游 rc16 起非流式协议不再教 `<say id>` 标记（镜像只留在 opt-in 流式分支）。
+        self.assertNotRegex(prompt, r'say id=')
+        self.assertRegex(prompt, r'When interaction is permitted, its shape is')
         self.assertRegex(prompt, r'same causal passage')
 
     def test_continuity_evolves_positively_without_forced_novelty_templates(self) -> None:
@@ -463,13 +508,204 @@ class PositiveNarrativePromptTests(unittest.TestCase):
         private_turn = system_prompt_6('user-message')
         group_turn = system_prompt_6('user-message', False, False, False, False, False, None, False, None, False, False, False, True)
         advance = system_prompt_6('advance')
-        self.assertRegex(private_turn, r'For this private turn, return interaction')
+        self.assertRegex(private_turn, r'For this private turn, interaction describes ONLY messages to the current private participant')
         self.assertNotRegex(private_turn, r'return groupReply as')
         self.assertRegex(group_turn, r'return groupReply as')
-        self.assertNotRegex(group_turn, r'For this private turn, return interaction')
+        self.assertRegex(group_turn, r'the exact words posted to the group now')
+        self.assertNotRegex(group_turn, r'For this private turn, interaction describes ONLY')
         self.assertRegex(group_turn, r'actually posts to the group')
         self.assertNotRegex(group_turn, r'actually sends a private reply')
-        self.assertNotRegex(advance, r'For this private turn, return interaction')
+        self.assertNotRegex(advance, r'For this private turn, interaction describes ONLY')
+
+
+class AdminNoteBudgetTests(unittest.TestCase):
+    """上游 1.0.1-rc3/rc4：管理员注记有语义权重，且在预算里**有上限地**受保护。"""
+
+    @staticmethod
+    def _entry(entry_id: int, kind: str, content: str, at: str = '2026-09-28T10:00:00+00:00') -> dict:
+        return {'id': entry_id, 'kind': kind, 'content': content, 'occurredAt': at}
+
+    def test_admin_notes_carry_explicit_semantic_weight_in_the_prompt(self):
+        prompt = system_prompt_6('user-message')
+        self.assertIn('entries whose content begins with [管理员注记] are authoritative', prompt)
+        self.assertIn('carry more weight than ordinary system events', prompt)
+        self.assertIn('she follows them without needing to see or reference the note itself', prompt)
+
+    def test_a_huge_admin_note_is_truncated_within_budget_instead_of_pushing_out_the_script(self):
+        entries = [
+            self._entry(1, 'script', 'A' * 400),
+            self._entry(2, 'admin-note', '[管理员注记] ' + 'B' * 9_000),
+            self._entry(3, 'script', 'C' * 400),
+            self._entry(4, 'admin-note', '短注记'),
+        ]
+        out = compact_prompt_entries(entries, 12_000)
+        by_id = {entry['id']: entry for entry in out}
+        # 注记被保留但截断到保护额度内（3 条 × 2000 字、总量 ≤ 预算的 50%）。
+        self.assertTrue(by_id[2]['content'].startswith('[管理员注记]'))
+        self.assertLessEqual(len(by_id[2]['content']), 2_100)
+        self.assertIn('注记截断', by_id[2]['content'])
+        # 原始剧本仍然在窗口里（"保护"没有退化成"抢占"）。
+        self.assertIn(3, by_id)
+        # 超长注记只出现一次，不会既按保护额、又按普通条目重复投放。
+        self.assertEqual(len([entry for entry in out if entry['id'] == 2]), 1)
+
+    def test_short_admin_notes_are_protected_verbatim(self):
+        entries = [self._entry(1, 'admin-note', '把称呼改成小凌')]
+        out = compact_prompt_entries(entries, 1_000)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['content'], '把称呼改成小凌')
+
+
+class ModelSpecialtyPromptTests(unittest.TestCase):
+    """模型特化档在组装层的表现（上游 `upstream/test/specialization.test.ts` 的提示词断言）。"""
+
+    def test_typed_messages_block_appears_exactly_once_per_phase(self) -> None:
+        """打字块在私聊 / 推进 / 群聊三相位都恰好一块。"""
+        private = system_prompt_6('user-message')
+        advance = system_prompt_6('advance')
+        group = system_prompt_6('user-message', False, False, False, False, False, None, False, None, False, False, False, True)
+        for name, prompt in (('private', private), ('advance', advance), ('group', group)):
+            with self.subTest(phase=name):
+                self.assertEqual(prompt.count('WRITING BELIEVABLE TYPED MESSAGES:'), 1)
+                self.assertIn(TYPED_MESSAGES_BASE, prompt)
+
+    def test_family_offsets_replace_the_length_and_typed_blocks(self) -> None:
+        claude = system_prompt_specialty('user-message', {'tier': 'full', 'family': 'claude'})
+        self.assertIn(LENGTH_CLAUDE, claude)
+        self.assertIn(EXTRA_CLAUDE, claude)          # extraAfterPhase
+        self.assertNotIn(LIVED_LENGTH_PROMPT, claude)
+
+        flash = system_prompt_specialty('user-message', {'tier': 'full', 'family': 'gemini-flash'})
+        self.assertIn(LENGTH_GEMINI_FLASH, flash)    # length 块
+        self.assertIn(TYPED_MESSAGES_GEMINI_FLASH, flash)   # typed 块
+        self.assertIn(EXTRA_GEMINI_FLASH, flash)     # extraAfterLength（紧跟在长度块之后）
+        self.assertLess(flash.index(LENGTH_GEMINI_FLASH), flash.index(EXTRA_GEMINI_FLASH))
+        self.assertLess(flash.index(EXTRA_GEMINI_FLASH), flash.index(TYPED_MESSAGES_GEMINI_FLASH))
+        self.assertNotIn(LIVED_LENGTH_PROMPT, flash)
+        self.assertNotIn(TYPED_MESSAGES_BASE, flash)
+
+        kimi = system_prompt_specialty('user-message', {'tier': 'full', 'family': 'kimi'})
+        self.assertIn(TYPED_MESSAGES_KIMI, kimi)
+
+        deepseek = system_prompt_specialty('user-message', {'tier': 'full', 'family': 'deepseek'})
+        self.assertIn(LENGTH_DEEPSEEK, deepseek)
+
+    def test_standard_and_full_tiers_pick_their_transport_contract(self) -> None:
+        standard = system_prompt_specialty('user-message', {'tier': 'standard', 'family': 'generic'})
+        self.assertIn(CONTENT_ONLY_TRANSPORT, standard)
+        self.assertNotIn('say id=', standard)
+        self.assertNotIn('When interaction is permitted', standard)
+
+        full = system_prompt_specialty('user-message', {'tier': 'full', 'family': 'generic'})
+        self.assertNotIn(CONTENT_ONLY_TRANSPORT, full)
+        self.assertIn('When interaction is permitted, its shape is', full)
+        # rc16 起 full 档的非流式协议也不再教 `<say id>` 标记：上游
+        # `positive-narrative-prompt.test.ts` 与 `narrative-prompts.test.ts` 都断言
+        # 默认（full）提示词 `doesNotMatch(/say id=/)`。
+        self.assertNotIn('say id=', full)
+
+        lite = system_prompt_specialty('user-message', {'tier': 'lite', 'family': 'generic'})
+        self.assertNotIn('EVIDENCE AND EXPECTATION', lite)
+        self.assertNotIn('CROSS-CHANNEL DELIVERY', lite)
+        self.assertNotIn('SCRIPT-FIRST TRANSPORT MIRROR', lite)
+        self.assertNotIn('say id=', lite)
+        self.assertIn(CONTENT_ONLY_TRANSPORT, lite)
+        self.assertEqual(list(lite_blocks('user-message', False))[:3],
+                         [LIVED_WRITING_PROMPT, LIVED_LENGTH_PROMPT, TYPED_MESSAGES_BASE])
+
+    def test_deepseek_transport_line_is_family_scoped_and_crosses_tiers(self) -> None:
+        deepseek = system_prompt_specialty('user-message', {'tier': 'standard', 'family': 'deepseek'})
+        self.assertIn('TRANSPORT IS PER-TURN', deepseek)
+        self.assertIn(CONTENT_ONLY_TRANSPORT, deepseek)
+        self.assertIn(EXTRA_DEEPSEEK, deepseek)
+
+        glm = system_prompt_specialty('user-message', {'tier': 'standard', 'family': 'glm'})
+        self.assertNotIn('TRANSPORT IS PER-TURN', glm)
+        self.assertIn(CONTENT_ONLY_TRANSPORT, glm)
+
+        generic = system_prompt_specialty('user-message', {'tier': 'standard', 'family': 'generic'})
+        self.assertNotIn('TRANSPORT IS PER-TURN', generic)
+
+        lite = system_prompt_specialty('user-message', {'tier': 'lite', 'family': 'deepseek'})
+        self.assertIn('TRANSPORT IS PER-TURN', lite)
+        self.assertIn(CONTENT_ONLY_TRANSPORT, lite)
+
+    def test_full_tier_carries_the_standing_blocks_and_lite_does_not(self) -> None:
+        full = system_prompt_specialty('user-message', {'tier': 'full', 'family': 'generic'})
+        for block in (ADMIN_NOTES_FULL, WORLD_EVENTS_FULL, CHANNELS_FULL, CHANNEL_CONTEXT_FULL):
+            with self.subTest(block=block[:24]):
+                self.assertIn(block, full)
+        # 常设块排在写作能力段之后。
+        self.assertGreater(full.index(ADMIN_NOTES_FULL), full.index('Browsing uses deferred work'))
+        self.assertGreater(full.index(WORLD_EVENTS_FULL), full.index(ADMIN_NOTES_FULL))
+        self.assertGreater(full.index(CHANNELS_FULL), full.index(WORLD_EVENTS_FULL))
+        self.assertGreater(full.index(CHANNEL_CONTEXT_FULL), full.index(CHANNELS_FULL))
+
+        lite = system_prompt_specialty('user-message', {'tier': 'lite', 'family': 'generic'})
+        for block in (ADMIN_NOTES_FULL, WORLD_EVENTS_FULL, CHANNELS_FULL, CHANNEL_CONTEXT_FULL):
+            with self.subTest(lite_block=block[:24]):
+                self.assertNotIn(block, lite)
+        # lite 用精简版的 CHANNELS / CHANNEL CONTEXT 与 ADMIN NOTES / WORLD EVENTS。
+        self.assertIn(CHANNELS_LITE, lite)
+        self.assertIn(CHANNEL_CONTEXT_LITE, lite)
+        self.assertIn(LITE_ADMIN_NOTES, lite)
+        self.assertIn(LITE_WORLD_EVENTS, lite)
+
+    def test_streaming_branch_keeps_the_script_first_mirror(self) -> None:
+        """流式分支保持原样（上游只在 opt-in 流式路径保留镜像）。"""
+        streamed = system_prompt_6('user-message', False, False, False, False, False, None, False, None, False, True)
+        self.assertRegex(streamed, r'SCRIPT-FIRST TRANSPORT MIRROR')
+        self.assertRegex(streamed, r'supply reply\.content directly instead of an id')
+        self.assertNotIn(CONTENT_ONLY_TRANSPORT, streamed)
+        # standard 档 + 流式仍走镜像函数（上游 `tier === 'standard' && !streamingReplyFirst`）。
+        standard_streamed = system_prompt_specialty(
+            'user-message', {'tier': 'standard', 'family': 'generic'}, streaming_reply_first=True)
+        self.assertRegex(standard_streamed, r'SCRIPT-FIRST TRANSPORT MIRROR')
+        self.assertNotIn(CONTENT_ONLY_TRANSPORT, standard_streamed)
+
+    def test_repetition_guard_renders_only_a_detected_fixed_bubble_run(self) -> None:
+        hit = system_prompt_specialty(
+            'user-message', None, writing_options={'messageRepetition': {'bubbles': 2, 'consecutive': 3}})
+        self.assertIn('REPETITION GUARD', hit)
+        self.assertIn('exactly 2 separate chat bubbles', hit)
+        self.assertIn('each of her last 3', hit)
+        guard = hit[hit.index('REPETITION GUARD'):]
+        self.assertTrue(guard.startswith('REPETITION GUARD (host observation about the recent script):'))
+        self.assertIn(REPETITION_GUARD_TAIL, guard)
+        # 渲染在写作能力段尾部（气泡段与 browser 段之后）。
+        self.assertGreater(hit.index('REPETITION GUARD'), hit.index('Browsing uses deferred work'))
+
+        single = system_prompt_specialty(
+            'user-message', None, writing_options={'messageRepetition': {'bubbles': 1, 'consecutive': 3}})
+        self.assertNotIn('REPETITION GUARD', single)
+
+        absent = system_prompt_specialty('user-message', None, writing_options={})
+        self.assertNotIn('REPETITION GUARD', absent)
+
+    def test_multi_platform_transport_selection_follows_the_host_flag(self) -> None:
+        off = system_prompt_specialty('user-message', None)
+        self.assertNotIn('MULTI-PLATFORM TRANSPORT SELECTION', off)
+        self.assertNotIn(MULTI_PLATFORM_TRANSPORT_SELECTION, off)
+
+        on = system_prompt_specialty('user-message', None, channel_selection_enabled=True)
+        self.assertIn(MULTI_PLATFORM_TRANSPORT_SELECTION, on)
+
+        lite_on = system_prompt_specialty(
+            'user-message', {'tier': 'lite', 'family': 'generic'}, channel_selection_enabled=True)
+        self.assertIn(MULTI_PLATFORM_TRANSPORT_SELECTION, lite_on)
+
+    def test_no_specialty_is_byte_identical_to_full_generic(self) -> None:
+        for phase in ('user-message', 'advance', 'conversation-follow-up', 'intent-due'):
+            with self.subTest(phase=phase):
+                self.assertEqual(
+                    system_prompt_6(phase),
+                    system_prompt_specialty(phase, {'tier': 'full', 'family': 'generic'}),
+                )
+        self.assertEqual(
+            system_prompt_specialty('user-message', None, channel_selection_enabled=True),
+            system_prompt_specialty('user-message', {'tier': 'full', 'family': 'generic'},
+                                    channel_selection_enabled=True),
+        )
 
 
 if __name__ == '__main__':

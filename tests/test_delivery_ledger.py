@@ -278,6 +278,54 @@ class DeliveryLedgerTest(unittest.TestCase):
         self.assertEqual(segment['status'], 'delivered')
         self.assertIsNone(segment.get('reason'))
 
+    def test_cancelled_is_terminal_and_late_bookkeeping_cannot_revive_it(self) -> None:
+        """上游 1.0.1-rc25：`cancelled` 与 `delivered` 同为终态。
+
+        已撤销的行动如果被迟到的回执复活，用户看到的是"撤了又发"。这条钉住不可逆。
+        """
+        value = _commit()
+        event = _outgoing_event(value)
+        reference = delivery_reference(event, 42, 0)
+        cancelled = update_script_delivery_actions(
+            create_script_delivery_actions(value), reference, 'cancelled', _utc_now(),
+            'delivery-target-unavailable',
+        )
+        self.assertIsNotNone(cancelled)
+        segment = next(item for item in cancelled
+                       if item['event_id'] == event['event_id'])['segments'][0]
+        self.assertEqual(segment['status'], 'cancelled')
+        self.assertEqual(segment['reason'], 'delivery-target-unavailable')
+        # 迟到记账：pending 与 delivered 都不得改写它（返回 None = 调用方跳过写库）。
+        for status in ('pending', 'delivered'):
+            with self.subTest(status=status):
+                self.assertIsNone(
+                    update_script_delivery_actions(cancelled, reference, status, _utc_now()),
+                )
+
+    def test_returning_to_pending_for_a_retry_clears_the_previous_completion_timestamp(self) -> None:
+        """上游 1.0.1-rc25：`failed → pending` 是重试，上一轮的 `completedAt` 必须清掉。
+
+        留着它，`deliveryReality` 会把一次失败读成"曾经完成"。
+        """
+        value = _commit()
+        event = _outgoing_event(value)
+        reference = delivery_reference(event, 42, 0)
+        failed = update_script_delivery_actions(
+            create_script_delivery_actions(value), reference, 'failed',
+            _dt('2026-09-05T10:02:00.000Z'), 'temporary network failure',
+        )
+        segment = next(item for item in failed
+                       if item['event_id'] == event['event_id'])['segments'][0]
+        self.assertIsNotNone(segment.get('completed_at'))
+        retried = update_script_delivery_actions(
+            failed, reference, 'pending', _dt('2026-09-05T10:03:00.000Z'), 'scheduled again',
+        )
+        segment = next(item for item in retried
+                       if item['event_id'] == event['event_id'])['segments'][0]
+        self.assertEqual(segment['status'], 'pending')
+        self.assertIsNone(segment.get('completed_at'))
+        self.assertEqual(segment['reason'], 'scheduled again')
+
     def test_m6_persistence_changes_metadata_only_and_delivery_preserves_exact_bubble_text_and_source_row(self) -> None:
         value = _commit()
         interaction = ({'seen': True, 'reply': {'mode': 'immediate', 'content': REPLY_CONTENT}}

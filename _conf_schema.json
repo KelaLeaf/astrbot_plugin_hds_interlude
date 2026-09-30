@@ -30,12 +30,18 @@
       },
       "perspective": {
         "type": "text",
-        "description": "主角视角",
+        "description": "主角视角（单条总述）",
         "default": "",
         "condition": {
           "persona_id": ""
         },
         "hint": "独立于 Canon 的价值观外壳，长期剧情可形成 perspective overlay"
+      },
+      "perspectives": {
+        "type": "list",
+        "description": "主角多条独立视角",
+        "default": [],
+        "hint": "每条一段，进入提示词时保持独立条目不合并；与「主角视角」并存且同等权威，可以互相矛盾"
       },
       "user_profile": {
         "type": "text",
@@ -77,6 +83,12 @@
         "description": "其它设定补充",
         "default": "",
         "hint": "额外的人格 / 世界观自由文本，主叙事时注入"
+      },
+      "supplementary_facts": {
+        "type": "list",
+        "description": "补充事实",
+        "default": [],
+        "hint": "界限不明显的世界/人物/关系复杂事实，每条一段；新建剧本时作为初始长期事实写入"
       },
       "timezone": {
         "type": "string",
@@ -216,8 +228,25 @@
           },
           "endpoint": {
             "type": "string",
-            "description": "Chat Completions 完整地址",
-            "default": ""
+            "description": "完整地址（Chat Completions）",
+            "default": "",
+            "hint": "如 https://host/v1/chat/completions；Anthropic Messages 协议本移植版暂未实现"
+          },
+          "protocol": {
+            "type": "string",
+            "description": "自定义连接协议",
+            "default": "chat-completions",
+            "options": [
+              "chat-completions",
+              "anthropic-messages"
+            ],
+            "hint": "上游 1.0.1-rc28 新增；本移植版只支持 Chat Completions，设成 Anthropic Messages 会记一条 warn 并按不可用处理"
+          },
+          "anthropic_cache": {
+            "type": "bool",
+            "description": "Anthropic 缓存标记",
+            "default": false,
+            "hint": "上游 1.0.1-rc28 新增；本移植版暂未实现"
           },
           "api_key": {
             "type": "string",
@@ -348,6 +377,11 @@
             "description": "用于侧端识图",
             "default": false
           },
+          "use_for_world_seeding": {
+            "type": "bool",
+            "description": "用于世界播种",
+            "default": false
+          },
           "price_input": {
             "type": "float",
             "description": "输入单价 / 百万 token",
@@ -466,12 +500,42 @@
       "main_payload_order": {
         "type": "string",
         "description": "请求字段顺序",
-        "default": "legacy",
+        "default": "cache-first",
         "options": [
           "legacy",
           "cache-first"
         ],
         "hint": "支持前缀缓存的接口可选 cache-first"
+      },
+      "specialization": {
+        "type": "string",
+        "description": "模型特化档位",
+        "default": "off",
+        "options": [
+          "off",
+          "lite",
+          "standard",
+          "full"
+        ],
+        "hint": "按模型能力裁剪合约块：flash 级选 lite，Gemini/GLM/Kimi/DeepSeek 选 standard，Claude/GPT 选 full；关闭时与历史行为一致"
+      },
+      "specialization_family": {
+        "type": "string",
+        "description": "特化家族",
+        "default": "auto",
+        "options": [
+          "auto",
+          "gemini-flash",
+          "gemini",
+          "claude",
+          "gpt",
+          "glm",
+          "kimi",
+          "deepseek",
+          "grok",
+          "generic"
+        ],
+        "hint": "auto 按模型名识别；中转别名认不出来时在这里显式指定"
       },
       "failover": {
         "type": "object",
@@ -805,9 +869,68 @@
             "description": "群发言冷却秒",
             "default": 60
           },
+          "willingness_preset": {
+            "type": "string",
+            "description": "群聊发言意愿档位",
+            "default": "off",
+            "options": [
+              "off",
+              "quiet",
+              "reserved",
+              "normal",
+              "active",
+              "eager",
+              "auto",
+              "custom"
+            ],
+            "hint": "关＝只按响应模式与冷却；档位＝按普通消息条数给概率；自动＝按她的生活状态切换；自定义＝用下方旧数值门"
+          },
+          "willingness_auto": {
+            "type": "object",
+            "description": "自动档的三态映射",
+            "items": {
+              "busy": {
+                "type": "string",
+                "description": "忙碌时档位",
+                "default": "quiet",
+                "options": [
+                  "quiet",
+                  "reserved",
+                  "normal",
+                  "active",
+                  "eager"
+                ]
+              },
+              "idle": {
+                "type": "string",
+                "description": "空闲时档位",
+                "default": "active",
+                "options": [
+                  "quiet",
+                  "reserved",
+                  "normal",
+                  "active",
+                  "eager"
+                ]
+              },
+              "asleep": {
+                "type": "string",
+                "description": "睡眠时档位",
+                "default": "quiet",
+                "options": [
+                  "quiet",
+                  "reserved",
+                  "normal",
+                  "active",
+                  "eager"
+                ],
+                "hint": "睡眠态额外有概率 ×0.2 与 @ 阻断"
+              }
+            }
+          },
           "willingness": {
             "type": "object",
-            "description": "该群的本地意愿门",
+            "description": "自定义数值门",
             "items": {
               "enabled": {
                 "type": "bool",
@@ -864,7 +987,8 @@
                   "type": "string"
                 }
               }
-            }
+            },
+            "hint": "仅「群聊发言意愿档位＝自定义」时生效"
           }
         },
         "default": [],
@@ -1028,12 +1152,12 @@
       "context_entry_limit": {
         "type": "int",
         "description": "近期原始记录最低条数",
-        "default": 50
+        "default": 35
       },
       "context_time_window_minutes": {
         "type": "int",
         "description": "额外保留时间窗分钟",
-        "default": 60,
+        "default": 45,
         "hint": "0 关闭"
       },
       "memory_limit": {
@@ -1356,12 +1480,46 @@
         "type": "int",
         "description": "普通主动联系安全间隔分钟",
         "default": 60,
-        "hint": "承诺型联系可绕过"
+        "hint": "承诺型联系可绕过；自然/平衡模式下取本项与「自然模式间隔」的较小值"
       },
       "max_candidate_hours": {
         "type": "int",
         "description": "联系候选保留小时",
         "default": 24
+      },
+      "contact_mode": {
+        "type": "string",
+        "description": "主动联系温度",
+        "default": "strict",
+        "options": [
+          "strict",
+          "natural",
+          "balanced"
+        ],
+        "hint": "严格＝沉默本身不是理由；自然＝想念、好奇近况、想分享此刻也是合法动机；平衡＝同自然但要求节制"
+      },
+      "natural_willingness_threshold": {
+        "type": "float",
+        "description": "自然模式意愿阈值",
+        "default": 0.25,
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.05
+        },
+        "hint": "仅自然/平衡模式；严格模式沿用 Urge 阈值"
+      },
+      "natural_minimum_interval_minutes": {
+        "type": "int",
+        "description": "自然模式安全间隔（分钟）",
+        "default": 30,
+        "hint": "仅当小于「主动联系安全间隔」时生效"
+      },
+      "proactive_daily_cap": {
+        "type": "int",
+        "description": "每日主动联系上限",
+        "default": 3,
+        "hint": "按参与者每 24 小时计；0 = 不限"
       }
     }
   },
@@ -1984,6 +2142,127 @@
         "default": false
       }
     }
+  },
+  "world_seeder": {
+    "type": "object",
+    "title": "世界播种器",
+    "description": "【扩展 15】世界播种器：后台低频生成与她有关的外部事件，到点以 [世界事件] 条目进入剧本。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用世界播种器",
+        "default": false,
+        "hint": "模型在「模型中心」的连接行勾选「用于世界播种」；没有勾选任何连接时本开关无效"
+      },
+      "cadence_minutes": {
+        "type": "int",
+        "description": "生成检查间隔（分钟）",
+        "default": 45,
+        "hint": "含随机抖动，多数检查输出空"
+      },
+      "max_pending": {
+        "type": "int",
+        "description": "未注入事件上限",
+        "default": 4
+      },
+      "daily_cap": {
+        "type": "int",
+        "description": "每 24 小时注入上限",
+        "default": 4,
+        "hint": "推荐 1~4"
+      },
+      "max_horizon_hours": {
+        "type": "int",
+        "description": "事件最远发生时限（小时）",
+        "default": 72
+      },
+      "temperature": {
+        "type": "float",
+        "description": "生成温度",
+        "default": 0.9,
+        "slider": {
+          "min": 0,
+          "max": 2,
+          "step": 0.1
+        }
+      },
+      "max_tokens": {
+        "type": "int",
+        "description": "单次输出预算（tokens）",
+        "default": 1000
+      },
+      "timeout": {
+        "type": "int",
+        "description": "请求超时（毫秒）",
+        "default": 60000
+      }
+    }
+  },
+  "qzone_compat": {
+    "type": "object",
+    "title": "QQ 空间（未移植）",
+    "description": "【扩展 16】上游 1.0.1-rc28 的 QQ 空间通道；本移植版暂未实现（P3），仅保留键位。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用 QQ 空间通道",
+        "default": false
+      },
+      "daily_post_cap": {
+        "type": "int",
+        "description": "每日发帖上限",
+        "default": 3
+      },
+      "daily_comment_cap": {
+        "type": "int",
+        "description": "每日评论上限",
+        "default": 6
+      },
+      "daily_like_cap": {
+        "type": "int",
+        "description": "每日点赞上限",
+        "default": 12
+      },
+      "min_interval_minutes": {
+        "type": "int",
+        "description": "动作最小间隔（分钟）",
+        "default": 90
+      },
+      "feed_window_minutes": {
+        "type": "int",
+        "description": "好友动态时间窗（分钟）",
+        "default": 120
+      }
+    },
+    "invisible": true
+  },
+  "forward_message_compat": {
+    "type": "object",
+    "title": "合并转发读取（未移植）",
+    "description": "上游 1.0.1-rc28 的合并转发正文读取；本移植版暂未实现（P3），仅保留键位。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "读取合并转发正文",
+        "default": true
+      },
+      "max_nodes": {
+        "type": "int",
+        "description": "最多节点数",
+        "default": 30
+      },
+      "max_characters": {
+        "type": "int",
+        "description": "最大注入字符数",
+        "default": 8000
+      },
+      "max_depth": {
+        "type": "int",
+        "description": "最多展开层数",
+        "default": 3
+      }
+    },
+    "invisible": true
   },
   "blind_mode": {
     "type": "object",

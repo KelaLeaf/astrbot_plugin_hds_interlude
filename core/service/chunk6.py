@@ -894,11 +894,17 @@ class ServiceChunk6(ServiceBase):
         session: Any = None,
         should_cancel: Optional[Callable[[Any], bool]] = None,
         record_failures: bool = True,
+        request_started_at: Optional[datetime] = None,
     ) -> list[dict[str, Any]]:
         """上游 `sendOutgoingMessages(...)`（`:5107`）逐条移植。
 
         立即回复可以复用入站 `session`；跨账号与定时消息则通过**目标参与者自己的**
         通道投递。这条边界保证共享剧本不会把每条回复都发回恰好触发本回合的那个账号。
+
+        `request_started_at`（上游 1.0.1-rc21）：叙事请求**发起**的时刻。模型返回得比
+        「她打字该花的时间」快时，首条消息补足等待再发；已经超过就立刻发。只对当前
+        对话参与者的**首条**生效，整批至多一次；拆条后续分段、定时意图、跨参与者/跨群
+        与推进回合都有各自的时间语义，不接管。
         """
         delivered: list[dict[str, Any]] = []
         if not messages:
@@ -916,6 +922,7 @@ class ServiceChunk6(ServiceBase):
         for participant in participants:
             if participant:
                 by_id[pick(participant, 'id')] = participant
+        typing_floor_applied = False
         for message in messages:
             message_participant_id = pick(message, 'participantId', 'participant_id')
             target = by_id.get(message_participant_id)
@@ -940,6 +947,20 @@ class ServiceChunk6(ServiceBase):
                         story, target_id, message, 'participant-not-allowed',
                     )
                 continue
+            if (request_started_at is not None and current is not None
+                    and message_participant_id == pick(current, 'id') and not typing_floor_applied):
+                # 上游 1.0.1-rc21：首条发言的打字时间下限。基准是叙事请求发起时刻，
+                # 目标延迟沿用与分段相同的 `typing_delay_milliseconds`。
+                typing_floor_applied = True
+                hold = self.first_message_typing_hold_ms(
+                    pick(message, 'content') or '', request_started_at,
+                )
+                if hold > 0:
+                    self.report_operation(
+                        'diagnostic', 'debug', story, 'user-message',
+                        '首条消息按打字时间补足等待 参与者=%s 等待=%dms', target_id, hold,
+                    )
+                    await asyncio.sleep(hold / 1000)
             if should_cancel is not None and should_cancel(target):
                 self.report_operation(
                     'standard', 'info', story, 'user-message',
@@ -983,8 +1004,12 @@ class ServiceChunk6(ServiceBase):
                         # 上游把正文换成 `h('quote', {id}) + '\u200b'`；`send_session`
                         # 协议没有 reply_to，照原样发就只剩零宽占位，故这条降级路径
                         # 改走按参与者投递，把引用目标显式交给适配器（见模块文档串第 3 条）。
+                        # 上游 M1a：出站地址以端点注册表为准（无注册表时原样）。
+                        # `getattr` 兜底：极简测试桩不必实现端点层。
+                        sync = getattr(self, 'delivery_address_for', None)
                         result = await self.transport.send_private(
-                            target, _QUOTE_PLACEHOLDER, literal_quote_message_id,
+                            sync(story, target) if callable(sync) else target,
+                            _QUOTE_PLACEHOLDER, literal_quote_message_id,
                         )
                     else:
                         result = await self.transport.send_session(session, outgoing_content)
@@ -1029,9 +1054,21 @@ class ServiceChunk6(ServiceBase):
                     # 找到了 Koishi 式 bot 对象，但本移植版的出站协议只有 Transport：
                     # 记一次明确失败，绝不静默丢消息（见模块文档串第 2 条）。
                     raise RuntimeError('transport-unavailable')
+                sync = getattr(self, 'delivery_address_for', None)
+                delivery_target = sync(story, target) if callable(sync) else target
                 result = await self.transport.send_private(
-                    target, outgoing_content, literal_quote_message_id,
+                    delivery_target, outgoing_content, literal_quote_message_id,
                 )
+                # 出站结果回写端点状态（deliverable 维）：失败进 5 分钟冷却。
+                note_outbound = getattr(self, 'note_endpoint_outbound', None)
+                if callable(note_outbound):
+                    failure = _transport_failure(result)
+                    note_outbound(
+                        'participant-user', pick(target, 'id'), failure is None,
+                        failure or 'delivered',
+                        {'platform': pick(delivery_target, 'platform'),
+                         'selfId': pick(delivery_target, 'selfId', 'self_id')},
+                    )
                 error = _transport_failure(result)
                 if error is not None:
                     raise RuntimeError(error)
@@ -1476,6 +1513,18 @@ class ServiceChunk6(ServiceBase):
         factor = 1 + (random.random() * 2 - 1) * jitter if jitter else 1
         return int(max(250, min(maximum_seconds * _SECOND_MS,
                                 _js_round(nominal * factor * _SECOND_MS))))
+
+    def first_message_typing_hold_ms(self, content: str, request_started_at: datetime) -> int:
+        """上游 1.0.1-rc21 `firstMessageTypingHoldMs(content, requestStartedAt)`。
+
+        `hold = max(0, 打字目标时长 - 从请求发起到现在的耗时)`：模型快于目标就补足差额，
+        已经超过就立即发。`elapsed` 以 0 为下限——起点时间戳异常（时钟回拨）不会反向
+        放大等待，也不会给出负数。
+        """
+        floor_ms = self.typing_delay_milliseconds(content)
+        started = dt_ms(request_started_at) if request_started_at is not None else 0.0
+        elapsed = max(0.0, dt_ms(_now_of(self)) - started)
+        return int(max(0.0, floor_ms - elapsed))
 
     # ------------------------------------------------------------------ #
     # findBotForParticipant（上游 :5389）

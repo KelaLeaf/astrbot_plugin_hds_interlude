@@ -531,8 +531,13 @@ class _FlushHost(FakeService):
     def can_handle_participant(self, participant: Any) -> bool:
         return True
 
-    async def send_outgoing_messages(self, story: Any, messages: Any, participant: Any, session: Any) -> list[Any]:
+    async def send_outgoing_messages(
+        self, story: Any, messages: Any, participant: Any, session: Any,
+        should_cancel: Any = None, record_failures: bool = True, request_started_at: Any = None,
+    ) -> list[Any]:
         self.calls['send_outgoing_messages'] = (messages, participant, session)
+        # 上游 1.0.1-rc21：叙事请求发起时刻必须传到投递侧（首条打字时间下限的基准）。
+        self.calls['request_started_at'] = request_started_at
         return list(messages)
 
     async def confirm_outgoing_deliveries(self, story: Any, delivered: Any) -> None:
@@ -601,6 +606,7 @@ class TestFlushBufferedNarrativePipeline(unittest.IsolatedAsyncioTestCase):
         # 4) 投递 + 后续调度。
         self.assertEqual(host.calls['send_outgoing_messages'][0], [{'content': '在的。'}])
         self.assertEqual(host.calls['confirm_outgoing_deliveries'], [{'content': '在的。'}])
+        self.assertIsNotNone(host.calls.get('request_started_at'), '投递侧必须拿到请求发起时刻')
         self.assertEqual(host.calls['schedule_compaction'], 's')
         self.assertEqual(host.calls['follow_ups'][0], 's')
 

@@ -469,6 +469,17 @@ class ConsoleApi:
     # 总览
     # ------------------------------------------------------------------ #
 
+    def health_snapshot(self, story_id: str = '') -> dict[str, Any]:
+        """读 service 的健康快照；service 未起或没有该能力时回零值空壳。"""
+        service = getattr(self.bridge, 'service', None)
+        reader = getattr(service, 'health_snapshot', None)
+        if not callable(reader):
+            return {}
+        try:
+            return reader(story_id) or {}
+        except Exception:  # noqa: BLE001 - 面板取数永远不许把整页打成 500
+            return {}
+
     async def overview(self, story_id: str = '') -> dict[str, Any]:
         database = self.bridge.db
         stories = _safe_all(database, 'interlude_story', order='updatedAt DESC', limit=50)
@@ -498,6 +509,15 @@ class ConsoleApi:
                 'entry_count': entries,
             },
             'story': self._story_brief(current) if current else None,
+            # 上游 1.0.1-rc28 `health.ts`：自插件重载以来的滚动健康指标。
+            # 没有样本时返回零值快照（面板显示 0 而不是 500，见 §29 的控制台取数约定）。
+            'health': self.health_snapshot(_text(current.get('id'))) if current else {
+                'narrativeTotal': 0, 'narrativeFailed': 0, 'structureMissing': 0,
+                'recoverySaved': 0, 'replyModes': {}, 'sideTaskTotal': 0, 'sideTaskFailed': 0,
+                'proactiveTotal': 0, 'proactiveSent': 0, 'inputTokens': 0, 'cachedTokens': 0,
+                'latenciesMs': [], 'sinceAt': '', 'successRate': 1, 'structureMissingRate': 0,
+                'cacheHitRate': 0, 'proactiveRate': 0, 'medianLatencyMs': 0,
+            },
             'stories': [self._story_brief(item) for item in stories],
             'flags': self._flags(),
             'routing': self._routing_rows(),
@@ -1002,6 +1022,8 @@ class ConsoleApi:
     TASK_FLAGS: tuple[str, ...] = (
         'use_for_main', 'use_for_compaction', 'use_for_alter',
         'use_for_embedding', 'use_for_stickers', 'use_for_vision',
+        # 上游 1.0.1-rc24：世界播种器的模型选择并入用途勾选。
+        'use_for_world_seeding',
     )
 
     async def save_connection(self, payload: Any) -> dict[str, Any]:

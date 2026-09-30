@@ -68,7 +68,7 @@ M4 桥：把 beta10 那些被验证过的字段编译成**正向续写脚手架*
 from __future__ import annotations
 
 import re
-from typing import Any, Required, TypedDict
+from typing import Any, Optional, Required, TypedDict
 
 from ..types import DialogueBurstState, SceneFrame
 
@@ -138,6 +138,10 @@ def compile_narrative_context(
     _burst: DialogueBurstState | None,
 ) -> CompiledNarrativeContext:
     """把一个扁平 payload 编译成七段式脚手架（顺序与字段照抄上游）。"""
+    # 上游 `projectChannelContext` 返回 `undefined`，`compactObject` 会把它丢掉；
+    # Python 侧 `None` 是「显式 null」，必须显式剔除——否则 payload 里会多出一个
+    # `channelContext: null`，与上游的键集合不一致。
+    channel_annotation = project_channel_context(payload)
     return {
         # 上游这里没有 compactObject，靠 `JSON.stringify` 丢掉 undefined 的键；
         # Python 侧必须显式过滤，否则内部哨兵会漏进 json.dumps。
@@ -196,6 +200,9 @@ def compile_narrative_context(
             'groupContext': _field(payload, 'groupContext', 'group_context'),
             'chatCapabilities': _field(payload, 'chatCapabilities', 'chat_capabilities'),
             'stickerCatalog': _field(payload, 'stickerCatalog', 'sticker_catalog'),
+            # M4 §十：确定性通道标注——命中五规则时注入 `channelContext` + 简短标记；
+            # 未命中时这个键整个不出现（单平台零影响）。
+            **({'channelContext': channel_annotation} if channel_annotation is not None else {}),
         }),
         'authoringWindow': _compact_object({
             'phase': _field(payload, 'phase'),
@@ -279,6 +286,95 @@ def _sourced(frame: SceneFrame, field: str, recent_entry_ids: set[int]) -> Any:
     ):
         return {'value': value, 'sourceEntryIds': source_entry_ids}
     return _OMIT
+
+
+def _text(value: Any) -> str:
+    """JS `String(x ?? '')`：None → 空串。"""
+    return '' if value is None else str(value)
+
+
+def _number(value: Any) -> Any:
+    """JS `Number(x)` 的宽容读取（非数字返回 None，调用方自行回落）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return int(parsed) if parsed.is_integer() else parsed
+
+
+def project_channel_context(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """上游 1.0.1-rc28（M4 §十）`projectChannelContext`：确定性通道标注五规则。
+
+    命中即标，格式 = 结构化通道上下文 + 简短标记（`[微信·私]`）。**投递不依赖标注**，
+    漏标的后果只限质感层面（模型会把两个通道的消息当成同一个人的连续发言）。
+
+    五规则（v3 §十原文）：
+    1. 回合内端点切换（`turn.sources.length > 1`）
+    2. 同批消息多端点（`currentEvent.multiEndpoint` 或批量标记）
+    3. 私聊 ↔ 群聊切换（上一条目与当前 `conversationKind` 不同）
+    4. 同一参与者不同端点连续出现
+    5. 回复目标 ≠ 来源端点（投递目标端点不同于最后入站端点）
+
+    来源端点集是标注的**证据**：即便只命中规则 3/4/5 也要保留（并按接收序号稳定排序）。
+    """
+    def present(value: Any) -> Any:
+        """`_field` 用 `_OMIT` 表示"键不存在"；本函数里一律当 None 处理。"""
+        return None if _is_undefined(value) else value
+
+    rules: list[str] = []
+    sources: list[dict[str, Any]] = []
+    turn_sources = present(_field(payload, '_channelTurnSources', '_channel_turn_sources'))
+    last_entry_channel = present(_field(payload, '_channelLastEntryChannel', '_channel_last_entry_channel'))
+    current_channel = present(_field(payload, '_channelCurrentChannel', '_channel_current_channel'))
+    reply_endpoint = present(_field(payload, '_channelReplyEndpoint', '_channel_reply_endpoint'))
+    participant = present(_field(payload, 'currentParticipant', 'current_participant'))
+
+    if isinstance(turn_sources, list):
+        seen: set[str] = set()
+        for source in turn_sources:
+            endpoint_id = _text(present(_field(source, 'endpointId', 'endpoint_id'))).strip()
+            if not endpoint_id or endpoint_id in seen:
+                continue
+            received_seq = _number(present(_field(source, 'receivedSeq', 'received_seq')))
+            sources.append({
+                'endpointId': endpoint_id,
+                'channelKind': 'wechat' if present(_field(source, 'channelKind', 'channel_kind')) == 'wechat' else 'qq',
+                'receivedSeq': int(received_seq) if _is_safe_integer(received_seq) and received_seq >= 0 else 0,
+            })
+            seen.add(endpoint_id)
+        sources.sort(key=lambda item: (item['receivedSeq'], item['endpointId']))
+        if len(sources) > 1:
+            rules.append('multi-endpoint-turn')
+
+    current_event = present(_field(payload, 'currentEvent', 'current_event'))
+    if present(_field(current_event, 'multiEndpoint', 'multi_endpoint')) is True \
+            or present(_field(payload, '_channelBatchMultiEndpoint', '_channel_batch_multi_endpoint')) is True:
+        rules.append('batch-multi-endpoint')
+
+    last_kind = present(_field(last_entry_channel, 'conversationKind', 'conversation_kind'))
+    current_kind = present(_field(current_channel, 'conversationKind', 'conversation_kind'))
+    if last_kind and current_kind and last_kind != current_kind:
+        rules.append('conversation-kind-switch')
+
+    last_endpoint = present(_field(last_entry_channel, 'endpointId', 'endpoint_id'))
+    current_endpoint = present(_field(current_channel, 'endpointId', 'endpoint_id'))
+    if last_endpoint and current_endpoint and last_endpoint != current_endpoint \
+            and present(_field(participant, 'id')):
+        rules.append('participant-endpoint-switch')
+
+    reply_endpoint_id = present(_field(reply_endpoint, 'endpointId', 'endpoint_id'))
+    if reply_endpoint_id and current_endpoint and reply_endpoint_id != current_endpoint:
+        rules.append('reply-target-differs')
+
+    if not rules:
+        return None
+    kind = '微信' if present(_field(current_channel, 'channelKind', 'channel_kind')) == 'wechat' else 'QQ'
+    conversation = '群' if current_kind == 'group' else '私'
+    return {'tag': '[%s·%s]' % (kind, conversation), 'rules': rules, 'sources': sources}
 
 
 def _is_safe_integer(value: Any) -> bool:

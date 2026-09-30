@@ -77,7 +77,7 @@ from ..memory_maintenance import (
 )
 from ..script.knowledge_evidence import normalize_knowledge_evidence, supports_recorded_outcome
 from ..schedule_preplan import apply_schedule_preplan_proposal
-from ..story_state import decode_story_state, encode_story_state
+from ..story_state import decode_story_state, encode_story_state, normalize_life_status
 from ..time import calendar_day_key, dt_ms, iso, parse_dt, utc_now
 from .base import ServiceBase, _config_section, pick
 from .config import SCHEDULE_PREPLAN_RETRY_BACKOFF
@@ -762,7 +762,11 @@ class ServiceChunk8(ServiceBase):
         context = await self.prepare_compaction(story, now, force)
         needs_model = bool(pick(review, 'needsModel', 'needs_model')) if review else False
         if needs_model and pick(review, 'request'):
+            # 上游 rc28 健康指标：日程预排是一次侧端任务（失败也要计数）。
             proposal = await self.request_schedule_preplan(story, pick(review, 'request'))
+            health = getattr(self, 'health', None)
+            if health is not None:
+                health.record_side_task(pick(story, 'id'), bool(proposal))
             persisted = await self.persist_schedule_preplan_review(story, review, proposal, self.now())
             if persisted:
                 self.schedule_preplan_backoff.pop(story.get('id'), None)
@@ -1673,6 +1677,24 @@ class ServiceChunk8(ServiceBase):
             if not has_compaction_evidence(pick(patch, 'sourceEntryIds', 'source_entry_ids'), entries):
                 continue
             await self.persist_state_patch(story, patch, entries, now)
+        # 上游 1.0.1-rc23：压缩器顺带回报她接下来几小时的生活状态（群聊意愿 auto 档的输入）。
+        # 只有合法值才写；缺失/非法**保持旧值**——一次没带状态的压缩不该把已有状态清空。
+        draft_status = normalize_life_status({
+            'status': pick(decision, 'lifeStatus', 'life_status'),
+            'updatedAt': iso(now),
+        })
+        if draft_status:
+            current = decode_story_state(pick(story, 'state')).get('life_status') or {}
+            if pick(current, 'status') != draft_status['status']:
+                state = decode_story_state(pick(story, 'state'))
+                state['life_status'] = draft_status
+                await self.db_set(  # type: ignore[attr-defined]
+                    'interlude_story', {'id': story_id}, {'state': encode_story_state(state)},
+                )
+                self.report_operation(  # type: ignore[attr-defined]
+                    'diagnostic', 'debug', story, 'advance',
+                    '生活状态已更新 状态=%s', draft_status['status'],
+                )
         if resolved_facts:
             await self.mark_continuity_dirty(story_id, now)
 

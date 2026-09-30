@@ -294,12 +294,33 @@ class ServiceChunk9(ServiceBase):
         """
         if self.desktop_event_sink is not None:
             self.desktop_event_sink('token', record)
+        # 健康指标（rc28）：输入/缓存 token 在同一个收口点累计，缓存命中率由此得出。
+        health = getattr(self, 'health', None)
+        story_id = pick(record, 'storyId', 'story_id')
+        if health is not None and story_id:
+            health.record_tokens(
+                story_id, pick(record, 'inputTokens', 'input_tokens') or 0,
+                pick(record, 'cachedTokens', 'cached_tokens') or 0,
+            )
         line = _format_token_usage_line(record)
         if not line:
             return
         self.report_standalone(
             'info', 'Token 用量[%s] 模型=%s %s', pick(record, 'task'), pick(record, 'model'), line,
         )
+
+    def health_snapshot(self, story_id: str = '') -> dict[str, Any]:
+        """上游 `HealthMonitor.snapshot(storyId)` / `all()`：控制台面板的数据源。
+
+        `story_id` 为空时返回全部故事的快照表；给了就只返回那一个。没有任何样本时
+        返回零值快照（面板显示 0 而不是 500 —— 与 §29 的控制台取数约定一致）。
+        """
+        monitor = getattr(self, 'health', None)
+        if monitor is None:
+            return {} if not story_id else {}
+        if story_id:
+            return monitor.snapshot(story_id)
+        return monitor.all()
 
     def report_standalone_operation(
         self,

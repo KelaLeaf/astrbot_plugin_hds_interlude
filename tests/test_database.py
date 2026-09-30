@@ -67,6 +67,11 @@ EXPECTED_TABLES = [
     'interlude_overlay_snapshot',
     'interlude_sticker',
     'interlude_schedule_preplan',
+    # 上游 1.0.1-rc23：世界播种器的事件表。
+    'interlude_seeded_event',
+    # 上游 1.0.1-rc28（M1a/M1b）：端点注册表与剧本别名。
+    'interlude_endpoint',
+    'interlude_story_alias',
 ]
 
 #: `(表, 主键, 是否自增)` —— 直接抄自 database.ts 的 `primary` / `autoInc`。
@@ -85,6 +90,9 @@ EXPECTED_PRIMARY = {
     'interlude_sticker': ('id', True),
     # 日程预排是每剧本一行，主键是 `storyId`（非自增）。
     'interlude_schedule_preplan': ('storyId', False),
+    'interlude_seeded_event': ('id', True),
+    'interlude_endpoint': ('id', False),
+    'interlude_story_alias': ('aliasStoryId', False),
 }
 
 #: `indexes` / `unique` 选项 → 期望存在的索引列（顺序照抄 database.ts）。
@@ -164,6 +172,15 @@ EXPECTED_COLUMNS = {
         'lastReviewedLocalDate', 'lastEvidenceEntryId', 'reviewReason', 'regimes',
         'exceptions', 'materializedDays', 'createdAt', 'updatedAt',
     ],
+    'interlude_seeded_event': [
+        'id', 'storyId', 'summary', 'importance', 'occursAt', 'expiresAt', 'status',
+        'subjects', 'sourcePayload', 'injectedEntryId', 'createdAt', 'updatedAt',
+    ],
+    'interlude_endpoint': [
+        'id', 'ownerKind', 'ownerId', 'channelKind', 'platform', 'accountKey', 'selfId',
+        'userId', 'channelId', 'groupId', 'conversationKind', 'enabled', 'createdAt', 'updatedAt',
+    ],
+    'interlude_story_alias': ['aliasStoryId', 'canonicalStoryId', 'reason', 'createdAt'],
 }
 
 #: sqlite3 类型映射断言（`unsigned`/`double`/`boolean`/`json`/`timestamp`）。
@@ -266,12 +283,12 @@ class _DatabaseTestCase(unittest.TestCase):
 class RegisterTablesTests(_DatabaseTestCase):
     """对应上游 `registerTables(ctx)`：13 张表一次性建成。"""
 
-    def test_all_thirteen_tables_created(self):
+    def test_all_sixteen_tables_created(self):
         created = self.db.register_tables()
         self.assertEqual(sorted(created), sorted(EXPECTED_TABLES))
         self.assertEqual(sorted(self._table_names()), sorted(EXPECTED_TABLES))
-        # `TABLES` 注册表本身也是 13 项。
-        self.assertEqual(len(TABLES), 13)
+        # `TABLES` 注册表本身是 16 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表）。
+        self.assertEqual(len(TABLES), 16)
         self.assertEqual(db_mod.table_names(), EXPECTED_TABLES)
 
     def test_columns_match_upstream_declaration(self):

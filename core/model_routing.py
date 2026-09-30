@@ -147,6 +147,7 @@ def resolve_model_routing(config: ModelConfig, alter_config: AlterSystemConfig |
         else disabled_route('embedding', embedding_target),
         'stickers': resolve_assigned_only_route('stickers', providers),
         'vision': resolve_assigned_only_route('vision', providers),
+        'world_seeding': resolve_assigned_only_route('world_seeding', providers),
     }
 
 
@@ -249,12 +250,17 @@ def is_assigned_to(provider: ProviderConfig, task: str) -> bool:
         return provider.get('use_for_embedding') is True
     if task == 'stickers':
         return provider.get('use_for_stickers') is True
+    if task == 'world_seeding':
+        # 上游 1.0.1-rc24：世界播种器的模型选择并入连接行的用途勾选。
+        return provider.get('use_for_world_seeding') is True
     return provider.get('use_for_vision') is True
 
 
 def format_model_routing(table: ModelRoutingTable) -> str:
     """上游 `formatModelRouting()`：一行人类可读的路由摘要（启动日志用）。"""
-    tasks: list[ModelTask] = ['main', 'compaction', 'timeline', 'alter', 'embedding', 'stickers', 'vision']
+    tasks: list[ModelTask] = [
+        'main', 'compaction', 'timeline', 'alter', 'embedding', 'stickers', 'vision', 'world_seeding',
+    ]
     parts: list[str] = []
     for task in tasks:
         route = table[task]
@@ -418,6 +424,7 @@ def normalize_provider(provider: ProviderConfig) -> ProviderConfig:
         'use_for_embedding': provider.get('use_for_embedding') is True,
         'use_for_stickers': provider.get('use_for_stickers') is True,
         'use_for_vision': provider.get('use_for_vision') is True,
+        'use_for_world_seeding': provider.get('use_for_world_seeding') is True,
     })
     return normalized
 

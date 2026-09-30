@@ -85,7 +85,7 @@ from ..script.commit_builder import find_outgoing_script_event
 from ..script.delivery_ledger import platform_action_reference
 from ..script.intent_lifecycle import consumed_live_intent_ids, live_narrative_intents
 from ..story_state import decode_story_state, encode_story_state
-from ..time import format_log_time, iso, parse_dt
+from ..time import dt_ms, format_log_time, iso, parse_dt
 from .base import ServiceBase, pick
 from .config import RECALLABLE_ENTRY_KINDS, is_trusted_image_host
 from .helpers import (
@@ -1372,6 +1372,8 @@ class ServiceChunk3(ServiceBase):
             snapshot = await self.serial(story_id, snapshot_task)
             if not snapshot:
                 return
+            # 上游 1.0.1-rc21：以「叙事请求发起时刻」为基准算首条发言的打字时间下限。
+            request_started_at = self.now()
             user_message = _format_buffered_user_messages(batch)
             trimmed = (user_message or '').strip()
             turn_query_embedding = None
@@ -1462,6 +1464,9 @@ class ServiceChunk3(ServiceBase):
                 None, images, audio, chat_capabilities, quoted_messages, sticker_catalog,
                 turn_query_embedding, visual_observations, on_early_reply, attachments,
             )
+            # 上游 M4：批次端点集合只描述刚被消费的这一批——标注算完即清空，
+            # 否则下一回合会把上一批的多端点事实当成自己的（规则 2 会误命中）。
+            _turn_set(turn, 'activeBatchEndpointIds', 'active_batch_endpoint_ids', [])
             succeeded = bool(pick(narrative, 'succeeded'))
             effective_now = pick(narrative, 'effectiveNow', 'effective_now')
             immediate_observations = pick(narrative, 'immediateObservations', 'immediate_observations') or []
@@ -1593,6 +1598,7 @@ class ServiceChunk3(ServiceBase):
             if self.can_handle_participant(snapshot['participant']):
                 delivered = await self.send_outgoing_messages(
                     snapshot['story'], result['messages'], snapshot['participant'], latest_session,
+                    request_started_at=request_started_at,
                 )
                 await self.confirm_outgoing_deliveries(snapshot['story'], delivered)
                 channel_id = pick(snapshot['participant'], 'channelId', 'channel_id')
@@ -1612,9 +1618,29 @@ class ServiceChunk3(ServiceBase):
                             'native-face', native_face,
                         ),
                     )
+            # 上游 rc28 健康指标：一次私聊主叙事回合的延迟与回复模式分桶。
+            # 回复模式取自 `interaction.reply.mode`；**没有结构化 interaction 时记
+            # `noDelivery`**（上游分桶的 else 分支）——"她没回"与"协议壳没写对"在面板上
+            # 是同一格，这正是该格存在的意义（见 `core/health.py`）。
+            # 这段刻意内联：Chunk3 的成员清单是「上游行段铁律」，不新增成员方法。
+            health = getattr(self, 'health', None)
+            if health is not None:
+                if succeeded:
+                    interaction = pick(decision, 'interaction')
+                    reply = pick(interaction, 'reply') if isinstance(interaction, dict) else None
+                    mode = pick(reply, 'mode') if isinstance(reply, dict) else None
+                    latency = 0.0
+                    if request_started_at is not None:
+                        latency = max(0.0, float(dt_ms(self.now()) - dt_ms(request_started_at)))
+                    health.record_narrative_complete(story_id, latency, mode or 'noDelivery')
+                else:
+                    health.record_narrative_failed(story_id)
             self.schedule_compaction(story_id)
         except Exception as error:
             self.report_standalone('warn', '合并写作任务失败：参与者=%s 错误=%s', participant_id, error)
+            health = getattr(self, 'health', None)
+            if health is not None:
+                health.record_narrative_failed(story_id)
         finally:
             if _turn_get(turn, 'inFlightRequestId', 'in_flight_request_id') == request_id:
                 _turn_set(turn, 'inFlightRequestId', 'in_flight_request_id', None)
@@ -1672,7 +1698,16 @@ class ServiceChunk3(ServiceBase):
         if not self.can_handle_story(story):
             return False
 
+        # 上游 1.0.1-rc26：进串行队列前捕获代际；队首等待期间发生的清库/暂停会让这次
+        # 压缩在执行时自认过期，迟到的模型结果不再写进新库。
+        generation = self.task_generation(pick(story, 'id'))
+
         async def task() -> bool:
+            if not self.task_generation_current(pick(story, 'id'), generation):
+                self.report_operation(
+                    'standard', 'info', story, 'advance', '压缩任务已过期，跳过本轮回写',
+                )
+                return False
             return await self.compact_unlocked(await self.get_story(pick(story, 'id')), self.now(), force)
 
         return await self.serial(pick(story, 'id'), task)

@@ -75,6 +75,175 @@ DEFAULT_GROUP_WILLINGNESS: GroupWillingnessConfig = {
 }
 
 
+#: 上游 1.0.1-rc23 `WILLINGNESS_TIERS`：五档预设，全部 `enabled: true`、`max_score: 2`。
+#: `keywords` 是内容维度、与档位正交，始终从旧配置取（见 `resolve_willingness_preset`）。
+WILLINGNESS_TIERS: dict[str, GroupWillingnessConfig] = {
+    'quiet': {
+        'enabled': True, 'max_score': 2, 'threshold': 0.80, 'base_gain': 0.12,
+        'quote_gain': 0.08, 'keyword_gain': 0.12, 'probability_amplifier': 1.1,
+        'decay_half_life_seconds': 150, 'reply_cost': 0.85, 'keywords': [],
+    },
+    'reserved': {
+        'enabled': True, 'max_score': 2, 'threshold': 0.75, 'base_gain': 0.17,
+        'quote_gain': 0.12, 'keyword_gain': 0.16, 'probability_amplifier': 1.25,
+        'decay_half_life_seconds': 200, 'reply_cost': 0.85, 'keywords': [],
+    },
+    # normal 的标定：单条批次、零衰减下逐条概率 0.155 / 0.458 / 0.730 → 公平掷骰
+    # 期望 4.43 条（固定掷骰 0.4 命中第 4 条），所以文档写"约每 4~5 条一次"。
+    'normal': {
+        'enabled': True, 'max_score': 2, 'threshold': 0.62, 'base_gain': 0.25,
+        'quote_gain': 0.15, 'keyword_gain': 0.20, 'probability_amplifier': 1.4,
+        'decay_half_life_seconds': 240, 'reply_cost': 0.80, 'keywords': [],
+    },
+    'active': {
+        'enabled': True, 'max_score': 2, 'threshold': 0.30, 'base_gain': 0.34,
+        'quote_gain': 0.20, 'keyword_gain': 0.25, 'probability_amplifier': 1.6,
+        'decay_half_life_seconds': 300, 'reply_cost': 0.60, 'keywords': [],
+    },
+    'eager': {
+        'enabled': True, 'max_score': 2, 'threshold': 0.10, 'base_gain': 0.45,
+        'quote_gain': 0.28, 'keyword_gain': 0.30, 'probability_amplifier': 1.8,
+        'decay_half_life_seconds': 360, 'reply_cost': 0.50, 'keywords': [],
+    },
+}
+
+WILLINGNESS_PRESETS = ('off', 'quiet', 'reserved', 'normal', 'active', 'eager', 'auto', 'custom')
+WILLINGNESS_TIER_ORDER = ('quiet', 'reserved', 'normal', 'active', 'eager')
+
+#: 上游 `DEFAULT_AUTO_WILLINGNESS`：auto 档的三态默认映射。
+DEFAULT_AUTO_WILLINGNESS = {'busy': 'quiet', 'idle': 'active', 'asleep': 'quiet'}
+
+#: 上游 `LIFE_STATUS_STALE_MS`：生活状态超过 6 小时视为过期，回落 normal。
+LIFE_STATUS_STALE_MS = 6 * 60 * 60 * 1000
+
+#: 上游 `ASLEEP_PROBABILITY_MULTIPLIER`：睡眠态的概率乘数（**不可配**的安全余量）。
+ASLEEP_PROBABILITY_MULTIPLIER = 0.2
+
+
+def resolve_willingness_preset(
+    preset: object, legacy: Optional[Mapping[str, object]] = None,
+) -> tuple[str, GroupWillingnessConfig]:
+    """上游 `resolveWillingnessPreset`：把档位名 + 旧数值门解析成实际配置。
+
+    兼容判定**不看任何数值**，只看旧对象的 `enabled === true`：
+    - 档位为空或 `off`、且旧门已启用 → `custom`（原样用旧对象，行为字节级不变）；
+    - 五档之一 → 用档位参数，`keywords` 仍从旧配置取；
+    - `auto` → 返回 auto 标记，真正的档位在 `evaluate_willingness_gate` 里按生活状态选；
+    - `custom` → 原样用旧对象；
+    - 未知/空 preset → `off`（不放行旧数值）。
+    """
+    raw = preset.strip() if isinstance(preset, str) else ''
+    legacy_record = legacy if isinstance(legacy, Mapping) else {}
+    legacy_enabled = legacy_record.get('enabled') is True
+    if legacy_enabled and raw in ('', 'off'):
+        return 'custom', resolve_group_willingness(legacy_record)
+    if raw in WILLINGNESS_TIERS:
+        config = dict(WILLINGNESS_TIERS[raw])  # type: ignore[arg-type]
+        config['keywords'] = resolve_group_willingness(legacy_record)['keywords']
+        return raw, config
+    if raw == 'auto':
+        return 'auto', dict(DEFAULT_GROUP_WILLINGNESS)
+    if raw == 'custom':
+        return 'custom', resolve_group_willingness(legacy_record)
+    return 'off', {**resolve_group_willingness(legacy_record), 'enabled': False}
+
+
+def resolve_auto_willingness(value: Optional[Mapping[str, object]]) -> dict[str, str]:
+    """上游 `resolveAutoWillingness`：三态映射逐项校验，非法值逐个回落默认。"""
+    resolved = dict(DEFAULT_AUTO_WILLINGNESS)
+    if isinstance(value, Mapping):
+        for status, fallback in DEFAULT_AUTO_WILLINGNESS.items():
+            candidate = value.get(status, value.get(status.replace('_', '')))
+            if isinstance(candidate, str) and candidate in WILLINGNESS_TIERS:
+                resolved[status] = candidate
+    return resolved
+
+
+def resolve_life_status_tier(
+    life_status: Optional[Mapping[str, object]], auto_map: Mapping[str, str],
+    now_ms: int,
+) -> tuple[str, bool, Optional[str]]:
+    """上游 `resolveAutoTier`：返回 `(档位, 是否过期, 生活状态原文)`。
+
+    状态缺失 → `normal`（`stale=False`）；状态不在三值内 / 时间解析不出 / 超过 6 小时
+    → `normal` 且 `stale=True`。状态存在时按 `auto_map` 取档位。
+    """
+    if not isinstance(life_status, Mapping):
+        return 'normal', False, None
+    status = life_status.get('status')
+    updated_at = life_status.get('updated_at', life_status.get('updatedAt'))
+    if not isinstance(status, str) or status not in DEFAULT_AUTO_WILLINGNESS:
+        return 'normal', True, None
+    try:
+        from datetime import datetime as _dt
+
+        updated_ms = _dt.fromisoformat(str(updated_at).replace('Z', '+00:00')).timestamp() * 1000
+    except (TypeError, ValueError):
+        return 'normal', True, status
+    if now_ms - updated_ms > LIFE_STATUS_STALE_MS:
+        return 'normal', True, status
+    return auto_map.get(status, 'normal'), False, status
+
+
+def evaluate_willingness_gate(
+    previous: Optional[GroupWillingnessState],
+    preset: object,
+    auto_map: Optional[Mapping[str, object]],
+    life_status: Optional[Mapping[str, object]],
+    legacy: Optional[Mapping[str, object]],
+    input: GroupWillingnessInput,
+    rng: Optional[Callable[[], float]] = None,
+) -> dict[str, object]:
+    """上游 1.0.1-rc23 `evaluateWillingnessGate`：档位解析层 + 核心打分。
+
+    返回核心 decision 的副本，外加 `diagnosis`（`preset` / `tier` / `life_status` /
+    `stale` / `asleep`），日志与测试都读它。核心数学**一字未改**（`evaluate_group_willingness`）。
+    """
+    resolution, config = resolve_willingness_preset(preset, legacy)
+    now_ms = int(input.get('now') or 0)
+    tier = 'normal'
+    stale = False
+    status: Optional[str] = None
+    asleep = False
+    if resolution == 'auto':
+        mapping = resolve_auto_willingness(auto_map)
+        tier, stale, status = resolve_life_status_tier(life_status, mapping, now_ms)
+        config = dict(WILLINGNESS_TIERS[tier])  # type: ignore[arg-type]
+        config['keywords'] = resolve_group_willingness(legacy)['keywords']
+        asleep = status == 'asleep'
+    elif resolution in WILLINGNESS_TIERS:
+        tier = resolution
+
+    if asleep:
+        # 睡眠态：@ 不再直通，概率先算基础值再乘 0.2（独立于所配档位的安全余量）。
+        base = evaluate_group_willingness(
+            previous, config,
+            {**input, 'mentioned_bot': False, 'random': 1},
+            rng=rng,
+        )
+        probability = max(0.0, min(1.0, float(base['probability']) * ASLEEP_PROBABILITY_MULTIPLIER))
+        roll = input.get('random')
+        draw = float(roll) if isinstance(roll, (int, float)) else (rng or _random.random)()
+        should_call = draw < probability
+        decision: dict[str, object] = {
+            'state': base['state'],
+            'should_call': should_call,
+            'probability': probability,
+            'reason': 'probability-roll' if should_call else 'asleep',
+        }
+    else:
+        decision = dict(evaluate_group_willingness(previous, config, input, rng=rng))
+
+    decision['diagnosis'] = {
+        'preset': resolution,
+        'tier': tier,
+        'life_status': status,
+        'stale': stale,
+        'asleep': asleep,
+    }
+    return decision
+
+
 def resolve_group_willingness(
     config: Optional[Mapping[str, object]] = None,
 ) -> GroupWillingnessConfig:
@@ -145,6 +314,24 @@ def consume_group_willingness(
     config = resolve_group_willingness(config_input)
     state = _decay(previous, config, now)
     return {'score': max(0, state['score'] - config['reply_cost']), 'updated_at': now}
+
+
+def consume_willingness_gate(
+    previous: Optional[GroupWillingnessState],
+    preset: object,
+    auto_map: Optional[Mapping[str, object]],
+    life_status: Optional[Mapping[str, object]],
+    legacy: Optional[Mapping[str, object]],
+    now_ms: int,
+) -> GroupWillingnessState:
+    """上游 `consumeWillingnessGate`：用**同一套档位解析**扣减，保证 replyCost 对齐档位。"""
+    resolution, config = resolve_willingness_preset(preset, legacy)
+    if resolution == 'auto':
+        mapping = resolve_auto_willingness(auto_map)
+        tier, _stale, _status = resolve_life_status_tier(life_status, mapping, now_ms)
+        config = dict(WILLINGNESS_TIERS[tier])  # type: ignore[arg-type]
+        config['keywords'] = resolve_group_willingness(legacy)['keywords']
+    return consume_group_willingness(previous, config, now_ms)
 
 
 def _decay(

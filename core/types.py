@@ -396,6 +396,11 @@ class AgencyConfig(TypedDict, total=False):
     max_window_minutes: Required[int]
     minimum_proactive_interval_minutes: Required[int]
     max_candidate_hours: Required[int]
+    # 上游 1.0.1-rc25：三模式主动联系温度 + 每参与者每日上限。
+    contact_mode: str
+    natural_willingness_threshold: float
+    natural_minimum_interval_minutes: int
+    proactive_daily_cap: int
 
 
 class StorySettingOverlay(TypedDict, total=False):

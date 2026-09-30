@@ -22,7 +22,7 @@
   "format": "astrbot_plugin_hds_interlude.config",
   "formatVersion": 1,
   "pluginVersion": "v1.1.0",
-  "upstreamVersion": "1.0.1-beta6-rebuild",
+  "upstreamVersion": "1.0.1-rc28",
   "exportedAt": "2026-09-13T18:40:00.000Z",
   "sections": ["story_defaults", "model_center", "..."],
   "config": { "story_defaults": {...}, "model_center": {...} }

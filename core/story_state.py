@@ -41,6 +41,8 @@ _KNOWN_SNAKE_KEYS = frozenset({
     "continuity_dirty", "automation", "alter_system", "agency_window", "scene_presence",
     "automatic_delivery_summaries", "working_details", "timeline_carry", "chat_rhythm",
     "scene_frame", "dialogue_burst", "working_detail_resolutions",
+    # 上游 1.0.1-rc23 / rc25：生活状态（群聊意愿 auto 档用）与主动联系审计窗。
+    "life_status", "proactive_contact_log",
 })
 
 # 上游 camelCase 拼写 → snake_case，用于识别「已知键」。
@@ -63,6 +65,8 @@ _CAMEL_TO_SNAKE = {
     "chatRhythm": "chat_rhythm",
     "sceneFrame": "scene_frame",
     "dialogueBurst": "dialogue_burst",
+    "lifeStatus": "life_status",
+    "proactiveContactLog": "proactive_contact_log",
 }
 
 _KNOWN_ALL_KEYS = _KNOWN_SNAKE_KEYS | frozenset(_CAMEL_TO_SNAKE)
@@ -266,6 +270,10 @@ def upgrade_story_state(value: Any) -> dict[str, Any]:
             if _is_record(_pick(record, "chatRhythm", "chat_rhythm"))
             else None
         ),
+        "life_status": normalize_life_status(_pick(record, "lifeStatus", "life_status")),
+        "proactive_contact_log": normalize_proactive_contact_log(
+            _pick(record, "proactiveContactLog", "proactive_contact_log")
+        ),
         "scene_frame": normalize_scene_frame(_pick(record, "sceneFrame", "scene_frame")),
         "dialogue_burst": normalize_dialogue_burst(
             _pick(record, "dialogueBurst", "dialogue_burst")
@@ -387,6 +395,93 @@ def normalize_dialogue_burst(value: Any) -> dict[str, Any] | None:
 def encode_story_state(value: Any) -> dict[str, Any]:
     """走同一个编解码器，写入永远不能绕过归一化。"""
     return upgrade_story_state(value)
+
+
+#: 上游 `LIFE_STATUS_STALE_MS`：生活状态超过 6 小时视为过期（群聊意愿回落 normal）。
+LIFE_STATUS_STALE_MS = 6 * 60 * 60 * 1000
+_LIFE_STATUS_VALUES = ("busy", "asleep", "idle")
+
+
+def normalize_life_status(value: Any) -> dict[str, Any] | None:
+    """上游 `normalizeLifeStatus`：只认 busy/asleep/idle + 可解析的 updatedAt。"""
+    if not _is_record(value):
+        return None
+    status = _pick(value, "status")
+    if status not in _LIFE_STATUS_VALUES:
+        return None
+    updated_at = _valid_iso(_pick(value, "updatedAt", "updated_at"))
+    if not updated_at:
+        return None
+    return {"status": status, "updated_at": updated_at}
+
+
+def normalize_proactive_contact_log(value: Any) -> list[dict[str, Any]]:
+    """上游 `normalizeProactiveContactLog`：滚动保留最近 20 条，坏行直接丢。
+
+    结构（snake_case 内部键）：`{participant_id, at, endpoint_id?, channel_reason?}`。
+    该日志**不进模型上下文**，只做渠道选择审计与每日主动联系上限的计数来源。
+    """
+    if not isinstance(value, list):
+        return []
+    log: list[dict[str, Any]] = []
+    for item in value:
+        if not _is_record(item):
+            continue
+        participant_id = _clipped_text_or_none(
+            _pick(item, "participantId", "participant_id"), 255
+        )
+        at = _valid_iso(_pick(item, "at"))
+        if not participant_id or not at:
+            continue
+        entry: dict[str, Any] = {"participant_id": participant_id, "at": at}
+        endpoint_id = _clipped_text_or_none(_pick(item, "endpointId", "endpoint_id"), 63)
+        if endpoint_id:
+            entry["endpoint_id"] = endpoint_id
+        channel_reason = _clipped_text_or_none(
+            _pick(item, "channelReason", "channel_reason"), 100
+        )
+        if channel_reason:
+            entry["channel_reason"] = channel_reason
+        log.append(entry)
+    return log[-20:]
+
+
+def append_proactive_contact(
+    log: Any, participant_id: str, at: Any, endpoint_id: str = "",
+) -> list[dict[str, Any]]:
+    """上游 `appendProactiveContact`：追加一条并保持 20 条滚动窗口。"""
+    entries = normalize_proactive_contact_log(log)
+    entry: dict[str, Any] = {"participant_id": str(participant_id or ""), "at": str(at or "")}
+    if endpoint_id:
+        entry["endpoint_id"] = str(endpoint_id)
+    entries.append(entry)
+    return entries[-20:]
+
+
+def count_proactive_contacts_in_window(
+    log: Any, participant_id: str, now: Any, window_ms: int = 86_400_000,
+) -> int:
+    """上游 `countProactiveContactsInWindow`：同参与者在窗口内的条数。
+
+    `now` 可以是 aware datetime 或 epoch 毫秒；`at` 用 ISO 解析。窗口**没有下界**，
+    所以一条未来时间戳也会被计入（与上游一致）。
+    """
+    entries = normalize_proactive_contact_log(log)
+    if isinstance(now, datetime):
+        now_ms = now.timestamp() * 1000
+    else:
+        now_ms = float(now or 0)
+    count = 0
+    for entry in entries:
+        if entry["participant_id"] != participant_id:
+            continue
+        try:
+            at_ms = datetime.fromisoformat(entry["at"].replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            continue
+        if now_ms - at_ms < window_ms:
+            count += 1
+    return count
 
 
 def normalize_automatic_delivery_summaries(value: Any) -> list[dict[str, Any]]:

@@ -46,6 +46,10 @@ UPSTREAM_SECTION_ORDER = [
     "chatRhythm",
 ]
 
+#: 上游 1.0.1-rc23 / rc27 新增的两个扩展分组；`worldSeeder` 本移植版已移植，
+#: `qzone` 属 P3（暂缓），落在隐藏兼容位 `qzone_compat`。
+UPSTREAM_NEW_SECTIONS = [("worldSeeder", "world_seeder"), ("qzone", "qzone_compat")]
+
 #: 上游键 → 本插件顶层键（顺序与上游一致）。
 SECTION_MAP = [
     ("storyDefaults", "story_defaults"),
@@ -62,6 +66,7 @@ SECTION_MAP = [
     ("memory", "memory"),
     ("alterSystem", "alter_system"),
     ("browser", "browser"),
+    ("worldSeeder", "world_seeder"),
     ("blindMode", "blind_mode"),
     ("logging", "logging"),
     ("chatRhythm", "chat_rhythm"),
@@ -70,13 +75,20 @@ SECTION_MAP = [
 #: 上游 Console 的完整字段清单（camelCase），用于逐项对账 coverage。
 #: 来源：`upstream/src/index.ts` 中各组 Schema.object 的键。
 UPSTREAM_FIELDS = {
+    # 上游 1.0.1-rc23【扩展 15】世界播种器（本移植版已移植）。
+    "world_seeder": [
+        "enabled", "cadenceMinutes", "maxPending", "dailyCap", "maxHorizonHours",
+        "temperature", "maxTokens", "timeout",
+    ],
     "story_defaults": [
-        "characterName", "characterProfile", "perspective", "userProfile", "relationship",
+        "characterName", "characterProfile", "perspective", "perspectives",
+        "supplementaryFacts", "userProfile", "relationship",
         "world", "supportingCast", "location", "style", "timezone",
     ],
     "model_center": [
         "vision", "audio", "providers", "mainTemperature", "mainTopP", "mainMaxTokens",
         "mainTimeout", "mainResponseFormat", "mainStreamingMode", "mainPayloadOrder",
+        "specialization", "specializationFamily",
         "failover", "mainPrompt", "formatPrompt", "fixedPrompt", "stylePrompt",
         "embedding", "compaction",
     ],
@@ -110,6 +122,8 @@ UPSTREAM_FIELDS = {
     "timeline_director": ["enabled"],
     "agency": [
         "enabled", "maxWindowMinutes", "minimumProactiveIntervalMinutes", "maxCandidateHours",
+        "contactMode", "naturalWillingnessThreshold", "naturalMinimumIntervalMinutes",
+        "proactiveDailyCap",
     ],
     "chat_actions": [
         "enabled", "platforms", "quoteReply", "messageReactions", "allowedReactions",
@@ -157,6 +171,11 @@ UPSTREAM_FIELDS = {
 
 #: 已弃用 / 隐藏的旧字段（上游 `CONFIGURATION_GUIDE.md`「隐藏的历史兼容字段」）。
 UPSTREAM_COMPAT_FIELDS = {
+    "qzone_compat": [
+        "enabled", "dailyPostCap", "dailyCommentCap", "dailyLikeCap",
+        "minIntervalMinutes", "feedWindowMinutes",
+    ],
+    "forward_message_compat": ["enabled", "maxNodes", "maxCharacters", "maxDepth"],
     "shared_story_compat": ["enabled", "participantPresets"],
     "runtime_compat": ["pauseAfterConversationMinutes", "staleNarrativeRequestWindowSeconds"],
 }
@@ -225,6 +244,22 @@ UPSTREAM_PROVIDER_DEFAULT = {
 
 #: 上游字段名 → 本插件 snake_case 键名（配置映射表，见 `docs/CONFIG_MAP.md`）。
 CAMEL_TO_SNAKE = {
+    # 上游 1.0.1-rc28：故事档案、模型特化、主动联系、意愿档位、世界播种器、
+    # QQ 空间与合并转发（后两者落在隐藏兼容位）。
+    "perspectives": "perspectives", "supplementaryFacts": "supplementary_facts",
+    "specialization": "specialization", "specializationFamily": "specialization_family",
+    "contactMode": "contact_mode", "proactiveDailyCap": "proactive_daily_cap",
+    "naturalWillingnessThreshold": "natural_willingness_threshold",
+    "naturalMinimumIntervalMinutes": "natural_minimum_interval_minutes",
+    "useForWorldSeeding": "use_for_world_seeding", "protocol": "protocol",
+    "anthropicCache": "anthropic_cache",
+    "cadenceMinutes": "cadence_minutes", "maxPending": "max_pending",
+    "dailyCap": "daily_cap", "maxHorizonHours": "max_horizon_hours",
+    "willingnessPreset": "willingness_preset", "willingnessAuto": "willingness_auto",
+    "dailyPostCap": "daily_post_cap", "dailyCommentCap": "daily_comment_cap",
+    "dailyLikeCap": "daily_like_cap", "minIntervalMinutes": "min_interval_minutes",
+    "feedWindowMinutes": "feed_window_minutes",
+    "maxNodes": "max_nodes", "maxCharacters": "max_characters", "maxDepth": "max_depth",
     "characterName": "character_name", "characterProfile": "character_profile",
     "userProfile": "user_profile", "supportingCast": "supporting_cast",
     "maxImageDimension": "max_image_dimension", "outFormat": "out_format",
@@ -541,9 +576,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
     # -- 上游第 6 条：runtime and plugin exports share one version constant -----
 
     def test_runtime_and_plugin_exports_share_one_version_constant(self):
-        # 上游：`version === HDS_INTERLUDE_VERSION === '1.0.1-beta6-rebuild'`。
+        # 上游：`version === HDS_INTERLUDE_VERSION`。v2 起本插件跟进上游 1.0.1-rc28。
         # 本插件 `plugin/_conf_schema.json` 不再是版本的载体，等价物是 core/meta.py。
-        self.assertEqual(load_meta_version(), "1.0.1-beta6-rebuild")
+        self.assertEqual(load_meta_version(), "1.0.1-rc28")
         self.assertIn("HDS_INTERLUDE_VERSION", read(META_PY_PATH))
 
     # -- 上游第 7 条：layered colored logs are the Console default --------------
@@ -564,7 +599,8 @@ class ConfigurationSchemaTest(unittest.TestCase):
             self.assertNotIn(absent, model)
         self.assertEqual(model["main_response_format"]["default"], "json-object")
         self.assertEqual(model["main_streaming_mode"]["default"], "off")
-        self.assertEqual(model["main_payload_order"]["default"], "legacy")
+        # 上游 1.0.1-rc14 起默认 cache-first（支持前缀缓存的接口受益）。
+        self.assertEqual(model["main_payload_order"]["default"], "cache-first")
         self.assertEqual(model["vision"]["items"]["mode"]["default"], "native")
         self.assertEqual(model["vision"]["items"]["detail"]["default"], "auto")
 
@@ -608,16 +644,23 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
     # -- 上游第 10 条：Agency Window exposes only four bounded controls ---------
 
-    def test_agency_window_exposes_only_the_four_bounded_controls(self):
+    def test_agency_window_exposes_only_the_bounded_controls(self):
         agency = self.section("agency")
         self.assertEqual(list(agency.keys()), [
             "enabled", "max_window_minutes", "minimum_proactive_interval_minutes",
             "max_candidate_hours",
+            # 上游 1.0.1-rc25：三模式主动联系 + 每参与者每日上限。
+            "contact_mode", "natural_willingness_threshold",
+            "natural_minimum_interval_minutes", "proactive_daily_cap",
         ])
         self.assertIs(agency["enabled"]["default"], True)
         self.assertEqual(agency["max_window_minutes"]["default"], 240)
         self.assertEqual(agency["minimum_proactive_interval_minutes"]["default"], 60)
         self.assertEqual(agency["max_candidate_hours"]["default"], 24)
+        self.assertEqual(agency["contact_mode"]["default"], "strict")
+        self.assertEqual(agency["natural_willingness_threshold"]["default"], 0.25)
+        self.assertEqual(agency["natural_minimum_interval_minutes"]["default"], 30)
+        self.assertEqual(agency["proactive_daily_cap"]["default"], 3)
 
     # -- 上游第 11 条：Schedule Preplan is lightweight --------------------------
 
@@ -655,10 +698,11 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
     # -- 上游第 15 条：recent context floor + window ----------------------------
 
-    def test_recent_context_combines_a_fifty_entry_floor_with_a_one_hour_window(self):
+    def test_recent_context_combines_a_thirty_five_entry_floor_with_a_forty_five_minute_window(self):
+        # 上游 1.0.1-rc2 把 Schema 默认值对齐服务层 fallback（50→35、60→45）。
         runtime = self.section("runtime")
-        self.assertEqual(runtime["context_entry_limit"]["default"], 50)
-        self.assertEqual(runtime["context_time_window_minutes"]["default"], 60)
+        self.assertEqual(runtime["context_entry_limit"]["default"], 35)
+        self.assertEqual(runtime["context_time_window_minutes"]["default"], 45)
 
     # -- 上游第 16 条：separate optional perspective layer ----------------------
 
@@ -1054,9 +1098,9 @@ class ReleaseConsistencyTest(unittest.TestCase):
         self.assertRegex(metadata, r"astrbot_version:\s*\"?[><=~!]", "必须声明 astrbot_version")
 
     def test_upstream_version_constant_records_the_snapshot_version(self):
-        self.assertEqual(self.meta_version, "1.0.1-beta6-rebuild")
+        self.assertEqual(self.meta_version, "1.0.1-rc28")
         self.assertRegex(read(META_PY_PATH),
-                         r'HDS_INTERLUDE_VERSION\s*=\s*["\']1\.0\.1-beta6-rebuild["\']')
+                         r'HDS_INTERLUDE_VERSION\s*=\s*["\']1\.0\.1-rc28["\']')
 
     def test_upstream_package_json_matches_the_snapshot_version(self):
         with open(UPSTREAM_PACKAGE_PATH, encoding="utf-8") as fp:

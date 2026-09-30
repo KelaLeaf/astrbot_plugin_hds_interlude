@@ -32,6 +32,7 @@ from .adapters.astrbot_bridge import (
     session_view,
 )
 from .adapters.console_api import ConsoleApi
+from .core.health import format_health_lines
 
 __all__ = ['COMMANDS', 'COMMAND_HANDLERS', 'HDSInterludePlugin', 'MANAGEMENT_COMMANDS']
 
@@ -140,6 +141,28 @@ COMMANDS: tuple[CommandSpec, ...] = (
         'interlude.purge.range', 'hdsi_purge_range', 'hdsi_purge_range', 'admin',
         'hdsi_purge_range <开始> <结束>',
     ),
+    # ── 上游 1.0.1-rc28（单剧本多通道 M1a/M1b/M2）────────────────────────────
+    CommandSpec(
+        'interlude.participant.link', 'hdsi_participant_link', 'hdsi_participant_link', 'admin',
+        'hdsi_participant_link <参与者ID> <用户ID>',
+    ),
+    CommandSpec(
+        'interlude.participant.unlink', 'hdsi_participant_unlink', 'hdsi_participant_unlink', 'admin',
+        'hdsi_participant_unlink <端点ID>',
+    ),
+    CommandSpec(
+        'interlude.participant.endpoints', 'hdsi_participant_endpoints', 'hdsi_participant_endpoints', 'admin',
+        'hdsi_participant_endpoints <参与者ID>',
+    ),
+    CommandSpec(
+        'interlude.story.endpoint', 'hdsi_story_endpoint', 'hdsi_story_endpoint', 'admin',
+        'hdsi_story_endpoint [add <平台> <账号> [qq|wechat] | disable <端点ID>]',
+    ),
+    CommandSpec(
+        'interlude.story.alias', 'hdsi_story_alias', 'hdsi_story_alias', 'admin',
+        'hdsi_story_alias [remove <别名ID>]',
+    ),
+    CommandSpec('interlude.reset', 'hdsi_reset', 'hdsi_reset', 'admin', 'hdsi_reset'),
 )
 
 #: AstrBot 命令名 → 处理器方法名。
@@ -265,6 +288,14 @@ def _parse_iso(value: str) -> Any:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _local_time_text(value: Any) -> str:
+    """把 ISO 时间戳渲染成本地可读文本（别名列表用；解析不出就原样回显）。"""
+    parsed = _parse_iso(value) if isinstance(value, str) else value
+    if not isinstance(parsed, datetime):
+        return str(value or '')
+    return parsed.astimezone().strftime('%Y-%m-%d %H:%M')
 
 
 def format_story_start_readiness(readiness: Any, title: str = 'Console 档案检查') -> str:
@@ -1054,6 +1085,12 @@ class HDSInterludePlugin(Star):
                 _pick(window, 'activityLoad', 'activity_load') or '尚未建立',
             ),
         ]
+        # 上游 1.0.1-rc28 的健康指标：命令行长文本不好读，给一份 6 行人话摘要
+        # （数值与 Console 面板同源，见 `core/health.py::format_health_lines`）。
+        snapshot = service.health_snapshot(_pick(story, 'id')) if hasattr(service, 'health_snapshot') else {}
+        if snapshot:
+            lines.append('健康指标（自本次重载）：')
+            lines.extend('· %s' % line for line in format_health_lines(snapshot))
         yield event.plain_result('\n'.join(lines))
 
     async def _change_status(self, session: Any, status: str) -> str:
@@ -1693,6 +1730,204 @@ class HDSInterludePlugin(Star):
         yield event.plain_result(
             '已彻底重置所有平台：旧剧本、场景摘要、剧情弧线、长期事实、记忆、意图、状态演化和参与者关系状态均已清除；'
             '当前故事保留为空白的全局主剧本，Canon 已按当前 Console 配置重建。'
+        )
+
+    @filter.command('hdsi_participant_link')
+    async def hdsi_participant_link(self, event: AstrMessageEvent):
+        """管理员：把同一个人的另一个号链入既有参与者（第二端点消息进入同一关系分支）。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        args = self._raw_args(event)
+        participant_id = self._text_arg(args, 0).strip()
+        account = self._text_arg(args, 1).strip()
+        if not participant_id or not account:
+            yield event.plain_result('用法：hdsi_participant_link <参与者ID> <用户ID>')
+            return
+        service = self.bridge.service
+        participant = await service.get_participant(participant_id) if hasattr(service, 'get_participant') else None
+        if not participant:
+            yield event.plain_result('参与者不存在：%s' % participant_id)
+            return
+        platform = _pick(session, 'platform') or 'onebot'
+        result = await service.link_participant_endpoint(participant, platform, account)
+        if _pick(result, 'ok'):
+            display = _pick(participant, 'displayName', 'display_name') or participant_id
+            yield event.plain_result('用户端点已链接（%s → %s）。' % (account, display))
+            return
+        yield event.plain_result('链接失败：%s' % _pick(result, 'error'))
+
+    @filter.command('hdsi_participant_unlink')
+    async def hdsi_participant_unlink(self, event: AstrMessageEvent):
+        """管理员：解除一个用户端点链接（可撤销；身份与历史保留）。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        endpoint_id = self._text_arg(self._raw_args(event), 0).strip()
+        if not endpoint_id:
+            yield event.plain_result('用法：hdsi_participant_unlink <端点ID>')
+            return
+        result = await self.bridge.service.unlink_participant_endpoint(endpoint_id)
+        if _pick(result, 'ok'):
+            yield event.plain_result('端点已解除链接（%s）。' % endpoint_id)
+            return
+        yield event.plain_result('解除失败：%s' % _pick(result, 'error'))
+
+    @filter.command('hdsi_participant_endpoints')
+    async def hdsi_participant_endpoints(self, event: AstrMessageEvent):
+        """管理员：列出参与者名下全部用户端点。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        participant_id = self._text_arg(self._raw_args(event), 0).strip()
+        if not participant_id:
+            yield event.plain_result('用法：hdsi_participant_endpoints <参与者ID>')
+            return
+        await self.bridge.service.ensure_endpoint_registry()
+        endpoints = self.bridge.service.list_participant_endpoints(participant_id)
+        if not endpoints:
+            yield event.plain_result('参与者 %s 没有用户端点。' % participant_id)
+            return
+        lines = [
+            '%s %s %s 端点=%s' % (
+                '●' if _pick(item, 'enabled') else '○', _pick(item, 'platform'),
+                _pick(item, 'userId', 'user_id'), _pick(item, 'endpointId', 'endpoint_id'),
+            )
+            for item in endpoints
+        ]
+        yield event.plain_result('用户端点（%d 个）：\n%s' % (len(endpoints), '\n'.join(lines)))
+
+    @filter.command('hdsi_story_endpoint')
+    async def hdsi_story_endpoint(self, event: AstrMessageEvent):
+        """管理员：管理剧本的角色端点（账号迁移的唯一显式途径）。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        story = await self._require_story(session)
+        if isinstance(story, str):
+            yield event.plain_result(story)
+            return
+        service = self.bridge.service
+        parts = [part for part in self._text_arg(self._raw_args(event), 0).split() if part]
+        if parts and parts[0] == 'add':
+            if len(parts) < 3:
+                yield event.plain_result('用法：hdsi_story_endpoint add <平台> <账号> [qq|wechat]')
+                return
+            channel_kind = 'wechat' if len(parts) > 3 and parts[3] == 'wechat' else 'qq'
+            result = await service.add_story_endpoint(story, parts[1], parts[2], channel_kind)
+            if _pick(result, 'ok'):
+                yield event.plain_result('角色端点已注册（%s %s，%s，端点 %s）。' % (
+                    parts[1], parts[2], channel_kind, _pick(result, 'endpointId', 'endpoint_id')))
+                return
+            yield event.plain_result('注册失败：%s' % _pick(result, 'error'))
+            return
+        if parts and parts[0] == 'disable':
+            if len(parts) < 2:
+                yield event.plain_result('用法：hdsi_story_endpoint disable <端点ID>')
+                return
+            result = await service.disable_story_endpoint(parts[1])
+            if _pick(result, 'ok'):
+                yield event.plain_result('端点已停用（%s）。' % parts[1])
+                return
+            yield event.plain_result('停用失败：%s' % _pick(result, 'error'))
+            return
+        if parts:
+            yield event.plain_result('用法：hdsi_story_endpoint [add <平台> <账号> [qq|wechat] | disable <端点ID>]')
+            return
+        await service.ensure_endpoint_registry()
+        endpoints = service.list_story_endpoints(_pick(story, 'id'))
+        if not endpoints:
+            yield event.plain_result('当前故事没有登记任何角色端点。')
+            return
+        lines = [
+            '%s %s %s（%s%s）端点=%s' % (
+                '●' if _pick(item, 'enabled') else '○', _pick(item, 'platform'), _pick(item, 'selfId', 'self_id'),
+                _pick(item, 'channelKind', 'channel_kind'),
+                '·在线' if _pick(item, 'online') else '·离线',
+                _pick(item, 'endpointId', 'endpoint_id'),
+            )
+            for item in endpoints
+        ]
+        yield event.plain_result('角色端点（%d 个）：\n%s' % (len(endpoints), '\n'.join(lines)))
+
+    @filter.command('hdsi_story_alias')
+    async def hdsi_story_alias(self, event: AstrMessageEvent):
+        """管理员：查看/回滚剧本别名重定向（单剧本多通道 M1b）。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result(NO_MANAGER)
+            return
+        service = self.bridge.service
+        await service.ensure_endpoint_registry()
+        text = self._text_arg(self._raw_args(event), 0).strip()
+        if text.startswith('remove'):
+            alias_id = text[len('remove'):].strip()
+            if not alias_id:
+                yield event.plain_result('用法：hdsi_story_alias remove <别名ID>')
+                return
+            result = await service.remove_story_alias(
+                alias_id, 'by %s' % (_pick(session, 'userId', 'user_id') or 'admin'),
+            )
+            if _pick(result, 'ok'):
+                yield event.plain_result('已回滚别名 %s（审计已写入剧本条目）。' % alias_id)
+                return
+            yield event.plain_result('回滚失败：%s' % _pick(result, 'error'))
+            return
+        if text:
+            yield event.plain_result('用法：hdsi_story_alias [remove <别名ID>]')
+            return
+        aliases = service.list_story_aliases()
+        if not aliases:
+            yield event.plain_result('当前没有剧本别名。')
+            return
+        lines = [
+            '%s → %s（%s，%s）' % (
+                _pick(row, 'aliasStoryId', 'alias_story_id'),
+                _pick(row, 'canonicalStoryId', 'canonical_story_id'),
+                _pick(row, 'reason'), _local_time_text(_pick(row, 'createdAt', 'created_at')),
+            )
+            for row in aliases
+        ]
+        yield event.plain_result('剧本别名（%d 条）：\n%s' % (len(aliases), '\n'.join(lines)))
+
+    @filter.command('hdsi_reset')
+    async def hdsi_reset(self, event: AstrMessageEvent):
+        """管理员：完全重置——清空数据库并把角色设定重置为 Console 档案当前值。"""
+        if self.blind_mode:
+            return
+        session = await self._prepare(event)
+        if not self._is_manager(session):
+            yield event.plain_result('无权限。')
+            return
+        story = await self._require_story(session)
+        if isinstance(story, str):
+            yield event.plain_result(story)
+            return
+        confirmed = await self._ask_confirmation(
+            event, '这将删除所有剧本、记忆、事实，并将角色设定重置为 Console 档案当前值。确定吗？(y/n)',
+        )
+        if not confirmed:
+            yield event.plain_result(CANCELLED)
+            return
+        await self.bridge.service.clear_database()
+        await self.bridge.service.purge_all_story_data(_pick(story, 'id'))
+        yield event.plain_result(
+            '已完全重置。数据库已清空，角色设定已回到 Console 故事档案（storyDefaults）模板。\n'
+            '如需更换角色身份，请在 Console 修改故事档案后重新开始。'
         )
 
     @filter.command('hdsi_purge_platform')

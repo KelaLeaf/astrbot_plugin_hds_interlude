@@ -453,11 +453,78 @@ SCHEDULE_PREPLAN = TableSpec(
     added_later=True,
 )
 
+#: `interlude_seeded_event` —— 世界播种器的事件表（上游 1.0.1-rc23）。
+#: 列名逐字 camelCase（持久化 wire format）；`status` 生命周期
+#: `scheduled → injecting → injected`，旁路 `expired`。
+SEEDED_EVENT = TableSpec(
+    name='interlude_seeded_event',
+    fields={
+        'id': _spec('unsigned autoInc'),
+        'storyId': _spec('string(255)'),
+        'summary': _spec('text'),
+        'importance': _spec('string(16)'),
+        'occursAt': _spec('timestamp'),
+        'expiresAt': _spec('timestamp'),
+        'status': _spec('string(16)'),
+        'subjects': _spec('json'),
+        'sourcePayload': _spec('json'),
+        'injectedEntryId': _spec('unsigned'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='id',
+    auto_increment=True,
+    indexes=('storyId', 'status', 'occursAt'),
+    added_later=True,
+)
+
+#: `interlude_endpoint` —— 端点注册表（上游 1.0.1-rc28 的 M1a）。
+#: 身份与地址分离：主键是持久随机 ID，`accountKey` 等地址字段可变；唯一性靠应用层的
+#: `endpoint_unique_key()` 校验（`unique` 约束表达不了"ownerKind 决定键形状"）。
+ENDPOINT = TableSpec(
+    name='interlude_endpoint',
+    fields={
+        'id': _spec('string(63)'),
+        'ownerKind': _spec('string(24)'),
+        'ownerId': _spec('string(255)'),
+        'channelKind': _spec('string(8)'),
+        'platform': _spec('string(63)'),
+        'accountKey': _spec('string(127)'),
+        'selfId': _spec('string(63)'),
+        'userId': _spec('string(127)'),
+        'channelId': _spec('string(127)'),
+        'groupId': _spec('string(127)'),
+        'conversationKind': _spec('string(16)'),
+        'enabled': _spec('boolean'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='id',
+    indexes=('accountKey', 'ownerKind', 'ownerId'),
+    added_later=True,
+)
+
+#: `interlude_story_alias` —— 推导 ID → 稳定剧本 ID 的重定向（M1b）。
+#: 回滚 = 删行；行自带审计（`reason` + 时间）。
+STORY_ALIAS = TableSpec(
+    name='interlude_story_alias',
+    fields={
+        'aliasStoryId': _spec('string(255)'),
+        'canonicalStoryId': _spec('string(255)'),
+        'reason': _spec('string(255)'),
+        'createdAt': _spec('timestamp'),
+    },
+    primary='aliasStoryId',
+    indexes=('canonicalStoryId',),
+    added_later=True,
+)
+
 #: 表名 → `TableSpec`。键顺序 = 上游 `registerTables` 的注册顺序。
 TABLES: dict[str, TableSpec] = {
     spec.name: spec for spec in (
         STORY, PARTICIPANT, SCRIPT_ENTRY, MEMORY, INTENT, SCENE, ARC, FACT, STATE_PATCH,
-        WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, SCHEDULE_PREPLAN,
+        WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, SCHEDULE_PREPLAN, SEEDED_EVENT,
+        ENDPOINT, STORY_ALIAS,
     )
 }
 

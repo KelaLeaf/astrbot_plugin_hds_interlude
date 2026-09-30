@@ -154,7 +154,10 @@ def update_script_delivery_actions(
 
     * ``current`` 不是数组时返回 ``None``。
     * 没有任何片段真正改变时返回 ``None``（调用方据此跳过写库）。
-    * 已 ``delivered`` 的片段是终态；更晚的记账错误不得将其降级。
+    * ``delivered`` 与 ``cancelled`` 都是终态（上游 1.0.1-rc25 收紧）：已送达的发言不能
+      被更晚的记账错误降级，已撤销的行动也不能被迟到的回执复活。
+    * 回到 ``pending`` 表示重试：上一轮的 ``completedAt`` 必须清掉，否则
+      ``deliveryReality`` 会把一次失败说成"曾经完成"。
     """
     if not isinstance(current, list):
         return None
@@ -176,8 +179,9 @@ def update_script_delivery_actions(
             if not _is_record(segment) or _get(segment, 'index') != ref_segment_index:
                 segments.append(segment)
                 continue
-            # 平台已接受的片段是终态：更晚的记账错误绝不能把已送达的发言变回未发送。
-            if _get(segment, 'status') == 'delivered':
+            # 终态不可逆（上游 rc25）：`delivered` 是平台已接受，`cancelled` 是已撤销——
+            # 更晚的记账/迟到回执都不得改写它们（cancelled 被复活会变成"撤了又发"）。
+            if _get(segment, 'status') in ('delivered', 'cancelled'):
                 segments.append(segment)
                 continue
             if _get(segment, 'status') == status and _get(segment, 'reason') == reason:
@@ -295,8 +299,11 @@ def _updated_segment(
     next_segment['status'] = status
     attempted_at = _get(segment, 'attempted_at', 'attemptedAt')
     next_segment['attempted_at'] = timestamp if attempted_at is None else attempted_at
-    # 上游：pending 时不写 completedAt，但也不删除既有的值（保持原样）。
-    if status != 'pending':
+    # 上游 rc25：回到 pending 是**重试**，上一轮的完成时间不再成立，必须清掉；
+    # 其余状态写本次时间戳。
+    if status == 'pending':
+        next_segment.pop('completed_at', None)
+    else:
         next_segment['completed_at'] = timestamp
     if reason:
         next_segment['reason'] = reason

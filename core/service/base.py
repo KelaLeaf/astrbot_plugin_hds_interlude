@@ -32,6 +32,7 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
+from ..health import HealthMonitor
 from ..time import dt_ms, iso, parse_dt, utc_now
 from .. import logging as interlude_logging
 from ..database import timestamp_columns
@@ -611,6 +612,8 @@ class ServiceBase:
     service_logger: Any
     background_started: bool
     database_resetting: bool
+    runtime_generation: int
+    story_task_generations: dict[str, int]
     sweep_running: bool
     compaction_sweep_running: bool
     blind_mode_health_issue: bool
@@ -711,6 +714,12 @@ class ServiceBase:
         self.service_logger = getattr(ctx, 'logger', None)
         self.background_started = False
         self.database_resetting = False
+        # 上游 1.0.1-rc26：任务失效代际。清库/清剧本/桌面端 paused 会递增，
+        # 在途模型结果回来时按组合键判废，避免把旧记忆写进刚清过的库。
+        self.runtime_generation = 0
+        self.story_task_generations = {}
+        # 上游 1.0.1-rc28 `health.ts`：纯内存滚动健康指标（重载即归零）。
+        self.health = HealthMonitor()
         self.sweep_running = False
         self.compaction_sweep_running = False
         self.blind_mode_health_issue = False
@@ -737,6 +746,9 @@ class ServiceBase:
 
         # ---- 计时器句柄（上游只靠 `ctx` 持有，这里留一个可取消的引用） ----
         self._sweep_timer: Optional[TimerHandle] = None
+        # 上游 1.0.1-rc23：世界播种器定时器（总开关 + 勾选连接都满足时才注册）。
+        self._world_seeder_timer: Optional[TimerHandle] = None
+        self._world_seeder_sweep_running = False
         self._compaction_timer: Optional[TimerHandle] = None
         self._blind_mode_timer: Optional[TimerHandle] = None
         self._sticker_scan_timer: Optional[TimerHandle] = None
@@ -821,6 +833,42 @@ class ServiceBase:
     # ------------------------------------------------------------------ #
     # 配置段访问（`cachedXxxConfig` 的惰性解析）
     # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # 任务失效代际（上游 1.0.1-rc26 `taskGeneration` / `invalidateStoryTasks`）
+    # ------------------------------------------------------------------ #
+
+    def task_generation(self, story_id: str) -> str:
+        """上游 `taskGeneration(storyId)`：全局代际与故事代际的组合键。"""
+        return '%d:%d' % (
+            int(getattr(self, 'runtime_generation', 0)),
+            int((getattr(self, 'story_task_generations', None) or {}).get(story_id, 0)),
+        )
+
+    def task_generation_current(self, story_id: str, generation: Any) -> bool:
+        """上游 `taskGenerationCurrent`：代际匹配 + 不在清库 + 桌面端未暂停。"""
+        if not generation:
+            return True
+        if getattr(self, 'database_resetting', False):
+            return False
+        if getattr(self, 'desktop_runtime_phase', 'active') == 'paused':
+            return False
+        return self.task_generation(story_id) == generation
+
+    def invalidate_story_tasks(self, story_id: str = '') -> None:
+        """上游 `invalidateStoryTasks(storyId?)`：带 storyId 只作废该故事，否则全局。
+
+        ⚠️ `set_status(story, 'paused')`（`hdsi_pause` 命令）**不**递增代际：
+        故事暂停靠每步读 `story.status !== 'active'` 与桌面端相位检查。
+        """
+        if story_id:
+            generations = getattr(self, 'story_task_generations', None)
+            if generations is None:
+                generations = {}
+                self.story_task_generations = generations
+            generations[story_id] = int(generations.get(story_id, 0)) + 1
+            return
+        self.runtime_generation = int(getattr(self, 'runtime_generation', 0)) + 1
 
     def _config_cache(
         self, attribute: str, resolver_name: str, section: str, parent: Optional[str] = None,
@@ -1018,6 +1066,19 @@ class ServiceBase:
 
     def write_standalone(self, level: str, message: str, args: Any) -> None:
         """上游 `writeStandalone`（`src/service.ts:6778`）逐条移植。"""
+        # 上游 1.0.1-rc23：世界播种器。启用条件是**总开关 + 至少一条勾选「用于世界播种」
+        # 的连接**（AND）。不满足时连定时器都不注册（零成本）；但启动时要说清原因——
+        # 上游在这条路径上完全静默，用户会以为坏了（见 PORTING_NOTES §31）。
+        if hasattr(self, 'world_seeder_runtime'):
+            seeder_runtime = self.world_seeder_runtime()
+            if seeder_runtime.get('enabled'):
+                self._world_seeder_timer = self.ctx.set_interval(
+                    lambda: self._spawn(self.world_seeder_sweep()),
+                    max(5, int(seeder_runtime['cadence_minutes'])) * 60_000,
+                )
+                self.report_standalone('info', self.explain_world_seeder_state())
+            else:
+                self.report_standalone('warn', self.explain_world_seeder_state())
         if self.blind_mode_config.get('enabled'):
             if level in ('error', 'warn'):
                 self.blind_mode_health_issue = True
@@ -1524,7 +1585,11 @@ class ServiceChunk0(ServiceBase):
 
     async def set_desktop_runtime_phase(self, phase: str) -> None:
         """上游 `setDesktopRuntimePhase(phase)`（`src/service.ts:769`）逐条移植。"""
+        previous = self.desktop_runtime_phase
         self.desktop_runtime_phase = phase
+        if phase == 'paused' and previous != 'paused':
+            # 上游 1.0.1-rc26：从非 paused 进入 paused 时递增全局代际，在途结果作废。
+            self.invalidate_story_tasks()
         if phase == 'paused':
             for timer in list(self.due_intent_wake_timers.values()):
                 cancel = getattr(timer, 'cancel', None)
@@ -2033,6 +2098,51 @@ class ServiceChunk0(ServiceBase):
         platform = pick(session, 'platform')
         self_id = pick(session, 'selfId', 'self_id')
         user_id = pick(session, 'userId', 'user_id')
+        # 上游 1.0.1-rc28（M1a）：查找剧本前确保端点注册表已并轨（幂等 + 单飞锁）。
+        # 单平台零影响：注册表只有派生端点时解析结果与旧字段逐字节一致。
+        await self.ensure_endpoint_registry()
+        if self.shared_story_config.get('enabled') and self_id and is_one_bot_platform(platform):
+            # M1b（v3 §三/§六）：注册表与别名**先于**「按账号推导 ID」。注册表就绪后，
+            # 未注册的 OneBot 账号直接判为无故事——绝不落到全局 fallback，也不触发
+            # transport 自愈改绑（那会把主剧本绑到陌生账号上）。账号迁移只能经
+            # `hdsi_story_endpoint add` 显式完成。
+            try:
+                endpoint_hit = await self.resolve_inbound_endpoint_for({
+                    'platform': platform, 'selfId': self_id,
+                })
+                redirect_id = pick(pick(endpoint_hit, 'role_endpoint'), 'ownerId', 'owner_id') \
+                    if endpoint_hit else None
+                if not redirect_id:
+                    redirect_id = await self.resolve_story_id_alias(
+                        story_id_for_character(platform, self_id),
+                    )
+                if redirect_id:
+                    redirected = await self.get_canonical_story(redirect_id) \
+                        or await self.get_paused_story(redirect_id)
+                    if redirected:
+                        redirected = await self.repair_canonical_one_bot_story_transport(redirected, session)
+                        # 命中的剧本 id 若仍是旧的按账号形态，走与下方同一条惰性迁移
+                        # （重命名成共享 id + 其余活动剧本归档）；否则只并入共享分支。
+                        shared_id = story_id_for_character(platform, self_id)
+                        if pick(redirected, 'platform') == platform and pick(redirected, 'id') != shared_id:
+                            return await self.migrate_legacy_story(redirected, session)
+                        await self.migrate_legacy_branch_into_shared(redirected, session)
+                        return redirected
+                if getattr(self, 'endpoint_registry_ready', False):
+                    # v3 §三边界行为：陌生账号不自动挂载。注册表就绪意味着所有既有
+                    # 故事的账号都已登记——此刻的 miss 是真正的未知账号。
+                    self.note_unknown_one_bot_account(platform, self_id)
+                    return None
+            except Exception as error:
+                # 注册表已就绪后的解析异常 = 数据/存储故障，拒绝本次入站（不落全局
+                # fallback，防止陌生账号绕过隔离触发重绑）；仅冷启动（注册表自身
+                # 未能加载）时回落旧路径维持可用性。
+                if getattr(self, 'endpoint_registry_ready', False):
+                    self.report_standalone(
+                        'warn', '端点解析异常，已拒绝本次入站（不回落全局故事查找）账号=%s 错误=%s',
+                        self_id, error,
+                    )
+                    return None
         if self.shared_story_config.get('enabled'):
             # 共享模式刻意在整个实例里只有一部 canonical 活动剧本。
             shared_id = story_id_for_character(platform, self_id)
@@ -2177,6 +2287,12 @@ class ServiceChunk0(ServiceBase):
             'content': 'The story begins with %s.' % pick(character, 'name'),
             'occurredAt': iso(now), 'metadata': {},
         }, now)
+        # 上游 1.0.1-beta16-tuned / rc4：补充事实写成初始长期事实，并给历史空
+        # `lastSeenAt` 回填时间戳（旧行没有这个字段时检索排序会读到空值）。
+        await self.seed_supplementary_facts(story, now)
+        await self.backfill_fact_last_seen(story['id'], now)
+        # 上游 1.0.1-rc28（M1a/M1b）：新故事同步登记角色端点与推导 ID 别名。
+        await self.register_story_role_endpoint_row(story)
         await self.schedule_next_automatic_advance(story['id'], now)
         return story
 
@@ -2346,6 +2462,8 @@ class ServiceChunk0(ServiceBase):
             'content': "%s entered the character's relationship network." % participant['displayName'],
             'occurredAt': iso(now), 'metadata': {'personId': participant['personId']},
         }, now, participant['id'])
+        # 上游 1.0.1-rc28（M1a）：参与者同步登记用户端点（多号链入的锚点）。
+        await self.register_participant_user_endpoint_row(participant)
         return participant
 
     async def update_setting(self, story: InterludeStory, patch: Any) -> InterludeStory:

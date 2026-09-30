@@ -1268,9 +1268,14 @@ class FactoryTests(unittest.IsolatedAsyncioTestCase):
         vision = create_vision_describer(
             http, make_config(providers=[make_provider(use_for_main=False, use_for_vision=True)]),
         )
-        # 上游 `available()` 问的是表情连接；侧端识图看 `visionAvailable()`。
-        self.assertTrue(vision.vision_available())
-        self.assertFalse(vision.available())
+        # 上游 1.0.1-rc26：工厂返回薄包装，`available()` 走 **vision 路由**口径。
+        # 旧实现直接把 narrator 交出去，而它的 `available()` 问的是**贴纸连接**——
+        # 只勾「用于侧端识图」的用户被误判成「没有配置视觉模型」，识图静默跳过。
+        self.assertTrue(vision.available())
+        stickers_only = create_vision_describer(
+            http, make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)]),
+        )
+        self.assertFalse(stickers_only.available(), '识图只认 useForVision，不认贴纸连接')
 
     async def test_context_style_sources_are_accepted_by_the_factories(self):
         http = FakeHttpClient()

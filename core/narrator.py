@@ -75,6 +75,7 @@ from .model_routing import (
     resolve_model_routing,
 )
 from .script.continuation import prose_reuse_observation
+from .specialization import resolve_manual_specialty
 from .time import dt_ms, iso, parse_dt, utc_now
 from .types import (
     AlterAnalysisDecision,
@@ -283,6 +284,7 @@ class ProviderConfig(TypedDict, total=False):
     use_for_embedding: bool
     use_for_stickers: bool
     use_for_vision: bool
+    use_for_world_seeding: bool
     zhipu_official: bool
     reasoning_effort: ZhipuReasoningEffort
     deepseek_official: bool
@@ -476,6 +478,7 @@ class ChatRequestOverrides(TypedDict, total=False):
 #: 日程预排 / Overlay 整理都跟随 `compaction` 的连接（`isAssignedTo` 里没有独立
 #: 开关），所以这里统一映射到 `compaction`。
 SIDE_TASK_ROUTES: dict[str, str] = {
+    '世界播种': 'world_seeding',
     '压缩': 'compaction',
     '时间导演': 'compaction',
     '日程预排': 'compaction',
@@ -671,6 +674,10 @@ class SinkLogger:
         """调试级日志。"""
         self._emit('debug', message, args)
 
+    def info(self, message: str, *args: Any) -> None:
+        """信息级日志（上游 `logger.info`；适配层按既有映射落到宿主 debug）。"""
+        self._emit('info', message, args)
+
     def warn(self, message: str, *args: Any) -> None:
         """警告级日志。"""
         self._emit('warn', message, args)
@@ -719,6 +726,46 @@ class SilentCompactor:
     async def compact_overlay(self, request: OverlayCompactionRequest) -> OverlayCompactionDecision:
         """不产出 overlay 压缩结果。"""
         return {'summary': ''}
+
+    async def generate_world_seeds(self, system: str, user: str, runtime: dict[str, Any]) -> Any:
+        """上游 `worldSeeder.generate(payload)`：世界播种器的一次生成调用。
+
+        走侧任务链（`customSideTask(provider, '世界播种', timeout, temperature, maxTokens,
+        system, user)` → `sideTaskJson`）：`response_format=json_object`，思考型网关截断时
+        去掉 `max_tokens` 重试一次（`_side_task_json` 已内建）。返回解析后的对象；
+        没有勾选「用于世界播种」的连接时返回 None（播种器整体关闭）。
+        """
+        assigned = self._assigned_providers('world_seeding')
+        if not assigned:
+            return None
+        provider = assigned[0]
+        model = _trim(_get(provider, 'model'))
+        if not model:
+            return None
+        timeout = _coalesce(_get(runtime, 'timeout'), provider.get('timeout'))
+
+        def build_body(capped: bool) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                **parse_object(provider.get('extra_body'), 'extraBody', self.logger),
+                'model': model,
+                'temperature': _coalesce(_get(runtime, 'temperature'), provider.get('temperature'), 0.9),
+                'top_p': _coalesce(provider.get('top_p'), 1),
+            }
+            if capped:
+                body['max_tokens'] = _coalesce(_get(runtime, 'max_tokens'), 1_000)
+            body['response_format'] = {'type': 'json_object'}
+            body['messages'] = [
+                {'role': 'system', 'content': system},
+                {'role': 'user', 'content': user},
+            ]
+            return body
+
+        def parse(text: str) -> Any:
+            if not text:
+                raise RuntimeError('World seeder returned an empty response.')
+            return parse_json_response(text, 'World seeder')
+
+        return await self._side_task_json(provider, model, '世界播种', timeout, build_body, parse)
 
     async def plan_schedule_preplan(
         self, request: SchedulePreplanReviewRequest,
@@ -934,6 +981,8 @@ class OpenAICompatibleNarrator:
         self.routing = routing if routing is not None else resolve_model_routing(config)
         self.cooldown_until: dict[str, int] = {}
         self.round_robin_offset = 0
+        # 模型特化 profile 缓存：键是「探测串 + 配置」，值是不可变使用的纯 dict。
+        self._specialty_cache: dict[tuple[str, Any, Any], dict[str, Any]] = {}
 
     # ---------- 路由与日志 ----------
 
@@ -941,9 +990,51 @@ class OpenAICompatibleNarrator:
         if self.logger is not None:
             self.logger.debug(message, *args)
 
+    def _info(self, message: str, *args: Any) -> None:
+        """信息级日志（上游 `logger?.info?.(...)`）。
+
+        注入的 logger 没有 `info`（`LoggerLike` 协议只要求 `debug`/`warn`）时落到 core
+        日志 sink，**不冒充 debug**——只记录 debug/warn 的调用方不该被这条摘要污染。
+        """
+        if self.logger is None:
+            return
+        info = getattr(self.logger, 'info', None)
+        if callable(info):
+            info(message, *args)
+            return
+        log_layered({'level': 'info', 'message': message, 'args': list(args), 'standalone': True})
+
     def _warn(self, message: str, *args: Any) -> None:
         if self.logger is not None:
             self.logger.warn(message, *args)
+
+    # ---------- 模型特化 ----------
+
+    def resolve_specialty(self, provider: Optional[ProviderConfig] = None) -> dict[str, Any]:
+        """当前主模型的手动特化（上游 `OpenAICompatibleNarrator.resolveSpecialty`）。
+
+        档位由 Console 显式选择（`specialization`，默认 `off` = rc12 原样 full+generic），
+        家族默认按模型名识别（`specialization_family` / `specializationFamily`）。探测串取
+        连接的 `model / id / label`；结果按「探测串 + 配置」缓存，键不变时不重算、不重复打日志。
+
+        **没有特化配置时返回 full+generic**，与历史版本的提示词逐字相同。
+        """
+        provider = provider or {}
+        probe = ' '.join(filter(None, (
+            _trim(_get(provider, 'model')), _trim(_get(provider, 'id')), _trim(_get(provider, 'label')),
+        )))
+        mode = _coalesce(_get(self.config, 'specialization'), _get(self.config, 'specialization_mode'))
+        family_setting = _coalesce(_get(self.config, 'specialization_family'),
+                                   _get(self.config, 'specializationFamily'))
+        key = (probe, mode, family_setting)
+        cached = self._specialty_cache.get(key)
+        if cached is not None:
+            return cached
+        profile = resolve_manual_specialty(probe, mode, family_setting)
+        self._specialty_cache[key] = profile
+        self._info('模型特化已切换 档位=%s 家族=%s 来源=%s 探测=%s',
+                   profile['tier'], profile['family'], profile['source'], profile['probe'])
+        return profile
 
     def _assigned_providers(self, task: str) -> list[ProviderConfig]:
         route = self.routing[task]
@@ -1147,6 +1238,8 @@ class OpenAICompatibleNarrator:
                     cache_first_payload,
                     bool(_truthy(group_context)),
                     request.get('writing_options'),
+                    specialty=self.resolve_specialty(provider),
+                    channel_selection_enabled=bool(request.get('channel_selection_enabled')),
                 ) + urge_instruction(request.get('urge_enabled') is True, request.get('phase')),
             },
             {'role': 'user', 'content': user_content},
@@ -1810,6 +1903,27 @@ def create_sticker_describer(
     return SilentStickerDescriber()
 
 
+class _VisionDescriberProxy:
+    """上游 1.0.1-rc26：`createVisionDescriber()` 返回的薄包装。
+
+    `OpenAICompatibleNarrator.available()` 是**贴纸口径**（有没有勾「用于表情包描述」），
+    而上层用它判「侧端识图能不能用」。只勾了「用于侧端识图」的用户于是被误判成
+    「没有配置视觉模型」，识图被静默跳过（上游 rc26 修的就是这条）。包装只暴露
+    `VisionDescriber` 契约的两个方法，`available()` 走 vision 路由口径。
+    """
+
+    def __init__(self, narrator: 'OpenAICompatibleNarrator') -> None:
+        self._narrator = narrator
+
+    def available(self) -> bool:
+        """按 vision 路由判定，而不是 stickers 口径。"""
+        return self._narrator.vision_available()
+
+    async def describe_images(self, *args: Any, **kwargs: Any) -> Any:
+        """转发给真实 narrator。"""
+        return await self._narrator.describe_images(*args, **kwargs)
+
+
 def create_vision_describer(
     http: Any,
     config: ModelConfig,
@@ -1821,7 +1935,9 @@ def create_vision_describer(
     """上游 `createVisionDescriber()`。"""
     resolved = routing if routing is not None else resolve_model_routing(config)
     if _truthy(_get(resolved.get('vision'), 'available')):
-        return OpenAICompatibleNarrator(http, config, silent_logs, on_usage, resolved, logger)
+        return _VisionDescriberProxy(
+            OpenAICompatibleNarrator(http, config, silent_logs, on_usage, resolved, logger),
+        )
     return SilentVisionDescriber()
 
 

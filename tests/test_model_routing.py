@@ -397,7 +397,8 @@ class SupplementaryTests(unittest.TestCase):
             format_model_routing(routing),
             'main=未配置[unavailable] compaction=未配置[unavailable] timeline=未配置[unavailable] '
             'alter=未配置[unavailable] embedding=未配置[disabled] stickers=未配置[unavailable] '
-            'vision=未配置[unavailable]',
+            # 上游 1.0.1-rc24：世界播种器也是一个独立任务。
+            'vision=未配置[unavailable] world_seeding=未配置[unavailable]',
         )
 
     def test_format_model_routing_uses_assigned_provider_model_and_未指定_fallback(self):

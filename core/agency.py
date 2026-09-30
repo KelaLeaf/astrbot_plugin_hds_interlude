@@ -37,6 +37,8 @@
 
 from __future__ import annotations
 
+import math
+
 from datetime import datetime, timedelta
 from typing import Any, Mapping, Optional, TypedDict
 
@@ -72,7 +74,76 @@ DEFAULT_AGENCY_CONFIG: AgencyConfig = {
     'max_window_minutes': 240,
     'minimum_proactive_interval_minutes': 60,
     'max_candidate_hours': 24,
+    # 上游 1.0.1-rc25。
+    'contact_mode': 'strict',
+    'natural_willingness_threshold': 0.25,
+    'natural_minimum_interval_minutes': 30,
+    'proactive_daily_cap': 3,
 }
+
+#: 上游 `CONTACT_MODES`：主动联系温度三模式。
+CONTACT_MODES = ('strict', 'natural', 'balanced')
+
+#: 教义里**三模式共用**的基句后缀（上游 rc25 给 Agency 教义加的半句；strict 也带它，
+#: 所以「strict = 旧字符串原样」这个假设是错的）。
+CONTACT_LIFE_COUNTS_CLAUSE = (
+    '— and the life she just lived counts: a thought that reminded her of someone, something '
+    'funny that happened, a topic she wants to continue, or genuine curiosity about what they '
+    'are doing are all valid life-grounded motives.'
+)
+
+#: natural 模式追加文本（逐字，注意句首空格）。
+CONTACT_NATURAL_CLAUSE = (
+    ' Contact temperature (host-configured natural): beyond concrete life events, missing '
+    'someone, wondering how they are doing, or wanting to share a small moment are equally '
+    'valid motives when this script genuinely shows her thinking of them. '
+    'participants[].lastUserMessageAt shows how long it has been since each person last wrote; '
+    'a long silence may weigh on her, and reaching out then is human. She still decides for '
+    'herself whether and how to speak.'
+)
+
+#: balanced 模式追加文本（逐字）。
+CONTACT_BALANCED_CLAUSE = (
+    ' Contact temperature (host-configured balanced): missing someone, wondering how they are '
+    'doing, or wanting to share a small moment are also valid motives when this script '
+    'genuinely shows her thinking of them — use these quieter motives sparingly, so most '
+    'proactive contact still follows a concrete life reason.'
+)
+
+
+def contact_temperature_clause(mode: Any) -> str:
+    """上游 `contactTemperatureClause(mode)`：三模式的追加文本；strict 为空串。"""
+    if mode == 'natural':
+        return CONTACT_NATURAL_CLAUSE
+    if mode == 'balanced':
+        return CONTACT_BALANCED_CLAUSE
+    return ''
+
+
+def resolve_proactive_threshold(config: Mapping[str, Any], urge_threshold: Any) -> float:
+    """上游：严格模式沿用 Urge/运行时阈值；自然/平衡模式用 `natural_willingness_threshold`。"""
+    if _pick(config, 'contact_mode', 'contactMode') in ('natural', 'balanced'):
+        natural = _finite(_pick(config, 'natural_willingness_threshold', 'naturalWillingnessThreshold'))
+        return _clamp(natural if natural is not None else 0.25, 0.0, 1.0)
+    return _clamp(_finite(urge_threshold) if _finite(urge_threshold) is not None else 0.65, 0.0, 1.0)
+
+
+def resolve_proactive_interval_minutes(
+    config: Mapping[str, Any], urge_burst_interval: Any = None,
+) -> int:
+    """上游：Urge 爆发间隔优先级最高；否则自然/平衡模式**只在更小时**替换严格间隔。"""
+    strict = max(0, int(_number(_pick(config, 'minimum_proactive_interval_minutes', 'minimumProactiveIntervalMinutes')) or 0))
+    if urge_burst_interval is not None:
+        return max(1, min(60, int(_number(urge_burst_interval) or 0)))
+    natural = max(0, int(_number(_pick(config, 'natural_minimum_interval_minutes', 'naturalMinimumIntervalMinutes')) or 0))
+    if _pick(config, 'contact_mode', 'contactMode') in ('natural', 'balanced') and natural < strict:
+        return natural
+    return strict
+
+
+def resolve_proactive_daily_cap(config: Mapping[str, Any]) -> int:
+    """上游 `proactiveDailyCap`：`floor(clamp(x, 0, 20))`，默认 3；**0 必须存活**（0 = 不限）。"""
+    return max(0, min(20, int(_number(_pick(config, 'proactive_daily_cap', 'proactiveDailyCap')) if _pick(config, 'proactive_daily_cap', 'proactiveDailyCap') is not None else 3)))
 
 
 class AgencyCapacityResult(TypedDict, total=False):
@@ -88,8 +159,24 @@ class AgencyCapacityResult(TypedDict, total=False):
 
 
 def resolve_agency_config(value: Optional[Mapping[str, Any]] = None) -> AgencyConfig:
-    """上游 `resolveAgencyConfig`：`{ ...DEFAULT_AGENCY_CONFIG, ...value }`。"""
+    """上游 `resolveAgencyConfig`：`{ ...DEFAULT_AGENCY_CONFIG, ...value }` + rc25 的夹取。
+
+    `contactMode` 走白名单（非法值回落 strict）；三个数值分别夹取，**`proactive_daily_cap`
+    的 0 必须活着**（0 = 不限）。
+    """
     resolved = {**DEFAULT_AGENCY_CONFIG, **(value or {})}
+    mode = _pick(resolved, 'contact_mode', 'contactMode')
+    resolved['contact_mode'] = mode if mode in CONTACT_MODES else 'strict'
+    threshold = _finite(_pick(resolved, 'natural_willingness_threshold', 'naturalWillingnessThreshold'))
+    resolved['natural_willingness_threshold'] = _clamp(
+        threshold if threshold is not None else 0.25, 0.0, 1.0,
+    )
+    natural = _finite(_pick(resolved, 'natural_minimum_interval_minutes', 'naturalMinimumIntervalMinutes'))
+    resolved['natural_minimum_interval_minutes'] = max(
+        0, min(10_080, math.floor(natural if natural is not None else 30)),
+    )
+    cap = _finite(_pick(resolved, 'proactive_daily_cap', 'proactiveDailyCap'))
+    resolved['proactive_daily_cap'] = max(0, min(20, math.floor(cap if cap is not None else 3)))
     return resolved  # type: ignore[return-value]
 
 

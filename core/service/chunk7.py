@@ -634,7 +634,88 @@ class ServiceChunk7(ServiceBase):
         setting['location'] = _cfg(defaults, 'location', 'location', '')
         setting['style'] = _cfg(defaults, 'style', 'style', '') or setting['style']
         setting['timezone'] = _cfg(defaults, 'timezone', 'timezone', '') or setting['timezone']
+        # 上游 1.0.1-beta16-tuned：多条独立视角（≤12 条、每条 ≤800 字）与补充事实
+        # （≤20 条、每条 ≤800 字）。**空数组不落键**，旧故事的 setting 形态不变。
+        raw_perspectives = _cfg(defaults, 'perspectives', 'perspectives', [])
+        perspectives = [
+            item.strip()[:800] for item in (raw_perspectives if isinstance(raw_perspectives, list) else [])
+            if isinstance(item, str) and item.strip()
+        ][:12]
+        if perspectives:
+            setting['perspectives'] = perspectives
+        raw_facts = _cfg(defaults, 'supplementaryFacts', 'supplementary_facts', [])
+        supplementary = [
+            item.strip()[:800] for item in (raw_facts if isinstance(raw_facts, list) else [])
+            if isinstance(item, str) and item.strip()
+        ][:20]
+        if supplementary:
+            setting['supplementary_facts'] = supplementary
         return setting
+
+    async def seed_supplementary_facts(self, story: Any, now: Any) -> int:
+        """上游建剧本路径：把 `supplementaryFacts` 写成初始长期事实。
+
+        scope 按内容推断（主角…/她的… → character；关系/两人之间/互动 → relationship；
+        其余 → world），`importance=0.6`、`confidence=0.95`（配置的既定事实），
+        `lastSeenAt` 与 created/updated 同一个 now。入库失败**要打可见 warn**——用户配了
+        却不生效是最难排查的一类问题。
+        """
+        setting = pick(story, 'setting') or {}
+        entries = pick(setting, 'supplementaryFacts', 'supplementary_facts')
+        if not isinstance(entries, list) or not entries:
+            return 0
+        inserted = 0
+        for index, item in enumerate(entries):
+            text = _trim(item)
+            if not text:
+                continue
+            if text.startswith('主角') or re.match(r'^(?:她|他)的', text):
+                scope = 'character'
+            elif re.search(r'关系|两人之间|互动', text):
+                scope = 'relationship'
+            else:
+                scope = 'world'
+            try:
+                await self.db_create('interlude_fact', {  # type: ignore[attr-defined]
+                    'storyId': pick(story, 'id'), 'participantId': '', 'scope': scope,
+                    'content': text[:4_000], 'importance': 0.6, 'confidence': 0.95,
+                    'unresolved': False, 'embedding': None, 'status': 'active',
+                    'sourceEntryIds': [], 'lastSeenAt': now, 'createdAt': now, 'updatedAt': now,
+                })
+                inserted += 1
+            except Exception as error:  # noqa: BLE001 - 一条失败不该阻断建剧本
+                self.report_standalone(  # type: ignore[attr-defined]
+                    'warn', '补充事实入库失败 故事=%s 序号=%d 错误=%s', pick(story, 'id'), index, error,
+                )
+        return inserted
+
+    async def backfill_fact_last_seen(self, story_id: str, now: Any) -> int:
+        """上游 rc4：给 `lastSeenAt` 为空的历史事实补一个时间戳。
+
+        rc2/rc3 写入的补充事实没有这个字段，检索排序会读到空值。防御性执行，
+        失败不阻断建剧本。
+        """
+        try:
+            rows = await self.db_get('interlude_fact', {'storyId': story_id, 'status': 'active'})  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return 0
+        fixed = 0
+        for row in rows:
+            if parse_dt(pick(row, 'lastSeenAt', 'last_seen_at')) is not None:
+                continue
+            fallback = (
+                parse_dt(pick(row, 'updatedAt', 'updated_at'))
+                or parse_dt(pick(row, 'createdAt', 'created_at'))
+                or now
+            )
+            try:
+                await self.db_set('interlude_fact', {'id': pick(row, 'id')}, {  # type: ignore[attr-defined]
+                    'lastSeenAt': fallback, 'updatedAt': now,
+                })
+                fixed += 1
+            except Exception:  # noqa: BLE001
+                continue
+        return fixed
 
     # ------------------------------------------------------------------ #
     # 参与者状态（`src/service.ts:5621-5681`）

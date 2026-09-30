@@ -894,6 +894,7 @@ class ServiceChunk2(ServiceBase):
         audio_sources: Optional[list[str]] = None,
         quote: Any = None,
         media: Optional[list[dict[str, Any]]] = None,
+        endpoint_id: str = '',
     ) -> None:
         """上游 `bufferUserNarrative(...)`（`src/service.ts:2189`）。
 
@@ -944,7 +945,23 @@ class ServiceChunk2(ServiceBase):
         }
         if quote:
             message['quote'] = quote
+        if endpoint_id:
+            # 上游 1.0.1-rc28：逐条消息记住它的入站端点（M4 规则 1/2 的唯一依据）。
+            message['endpoint_id'] = endpoint_id
         turn.setdefault('messages', []).append(message)
+        if endpoint_id:
+            turn['source_seq'] = int(turn.get('source_seq') or 0) + 1
+            sources = turn.setdefault('sources', [])
+            if not any(pick(item, 'endpointId', 'endpoint_id') == endpoint_id for item in sources):
+                sources.append({'endpointId': endpoint_id, 'receivedSeq': turn['source_seq']})
+            elif sources:
+                for item in sources:
+                    if pick(item, 'endpointId', 'endpoint_id') == endpoint_id:
+                        item['receivedSeq'] = turn['source_seq']
+            # 当前批次的端点集合（`activeBatchEndpointIds`）：flush 消费后清空。
+            active = turn.setdefault('active_batch_endpoint_ids', [])
+            if endpoint_id not in active:
+                active.append(endpoint_id)
         turn['latest_session'] = session
         timer = turn.get('timer')
         if callable(timer):

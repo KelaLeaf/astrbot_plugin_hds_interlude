@@ -2145,7 +2145,10 @@ class AstrbotBridge:
 
     async def shutdown(self) -> None:
         """停止后台计时器、关闭 HTTP 客户端与数据库（幂等）。"""
-        for attribute in ('_sweep_timer', '_compaction_timer', '_blind_mode_timer', '_sticker_scan_timer'):
+        for attribute in (
+            '_sweep_timer', '_compaction_timer', '_blind_mode_timer', '_sticker_scan_timer',
+            '_world_seeder_timer',
+        ):
             handle = getattr(self.service, attribute, None)
             cancel = getattr(handle, 'cancel', None)
             if callable(cancel):
