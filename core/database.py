@@ -519,12 +519,37 @@ STORY_ALIAS = TableSpec(
     added_later=True,
 )
 
+#: `interlude_token_usage` —— Token 用量账本（本移植版新增，控制台「Token 统计」页）。
+#: 按 **(day, storyId, task, model)** 聚合，一行 = 某天某剧本某任务某模型的累计量；
+#: 刻意**不存每次调用明细**（一次长对话几百次调用，明细表会爆，而面板要的就是聚合视图）。
+TOKEN_USAGE = TableSpec(
+    name='interlude_token_usage',
+    fields={
+        'id': _spec('unsigned autoInc'),
+        'day': _spec('string(10)'),
+        'storyId': _spec('string(255)'),
+        'task': _spec('string(64)'),
+        'model': _spec('string(127)'),
+        'provider': _spec('string(127)'),
+        'inputTokens': _spec('unsigned'),
+        'outputTokens': _spec('unsigned'),
+        'cachedTokens': _spec('unsigned'),
+        'calls': _spec('unsigned'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='id',
+    auto_increment=True,
+    indexes=('day', 'task', 'model', 'storyId'),
+    added_later=True,
+)
+
 #: 表名 → `TableSpec`。键顺序 = 上游 `registerTables` 的注册顺序。
 TABLES: dict[str, TableSpec] = {
     spec.name: spec for spec in (
         STORY, PARTICIPANT, SCRIPT_ENTRY, MEMORY, INTENT, SCENE, ARC, FACT, STATE_PATCH,
         WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, SCHEDULE_PREPLAN, SEEDED_EVENT,
-        ENDPOINT, STORY_ALIAS,
+        ENDPOINT, STORY_ALIAS, TOKEN_USAGE,
     )
 }
 

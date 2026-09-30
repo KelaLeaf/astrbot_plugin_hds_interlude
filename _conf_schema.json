@@ -380,7 +380,8 @@
           "use_for_world_seeding": {
             "type": "bool",
             "description": "用于世界播种",
-            "default": false
+            "default": false,
+            "hint": "勾了它才让这条连接参与世界事件播种；也可以在上面的「世界播种模型」里直接指名 AstrBot 的模型（那条优先）。"
           },
           "price_input": {
             "type": "float",
@@ -439,6 +440,13 @@
         "_special": "select_provider",
         "description": "压缩与总结模型",
         "hint": "后台压缩、事实提取、时间导演与日程预排共用；留空则使用默认 Provider。结构化输出建议选支持 JSON 模式的模型。"
+      },
+      "world_seeding_provider_id": {
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "description": "世界播种模型",
+        "hint": "从 AstrBot 已配置的模型中选一个承担世界事件播种；留空则使用默认 Provider（连接行里勾了「用于世界播种」的那条）。播种器总开关在「世界事件播种器」组。"
       },
       "alter_provider_id": {
         "type": "string",

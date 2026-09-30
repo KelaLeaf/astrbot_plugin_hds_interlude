@@ -186,7 +186,7 @@ export function Input({
 }: {
   value: string | number
   onInput: (next: string) => void
-  type?: 'text' | 'number' | 'password'
+  type?: 'text' | 'number' | 'password' | 'date'
   placeholder?: string
   disabled?: boolean
 }) {

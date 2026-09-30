@@ -1977,6 +1977,8 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/config-set',
             f'/{main_module.PLUGIN_NAME}/console/participants',
             f'/{main_module.PLUGIN_NAME}/console/stories',
+            # v1.5.1：Token 用量统计（本移植版新增面板）。
+            f'/{main_module.PLUGIN_NAME}/console/token-stats',
             f'/{main_module.PLUGIN_NAME}/console/patch-decide',
             f'/{main_module.PLUGIN_NAME}/console/patch-rollback',
             f'/{main_module.PLUGIN_NAME}/console/story-merge',

@@ -72,6 +72,8 @@ EXPECTED_TABLES = [
     # 上游 1.0.1-rc28（M1a/M1b）：端点注册表与剧本别名。
     'interlude_endpoint',
     'interlude_story_alias',
+    # 本移植版新增：控制台「Token 统计」页的账本。
+    'interlude_token_usage',
 ]
 
 #: `(表, 主键, 是否自增)` —— 直接抄自 database.ts 的 `primary` / `autoInc`。
@@ -93,6 +95,7 @@ EXPECTED_PRIMARY = {
     'interlude_seeded_event': ('id', True),
     'interlude_endpoint': ('id', False),
     'interlude_story_alias': ('aliasStoryId', False),
+    'interlude_token_usage': ('id', True),
 }
 
 #: `indexes` / `unique` 选项 → 期望存在的索引列（顺序照抄 database.ts）。
@@ -181,6 +184,10 @@ EXPECTED_COLUMNS = {
         'userId', 'channelId', 'groupId', 'conversationKind', 'enabled', 'createdAt', 'updatedAt',
     ],
     'interlude_story_alias': ['aliasStoryId', 'canonicalStoryId', 'reason', 'createdAt'],
+    'interlude_token_usage': [
+        'id', 'day', 'storyId', 'task', 'model', 'provider',
+        'inputTokens', 'outputTokens', 'cachedTokens', 'calls', 'createdAt', 'updatedAt',
+    ],
 }
 
 #: sqlite3 类型映射断言（`unsigned`/`double`/`boolean`/`json`/`timestamp`）。
@@ -283,12 +290,12 @@ class _DatabaseTestCase(unittest.TestCase):
 class RegisterTablesTests(_DatabaseTestCase):
     """对应上游 `registerTables(ctx)`：13 张表一次性建成。"""
 
-    def test_all_sixteen_tables_created(self):
+    def test_all_seventeen_tables_created(self):
         created = self.db.register_tables()
         self.assertEqual(sorted(created), sorted(EXPECTED_TABLES))
         self.assertEqual(sorted(self._table_names()), sorted(EXPECTED_TABLES))
-        # `TABLES` 注册表本身是 16 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表）。
-        self.assertEqual(len(TABLES), 16)
+        # `TABLES` 注册表本身是 17 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表 + Token 账本）。
+        self.assertEqual(len(TABLES), 17)
         self.assertEqual(db_mod.table_names(), EXPECTED_TABLES)
 
     def test_columns_match_upstream_declaration(self):

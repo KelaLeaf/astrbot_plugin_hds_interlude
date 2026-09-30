@@ -481,6 +481,8 @@ class HDSInterludePlugin(Star):
              '控制台：已知参与者（白名单一键填入）'),
             (f'/{PLUGIN_NAME}/console/stories', self.page_console_stories, ['GET'],
              '控制台：剧本清单（含归档）'),
+            (f'/{PLUGIN_NAME}/console/token-stats', self.page_console_token_stats, ['GET'],
+             '控制台：Token 用量统计（按天/周/月/自选范围）'),
             (f'/{PLUGIN_NAME}/console/patch-decide', self.page_console_patch_decide, ['POST'],
              '设定候选审批'),
             (f'/{PLUGIN_NAME}/console/patch-rollback', self.page_console_patch_rollback, ['POST'],
@@ -577,6 +579,12 @@ class HDSInterludePlugin(Star):
 
     async def page_console_stories(self):
         return await self._console_json(lambda api, q: api.stories())
+
+    async def page_console_token_stats(self):
+        """Token 用量统计：`range=day|week|month|custom`（自选时带 `from` / `to`）。"""
+        return await self._console_json(lambda api, q: api.token_stats(
+            q('range'), q('from'), q('to'),
+        ))
 
     async def page_console_story_merge(self):
         return await self._console_write(lambda api, body: api.merge_story(

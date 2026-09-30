@@ -294,6 +294,15 @@ class ServiceChunk9(ServiceBase):
         """
         if self.desktop_event_sink is not None:
             self.desktop_event_sink('token', record)
+        # Token 账本（本移植版新增）：控制台「Token 统计」页要跨重启查历史，
+        # 所以在同一个收口点落库。**不 await**：这是旁路记账，绝不让它拖慢或
+        # 阻断模型调用链（写入侧自己串行 + 失败只 warn）。
+        recorder = getattr(self, 'record_token_usage', None)
+        if callable(recorder):
+            try:
+                asyncio.ensure_future(recorder(record, pick(record, 'storyId', 'story_id') or ''))
+            except RuntimeError:  # pragma: no cover - 没有事件循环时直接放弃记账
+                pass
         # 健康指标（rc28）：输入/缓存 token 在同一个收口点累计，缓存命中率由此得出。
         health = getattr(self, 'health', None)
         story_id = pick(record, 'storyId', 'story_id')

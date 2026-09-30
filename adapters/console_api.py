@@ -19,10 +19,12 @@ from __future__ import annotations
 import inspect
 import json
 import os
+from datetime import datetime
 from typing import Any, Optional
 
 from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
+from ..core.token_stats import normalize_range, range_bounds, summarize_usage
 from ..core.story_state import decode_story_state
 from .astrbot_bridge import (
     CONSOLE_LOG_BUFFER as CONSOLE_LOG_MAX,
@@ -464,6 +466,29 @@ class ConsoleApi:
 
     def __init__(self, bridge: Any) -> None:
         self.bridge = bridge
+
+    # ------------------------------------------------------------------ #
+    # Token 统计（本移植版新增）
+    # ------------------------------------------------------------------ #
+
+    async def token_stats(self, kind: str = 'day', from_value: str = '', to_value: str = '') -> dict[str, Any]:
+        """按天 / 周 / 月 / 自选范围汇总 Token 账本。
+
+        取数在 `console_api`（见 §29 的约定），数学在 `core/token_stats.py`（纯函数）。
+        表可能很大（一天一行 × 多个模型 × 多部剧本），所以**只取区间内的行**，
+        并把上限卡在 5000 行——真到那个量级说明跑了很久，页面要的是聚合而不是全量。
+        """
+        database = self.bridge.db
+        bounds = range_bounds(kind, datetime.now(), from_value, to_value)
+        rows = _safe_all(database, 'interlude_token_usage', None, 'day DESC', 5_000)
+        summary = summarize_usage(rows, bounds)
+        return {
+            'range': normalize_range(kind),
+            'from': bounds['from'],
+            'to': bounds['to'],
+            'timezone': 'server-local',
+            **summary,
+        }
 
     # ------------------------------------------------------------------ #
     # 总览

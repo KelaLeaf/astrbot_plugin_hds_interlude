@@ -17,7 +17,8 @@
         "delivery": "Delivery",
         "alter": "Mood",
         "agency": "Schedule",
-        "chats": "Chats"
+        "chats": "Chats",
+        "tokens": "Token usage"
       }
     }
   }

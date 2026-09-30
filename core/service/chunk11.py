@@ -45,6 +45,7 @@ from ..endpoints import (
     state_after_outbound,
 )
 from ..time import dt_ms, iso
+from ..token_stats import merge_usage, normalize_usage_record
 from .base import ServiceBase, pick, story_id_for_character
 
 __all__ = ['ServiceChunk11']
@@ -895,6 +896,45 @@ class ServiceChunk11(ServiceBase):
                 'conversationKind': pick(previous, 'conversation_kind', 'conversationKind'),
             }
         return data or None
+
+    # ------------------------------------------------------------------ #
+    # Token 用量账本（本移植版新增：控制台「Token 统计」页的写入侧）
+    # ------------------------------------------------------------------ #
+
+    async def record_token_usage(self, record: Any, story_id: str = '') -> bool:
+        """把一次模型调用的用量累加进账本（按 `(day, storyId, task, model)` 聚合）。
+
+        并发安全：读-改-写放在 `_token_usage_lock` 里串行执行。**失败只记 warn 不出抛**
+        ——账本写不进去不该影响任何一次模型调用。
+        """
+        delta = normalize_usage_record(record, self.now(), story_id)
+        if delta is None:
+            return False
+        lock = getattr(self, '_token_usage_lock', None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._token_usage_lock = lock
+        try:
+            async with lock:
+                rows = await self.db_get('interlude_token_usage', {
+                    'day': delta['day'], 'storyId': delta['storyId'],
+                    'task': delta['task'], 'model': delta['model'],
+                })
+                existing = rows[0] if rows else None
+                merged = merge_usage(existing, delta, self.now())
+                if existing is None:
+                    await self.db_create('interlude_token_usage', {**merged, 'createdAt': self.now()})
+                else:
+                    await self.db_set('interlude_token_usage', {'id': pick(existing, 'id')}, {
+                        key: merged[key] for key in (
+                            'provider', 'inputTokens', 'outputTokens', 'cachedTokens', 'calls', 'updatedAt',
+                        )
+                    })
+            return True
+        except Exception as error:  # noqa: BLE001 - 账本失败不阻断调用
+            self.report_standalone('warn', 'Token 用量记账失败（不影响调用）模型=%s 任务=%s 错误=%s',
+                                   delta['model'], delta['task'], error)
+            return False
 
     # ------------------------------------------------------------------ #
     # 内部助手

@@ -2240,6 +2240,8 @@ class AstrbotBridge:
         'audio': ('model', 'audio', 'provider_id'),
         'embedding': ('model', 'embedding', 'provider_id'),
         'stickers': ('stickers', 'provider_id'),
+        # 上游 1.0.1-rc24：世界播种器也是独立任务（这里让它同样能指名 AstrBot 模型）。
+        'world_seeding': ('model', 'world_seeding_provider_id'),
     }
 
     def task_model_id(self, task: Optional[str]) -> str:
@@ -2291,6 +2293,7 @@ class AstrbotBridge:
             'use_for_vision': task == 'vision',
             'use_for_stickers': task == 'stickers',
             'use_for_embedding': task == 'embedding',
+            'use_for_world_seeding': task == 'world_seeding',
         }
 
     def routing_config(self, config: Any = None) -> dict[str, Any]:
@@ -2303,7 +2306,7 @@ class AstrbotBridge:
         if not isinstance(base, dict):
             return base if isinstance(base, dict) else {}
         rows = []
-        for task in ('main', 'compaction', 'alter', 'vision', 'stickers', 'embedding'):
+        for task in ('main', 'compaction', 'alter', 'vision', 'stickers', 'embedding', 'world_seeding'):
             provider_id = self.task_model_id(task)
             if provider_id:
                 rows.append(self._binding_row(task, provider_id))

@@ -886,6 +886,8 @@ class ConfigurationSchemaTest(unittest.TestCase):
         "story_defaults": {"persona_id", "extra_setting"},
         "model_center": {
             "main_provider_id", "compaction_provider_id", "alter_provider_id",
+            # v1.5.0：世界播种器的「指名 AstrBot 模型」（上游只有连接行的用途勾选）。
+            "world_seeding_provider_id",
             # v1.4.0：模型调用治理（`docs/MEMORY_MAINTENANCE.md` §5.6）。
             "governor_enabled", "governor_max_concurrency", "governor_max_requests_per_minute",
             "governor_min_call_interval_ms", "governor_breaker_failures",

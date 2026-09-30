@@ -17,7 +17,8 @@
         "delivery": "投递",
         "alter": "情绪",
         "agency": "日程",
-        "chats": "聊天记录"
+        "chats": "聊天记录",
+        "tokens": "Token 统计"
       }
     }
   }

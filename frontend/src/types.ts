@@ -453,3 +453,43 @@ export interface ChatHistoryPayload {
   scanned: number
   truncated?: boolean
 }
+
+/** Token 统计（`console/token-stats`）。数值都是 token 数，`hitRate` 是 0~1 的比例。 */
+export interface TokenUsageBucket {
+  model?: string
+  task?: string
+  provider: string
+  inputTokens: number
+  outputTokens: number
+  cachedTokens: number
+  totalTokens: number
+  calls: number
+  hitRate: number
+}
+
+export interface TokenUsageDay {
+  day: string
+  inputTokens: number
+  outputTokens: number
+  cachedTokens: number
+  calls: number
+  hitRate: number
+}
+
+export interface TokenStatsPayload {
+  range: 'day' | 'week' | 'month' | 'custom'
+  from: string
+  to: string
+  timezone: string
+  totals: {
+    inputTokens: number
+    outputTokens: number
+    cachedTokens: number
+    totalTokens: number
+    calls: number
+    hitRate: number
+  }
+  byModel: TokenUsageBucket[]
+  byTask: TokenUsageBucket[]
+  series: TokenUsageDay[]
+}

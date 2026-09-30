@@ -70,6 +70,38 @@ class ConsoleApiTests(unittest.TestCase):
         self.bridge.db = self.database
         self.api = ConsoleApi(self.bridge)
 
+    # ---- token 统计 ----
+
+    def test_token_stats_summarises_the_ledger_and_handles_an_empty_table(self):
+        """空表也要回一个完整空壳（面板显示 0，不是 500）——§29 的控制台取数约定。"""
+        payload = _run(self.api.token_stats('day'))
+        self.assertEqual(payload['range'], 'day')
+        self.assertEqual(payload['totals']['inputTokens'], 0)
+        self.assertEqual(len(payload['series']), 1, '按天视图至少给今天这一格')
+
+        self.bridge.db.insert('interlude_token_usage', {
+            'day': '2026-09-30', 'storyId': 's1', 'task': '主叙事', 'model': 'deepseek-chat',
+            'provider': '连接A', 'inputTokens': 1200, 'outputTokens': 300, 'cachedTokens': 600,
+            'calls': 3, 'createdAt': '2026-09-30T00:00:00Z', 'updatedAt': '2026-09-30T00:00:00Z',
+        })
+        self.bridge.db.insert('interlude_token_usage', {
+            'day': '2026-09-29', 'storyId': 's1', 'task': '压缩', 'model': 'flash',
+            'provider': '连接B', 'inputTokens': 400, 'outputTokens': 100, 'cachedTokens': 0,
+            'calls': 1, 'createdAt': '2026-09-29T00:00:00Z', 'updatedAt': '2026-09-29T00:00:00Z',
+        })
+        week = _run(self.api.token_stats('week', '', ''))
+        self.assertEqual(week['range'], 'week')
+        self.assertEqual(week['totals']['inputTokens'], 1600)
+        self.assertAlmostEqual(week['totals']['hitRate'], 600 / 1600)
+        self.assertEqual({item['model'] for item in week['byModel']}, {'deepseek-chat', 'flash'})
+        self.assertEqual({item['task'] for item in week['byTask']}, {'主叙事', '压缩'})
+        self.assertEqual(len(week['series']), 7)
+
+        # 自选范围能精确圈住一天（8 月那类老数据不进本周视图这件事由纯函数测试覆盖）。
+        custom = _run(self.api.token_stats('custom', '2026-09-30', '2026-09-30'))
+        self.assertEqual(custom['totals']['inputTokens'], 1200)
+        self.assertEqual(custom['from'], '2026-09-30')
+
     # ---- overview ----
 
     def test_overview_shape_is_stable(self):
