@@ -35,6 +35,7 @@ __all__ = [
     'ACTIONS',
     'ACTION_CATEGORIES',
     'ACTION_CONFIG_GROUPS',
+    'ACTION_CONFIG_GROUP_LABELS',
     'ACTION_RISK_GROUP',
     'action_config_group',
     'PERMISSION_TIERS',
@@ -158,27 +159,45 @@ ACTION_CATEGORIES: dict[str, str] = {
 
 #: 动作类别 → 配置分组（**schema 与运行期共用这一条映射**，避免"开关在哪"两处各写一遍）。
 #: 危险动作不在这里：它们的开关集中在 `ACTION_RISK_GROUP`。
+#:
+#: **v1.7.2 收敛成四组**（`actions_chat` / `actions_group` / `actions_qzone` / `actions_risks`）：
+#: 原先十个 `actions_*` 组在配置页是十张"开关卡片"，用户要滚很久才找得到想要的那条。
+#: 收敛只动**分组名**，不动键名（键逐字 = 动作 id），旧分组由读取侧的 N:1 合并兜底
+#: （`core/service/config.py` 的 `LEGACY_SECTION_MERGES`）。
 ACTION_CONFIG_GROUPS: dict[str, str] = {
-    'interaction': 'actions_interaction',
-    'message': 'actions_message',
-    'history': 'actions_history',
-    'status': 'actions_status',
+    'interaction': 'actions_chat',
+    'message': 'actions_chat',
+    'history': 'actions_chat',
+    'status': 'actions_chat',
+    'profile': 'actions_chat',
+    'voice': 'actions_chat',
+    'contact': 'actions_chat',
     'group_read': 'actions_group',
     'group_write': 'actions_group',
-    'profile': 'actions_profile',
-    'voice': 'actions_voice',
-    'contact': 'actions_contact',
     'qzone': 'actions_qzone',
 }
 
 #: 危险动作的开关组（该组描述就是 `RISK_WARNING`）。
 ACTION_RISK_GROUP = 'actions_risks'
 
+#: 配置分组 → 中文标签（控制台「动作」页用来说明"这个开关在哪一组"）。
+#:
+#: 为什么单列一张表而不是按类别推：多个类别并进同一组之后，"先到的类别定标签"会
+#: 把 `actions_chat` 标成「互动」，而那一组里还有消息/历史/状态/资料/语音/联系人。
+#: 组名仍然只有一个来源（`ACTION_CONFIG_GROUPS` + `ACTION_RISK_GROUP`），
+#: `test_configuration.py` 断言两张表的键集合完全相等，改一处漏一处当场红。
+ACTION_CONFIG_GROUP_LABELS: dict[str, str] = {
+    'actions_chat': '会话动作',
+    'actions_group': '群管理动作',
+    'actions_qzone': 'QQ 空间动作',
+    ACTION_RISK_GROUP: '风险操作',
+}
+
 
 def action_config_group(action: 'PlatformAction') -> str:
     """某动作的开关落在哪个配置分组（危险动作一律进风险组）。"""
     return ACTION_RISK_GROUP if action.risk == 'dangerous' else ACTION_CONFIG_GROUPS.get(
-        action.category, 'actions_interaction',
+        action.category, 'actions_chat',
     )
 
 
@@ -284,6 +303,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='sensitive',
         returns='消息列表（含发送者、时间、内容）',
+        scopes=('group',),
     ),
     PlatformAction(
         'get_friend_msg_history', 'history', '拉私聊历史',
@@ -295,6 +315,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='sensitive',
         returns='消息列表',
+        scopes=('private',),
     ),
     # ---------------- QQ 状态 ----------------
     PlatformAction(
@@ -329,41 +350,48 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('limit', '条数', type='int', minimum=1, maximum=100),
         ),
         risk='safe',
+        scopes=('group',),
     ),
     PlatformAction(
         'get_user_group_role', 'group_read', '查群身份',
         '查某人在群里的身份（群主/管理员/成员）。',
         params=(_p('user_id', '用户号'), _p('group_id', '群号')),
         risk='safe',
+        scopes=('group',),
     ),
     PlatformAction(
         'get_group_honor_info', 'group_read', '群荣誉',
         '看群荣誉（龙王、群聊之火…）。',
         params=(_p('group_id', '群号'), _p('type', '类型')),
         risk='safe',
+        scopes=('group',),
     ),
     PlatformAction(
         'get_group_shut_list', 'group_read', '禁言列表',
         '看群里正在被禁言的人。',
         params=(_p('group_id', '群号'),),
         risk='safe',
+        scopes=('group',),
     ),
     PlatformAction(
         'get_group_notice_list', 'group_read', '群公告',
         '看群公告内容（她"知道"群里通知了什么）。',
         params=(_p('group_id', '群号'),),
         risk='safe',
+        scopes=('group',),
     ),
     PlatformAction(
         'get_group_at_all_remain', 'group_read', '@全体剩余',
         '看本群 @全体成员 还剩几次。',
         params=(_p('group_id', '群号'),),
         risk='safe',
+        scopes=('group',),
     ),
     PlatformAction(
         'list_group_files', 'group_read', '群文件列表', '看群文件有哪些。',
         params=(_p('group_id', '群号'),),
         risk='safe',
+        scopes=('group',),
     ),
     # ---------------- 群管理（写入） ----------------
     PlatformAction(
@@ -371,29 +399,34 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         '以机器人身份发一条群公告。',
         params=(_p('content', '内容', required=True), _p('group_id', '群号'), _p('image', '配图')),
         risk='sensitive',
+        scopes=('group',),
     ),
     PlatformAction(
         'delete_group_notice', 'group_write', '删群公告',
         '删掉一条群公告。',
         params=(_p('notice_id', '公告编号', required=True), _p('group_id', '群号')),
         risk='sensitive',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_essence_msg', 'group_write', '设精华',
         '把一条消息设为群精华。',
         params=(_p('message_id', '消息号', required=True),),
         risk='sensitive',
+        scopes=('group',),
     ),
     PlatformAction(
         'delete_essence_msg', 'group_write', '撤精华',
         '取消一条消息的群精华。',
         params=(_p('message_id', '消息号', required=True),),
         risk='sensitive',
+        scopes=('group',),
     ),
     PlatformAction(
         'send_group_sign', 'group_write', '群打卡', '在群里签到。',
         params=(_p('group_id', '群号'),),
         risk='safe',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_group_card', 'group_write', '改群名片',
@@ -404,6 +437,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('group_id', '群号'),
         ),
         risk='sensitive',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_group_special_title', 'group_write', '设专属头衔',
@@ -411,6 +445,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('user_id', '用户号', required=True), _p('title', '头衔', required=True)),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_group_add_option', 'group_write', '改加群方式',
@@ -418,6 +453,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('option', '方式', required=True, choices=('allow', 'audit', 'refuse')),),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_group_portrait', 'group_write', '改群头像',
@@ -425,6 +461,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('file', '图片', required=True), _p('group_id', '群号')),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_group_name', 'group_write', '改群名',
@@ -432,6 +469,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('name', '群名', required=True), _p('group_id', '群号')),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_group_ban', 'group_write', '禁言',
@@ -443,6 +481,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_group_whole_ban', 'group_write', '全员禁言',
@@ -450,6 +489,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('enable', '开启', type='bool', required=True), _p('group_id', '群号')),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_group_kick', 'group_write', '踢人',
@@ -461,6 +501,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'set_group_admin', 'group_write', '设管理',
@@ -472,6 +513,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'delete_group_file', 'group_write', '删群文件',
@@ -479,6 +521,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('file_id', '文件号', required=True), _p('group_id', '群号')),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'upload_group_file', 'group_write', '传群文件',
@@ -491,6 +534,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'rename_group_file', 'group_write', '重命名群文件',
@@ -503,6 +547,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'move_group_file', 'group_write', '移动群文件',
@@ -515,6 +560,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'create_group_file_folder', 'group_write', '建群文件夹',
@@ -522,6 +568,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('name', '名称', required=True), _p('group_id', '群号')),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'delete_group_folder', 'group_write', '删群文件夹',
@@ -529,6 +576,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('folder', '文件夹号', required=True), _p('group_id', '群号')),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     PlatformAction(
         'trans_group_file', 'group_write', '转存群文件',
@@ -536,6 +584,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('file_id', '文件号', required=True), _p('group_id', '群号')),
         risk='dangerous',
         default_permission='disabled',
+        scopes=('group',),
     ),
     # ---------------- 个人资料 ----------------
     PlatformAction(
@@ -800,6 +849,40 @@ def is_action_enabled(action_id: str, table: Any = None, enabled: Any = None) ->
     return effective_permission(action_id, table, enabled) != 'disabled'
 
 
+def permission_tiers_for(action_id: str) -> tuple[str, ...]:
+    """这条动作**实际适用**的权限档位（控制台下拉只列这些）。
+
+    - `groupadmin`（仅群管）只对群聊动作有意义：非群聊动作不下发这一档，
+      否则界面上会出现一个"选了等于关掉"的档位（用户直接指出过这个）。
+    - `admin`（仅管理员）与 `global`（任何人）在任何会话都有意义，一律保留。
+    """
+    action = ACTIONS.get(str(action_id or '').strip())
+    scopes = tuple(action.scopes) if action is not None else ('private', 'group')
+    allowed = [tier for tier in PERMISSION_TIERS
+               if tier != 'groupadmin' or 'group' in scopes]
+    return tuple(allowed)
+
+
+def normalize_tier_for(action_id: str, tier: Any) -> str:
+    """把不适用的档位收敛成**这条动作的默认档位**。
+
+    手改 `action_permissions.json` 塞了 `groupadmin`（而这是条私聊动作）时，
+    不能让它静默变成"永远不能用"——那看起来像 bug。收敛成默认档 + 一条 warn。
+    """
+    value = str(tier or '').strip().lower()
+    if value not in PERMISSION_TIERS:
+        return 'disabled'
+    if value in permission_tiers_for(action_id):
+        return value
+    return default_permission_for(action_id)
+
+
+def default_permission_for(action_id: str) -> str:
+    """这条动作在权限表里的默认档位（目录声明，危险动作默认关闭）。"""
+    action = ACTIONS.get(str(action_id or '').strip())
+    return action.default_permission if action is not None else 'global'
+
+
 def resolve_permission(
     action_id: str,
     table: Any = None,
@@ -813,7 +896,7 @@ def resolve_permission(
     - `admin`：只有插件管理员能用（由适配层传入 `session_role='admin'`）；
     - `disabled`：永远不能用。
     """
-    tier = effective_permission(action_id, table, enabled)
+    tier = normalize_tier_for(action_id, effective_permission(action_id, table, enabled))
     if tier == 'disabled':
         return False
     if tier == 'global':

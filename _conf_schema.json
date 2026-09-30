@@ -2280,14 +2280,14 @@
       }
     }
   },
-  "actions_interaction": {
+  "actions_chat": {
     "type": "object",
-    "title": "互动动作",
-    "description": "【动作 17】互动动作：戳一戳、点赞与撤回消息的独立开关。",
+    "title": "会话动作",
+    "description": "【动作 17】会话动作：互动、消息与定时、历史消息、QQ 状态、个人资料、语音与联系人的开关。",
     "items": {
       "enabled": {
         "type": "bool",
-        "description": "启用互动动作",
+        "description": "启用会话动作",
         "default": true,
         "hint": "本组总开关；关掉后这里的动作一律不可用"
       },
@@ -2308,19 +2308,6 @@
         "description": "撤回消息",
         "default": true,
         "hint": "撤回她刚发出去的一条消息（说错了、改口、反悔）。"
-      }
-    }
-  },
-  "actions_message": {
-    "type": "object",
-    "title": "消息与定时",
-    "description": "【动作 18】消息与定时：定时消息与定时命令的排期管理。",
-    "items": {
-      "enabled": {
-        "type": "bool",
-        "description": "启用消息与定时",
-        "default": true,
-        "hint": "本组总开关；关掉后这里的动作一律不可用"
       },
       "schedule_message": {
         "type": "bool",
@@ -2357,19 +2344,6 @@
         "description": "取消定时命令",
         "default": true,
         "hint": "取消一条定时命令。"
-      }
-    }
-  },
-  "actions_history": {
-    "type": "object",
-    "title": "历史消息",
-    "description": "【动作 19】历史消息：拉取群聊与私聊的近期记录，用于补上她不在场时的事。",
-    "items": {
-      "enabled": {
-        "type": "bool",
-        "description": "启用历史消息",
-        "default": true,
-        "hint": "本组总开关；关掉后这里的动作一律不可用"
       },
       "get_group_msg_history": {
         "type": "bool",
@@ -2382,19 +2356,6 @@
         "description": "拉私聊历史",
         "default": true,
         "hint": "拉取与某个人的最近聊天记录。"
-      }
-    }
-  },
-  "actions_status": {
-    "type": "object",
-    "title": "QQ 状态",
-    "description": "【动作 20】QQ 状态：在线状态与自定义状态的读取和切换。",
-    "items": {
-      "enabled": {
-        "type": "bool",
-        "description": "启用QQ 状态",
-        "default": true,
-        "hint": "本组总开关；关掉后这里的动作一律不可用"
       },
       "update_qq_status": {
         "type": "bool",
@@ -2413,6 +2374,91 @@
         "description": "查可选状态",
         "default": true,
         "hint": "列出可用的自定义状态（供改状态时挑）。"
+      },
+      "set_qq_profile": {
+        "type": "bool",
+        "description": "改资料",
+        "default": true,
+        "hint": "改机器人账号的昵称/个性签名。"
+      },
+      "set_qq_avatar": {
+        "type": "bool",
+        "description": "换头像",
+        "default": true,
+        "hint": "换机器人账号的头像。"
+      },
+      "get_qq_profile": {
+        "type": "bool",
+        "description": "查自己资料",
+        "default": true,
+        "hint": "看机器人账号当前的昵称与签名。"
+      },
+      "send_voice": {
+        "type": "bool",
+        "description": "发语音",
+        "default": true,
+        "hint": "把一段话用语音发出去（走宿主 TTS）。"
+      },
+      "list_voices": {
+        "type": "bool",
+        "description": "可用音色",
+        "default": true,
+        "hint": "列出宿主 TTS 能用的音色。"
+      },
+      "tts_provider_id": {
+        "type": "string",
+        "default": "",
+        "_special": "select_provider_tts",
+        "description": "文字转语音模型",
+        "hint": "从 AstrBot 已配置的语音服务商里选一个发语音；留空则用当前默认 TTS。"
+      },
+      "default_voice": {
+        "type": "string",
+        "description": "默认音色",
+        "default": "",
+        "hint": "上面那个服务商内部的音色名（例如 zh-CN-YunxiNeural）；留空用它自己配的音色。"
+      },
+      "list_contacts": {
+        "type": "bool",
+        "description": "联系人列表",
+        "default": true,
+        "hint": "列出好友与群（她可以自己决定要了解谁）。"
+      },
+      "search_contacts": {
+        "type": "bool",
+        "description": "搜联系人",
+        "default": true,
+        "hint": "按关键词搜好友/群（昵称、备注、群名、群号）。"
+      },
+      "get_user_profile": {
+        "type": "bool",
+        "description": "看资料卡片",
+        "default": true,
+        "hint": "看某个人的资料卡（昵称、签名、等级、性别等）。"
+      },
+      "get_group_info": {
+        "type": "bool",
+        "description": "看群资料",
+        "default": true,
+        "hint": "看某个群的资料（群名、人数、简介、群主等）。"
+      },
+      "handle_friend_request": {
+        "type": "bool",
+        "description": "处理加好友请求",
+        "default": true,
+        "hint": "同意或拒绝**别人加机器人**的请求（不能主动加人）。"
+      },
+      "handle_group_request": {
+        "type": "bool",
+        "description": "处理被拉群",
+        "default": true,
+        "hint": "同意或拒绝**别人拉机器人进群**的邀请/申请（不能主动加群）。"
+      },
+      "auto_learn": {
+        "type": "bool",
+        "description": "主动了解新联系人",
+        "default": false,
+        "hint": "允许她主动了解新联系人/群：看资料卡、群公告、空间动态"
       }
     }
   },
@@ -2504,123 +2550,6 @@
         "description": "改群名片",
         "default": true,
         "hint": "改群昵称（默认改自己）。"
-      }
-    }
-  },
-  "actions_profile": {
-    "type": "object",
-    "title": "个人资料",
-    "description": "【动作 22】个人资料：机器人账号的昵称、签名与头像。",
-    "items": {
-      "enabled": {
-        "type": "bool",
-        "description": "启用个人资料",
-        "default": true,
-        "hint": "本组总开关；关掉后这里的动作一律不可用"
-      },
-      "set_qq_profile": {
-        "type": "bool",
-        "description": "改资料",
-        "default": true,
-        "hint": "改机器人账号的昵称/个性签名。"
-      },
-      "set_qq_avatar": {
-        "type": "bool",
-        "description": "换头像",
-        "default": true,
-        "hint": "换机器人账号的头像。"
-      },
-      "get_qq_profile": {
-        "type": "bool",
-        "description": "查自己资料",
-        "default": true,
-        "hint": "看机器人账号当前的昵称与签名。"
-      }
-    }
-  },
-  "actions_voice": {
-    "type": "object",
-    "title": "语音与声聊",
-    "description": "【动作 23】语音与声聊：以语音回话与可用音色。",
-    "items": {
-      "enabled": {
-        "type": "bool",
-        "description": "启用语音与声聊",
-        "default": true,
-        "hint": "本组总开关；关掉后这里的动作一律不可用"
-      },
-      "send_voice": {
-        "type": "bool",
-        "description": "发语音",
-        "default": true,
-        "hint": "把一段话用语音发出去（走宿主 TTS）。"
-      },
-      "list_voices": {
-        "type": "bool",
-        "description": "可用音色",
-        "default": true,
-        "hint": "列出宿主 TTS 能用的音色。"
-      },
-      "default_voice": {
-        "type": "string",
-        "description": "默认 TTS 音色",
-        "default": "",
-        "hint": "留空用宿主默认 TTS 音色"
-      }
-    }
-  },
-  "actions_contact": {
-    "type": "object",
-    "title": "联系人与群",
-    "description": "【动作 24】联系人与群：联系人查询、资料卡，以及被动同意加好友与入群邀请。",
-    "items": {
-      "enabled": {
-        "type": "bool",
-        "description": "启用联系人与群",
-        "default": true,
-        "hint": "本组总开关；关掉后这里的动作一律不可用"
-      },
-      "list_contacts": {
-        "type": "bool",
-        "description": "联系人列表",
-        "default": true,
-        "hint": "列出好友与群（她可以自己决定要了解谁）。"
-      },
-      "search_contacts": {
-        "type": "bool",
-        "description": "搜联系人",
-        "default": true,
-        "hint": "按关键词搜好友/群（昵称、备注、群名、群号）。"
-      },
-      "get_user_profile": {
-        "type": "bool",
-        "description": "看资料卡片",
-        "default": true,
-        "hint": "看某个人的资料卡（昵称、签名、等级、性别等）。"
-      },
-      "get_group_info": {
-        "type": "bool",
-        "description": "看群资料",
-        "default": true,
-        "hint": "看某个群的资料（群名、人数、简介、群主等）。"
-      },
-      "handle_friend_request": {
-        "type": "bool",
-        "description": "处理加好友请求",
-        "default": true,
-        "hint": "同意或拒绝**别人加机器人**的请求（不能主动加人）。"
-      },
-      "handle_group_request": {
-        "type": "bool",
-        "description": "处理被拉群",
-        "default": true,
-        "hint": "同意或拒绝**别人拉机器人进群**的邀请/申请（不能主动加群）。"
-      },
-      "auto_learn": {
-        "type": "bool",
-        "description": "主动了解新联系人",
-        "default": false,
-        "hint": "允许她主动了解新联系人/群：看资料卡、群公告、空间动态"
       }
     }
   },
@@ -3119,5 +3048,272 @@
       }
     },
     "invisible": true
+  },
+  "actions_interaction": {
+    "type": "object",
+    "title": "互动动作（已弃用）",
+    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
+    "invisible": true,
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用互动动作",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "send_poke": {
+        "type": "bool",
+        "description": "戳一戳",
+        "default": true,
+        "hint": "戳一下对方（比发消息更轻的招呼）。"
+      },
+      "send_like": {
+        "type": "bool",
+        "description": "点赞",
+        "default": true,
+        "hint": "给对方的名片点赞。"
+      },
+      "recall_message": {
+        "type": "bool",
+        "description": "撤回消息",
+        "default": true,
+        "hint": "撤回她刚发出去的一条消息（说错了、改口、反悔）。"
+      }
+    }
+  },
+  "actions_message": {
+    "type": "object",
+    "title": "消息与定时（已弃用）",
+    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
+    "invisible": true,
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用消息与定时",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "schedule_message": {
+        "type": "bool",
+        "description": "定时消息",
+        "default": true,
+        "hint": "把一条消息排到将来某个时刻发出（例如明天早上说早安）。"
+      },
+      "list_scheduled_messages": {
+        "type": "bool",
+        "description": "定时消息列表",
+        "default": true,
+        "hint": "看还有哪些定时消息没发出去。"
+      },
+      "cancel_scheduled_message": {
+        "type": "bool",
+        "description": "取消定时消息",
+        "default": true,
+        "hint": "取消一条（或全部）还没发出的定时消息。"
+      },
+      "schedule_command": {
+        "type": "bool",
+        "description": "定时命令",
+        "default": true,
+        "hint": "按周期重复执行一个已登记的命令（例如每天凌晨整理记忆）。"
+      },
+      "list_scheduled_commands": {
+        "type": "bool",
+        "description": "定时命令列表",
+        "default": true,
+        "hint": "看已登记的定时命令。"
+      },
+      "cancel_scheduled_command": {
+        "type": "bool",
+        "description": "取消定时命令",
+        "default": true,
+        "hint": "取消一条定时命令。"
+      }
+    }
+  },
+  "actions_history": {
+    "type": "object",
+    "title": "历史消息（已弃用）",
+    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
+    "invisible": true,
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用历史消息",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "get_group_msg_history": {
+        "type": "bool",
+        "description": "拉群历史",
+        "default": true,
+        "hint": "拉取某个群最近的聊天记录（她不在场时发生的事也能补上）。"
+      },
+      "get_friend_msg_history": {
+        "type": "bool",
+        "description": "拉私聊历史",
+        "default": true,
+        "hint": "拉取与某个人的最近聊天记录。"
+      }
+    }
+  },
+  "actions_status": {
+    "type": "object",
+    "title": "QQ 状态（已弃用）",
+    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
+    "invisible": true,
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用QQ 状态",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "update_qq_status": {
+        "type": "bool",
+        "description": "改 QQ 状态",
+        "default": true,
+        "hint": "设置机器人账号的在线状态（在线/离开/忙碌/听歌中…）。"
+      },
+      "get_qq_status": {
+        "type": "bool",
+        "description": "查 QQ 状态",
+        "default": true,
+        "hint": "看机器人账号当前的在线状态。"
+      },
+      "get_fun_status_list": {
+        "type": "bool",
+        "description": "查可选状态",
+        "default": true,
+        "hint": "列出可用的自定义状态（供改状态时挑）。"
+      }
+    }
+  },
+  "actions_profile": {
+    "type": "object",
+    "title": "个人资料（已弃用）",
+    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
+    "invisible": true,
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用个人资料",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "set_qq_profile": {
+        "type": "bool",
+        "description": "改资料",
+        "default": true,
+        "hint": "改机器人账号的昵称/个性签名。"
+      },
+      "set_qq_avatar": {
+        "type": "bool",
+        "description": "换头像",
+        "default": true,
+        "hint": "换机器人账号的头像。"
+      },
+      "get_qq_profile": {
+        "type": "bool",
+        "description": "查自己资料",
+        "default": true,
+        "hint": "看机器人账号当前的昵称与签名。"
+      }
+    }
+  },
+  "actions_voice": {
+    "type": "object",
+    "title": "语音与声聊（已弃用）",
+    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
+    "invisible": true,
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用语音与声聊",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "send_voice": {
+        "type": "bool",
+        "description": "发语音",
+        "default": true,
+        "hint": "把一段话用语音发出去（走宿主 TTS）。"
+      },
+      "list_voices": {
+        "type": "bool",
+        "description": "可用音色",
+        "default": true,
+        "hint": "列出宿主 TTS 能用的音色。"
+      },
+      "tts_provider_id": {
+        "type": "string",
+        "default": "",
+        "_special": "select_provider_tts",
+        "description": "文字转语音模型",
+        "hint": "从 AstrBot 已配置的语音服务商里选一个发语音；留空则用当前默认 TTS。"
+      },
+      "default_voice": {
+        "type": "string",
+        "description": "默认音色",
+        "default": "",
+        "hint": "上面那个服务商内部的音色名（例如 zh-CN-YunxiNeural）；留空用它自己配的音色。"
+      }
+    }
+  },
+  "actions_contact": {
+    "type": "object",
+    "title": "联系人与群（已弃用）",
+    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
+    "invisible": true,
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用联系人与群",
+        "default": true,
+        "hint": "本组总开关；关掉后这里的动作一律不可用"
+      },
+      "list_contacts": {
+        "type": "bool",
+        "description": "联系人列表",
+        "default": true,
+        "hint": "列出好友与群（她可以自己决定要了解谁）。"
+      },
+      "search_contacts": {
+        "type": "bool",
+        "description": "搜联系人",
+        "default": true,
+        "hint": "按关键词搜好友/群（昵称、备注、群名、群号）。"
+      },
+      "get_user_profile": {
+        "type": "bool",
+        "description": "看资料卡片",
+        "default": true,
+        "hint": "看某个人的资料卡（昵称、签名、等级、性别等）。"
+      },
+      "get_group_info": {
+        "type": "bool",
+        "description": "看群资料",
+        "default": true,
+        "hint": "看某个群的资料（群名、人数、简介、群主等）。"
+      },
+      "handle_friend_request": {
+        "type": "bool",
+        "description": "处理加好友请求",
+        "default": true,
+        "hint": "同意或拒绝**别人加机器人**的请求（不能主动加人）。"
+      },
+      "handle_group_request": {
+        "type": "bool",
+        "description": "处理被拉群",
+        "default": true,
+        "hint": "同意或拒绝**别人拉机器人进群**的邀请/申请（不能主动加群）。"
+      },
+      "auto_learn": {
+        "type": "bool",
+        "description": "主动了解新联系人",
+        "default": false,
+        "hint": "允许她主动了解新联系人/群：看资料卡、群公告、空间动态"
+      }
+    }
   }
 }

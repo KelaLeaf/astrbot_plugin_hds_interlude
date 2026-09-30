@@ -59,6 +59,35 @@ export function tierOptions(
   return (tiers ?? []).map((tier) => ({ value: String(tier.id), label: tier.label || String(tier.id) }))
 }
 
+/**
+ * 这条动作**实际适用**的档位：优先用它自己的 `tiers`（后端下发，来源是
+ * `platform_actions.permission_tiers_for`），只有拿不到时才回落到全量档位。
+ *
+ * 为什么要按动作过滤：「仅群管」对私聊动作没有意义，列在下拉里只会让用户选到一个
+ * 永远不生效的档位（用户直接指出过这一点）。
+ */
+export function tierOptionsFor(
+  row: { tiers?: string[] },
+  tiers: PermissionTierBrief[],
+): Array<{ value: string; label: string }> {
+  const allowed = row && Array.isArray(row.tiers) && row.tiers.length ? row.tiers : null
+  const pool = allowed
+    ? (tiers ?? []).filter((tier) => allowed.includes(String(tier.id)))
+    : (tiers ?? [])
+  return pool.map((tier) => ({ value: String(tier.id), label: tier.label || String(tier.id) }))
+}
+
+/** 适用范围的中文说明（私聊 / 群聊 / 两者）。 */
+export function scopeLabel(scopes?: string[]): string {
+  const list = Array.isArray(scopes) ? scopes.map((item) => String(item)) : []
+  const hasPrivate = list.includes('private')
+  const hasGroup = list.includes('group')
+  if (hasPrivate && hasGroup) return '私聊与群聊'
+  if (hasGroup) return '仅群聊'
+  if (hasPrivate) return '仅私聊'
+  return ''
+}
+
 export function tierLabel(tiers: PermissionTierBrief[], tier: string): string {
   const found = (tiers ?? []).find((item) => String(item.id) === String(tier))
   return (found && found.label) || String(tier)

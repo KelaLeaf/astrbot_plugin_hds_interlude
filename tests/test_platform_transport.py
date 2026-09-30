@@ -380,6 +380,18 @@ class PlatformTransportTestCase(unittest.TestCase):
         self.addCleanup(self.bridge.end_capture)
         return endpoint
 
+    def set_action_config(self, category: str, **options) -> None:
+        """给某个动作类别所在的配置组配上一份设置。
+
+        分组名跟动作目录走（v1.7.2 把十个 `actions_*` 收敛成四个），桥构造时读的是
+        归一化后的那份配置，这里直接改它读的那一份。
+        """
+        group = pa.ACTION_CONFIG_GROUPS.get(category, 'actions_%s' % category)
+        self.bridge.config[group] = dict(options)
+
+    def set_voice_config(self, **options) -> None:
+        self.set_action_config('voice', **options)
+
     def run_action(self, action, params=None):
         return asyncio.run(self.transport.platform_action(action, params if params is not None else {}))
 
@@ -1056,6 +1068,169 @@ class VoiceAndInputStatusTests(PlatformTransportTestCase):
         self.assertFalse(result['ok'])
         self.assertIn('群聊不支持', result['error'])
         self.assertWarned('输入状态设置失败')
+
+
+# =========================================================================== #
+# 6b. 语音：指名 AstrBot 的 TTS 服务商（v1.7.2）
+# =========================================================================== #
+
+class VoiceProviderSelectionTests(PlatformTransportTestCase):
+    """「语音与声聊」里选的是**服务商**（`tts_provider_id`），音色是服务商内部的事。
+
+    钉住四条纪律：指名命中、指名但不存在**绝不回落**、宿主没有列表时 warn + 回落、
+    指名了一个存在但不是 TTS 的东西时把原因说清（含糊的"失败了"等于没报错）。
+    """
+
+    def _voice_file(self) -> str:
+        path = os.path.join(self._tmp.name, 'voice.wav')
+        with open(path, 'wb') as handle:
+            handle.write(b'RIFF0000WAVEfmt ')
+        return path
+
+    def _provider(self, identifier: str, **config) -> FakeTTSProvider:
+        return FakeTTSProvider(self._voice_file(), config={'id': identifier, 'model': identifier, **config})
+
+    def test_named_provider_wins_over_the_default_one(self):
+        self.enter_session()
+        default = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+        other = self._provider('fish-audio', voice='sweet')
+        self.context.tts_providers = [default, other]
+        self.set_voice_config(tts_provider_id='fish-audio')
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(other.texts, ['晚安'])
+        self.assertEqual(default.texts, [], '指名了就不该动默认那个服务商')
+        self.assertIn('fish-audio', result['data']['voice'])
+        umo, chain = self.context.sent[-1]
+        self.assertTrue(umo.endswith(':FriendMessage:1000008890'), umo)
+        self.assertEqual(chain.chain[0].file, other.path)
+
+    def test_named_provider_missing_fails_loudly_without_falling_back(self):
+        """指名了却找不到 ≠ 回落到默认：悄悄换一个服务商会让"配了没用"查不出来。"""
+        self.enter_session()
+        default = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+        self.context.tts_providers = [default]
+        self.set_voice_config(tts_provider_id='nope-tts')
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertFalse(result['ok'])
+        self.assertIn('nope-tts', result['error'])
+        self.assertIn('不存在', result['error'])
+        self.assertEqual(default.texts, [], '指名找不到时不能用别的 TTS 顶上')
+        self.assertEqual(self.context.sent, [])
+        self.assertWarned('nope-tts')
+
+    def test_named_provider_that_is_not_a_tts_provider_says_so(self):
+        self.enter_session()
+        self.context.tts_providers = [self._provider('edge-tts', **{'edge-tts-voice': 'x'})]
+        self.context.provider_manager = types.SimpleNamespace(inst_map={'qwen-max': object()})
+        self.set_voice_config(tts_provider_id='qwen-max')
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertFalse(result['ok'])
+        self.assertIn('qwen-max', result['error'])
+        self.assertIn('不是 AstrBot 的 TTS 服务商', result['error'])
+        self.assertWarned('qwen-max')
+
+    def test_named_provider_without_text_to_speech_capability_says_so(self):
+        """能力校验只信 Provider 自己声明的模态（与模型侧同一口吻）。"""
+        self.enter_session()
+        declared = types.SimpleNamespace(provider_config={'id': 'vision-only', 'modalities': ['image']})
+        self.context.tts_providers = [self._provider('edge-tts', **{'edge-tts-voice': 'x'}), declared]
+        self.set_voice_config(tts_provider_id='vision-only')
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertFalse(result['ok'])
+        self.assertIn('文字转语音', result['error'])
+        self.assertIn('image', result['error'], '要把它声明的能力报出来')
+        self.assertEqual(self.context.sent, [])
+
+    def test_named_provider_without_get_audio_says_so(self):
+        self.enter_session()
+        broken = types.SimpleNamespace(provider_config={'id': 'mute-tts'})
+        self.context.tts_providers = [broken]
+        self.set_voice_config(tts_provider_id='mute-tts')
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertFalse(result['ok'])
+        self.assertIn('t2s', result['error'])
+
+    def test_empty_selection_falls_back_to_the_default_provider(self):
+        self.enter_session()
+        default = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+        self.context.tts_providers = [default]
+        self.set_voice_config(tts_provider_id='')
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(default.texts, ['晚安'])
+
+    def test_configured_default_voice_picks_the_matching_provider(self):
+        """`default_voice` 是"服务商内的音色名"：留空服务商时按音色挑实例。"""
+        self.enter_session()
+        xiaoxiao = self._provider('edge-xiaoxiao', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+        yunxi = self._provider('edge-yunxi', **{'edge-tts-voice': 'zh-CN-YunxiNeural'})
+        self.context.tts_providers = [xiaoxiao, yunxi]
+        self.set_voice_config(default_voice='zh-CN-YunxiNeural')
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(yunxi.texts, ['晚安'])
+        self.assertEqual(xiaoxiao.texts, [])
+
+    def test_host_without_a_tts_list_falls_back_with_a_warning(self):
+        """宿主没暴露列表 ≠ 指名错了：无从按 id 取，只能 warn + 回落默认。"""
+        self.enter_session()
+        default = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+        self.context.tts_providers = [default]
+        self.set_voice_config(tts_provider_id='edge-tts')
+        with mock.patch.object(FakeContext, 'get_all_tts_providers', None):
+            result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(default.texts, ['晚安'])
+        self.assertWarned('回落')
+
+    def test_list_voices_uses_the_named_provider(self):
+        self.enter_session()
+        default = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+        other = self._provider('fish-audio', voice='sweet')
+        self.context.tts_providers = [default, other]
+        self.set_voice_config(tts_provider_id='fish-audio')
+        result = self.run_action('list_voices', {})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual([item['id'] for item in result['data']['voices']], ['fish-audio'])
+        self.assertEqual(result['data']['voices'][0]['voice'], 'sweet')
+
+    def test_list_voices_fails_loudly_when_the_named_provider_is_missing(self):
+        self.enter_session()
+        self.context.tts_providers = [self._provider('edge-tts', **{'edge-tts-voice': 'x'})]
+        self.set_voice_config(tts_provider_id='nope-tts')
+        result = self.run_action('list_voices', {})
+        self.assertFalse(result['ok'])
+        self.assertIn('nope-tts', result['error'])
+        self.assertWarned('nope-tts')
+
+    def test_list_voices_keeps_the_default_provider_first(self):
+        """留空时把默认服务商排在最前（其余服务商仍可被 `voice` 参数指定）。"""
+        self.enter_session()
+        first = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+        second = self._provider('fish-audio', voice='sweet')
+        self.context.tts_providers = [first, second]
+        self.assertEqual(self.run_action('list_voices', {})['data']['voices'][0]['id'], 'edge-tts')
+        # 默认服务商换成第二个时，排在首位的也跟着换。
+        self.context.tts_providers = [second, first]
+        self.assertEqual(self.run_action('list_voices', {})['data']['voices'][0]['id'], 'fish-audio')
+
+    def test_legacy_group_config_still_selects_the_provider(self):
+        """旧配置只写了 `actions_voice`（v1.7.2 收敛前的分组名）也照样选得中。
+
+        收敛只改名不改键，旧分组留作隐藏兼容位；适配层读的是**目录里的新分组名**，
+        值由 `bridge.section()` 的 N:1 归并兜底——两边任一环节漏了，用户升级后
+        "我明明配了"就会变成静默回落。
+        """
+        self.enter_session()
+        default = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+        other = self._provider('fish-audio', voice='sweet')
+        self.context.tts_providers = [default, other]
+        self.bridge.config['actions_voice'] = {'tts_provider_id': 'fish-audio'}
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(other.texts, ['晚安'])
+        self.assertEqual(default.texts, [])
 
 
 # =========================================================================== #

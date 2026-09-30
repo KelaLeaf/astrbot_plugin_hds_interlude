@@ -1710,6 +1710,11 @@ def _contact_matches(entry: Mapping[str, Any], keyword: str) -> bool:
     return False
 
 
+#: TTS 服务商可能声明的模态写法（宿主各版本 / 各家服务商拼写不一，全部小写比对）。
+#: 只用来**排除**"声明了但没有文字转语音能力"的服务商；没声明的一律照常。
+_TTS_MODALITIES = frozenset({'t2s', 'tts', 'text_to_speech', 'speech'})
+
+
 # =========================================================================== #
 # Transport：平台出站能力
 # =========================================================================== #
@@ -2330,10 +2335,8 @@ class AstrbotTransport:
         if provider is None:
             log_fallback('warn', '发语音失败：%s', provider_error)
             return {'ok': False, 'error': provider_error}
-        getter = getattr(provider, 'get_audio', None)
-        if not callable(getter):
-            log_fallback('warn', 'TTS 提供者 %s 没有 get_audio，发不了语音', self._provider_label(provider))
-            return {'ok': False, 'error': '宿主的 TTS 提供者不支持合成音频（没有 get_audio）'}
+        # `_tts_provider` 已经过一遍 `_tts_capability_error`：拿到手的服务商一定有 get_audio。
+        getter = provider.get_audio
         try:
             audio = getter(text)
             if inspect.isawaitable(audio):
@@ -2403,6 +2406,144 @@ class AstrbotTransport:
                 return value.strip()
         return ''
 
+    # ---- 指名的宿主 TTS 服务商（「语音与声聊」组的 `tts_provider_id`） ----
+    #
+    # 与模型侧的「任务指名 AstrBot Provider」是同一件事：用户在配置里明确选了哪一个
+    # 宿主服务商，就用哪一个；没选就沿用宿主当前的那个。区别只在段位——TTS 服务商
+    # 跟着「语音」这个动作类别走（`ACTION_CONFIG_GROUPS['voice']`），因为它只服务
+    # `send_voice` / `list_voices` 两条动作，不属于模型任务路由。
+
+    def voice_config_group(self) -> str:
+        """「语音与声聊」的配置分组名（**跟动作目录走，不写死字符串**）。
+
+        v1.7.2 把十个 `actions_*` 组收敛成四个，旧分组留作隐藏兼容位；
+        分组名是那个迁移的地盘，写死 `actions_voice` 会在收敛之后静默读不到
+        （配置变摆设，正是 AGENTS 坑 66 那类事故）。`bridge.section()` 自带
+        N:1 归并（新分组优先、旧分组补缺），所以这里只要报对**新**分组名。
+        """
+        return platform_action_catalog.ACTION_CONFIG_GROUPS.get('voice', 'actions_voice')
+
+    def _voice_option(self, key: str) -> str:
+        return _clean(self.bridge.section(self.voice_config_group()).get(key))
+
+    def tts_provider_id(self) -> str:
+        """`tts_provider_id`：指名的 AstrBot TTS 服务商（留空 = 用当前默认 TTS）。"""
+        return self._voice_option('tts_provider_id')
+
+    def default_voice(self) -> str:
+        """`default_voice`：**服务商内**的音色名（不是服务商 id）。"""
+        return self._voice_option('default_voice')
+
+    def _tts_list_exposed(self) -> bool:
+        """宿主有没有「列出 TTS 服务商」的入口。
+
+        用来区分两件看起来一样、处理方式却相反的事：
+
+        * **宿主没暴露列表**（老版本 / 精简宿主）→ 无从判断这个 id 存不存在，
+          硬失败等于把发语音整条功能关掉，只能 warn + 回落默认；
+        * **宿主有列表，但里面没有这个 id** → 用户指名错了，明确失败、绝不回落
+          （与模型侧指名 Provider、作品写手同一条纪律）。
+        """
+        if callable(getattr(self.context, 'get_all_tts_providers', None)):
+            return True
+        manager = getattr(self.context, 'provider_manager', None)
+        return isinstance(getattr(manager, 'tts_provider_insts', None), (list, tuple))
+
+    def _inst_by_id(self, provider_id: str) -> Any:
+        """宿主 `inst_map` 里按 id 取实例（**只为把"不存在"与"不是 TTS"分开报**）。"""
+        manager = getattr(self.context, 'provider_manager', None)
+        mapping = getattr(manager, 'inst_map', None)
+        if not isinstance(mapping, Mapping):
+            return None
+        wanted = _clean(provider_id)
+        if wanted in mapping:
+            return mapping[wanted]
+        for key, value in mapping.items():
+            if str(key).lower() == wanted.lower():
+                return value
+        return None
+
+    def _tts_provider_by_id(self, provider_id: str) -> Any:
+        """在宿主的 TTS 服务商里按 id 找（找不到 `None`）。
+
+        刻意**不走** `context.get_provider_by_id`：那个入口对不存在的 id 会往宿主日志
+        打一条 `Provider … was not found.`（坑 23 记过它的误导性），而"用户还没在
+        AstrBot 里配这个 TTS"根本不是异常。只比对 id / name，不拿 model 当 id 用。
+        """
+        wanted = _clean(provider_id).lower()
+        if not wanted:
+            return None
+        for provider in self._tts_providers():
+            config = self._provider_config(provider)
+            candidates = {
+                self._provider_id(provider).lower(),
+                _clean(config.get('id')).lower(),
+                _clean(config.get('provider_id')).lower(),
+                _clean(config.get('name')).lower(),
+            }
+            if wanted in {item for item in candidates if item}:
+                return provider
+        return None
+
+    def _tts_capability_error(self, provider: Any) -> str:
+        """这个服务商能不能做文字转语音；能就返回空串，不能就给一句人看的原因。
+
+        口吻与模型侧按 `modalities` 校验一致：**只信 Provider 自己声明的能力**。
+        TTS Provider 声明了模态却没有一项是 TTS 相关时才判"声明了但不支持"；
+        没声明（空 / 缺失）一律照常——"没声明"不等于"不支持"。
+        """
+        label = self._provider_label(provider)
+        config = self._provider_config(provider)
+        declared = config.get('modalities') if isinstance(config, Mapping) else None
+        if isinstance(declared, (list, tuple, set)):
+            tokens = {_clean(item).lower() for item in declared if _clean(item)}
+            if tokens and not (tokens & _TTS_MODALITIES):
+                return (
+                    'TTS 服务商 %s 没有声明文字转语音能力（已声明=%s）：请在 AstrBot 里换一个 '
+                    'TTS 服务商，或把「语音与声聊」的这一项改选'
+                    % (label, '/'.join(sorted(tokens)))
+                )
+        if not callable(getattr(provider, 'get_audio', None)):
+            return (
+                'TTS 服务商 %s 没有 t2s 能力（缺 get_audio）：它不是文字转语音模型，'
+                '请在 AstrBot 里换一个 TTS 服务商，或把「语音与声聊」的这一项改选' % label
+            )
+        return ''
+
+    def _named_tts_missing_error(self, provider_id: str) -> str:
+        """指名了却找不到时的报错文案（顺带说清"它其实是别的类型的模型"）。"""
+        other = self._inst_by_id(provider_id)
+        if other is not None:
+            return (
+                '「语音与声聊」指名的 %s 不是 AstrBot 的 TTS 服务商（它是 %s）：'
+                '请改选一个文字转语音模型，或把这一项留空用当前默认 TTS'
+                % (provider_id, type(other).__name__)
+            )
+        available = [self._provider_id(item) for item in self._tts_providers()]
+        return (
+            '「语音与声聊」指名的 TTS 服务商 %s 不存在（AstrBot 里可用的：%s）：'
+            '请确认这个服务商，或把这一项留空用当前默认 TTS'
+            % (provider_id, '、'.join(item for item in available if item) or '无')
+        )
+
+    def _note_named_voice(self, provider: Any, voice: str) -> None:
+        """指名的服务商**固定用它自己那份音色配置**：音色名对不上时留一条 debug。
+
+        音色（`voice` 参数 / `default_voice`）是"服务商内的音色名"，不是选服务商的手段；
+        指名了服务商之后它不该再把这次调用换到另一个服务商上——那会让用户配的
+        「用了 A」和实际听到的声音对不上。
+        """
+        wanted = _clean(voice) or self.default_voice()
+        if not wanted:
+            return
+        hint = self._voice_hint(self._provider_config(provider))
+        if hint and wanted.lower() != hint.lower():
+            log_fallback(
+                'debug',
+                '音色 %s 不是指名的 TTS 服务商 %s 当前用的音色（%s）；本次仍用指名的服务商',
+                wanted, self._provider_label(provider), hint,
+            )
+
     def _pick_voice_provider(self, voice: str) -> Any:
         wanted = _clean(voice).lower()
         if not wanted:
@@ -2420,7 +2561,45 @@ class AstrbotTransport:
         return None
 
     async def _tts_provider(self, umo: str, voice: str = '') -> tuple[Any, str]:
-        """取宿主 TTS 提供者：返回 `(provider, 错误文案)`。"""
+        """取这次要用的宿主 TTS 服务商：返回 `(provider, 错误文案)`。
+
+        解析优先级：
+
+        1. **指名的 `tts_provider_id`**（「语音与声聊」组）→ 按 id 取那一个（留空跳过）；
+        2. 宿主当前默认 TTS：`get_using_tts_provider_async` → `get_using_tts_provider`
+           → `provider_manager.curr_tts_provider_inst`（逐层判空，与历史行为一致）。
+
+        **指名了却找不到时不回落**（与模型侧指名 Provider、作品写手同一条纪律）：
+        指名是用户在配置里做出的明确选择，偷偷换一个服务商只会把"配了没用 / 声音不对"
+        变成查不出来的静默问题。唯一不硬失败的例外是宿主**根本没有**列出 TTS 的入口
+        （见 `_tts_list_exposed`）——那时无从判断这个 id 存不存在，只能 warn + 回落。
+        """
+        wanted = self.tts_provider_id()
+        if not wanted:
+            return await self._default_tts_provider(umo, voice)
+        if not self._tts_list_exposed():
+            log_fallback(
+                'warn',
+                '宿主没有暴露 TTS 服务商列表，无法按 id 取 %s；本次回落 AstrBot 当前默认 TTS',
+                wanted,
+            )
+            return await self._default_tts_provider(umo, voice)
+        provider = self._tts_provider_by_id(wanted)
+        if provider is None:
+            # 调用方（send_voice / list_voices）会把它记成 warn，这里不重复打日志。
+            return None, self._named_tts_missing_error(wanted)
+        error = self._tts_capability_error(provider)
+        if error:
+            return None, error
+        self._note_named_voice(provider, voice)
+        return provider, ''
+
+    async def _default_tts_provider(self, umo: str, voice: str = '') -> tuple[Any, str]:
+        """宿主当前默认的 TTS 服务商；给了音色名就按音色挑（既有行为）。
+
+        留空 `tts_provider_id` 时 `voice` / `default_voice` 可以指向**另一个**服务商
+        实例——宿主把音色配在服务商自己的配置里，所以"挑音色"在实现上就是"挑实例"。
+        """
         provider: Any = None
         for attribute in ('get_using_tts_provider_async', 'get_using_tts_provider'):
             getter = getattr(self.context, attribute, None)
@@ -2440,21 +2619,51 @@ class AstrbotTransport:
             provider = self._provider_from_manager()
         if provider is None:
             return None, '宿主没有可用的 TTS 提供者：发语音需要先在 AstrBot 里配置一个 TTS 服务商'
-        if voice:
-            chosen = self._pick_voice_provider(voice)
+        wanted = _clean(voice) or self.default_voice()
+        if wanted:
+            chosen = self._pick_voice_provider(wanted)
             if chosen is not None:
                 provider = chosen
             else:
                 log_fallback(
-                    'debug', '音色 %s 没有匹配到 TTS 提供者，改用默认提供者（可用音色见 list_voices）', voice,
+                    'debug', '音色 %s 没有匹配到 TTS 提供者，改用默认提供者（可用音色见 list_voices）', wanted,
                 )
+        error = self._tts_capability_error(provider)
+        if error:
+            return None, error
         return provider, ''
 
     def _action_list_voices(self) -> dict[str, Any]:
-        providers = self._tts_providers()
-        if not providers:
-            log_fallback('warn', '列音色失败：宿主没有配置 TTS 提供者')
-            return {'ok': False, 'error': '宿主没有可用的 TTS 提供者，列不出音色'}
+        """`list_voices`：列出**这次会用的那个**服务商能用的音色。
+
+        指名了 `tts_provider_id` 就只列它（取不到 → 与 `send_voice` 一样明确失败，
+        不假装成功）；留空时把**默认服务商排在最前**，后面跟上宿主里其它 TTS 服务商
+        ——留空时 `send_voice` 的 `voice` 参数本来就能指定另一个服务商，列全了模型才
+        知道有哪些可选。
+        """
+        wanted = self.tts_provider_id()
+        if wanted:
+            if not self._tts_list_exposed():
+                log_fallback('warn', '列音色失败：宿主没有暴露 TTS 服务商列表，读不到指名的 %s', wanted)
+                return {'ok': False, 'error': '宿主没有暴露 TTS 服务商列表，列不出音色'}
+            provider = self._tts_provider_by_id(wanted)
+            if provider is None:
+                error = self._named_tts_missing_error(wanted)
+                log_fallback('warn', '列音色失败：%s', error)
+                return {'ok': False, 'error': error}
+            error = self._tts_capability_error(provider)
+            if error:
+                log_fallback('warn', '列音色失败：%s', error)
+                return {'ok': False, 'error': error}
+            providers = [provider]
+        else:
+            providers = self._tts_providers()
+            if not providers:
+                log_fallback('warn', '列音色失败：宿主没有配置 TTS 提供者')
+                return {'ok': False, 'error': '宿主没有可用的 TTS 提供者，列不出音色'}
+            default = self._provider_from_manager()
+            if default is not None and any(item is default for item in providers):
+                providers = [default] + [item for item in providers if item is not default]
         voices = [
             {
                 'id': self._provider_id(provider),
@@ -2466,7 +2675,7 @@ class AstrbotTransport:
         return {
             'ok': True,
             'error': '',
-            'data': {'voices': voices, 'note': 'send_voice 的 voice 参数填这里的 id（音色由该提供者的配置决定）'},
+            'data': {'voices': voices, 'note': 'send_voice 的 voice 参数填这里的 id（音色由该服务商的配置决定）'},
         }
 
     async def _action_contacts(self, action_id: str, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -3202,12 +3411,16 @@ def _fallback_normalize_config(raw: Any) -> dict[str, Any]:
 try:  # pragma: no cover - 取决于并行任务落地顺序
     from ..core.service.config import (
         CONFIG_SECTION_ALIASES as _CORE_SECTION_ALIASES,
+        LEGACY_SECTION_MERGES as _CORE_SECTION_MERGES,
         apply_section_aliases as _core_apply_section_aliases,
+        merge_legacy_section_values as _core_merge_legacy_section_values,
         normalize_config as _core_normalize_config,
     )
 except ImportError:  # pragma: no cover
     _CORE_SECTION_ALIASES = None
+    _CORE_SECTION_MERGES = None
     _core_apply_section_aliases = None
+    _core_merge_legacy_section_values = None
     _core_normalize_config = None
 
 #: AstrBot `_conf_schema.json` 顶层分组名 → 上游 Console 分组名。
@@ -3229,6 +3442,40 @@ def _local_apply_section_aliases(raw: Any) -> dict[str, Any]:
         if alias in source and target not in source:
             source[target] = source[alias]
     return source
+
+
+#: **N:1 的历史分组归并表**（`新分组 → 旧分组`）。单一实现源在
+#: `plugin/core/service/config.py` 的 `LEGACY_SECTION_MERGES`；这里镜像一份给
+#: "core 尚未落地"的降级路径用（正常情况下是同一个对象的内容）。
+LEGACY_SECTION_MERGES: dict[str, tuple[str, ...]] = (
+    dict(_CORE_SECTION_MERGES) if _CORE_SECTION_MERGES is not None else {}
+)
+
+
+def _merge_legacy_section_values(raw: Any, name: str, values: Any = None) -> dict[str, Any]:
+    """读一个分组：**用户写过**的新分组值优先，其余从旧分组补（见 `LEGACY_SECTION_MERGES`）。
+
+    优先用 core 的实现（唯一真源，含"等于 schema 默认值 = 没写过"那条规则——宿主每次
+    加载都会把缺的键连默认值一起补进配置，见 `core/service/config.merge_legacy_section_values`）。
+    core 不可用时退回下面这份**等值但更钝**的本地实现（新分组一律优先）：它读不到 schema
+    默认值，所以做不到那条区分——属于"core 都还没落地"的降级路径，正常不会走到。
+    """
+    if _core_merge_legacy_section_values is not None:
+        try:
+            return _core_merge_legacy_section_values(raw, name, values)
+        except Exception:  # noqa: BLE001 - 读配置绝不因为归并失败而炸
+            pass
+    merged = dict(values) if isinstance(values, dict) else {}
+    sources = LEGACY_SECTION_MERGES.get(name)
+    if not sources or not isinstance(raw, dict):
+        return merged
+    for source in sources:
+        section = raw.get(source)
+        if not isinstance(section, dict):
+            continue
+        for key, value in section.items():
+            merged.setdefault(key, value)
+    return merged
 
 
 def _deep_merge(base: Any, incoming: Any) -> Any:
@@ -3381,6 +3628,14 @@ class AstrbotBridge:
                     await recover()
                 except Exception as error:  # noqa: BLE001 - 启动路径绝不因为可选特性失败
                     logger.warning('hds-interlude：共同作品恢复失败 %s' % error)
+            # v1.7.2 动作开关分组收敛（10 → 4）：把旧分组里用户写过的值折进新分组，
+            # 写一次盘就再也没有新旧两份打架的可能。**必须在启动时做**（放在适配层的
+            # 真实启动路径，同坑 68 的理由）：宿主在加载配置时已经按 schema 把新分组
+            # 补成默认值了，越早折越好——用户第一次打开配置页之前就该折完。
+            try:
+                await self.migrate_legacy_action_sections()
+            except Exception as error:  # noqa: BLE001 - 迁移失败不影响插件启动
+                logger.warning('hds-interlude：动作开关分组迁移失败 %s' % error)
             self.interlude_context.emit_ready()
             self._started = True
             missing = getattr(self.service, '_missing_chunks', ())
@@ -3445,6 +3700,37 @@ class AstrbotBridge:
             self.config['story_defaults'] = section
         log_fallback('info', '已从 AstrBot 人格导入角色设定 persona=%s 字数=%d', persona_id, len(profile))
         return persona_id
+
+    async def migrate_legacy_action_sections(self) -> int:
+        """把旧动作开关分组里用户写过的值折进新分组，写一次盘（v1.7.2 收敛用，幂等）。
+
+        为什么必须在**启动**时折一次（而不是只靠读取侧归并）：
+
+        1. 宿主每次加载都按 `_conf_schema.json` 补默认值再落盘
+           （`AstrbotConfig.check_config_integrity`：缺的键连默认值一起插进配置文件）。
+           升级后的第一次加载，`actions_chat` 就是这样被整组补上默认值（开关全 true）的，
+           而用户真正的选择还在旧分组里。读取侧的归并靠"等于默认值算没写过"能读对，
+           但**用户在新分组里把开关改回默认值**（比如重新打开升级前关掉的语音）时，
+           旧分组里的旧值会永远压着它——界面上就是"改了没反应"。
+        2. 折之前，宿主配置页显示的是文件里的新组值、运行期读的是旧组值：显示与行为相反
+           （坑 34 的老病）。折完两处才是同一份。
+
+        折叠规则与读取侧同一套（`core/service/config.py` 的 `fold_legacy_section_merges`
+        → `merge_legacy_section_values`；"用户写过 = 不等于 schema 默认值"）。没有可折的
+        东西时**不写盘**，返回 0。放在适配层的真实启动路径（同坑 68 的理由：别塞进 core
+        的定时器）。失败只 warn：读侧的归并仍然兜得住，不会丢配置。
+        """
+        from ..core.service.config import fold_legacy_section_merges  # noqa: PLC0415
+
+        raw = self.raw_config()
+        if not isinstance(raw, dict) or not raw:
+            return 0
+        target = fold_legacy_section_merges(dict(raw))
+        if target == raw:
+            return 0
+        await self.save_raw_config(target)
+        log_fallback('info', '动作开关分组迁移完成：旧分组的值已折进 actions_chat（v1.7.2 收敛）')
+        return 1
 
     async def shutdown(self) -> None:
         """停止后台计时器、关闭 HTTP 客户端与数据库（幂等）。"""
@@ -4641,6 +4927,12 @@ class AstrbotBridge:
         早期版本只看顶层，于是「运行开关」读出的是默认值而不是真实状态（配置里开着
         显示成关着、关着显示成开着，重启宿主剥掉历史遗留的假顶层键后必现）。
         顶层同名键只在嵌套缺失时兜底——那是旧版本控制台写出来的垃圾，宿主下次加载就会删。
+
+        **N:1 归并**（v1.7.2）：动作开关组由十个收敛成四个，旧分组留在 schema 里当
+        隐藏兼容位。读 `actions_chat` 这类新分组名时，缺的键从旧分组补（新值优先），
+        所以用户升级前设过的开关照旧读得到；旧分组本身也能直接读（`actions_interaction`
+        仍然回它自己的那份）。写方向只写新分组名，见 `core/service/config.py` 的
+        `LEGACY_SECTION_MERGES`。
         """
         if name in NESTED_MODEL_SECTIONS:
             nested = self.section('model').get(name)
@@ -4652,11 +4944,13 @@ class AstrbotBridge:
                 if target == name and isinstance(self.config, dict):
                     section = self.config.get(alias)
                     break
-        if section is None:
-            return {}
         if isinstance(section, dict):
-            return section
-        return {key: value for key, value in vars(section).items() if not key.startswith('_')}
+            values = section
+        elif section is None:
+            values = {}
+        else:
+            values = {key: value for key, value in vars(section).items() if not key.startswith('_')}
+        return _merge_legacy_section_values(self.config, name, values)
 
     def config_flag(self, section: str, *names: str, default: Any = None) -> Any:
         """读一个配置项：双拼写（camelCase / snake_case）都认。"""

@@ -130,7 +130,9 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
   const [failure, setFailure] = useState('')
   const [saving, setSaving] = useState(false)
 
-  const groups = schema.data?.groups ?? []
+  // `invisible` 的分组（旧版兼容位）不该出现在下拉/总览里——宿主配置页按这个字段隐藏，
+  // 我们自己的配置页也要一致，否则用户会看到一堆「（已弃用）」的组。
+  const groups = (schema.data?.groups ?? []).filter((group) => !group.invisible) ?? []
   const active = useMemo(() => {
     if (group === OVERVIEW) return null
     return groups.find((item) => item.key === group) ?? groups[0]

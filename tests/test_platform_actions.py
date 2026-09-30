@@ -182,5 +182,92 @@ class DescribeTests(unittest.TestCase):
         self.assertIn('recall_message', text)
 
 
+class ScopeAndTierTests(unittest.TestCase):
+    """动作适用范围 → 权限档位（用户指出：非群聊动作不该有"群主/管理员"档）。
+
+    这一层是**目录驱动**的：`scopes` 决定这条动作适用哪些会话，
+    `permission_tiers_for()` 据此下发给控制台下拉；手改权限表塞进不适用的档位时
+    由 `normalize_tier_for()` 收敛，**绝不静默变成"永远不能用"**。
+    """
+
+    def test_group_only_actions_are_declared_as_such(self):
+        # 群管理、群只读、群文件这些在私聊里根本没有意义。
+        for action_id in (
+            'set_group_kick', 'set_group_ban', 'set_group_whole_ban', 'set_group_admin',
+            'send_group_notice', 'set_group_card', 'upload_group_file', 'get_group_members_info',
+            'get_group_msg_history', 'trans_group_file',
+        ):
+            with self.subTest(action=action_id):
+                self.assertEqual(tuple(pa.ACTIONS[action_id].scopes), ('group',))
+
+    def test_private_only_actions_are_declared_as_such(self):
+        self.assertEqual(tuple(pa.ACTIONS['get_friend_msg_history'].scopes), ('private',))
+
+    def test_daily_interaction_actions_stay_available_in_both(self):
+        for action_id in ('send_poke', 'send_like', 'recall_message', 'update_qq_status'):
+            with self.subTest(action=action_id):
+                self.assertEqual(tuple(pa.ACTIONS[action_id].scopes), ('private', 'group'))
+
+    def test_groupadmin_tier_is_only_offered_for_group_actions(self):
+        self.assertNotIn('groupadmin', pa.permission_tiers_for('get_friend_msg_history'))
+        self.assertIn('groupadmin', pa.permission_tiers_for('set_group_kick'))
+        self.assertIn('groupadmin', pa.permission_tiers_for('send_poke'))
+        # 另外三档在任何动作上都成立
+        for action_id in ('get_friend_msg_history', 'set_group_kick', 'send_poke'):
+            for tier in ('global', 'admin', 'disabled'):
+                self.assertIn(tier, pa.permission_tiers_for(action_id))
+
+    def test_an_inapplicable_tier_converges_to_the_default_instead_of_locking_out(self):
+        # 手改权限表塞了 groupadmin（而这是条私聊动作）：收敛成这条动作的默认档，
+        # 而不是"选了等于永远不能发"。
+        self.assertEqual(pa.normalize_tier_for('get_friend_msg_history', 'groupadmin'), 'global')
+        self.assertEqual(pa.normalize_tier_for('set_group_kick', 'groupadmin'), 'groupadmin')
+        # 未知档位仍然是关闭（安全侧）
+        self.assertEqual(pa.normalize_tier_for('set_group_kick', 'nonsense'), 'disabled')
+
+    def test_resolve_permission_uses_the_converged_tier(self):
+        table = {'get_friend_msg_history': 'groupadmin'}
+        self.assertTrue(pa.resolve_permission('get_friend_msg_history', table, True, ''))
+
+    def test_console_only_accepts_tiers_the_action_supports(self):
+        """控制台的写入门禁与目录同源：`console_api.set_action_permission` 会拒绝不适用档位。"""
+        # 按文件读源码断言（不 import 适配层：那个包会拉起 astrbot）。
+        console = pathlib.Path(__file__).resolve().parents[1] / 'adapters' / 'console_api.py'
+        source = console.read_text(encoding='utf-8')
+        self.assertIn('permission_tiers_for', source, '控制台必须按动作过滤档位')
+        self.assertIn('permission_tiers_for(item.id)', source, '目录下发要带每条的适用档位')
+
+    def test_private_turn_is_not_offered_group_only_actions(self):
+        """适用范围要真的影响"这一回合能调什么"（不只是控制台显示）。
+
+        `ServiceChunk12.available_platform_actions` 按 `scopes` 过滤目录，
+        而回合入口传的 scopes 是 `('private','group')` 或 `('private',)`
+        （适配层按会话判定）——所以私聊回合不该被教去踢人/禁言。
+        """
+        import types
+
+        from plugin.core.service.chunk12 import ServiceChunk12
+
+        # 危险动作默认 `disabled`，所以给 `set_group_kick` 显式授权一档才算"可用"。
+        table = {'set_group_kick': 'global'}
+        stub = types.SimpleNamespace(
+            action_permission_table=lambda: dict(table),
+            action_switch=lambda action_id: True,
+        )
+        available_private = ServiceChunk12.available_platform_actions(stub, '', ('private',))
+        available_group = ServiceChunk12.available_platform_actions(stub, '', ('group',))
+
+        self.assertIn('send_poke', available_private)
+        self.assertIn('get_group_members_info', available_group)
+        # 群管理动作在私聊回合里根本不该出现（哪怕已经授权）
+        self.assertNotIn('set_group_kick', available_private)
+        self.assertNotIn('send_group_notice', available_private)
+        self.assertNotIn('get_group_members_info', available_private)
+        # 反过来，私聊专属的动作不该在群里出现
+        self.assertNotIn('get_friend_msg_history', available_group)
+        self.assertIn('get_friend_msg_history', available_private)
+        self.assertIn('set_group_kick', available_group)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -42,6 +42,7 @@ from ..scheduled_command import (
 )
 from ..time import iso
 from .base import ServiceBase, pick
+from .config import merge_legacy_section_values
 
 __all__ = ['ServiceChunk12']
 
@@ -112,12 +113,33 @@ class ServiceChunk12(ServiceBase):
         return normalize_permissions(data)
 
     def action_group_values(self, group: str) -> dict[str, Any]:
-        """读一个动作配置分组（不存在就回空 dict = "未配置"，等价于不限制）。"""
-        try:
-            section = self.section(group)
-        except Exception:  # noqa: BLE001 - 旧配置里没有这个分组是正常的
-            return {}
-        return dict(section) if isinstance(section, dict) else {}
+        """读一个动作配置分组（不存在就回空 dict = "未配置"，等价于不限制）。
+
+        两件事都在这里收口：
+
+        * **两个读法都试**：`ServiceBase` 本身没有 `section()`（那是适配层
+          `AstrbotBridge` 的成员，见 chunk14 的同款说明），所以宿主注入了 `section`
+          就用它、否则读 `self.config`。早期版本只走 `self.section`，异常被吞掉后
+          恒回 `{}` —— 配置页里的开关看着能点，运行期其实一条都不生效。
+        * **N:1 旧分组归并**（`LEGACY_SECTION_MERGES`）：动作开关组 v1.7.2 由十个
+          收敛成四个，用户升级前设过的键还在旧分组里；新分组的键优先、缺的键从旧
+          分组补，所以新旧配置读出来是同一份。
+        """
+        values: dict[str, Any] = {}
+        reader = getattr(self, 'section', None)
+        if callable(reader):
+            try:
+                section = reader(group)
+            except Exception:  # noqa: BLE001 - 旧配置里没有这个分组是正常的
+                section = None
+            if isinstance(section, dict):
+                values = dict(section)
+        raw = self.config if isinstance(self.config, dict) else {}
+        if not values:
+            own = raw.get(group)
+            if isinstance(own, dict):
+                values = dict(own)
+        return merge_legacy_section_values(raw, group, values)
 
     def action_switch(self, action_id: str) -> Optional[bool]:
         """某动作的开关值。`None` = 该分组/键不存在（= 未配置，不构成限制）。

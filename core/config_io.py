@@ -44,6 +44,7 @@
 from __future__ import annotations
 
 from .platform_actions import ACTION_CONFIG_GROUPS, ACTION_RISK_GROUP
+from .service.config import LEGACY_SECTION_MERGES
 
 import copy
 import json
@@ -86,6 +87,9 @@ KNOWN_SECTIONS = frozenset({
     # 动作分组名从目录派生，**不要手抄**——加动作时这里自动跟上。
     'qzone', 'input_status', 'world_seeder', 'works', 'forward_message', 'forward_message_compat',
     *sorted(set(ACTION_CONFIG_GROUPS.values()) | {ACTION_RISK_GROUP}),
+    # v1.7.2 收敛动作开关组后留下的旧分组（藏在 schema 里当只读兼容位）：老导出文件
+    # 里只有这些组名，认得出来才不会报"未知顶层键"。组名从归并表派生，别手抄。
+    *sorted({name for sources in LEGACY_SECTION_MERGES.values() for name in sources}),
     # 上游 Koishi Console 的分组名（老导出文件里会出现）
     'model', 'onebot', 'storyDefaults', 'sharedStory', 'alterSystem',
     'schedulePreplan', 'timelineDirector', 'chatActions', 'blindMode', 'chatRhythm', 'blackBox',

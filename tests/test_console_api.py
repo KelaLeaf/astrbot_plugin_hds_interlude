@@ -146,6 +146,13 @@ class ConsoleApiTests(unittest.TestCase):
                          console_module.RISK_GROUP_LABEL)
         for row in rows:
             self.assertIn(row['group'], payload['groups'])
+        # v1.7.2 收敛成四个开关组：文案必须是**合并后**的组名，而不是"先到的类别"
+        # （`actions_chat` 里坐着互动/消息/历史/状态/资料/语音/联系人七类，叫「互动」是错的）。
+        self.assertEqual(payload['groups'],
+                         dict(platform_actions.ACTION_CONFIG_GROUP_LABELS))
+        self.assertEqual(sorted(payload['groups']),
+                         ['actions_chat', 'actions_group', 'actions_qzone', 'actions_risks'])
+        self.assertEqual(payload['groups']['actions_chat'], '会话动作')
         # 各 risk 计数与档位分布都要对得上
         counts = {}
         for row in rows:
@@ -204,6 +211,51 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(row['permission'], 'admin')
         self.assertTrue(row['enabled'])
         self.assertEqual(payload['stats']['risky_enabled'], 1)
+
+    # ---- v1.7.2 分组收敛：旧格式配置仍要读得到（升级不丢配置） ----
+
+    def test_action_switches_read_old_format_groups(self):
+        """旧格式：开关写在 `actions_interaction` 等旧组里，没有 `actions_chat`。
+
+        这是本任务的核心验收——分组名收敛了，用户升级前设过的开关必须照旧读得到，
+        并且面板上报告的落点是**新组名**（写方向也只写新组）。
+        """
+        # ① 归一化路径：`normalize_config` 的 N:1 归并（服务层/桥接装配置时走它）
+        bridge = _make_bridge({
+            'actions_interaction': {'enabled': True, 'send_poke': False, 'send_like': True},
+            'actions_voice': {'send_voice': False, 'default_voice': 'zh-CN-YunxiNeural'},
+        })
+        bridge.db = self.bridge.db
+        payload = _run(ConsoleApi(bridge).actions_catalog())
+        switches = {row['id']: row['config_enabled'] for row in payload['actions']}
+        self.assertIs(switches['send_poke'], False, '关掉的开关升级后还是关着')
+        self.assertIs(switches['send_like'], True)
+        self.assertIs(switches['send_voice'], False)
+        self.assertIsNone(switches['set_group_kick'], '没配过的组照旧 = 未配置 = 不限制')
+        for row in payload['actions']:
+            with self.subTest(action=row['id']):
+                self.assertNotIn(row['group'], ('actions_interaction', 'actions_voice'),
+                                 '落点必须是收敛后的四个组之一')
+
+        # ② 直接改内存里的旧组（`bridge.section()` 自己会归并，不依赖归一化）
+        self.bridge.config.pop('actions_chat', None)
+        self.bridge.config['actions_interaction'] = {'send_poke': False}
+        row = next(item for item in _run(self.api.actions_catalog())['actions']
+                   if item['id'] == 'send_poke')
+        self.assertIs(row['config_enabled'], False)
+        self.assertEqual(row['group'], 'actions_chat')
+
+    def test_config_page_shows_the_merged_value_of_the_new_action_group(self):
+        """配置页显示的必须是运行期**真正生效**的值（含旧分组归并），见坑 34。"""
+        # 磁盘上（这里用 `_live_config` 代表）只有旧分组，没有 `actions_chat`
+        self.bridge._live_config['actions_interaction'] = {'send_poke': False}
+        payload = _run(self.api.config_schema())
+        groups = {group['key']: group for group in payload['groups']}
+        field = next(item for item in groups['actions_chat']['fields'] if item['key'] == 'send_poke')
+        self.assertIs(field['value'], False)
+        self.assertTrue(field['present'], '旧分组里的值也算"设过"')
+        self.assertTrue(groups['actions_interaction']['invisible'],
+                        '旧组下发的数据仍带 invisible 标记（宿主配置页据此隐藏）')
 
     def test_permission_write_round_trips_to_the_temp_data_dir(self):
         path = self._temp_permissions()
@@ -1289,6 +1341,42 @@ class ConfigEditorTests(unittest.TestCase):
         payload = _run(self.api.participants())
         self.assertEqual(payload['participants'][0]['user_id'], '10001')
         self.assertEqual(payload['participants'][0]['display_name'], '主人')
+
+    # ---- v1.7.2 升级现场：启动时把旧动作分组折进新分组 ----
+
+    def test_startup_migration_folds_legacy_action_switches_into_the_new_group(self):
+        """宿主已把 `actions_chat` 按 schema 补成默认值，用户的开关还在旧分组里。
+
+        启动迁移必须把用户的选择折进新组、清空旧组并写盘；折完之后用户在新组里
+        **把开关改回默认值**（关掉→打开）也必须真的生效——这正是"只靠读取侧归并"
+        做不到的那一步（旧组里的旧值会永远压着新组）。
+        """
+        with open(self.path, 'w', encoding='utf-8') as handle:
+            handle.write('\ufeff' + json.dumps({
+                'actions_chat': {
+                    'enabled': True, 'send_poke': True, 'send_like': True,
+                    'send_voice': True, 'default_voice': '',
+                },
+                'actions_interaction': {'enabled': True, 'send_poke': False, 'send_like': True},
+                'actions_voice': {'enabled': True, 'send_voice': False,
+                                  'default_voice': 'zh-CN-YunxiNeural'},
+            }, ensure_ascii=False))
+        self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 1)
+        data = self._read()
+        self.assertIs(data['actions_chat']['send_poke'], False)
+        self.assertIs(data['actions_chat']['send_voice'], False)
+        self.assertEqual(data['actions_chat']['default_voice'], 'zh-CN-YunxiNeural')
+        self.assertEqual(data['actions_interaction'], {})
+        self.assertEqual(data['actions_voice'], {})
+        # 运行期立刻读到折完的那份（`save_raw_config` 会用刚写下去的那份生效）
+        self.assertIs(self.bridge.section('actions_chat')['send_poke'], False)
+        # 幂等：再跑一次没有可折的东西，不写盘、内容不变
+        self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 0)
+        self.assertEqual(self._read(), data)
+        # 折完之后"改回默认值"必须生效（否则界面上就是"改了没反应"）
+        _run(self.api.set_config_value('actions_chat.send_poke', True))
+        self.assertIs(self.bridge.section('actions_chat')['send_poke'], True)
+        self.assertIs(self._read()['actions_chat']['send_poke'], True)
 
 
 # =========================================================================== #

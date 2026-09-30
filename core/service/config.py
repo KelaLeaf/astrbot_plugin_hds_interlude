@@ -33,7 +33,10 @@ TypedDict 不做运行期校验，键名表只表达**语义归属**；运行期
 from __future__ import annotations
 
 import copy
+import io
+import json
 import math
+import os
 import re
 from typing import Any, Literal, TypedDict
 
@@ -108,6 +111,10 @@ __all__ = [
     'CONFIG_SECTION_ALIASES',
     'CONFIG_SECTION_ALIASES_REVERSE',
     'LEGACY_SECTION_ALIASES',
+    'LEGACY_SECTION_MERGES',
+    'merge_legacy_section_values',
+    'fold_legacy_section_merges',
+    'schema_group_defaults',
     'apply_section_aliases',
     'to_schema_shape',
     'PROMPT_SECTION',
@@ -1043,6 +1050,113 @@ LEGACY_SECTION_ALIASES: dict[str, str] = {
     'forward_message_compat': 'forward_message',
 }
 
+#: **N:1 的历史分组归并（只用于读取）**：`新分组 → 一组旧分组`。
+#:
+#: v1.7.2 把十个动作开关组收敛成四个（`actions_chat` / `actions_group` / `actions_qzone` /
+#: `actions_risks`，见 `core/platform_actions.ACTION_CONFIG_GROUPS`）。语义是：
+#:
+#: * **用户写过的新分组值优先**——"写过"的判定是"不等于 schema 默认值"，理由见下；
+#: * 新分组里**没写过**的键，按顺序从这些旧分组里补，旧分组里也"没写过"（= 默认值）就跳过；
+#: * 只在**读**方向生效。写方向只写新分组名（`to_schema_shape` / 控制台）——旧名写回去
+#:   等于把用户配置塞进一堆作废的隐藏键，下次宿主按 schema 重建时还要再迁一遍。
+#:
+#: 为什么旧分组必须继续留在 `_conf_schema.json` 里（**并且 `invisible: true`**）：
+#: 宿主每次加载插件都按 schema 重建配置，schema 里没有的分组会被**直接删掉**（AGENTS 坑 22）。
+#: 所以"把 `actions_interaction` 改名成 `actions_chat`"这种做法，会在用户**下次启动前**
+#: 就把他设过的开关全清空——旧组留着 + 读取侧归并，才是升级不丢配置的唯一走法。
+#: （与 `LEGACY_SECTION_ALIASES` 的 1:1 别名同一套思路，只是这里是 N:1。）
+#:
+#: 为什么"新分组的值优先"要加"等于默认值不算写过"这个前提（**真机行为，别删**）：
+#: 宿主 `AstrbotConfig.check_config_integrity()` 在每次加载时把 schema 里**缺的键连默认值
+#: 一起补进配置文件**并落盘。升级后的第一次加载，`actions_chat` 就是这样被整组补上默认值
+#: （全 true）的——而用户真正的选择还留在旧分组里。若按字面"新分组一律优先"，宿主补的默认值
+#: 会顶掉用户的选择：关掉的开关全部自己打开（静默丢配置，正是本次收敛最要避免的事）。
+#: 规则与坑 33 的提示词搬迁同源：**等于内置默认值 = 视为没写过**。
+LEGACY_SECTION_MERGES: dict[str, tuple[str, ...]] = {
+    'actions_chat': (
+        'actions_interaction', 'actions_message', 'actions_history', 'actions_status',
+        'actions_profile', 'actions_voice', 'actions_contact',
+    ),
+}
+
+#: `plugin/_conf_schema.json` 的 `items.<键>.default` 缓存（懒加载一次，按分组）。
+_SCHEMA_DEFAULTS: dict[str, dict[str, Any]] | None = None
+
+
+def schema_group_defaults(group: str) -> dict[str, Any]:
+    """某个顶层分组的「键 → schema 默认值」（懒加载 + 缓存，读不到就回空 dict）。
+
+    唯一用途见 `merge_legacy_section_values`：区分"用户写过的值"与"宿主按 schema
+    补进来的默认值"。**宿主补默认值的规则就写在这份 schema 里**（`AstrbotConfig`
+    用 `_config_schema_to_default_config` 读同一个文件），所以这里读同一个文件最准。
+    """
+    global _SCHEMA_DEFAULTS
+    if _SCHEMA_DEFAULTS is None:
+        defaults: dict[str, dict[str, Any]] = {}
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            '_conf_schema.json',
+        )
+        try:
+            with io.open(path, encoding='utf-8-sig') as handle:
+                schema = json.load(handle)
+            if isinstance(schema, dict):
+                for name, spec in schema.items():
+                    if not isinstance(spec, dict):
+                        continue
+                    items = spec.get('items')
+                    if isinstance(items, dict):
+                        defaults[name] = {
+                            key: item.get('default')
+                            for key, item in items.items() if isinstance(item, dict)
+                        }
+        except (OSError, ValueError):
+            # 读不到 schema（打包异常等）：退回"新分组一律优先"的老行为，绝不因为
+            # 读不到默认值就不归并（旧配置读不到才是更糟的那头）。
+            defaults = {}
+        _SCHEMA_DEFAULTS = defaults
+    return _SCHEMA_DEFAULTS.get(group, {})
+
+
+def merge_legacy_section_values(
+    raw: Any, name: str, values: Any = None,
+) -> dict[str, Any]:
+    """读一个分组：**用户写过的新分组值优先，其余从旧分组补**（`LEGACY_SECTION_MERGES`）。
+
+    `values` 是调用方**已经读到**的"新分组"内容（宿主 `section()` 的返回、`raw[name]`、
+    或上一级归并的产物）——本函数不替调用方去 `raw[name]` 取，各读取路径的兜底各有各的
+    写法（见 `apply_section_aliases` / `AstrbotBridge.section` / `chunk12.action_group_values`）。
+    返回值永远是**新 dict**，不会改到 `raw` 里任何一个分组（调用方可能还拿着它）。
+
+    逐键规则（`defaults` = `schema_group_defaults(name)`）：
+
+    * 新分组的值**不等于** schema 默认值 → 用户写过，用它；
+    * 新分组的值**等于**默认值（含键不存在）→ 看旧分组：旧分组有**非默认值**就用旧分组的
+      （那是升级前用户的选择，宿主的默认值不许顶掉它）；
+    * 两边都等于默认值 → 就是默认值，谁说话都一样。
+
+    不是归并目标的分组原样返回 `values`（浅拷贝一份，调用方拿去随便改）。
+    """
+    merged = dict(values) if isinstance(values, dict) else {}
+    sources = LEGACY_SECTION_MERGES.get(name)
+    if not sources:
+        return merged
+    if not isinstance(raw, dict):
+        return merged
+    defaults = schema_group_defaults(name)
+    for source in sources:
+        section = raw.get(source)
+        if not isinstance(section, dict):
+            continue
+        for key, value in section.items():
+            if key not in merged:
+                merged[key] = value
+                continue
+            # 新分组里是"没写过"的默认值、而旧分组里是用户的选择 → 旧分组说了算。
+            if key in defaults and merged[key] == defaults[key] and value != defaults[key]:
+                merged[key] = value
+    return merged
+
 #: 「提示词四件套」的**权威分组**（`plugin/_conf_schema.json` 的顶层 `prompts` 组）。
 #:
 #: 上游把四个提示词放在 `model` 组里（`src/index.ts` 的 `ModelConfig`），本移植版
@@ -1114,6 +1228,10 @@ def to_schema_shape(config: Any) -> dict[str, Any]:
     `resolve_prompt_fields` 裁决过：提示词组写了就以它为准，没写就沿用模型中心的兼容位），
     所以不会丢用户内容。摘副本时**复制**分组而不是原地 `pop`：入参与出参的嵌套
     dict 目前是共享引用（浅拷贝），原地改会连带改掉调用方手里那份配置。
+
+    v1.7.2 起收尾再跑一次 **旧动作分组折叠**（`fold_legacy_section_merges`）：写盘时
+    把旧分组里用户写过的值折进新分组、清空旧分组。这也是唯一的"迁移入口"——控制台
+    改任意一项、配置导入，都会顺手把动作开关配置迁到新分组名下（见该函数的说明）。
     """
     if not isinstance(config, dict):
         return {}
@@ -1138,7 +1256,7 @@ def to_schema_shape(config: Any) -> dict[str, Any]:
         for key in PROMPT_FIELD_KEYS:
             if key in effective:
                 prompts[key] = effective[key]
-    return out
+    return fold_legacy_section_merges(out)
 
 
 def _to_snake_key(key: str) -> str:
@@ -1193,6 +1311,55 @@ def _normalize_config_value(value: Any, depth: int, key: str | None = None) -> A
     return value
 
 
+def fold_legacy_section_merges(config: Any) -> dict[str, Any]:
+    """把旧分组里用户写过的值**折进新分组**，并清空这些旧分组（**写盘目标用**，幂等）。
+
+    与 `merge_legacy_section_values` 共用同一套规则，差别是这里改的是"要落盘的那份"：
+
+    * 新分组拿到的是**生效值**（读取侧现在会给出什么，磁盘上就固化什么）；
+    * 旧分组清空 —— 宿主下次加载会给它们补默认值（`check_config_integrity`），
+      而归并规则里"等于默认值不算写过"让新分组说了算。
+
+    为什么非折不可：不折的话，旧分组里那个非默认的旧值会**永远**压着新分组。
+    用户在新分组里把开关改回默认值（比如重新打开一个升级前关掉的语音开关）时，
+    读取侧会判"新值 == 默认值 = 没写过"，于是又读回旧分组的旧值——界面上看起来
+    就是"改了没反应"。折一次之后新旧两处不再打架。
+
+    只在顶层换引用（`config[分组] = 新 dict`），不改任何传入的嵌套 dict，所以调用方
+    手里那份配置不会被连带改掉。不是归并目标的分组原样带过。
+
+    **幂等**：只有当某个旧分组里还留着"用户写过"（≠ schema 默认值）的键时才折；
+    宿主每次加载都会把空掉的旧组补成默认值（`check_config_integrity`），那不算用户写过，
+    于是后续启动不会反复写盘。
+    """
+    if not isinstance(config, dict):
+        return config
+    for target, sources in LEGACY_SECTION_MERGES.items():
+        defaults = schema_group_defaults(target)
+        live = False
+        for source in sources:
+            section = config.get(source)
+            if not isinstance(section, dict):
+                continue
+            for key, value in section.items():
+                if key not in defaults or value != defaults[key]:
+                    live = True
+                    break
+            if live:
+                break
+        if not live:
+            continue
+        own = config.get(target)
+        own = dict(own) if isinstance(own, dict) else {}
+        config[target] = merge_legacy_section_values(config, target, own)
+        for source in sources:
+            section = config.get(source)
+            if isinstance(section, dict) and section:
+                # 值已经（按规则）折进新分组了，旧分组留着只会继续产生歧义。
+                config[source] = {}
+    return config
+
+
 def apply_section_aliases(raw: Any) -> dict[str, Any]:
     """把 AstrBot schema 的顶层分组别名补成上游分组名（本模块是唯一实现源）。
 
@@ -1209,6 +1376,10 @@ def apply_section_aliases(raw: Any) -> dict[str, Any]:
       上游名也不会跟残留的别名打架；
     * `raw` 非 dict 时返回空 dict（调用方自行兜底）。
 
+    最后再跑一遍 **N:1 归并**（`LEGACY_SECTION_MERGES`）：把旧动作分组里剩下的键
+    补进新分组（`actions_interaction` … → `actions_chat`）。旧分组本身**不动**，
+    所以"未知键不丢"照旧；新分组只在有东西可补时才建出来。
+
     适配层（`plugin/adapters/astrbot_bridge.py`）复用本函数，不另抄一份表。
     """
     if not isinstance(raw, dict):
@@ -1218,6 +1389,10 @@ def apply_section_aliases(raw: Any) -> dict[str, Any]:
         for alias, target in table.items():
             if alias in source and target not in source:
                 source[target] = source[alias]
+    for target in LEGACY_SECTION_MERGES:
+        merged = merge_legacy_section_values(source, target, source.get(target))
+        if merged:
+            source[target] = merged
     return source
 
 

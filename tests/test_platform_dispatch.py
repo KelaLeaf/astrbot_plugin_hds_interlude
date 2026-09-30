@@ -11,6 +11,7 @@ import pathlib
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
@@ -132,6 +133,24 @@ class SwitchAndPermissionTests(unittest.TestCase):
         host = _Host(config={'actions_interaction': {'enabled': True, 'send_poke': False}})
         self.assertNotIn('send_poke', host.available_platform_actions())
         self.assertIn('send_like', host.available_platform_actions())
+
+    def test_switch_reads_work_without_a_host_section_reader(self):
+        """生产路径的形状：`ServiceBase` 本身没有 `section()`。
+
+        只有适配层 `AstrbotBridge` 有 `section()`；服务在生产里是直接被构造的，
+        早期版本只走 `self.section`、异常又被吞掉，于是恒回 `{}`——配置页里的开关
+        看着能点，运行期一条都不生效。现在回落读 `self.config`，并且新旧分组名都认。
+        """
+        host = _Host(config={'actions_chat': {'enabled': True, 'send_poke': False}})
+        with mock.patch.object(_Host, 'section', None):
+            self.assertIs(host.action_switch('send_poke'), False)
+            self.assertNotIn('send_poke', host.available_platform_actions())
+            self.assertIn('send_like', host.available_platform_actions())
+        # 旧分组名同理（v1.7.2 收敛前的配置直接读也要生效）
+        legacy = _Host(config={'actions_interaction': {'send_poke': False}})
+        with mock.patch.object(_Host, 'section', None):
+            self.assertIs(legacy.action_switch('send_poke'), False)
+            self.assertIsNone(legacy.action_switch('send_like'), '没写过的键照旧 = 未配置')
 
     def test_dangerous_actions_need_the_risk_switch_and_the_permission_table(self):
         host = _Host(config={'actions_risks': {'enabled': True, 'set_group_kick': True}})

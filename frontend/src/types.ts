@@ -531,6 +531,10 @@ export interface PlatformActionRow {
   backends?: string[]
   /** NapCat 专属：后端里没有标准 OneBot 的那几条（不装 NapCat 就用不了）。 */
   napcat_only?: boolean
+  /** 适用范围：`private` / `group`（两者都有时都给）。 */
+  scopes?: string[]
+  /** **这条动作实际适用**的权限档位（后端下发；非群聊动作没有 `groupadmin`）。 */
+  tiers?: string[]
   returns?: string
   params: ActionParamBrief[]
 }

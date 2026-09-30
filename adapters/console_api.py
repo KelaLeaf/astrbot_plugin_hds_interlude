@@ -25,6 +25,8 @@ from typing import Any, Optional
 from ..core import platform_actions
 from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
+#: N:1 旧分组归并（配置页显示的当前值必须与运行期读到的一致，见 `config_schema`）。
+from ..core.service.config import merge_legacy_section_values
 from ..core.token_stats import normalize_range, range_bounds, summarize_usage
 from ..core.story_state import decode_story_state
 # 作品正文 / 创作意图 / 修改理由的上限与分段长度：**单一事实源在 `core/works.py`**，
@@ -960,6 +962,10 @@ class ConsoleApi:
                 # `napcat_only` 与 core 的 `PlatformAction.napcat_only` 同源，前端不再自己判。
                 'backends': platform_actions.backend_labels(item),
                 'napcat_only': item.napcat_only,
+                # 适用范围与**这条动作实际适用**的档位：非群聊动作不下发「仅群管」
+                # （选了等于关掉，界面上不该出现），前端下拉直接读它。
+                'scopes': list(item.scopes),
+                'tiers': list(platform_actions.permission_tiers_for(item.id)),
                 'params': [
                     {
                         'name': param.name,
@@ -1020,6 +1026,13 @@ class ConsoleApi:
         if level not in platform_actions.PERMISSION_TIERS:
             raise ConsoleError('未知权限档位：%s（可选：%s）' % (
                 _text(tier) or '(空)', ' / '.join(platform_actions.PERMISSION_TIERS),
+            ))
+        allowed = platform_actions.permission_tiers_for(action.id)
+        if level not in allowed:
+            # 「仅群管」对私聊动作没有意义：存下去只会变成一个永远不生效的档位。
+            raise ConsoleError('「%s」不适用于动作「%s」（可选：%s）' % (
+                PERMISSION_TIER_LABELS.get(level, (level, ''))[0], action.label,
+                ' / '.join(PERMISSION_TIER_LABELS.get(t, (t, ''))[0] for t in allowed),
             ))
         table = self._action_permissions()
         table[action.id] = level
@@ -1087,14 +1100,21 @@ class ConsoleApi:
         return switches
 
     def _action_groups(self) -> dict[str, str]:
-        """配置分组 id → 中文标签（面板用它说明"开关在哪一组"）。"""
-        groups: dict[str, str] = {}
+        """配置分组 id → 中文标签（面板用它说明"开关在哪一组"）。
+
+        标签来自 `platform_actions.ACTION_CONFIG_GROUP_LABELS`——收敛成四个组之后
+        "先到的类别定标签"会把 `actions_chat` 标成「互动」，而那一组里还有消息 /
+        历史 / 状态 / 资料 / 语音 / 联系人。表里没有的分组才回落到类别标签。
+        """
+        groups: dict[str, str] = {
+            group: label
+            for group, label in platform_actions.ACTION_CONFIG_GROUP_LABELS.items()
+        }
         for category, label in platform_actions.ACTION_CATEGORIES.items():
             group = platform_actions.ACTION_CONFIG_GROUPS.get(category)
-            # `group_read` / `group_write` 共用 `actions_group`：先到的类别定标签。
             if group:
                 groups.setdefault(group, label)
-        groups[platform_actions.ACTION_RISK_GROUP] = RISK_GROUP_LABEL
+        groups.setdefault(platform_actions.ACTION_RISK_GROUP, RISK_GROUP_LABEL)
         return groups
 
     def _action_permissions_file(self) -> str:
@@ -1119,8 +1139,10 @@ class ConsoleApi:
         for group_key, group_spec in schema.items():
             if not isinstance(group_spec, dict) or group_spec.get('type') != 'object':
                 continue
-            current = raw.get(group_key)
-            current = current if isinstance(current, dict) else {}
+            # 当前值取**读取侧看到的那一份**（含 `LEGACY_SECTION_MERGES` 的 N:1 归并）：
+            # 配置页显示的必须是运行期真正生效的值，否则又会出现"界面开着、行为关着"
+            # （坑 34 的老病）。归并不是目标的普通分组原样返回。
+            current = merge_legacy_section_values(raw, group_key, raw.get(group_key))
             fields: list[dict[str, Any]] = []
             for field_key, spec in (group_spec.get('items') or {}).items():
                 if not isinstance(spec, dict):
@@ -1251,8 +1273,36 @@ class ConsoleApi:
         return {
             'select_provider': providers,
             'select_provider_stt': providers,
+            # 语音走的是**宿主的 TTS 服务商**，不是对话模型：复用 `_astrbot_providers()`
+            # 会选出一个发不出语音的 id（用户会以为"配了没用"）。
+            'select_provider_tts': self._tts_choices(),
             'select_persona': await self._persona_choices(),
         }
+
+    def _tts_choices(self) -> list[dict[str, str]]:
+        """`_special: select_provider_tts` 的候选项：宿主里配好的 TTS 服务商。"""
+        choices: list[dict[str, str]] = [{'value': '', 'label': '（留空 = 默认 TTS）'}]
+        lister = getattr(self.bridge, '_tts_providers', None)
+        rows = []
+        if callable(lister):
+            try:
+                rows = list(lister() or [])
+            except Exception as error:  # noqa: BLE001 - 读不到不影响整页
+                log_fallback('debug', '取 TTS 服务商候选项失败：%s', error)
+                rows = []
+        for provider in rows:
+            identifier = _text(
+                getattr(provider, 'provider_id', '') or getattr(provider, 'id', '')
+                or getattr(provider, 'name', '')
+            )
+            if not identifier:
+                continue
+            label = _text(getattr(provider, 'name', '')) or identifier
+            choices.append({
+                'value': identifier,
+                'label': '%s · %s' % (identifier, label) if label != identifier else identifier,
+            })
+        return choices
 
     async def _persona_choices(self) -> list[dict[str, str]]:
         """AstrBot 里的人格列表（`select_persona` 的候选项）。

@@ -18,7 +18,8 @@ import type { ActionsCatalogPayload, PlatformActionRow } from '../types'
 import { Badge, Button, Empty, ErrorNote, Grid, Loading, Panel, Select, Stack, Stat, Table } from '../components/ui'
 import {
   backendBadges, backendNote, filterNapcatOnly, groupActions, napcatOnlyCount, paramSummary,
-  riskLabel, riskTone, rowState, tierBreakdown, tierDescription, tierLabel, tierOptions,
+  riskLabel, riskTone, rowState, scopeLabel, tierBreakdown, tierDescription, tierLabel,
+  tierOptionsFor,
 } from '../actions-view'
 
 const DEFAULT_MAX_ROWS = 12
@@ -39,7 +40,6 @@ export function Actions({ refreshKey }: PanelProps) {
   if (loading && !data) return <Loading />
 
   const tiers = data?.tiers ?? []
-  const options = tierOptions(tiers)
   const stats = data?.stats
   const allActions = data?.actions ?? []
   const napcatTotal = napcatOnlyCount(allActions, stats)
@@ -191,7 +191,7 @@ export function Actions({ refreshKey }: PanelProps) {
                           value={row.permission}
                           disabled={Boolean(saving)}
                           onChange={(next) => changeTier(row, String(next))}
-                          options={options}
+                          options={tierOptionsFor(row, tiers)}
                           placeholder={tierLabel(tiers, row.permission)}
                         />
                         <div class="flex items-center gap-1 text-[11px] text-muted">
@@ -199,6 +199,11 @@ export function Actions({ refreshKey }: PanelProps) {
                           <span title={tierDescription(tiers, row.permission)}>
                             默认 {tierLabel(tiers, row.default_permission)}
                           </span>
+                          {scopeLabel(row.scopes) ? (
+                            <span class="text-muted" title="这条动作适用于哪些会话">
+                              {scopeLabel(row.scopes)}
+                            </span>
+                          ) : null}
                         </div>
                       </div>
                     )

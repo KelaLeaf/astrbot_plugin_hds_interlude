@@ -9,7 +9,8 @@ import assert from 'node:assert/strict'
 import {
   BACKEND_NAPCAT, BACKEND_ONEBOT, BACKEND_SNOWLUMA, backendBadges, backendNote, backendTone,
   describeParam, filterNapcatOnly, groupActions, isNapcatOnly, napcatOnlyCount, paramSummary,
-  riskLabel, riskTone, rowState, tierBreakdown, tierDescription, tierLabel, tierOptions,
+  riskLabel, riskTone, rowState, scopeLabel, tierBreakdown, tierDescription, tierLabel,
+  tierOptions, tierOptionsFor,
 } from '../src/actions-view.ts'
 
 const tiers = [
@@ -161,3 +162,16 @@ assert.equal(
 )
 
 console.log('actions-view ok（分组 / 参数摘要 / 档位文案 / 风险语气 / 行状态 / 后端标注与筛选）')
+
+// 权限档位按动作过滤：私聊动作的下拉里不许出现「仅群管」（选了等于关掉）。
+assert.deepEqual(
+  tierOptionsFor({ tiers: ['global', 'admin', 'disabled'] }, tiers).map((option) => option.value),
+  ['global', 'admin', 'disabled'],
+)
+assert.equal(tierOptionsFor({ tiers: ['global', 'groupadmin', 'admin', 'disabled'] }, tiers).length, 4)
+assert.equal(tierOptionsFor({}, tiers).length, tiers.length, '拿不到 tiers 时回落到全量档位')
+assert.equal(scopeLabel(['private', 'group']), '私聊与群聊')
+assert.equal(scopeLabel(['group']), '仅群聊')
+assert.equal(scopeLabel(['private']), '仅私聊')
+assert.equal(scopeLabel([]), '')
+console.log('tiers-and-scopes ok（档位按动作过滤 / 适用范围文案）')
