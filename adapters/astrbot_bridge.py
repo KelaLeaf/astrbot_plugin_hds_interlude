@@ -2864,7 +2864,7 @@ class AstrbotBridge:
             # 事件漏给后面坐着的那个人格），只是不再用 warn 打扰人。
             if self.owns_private_session(session):
                 event.stop_event()
-                log_fallback('debug', '已吞掉非消息事件（私聊归我们管）类型=%s 平台=%s 用户=%s',
+                log_fallback('debug', '已吞掉非消息事件 类型=%s 平台=%s 用户=%s',
                              kind_label, session.platform, session.user_id)
             else:
                 log_fallback('debug', '忽略非消息事件 类型=%s', kind_label)
