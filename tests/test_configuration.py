@@ -960,6 +960,8 @@ class ConfigurationSchemaTest(unittest.TestCase):
         "actions_qzone": {
             "enabled", "publish_qzone_post", "comment_qzone_post", "like_qzone_post",
             "list_qzone_posts",
+            # v1.7.1：走 NapCat WebSocket 方案（get_cookies + QZone CGI）新增的两条。
+            "list_qzone_feeds", "forward_qzone_post",
         },
         "actions_risks": {
             "enabled", "set_group_special_title", "set_group_add_option", "set_group_portrait",

@@ -1174,6 +1174,8 @@ class TransportDegradationTests(unittest.TestCase):
             'send_private', 'send_group', 'send_session', 'send_image', 'send_sticker',
             'send_native_face', 'react', 'fetch_member_name', 'fetch_image', 'fetch_audio',
             'list_sticker_files', 'search_web', 'visit_web', 'deliver_background',
+            # v1.7.1：QQ 空间的 NapCat WebSocket 方案要自带 Cookie/Referer 的原始 HTTP。
+            'request_text',
         ):
             with self.subTest(method=name):
                 self.assertTrue(callable(getattr(self.transport, name, None)))

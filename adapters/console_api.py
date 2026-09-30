@@ -918,6 +918,10 @@ class ConsoleApi:
            **与**配置开关的与关系：开关关掉时档位无论选什么都不生效；
         3. `config_enabled` = 那个开关的原始值（`True` / `False` / `None` = 未配置）。
 
+        另外每条动作带 `backends`（人话标签，**顺序 = 优先级**）与 `napcat_only`，
+        顶层再给一份 `napcat_only` id 清单——面板的「只看 NapCat 专属（N）」筛选与徽章
+        都读它，**不在前端重算**（`backends` 的顺序就是运行期的通道优先级）。
+
         配置开关的分组由 `platform_actions.action_config_group()` 给出（危险动作一律进
         `actions_risks` 风险组），子键 = 动作 id。**分组不存在 = 未配置 = 不限制**，
         所以旧版本升级上来的用户不会因为 schema 还没落地就整页显示"全关"。
@@ -952,6 +956,10 @@ class ConsoleApi:
                 'config_enabled': switch,
                 'group': platform_actions.action_config_group(item),
                 'returns': item.returns,
+                # 后端标注（顺序 = 优先级）：面板据此打徽章、聚「NapCat 专属」。
+                # `napcat_only` 与 core 的 `PlatformAction.napcat_only` 同源，前端不再自己判。
+                'backends': platform_actions.backend_labels(item),
+                'napcat_only': item.napcat_only,
                 'params': [
                     {
                         'name': param.name,
@@ -981,6 +989,10 @@ class ConsoleApi:
             'risk_warning': platform_actions.RISK_WARNING,
             'risk_labels': dict(RISK_LABELS),
             'risky': [item.id for item in platform_actions.risky_actions()],
+            # NapCat 专属动作（含"走 NapCat WS 拿 cookie 打 QZone CGI"的空间动作）：
+            # 面板的「只看 NapCat 专属」筛选与说明区都用它，顺序与 core 一致。
+            'napcat_only': [item.id for item in platform_actions.napcat_actions()],
+            'backend_labels': dict(platform_actions.BACKEND_LABELS),
             'permissionless_panels': list(PERMISSIONLESS_PANELS),
             'permissions_path': self._action_permissions_file(),
             'stats': {
@@ -989,6 +1001,7 @@ class ConsoleApi:
                 'disabled': len(actions) - enabled_total,
                 'risky': risk_counts.get('dangerous', 0),
                 'risky_enabled': risky_enabled,
+                'napcat_only': sum(1 for row in actions if row['napcat_only']),
                 'risk': risk_counts,
                 'permissions': tier_counts,
             },

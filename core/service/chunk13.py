@@ -46,6 +46,9 @@ from ..endpoints import endpoint_account_key
 from ..qzone import (
     QzoneActionError,
     call_qzone_action,
+    call_qzone_cgi,
+    QZONE_CGI_BY_ID,
+    QzoneCgiUnavailable,
     evaluate_qzone_gate,
     match_qzone_feed_content,
     normalize_qzone_feed_entry,
@@ -104,6 +107,15 @@ def _qzone_config_section(config: Any) -> Any:
     return None
 
 
+def _as_list(value: Any) -> list[Any]:
+    """把平台回执里的列表字段收敛成 list（None / 字典 / 标量都别炸）。"""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return list(value.values())
+    return []
+
+
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
@@ -124,6 +136,8 @@ def _kind_label(kind: Any) -> str:
         return '发帖'
     if kind == 'comment':
         return '评论'
+    if kind == 'forward':
+        return '转发'
     return '点赞'
 
 
@@ -171,6 +185,73 @@ class ServiceChunk13(ServiceBase):
         `qzone`——控制台改了配置就该立刻生效。
         """
         return resolve_qzone_config(_qzone_config_section(getattr(self, 'config', None)))
+
+    def _qzone_cgi_request(self) -> Any:
+        """NapCat WS 方案的原始 HTTP 入口（`Transport.request_text`）；拿不到就 None。"""
+        transport = getattr(self, 'transport', None)
+        return getattr(transport, 'request_text', None)
+
+    async def qzone_read(
+        self, story: Any, kind: str, params: Any = None, *, include_self: bool = False,
+    ) -> dict[str, Any]:
+        """只读的空间动作（好友动态 / 某人说说）：**NapCat WebSocket 方案优先**。
+
+        与 `qzone_execute` 的区别：只读动作**不占配额、不落 pending 行**（上游的限流门
+        只管写），但仍然按账号端点解析——账号没登记就明确报错，绝不悄悄换账号。
+        """
+        payload = _mapping(params)
+        runtime = self.qzone_runtime()
+        call = self._qzone_call_onebot()
+        request = self._qzone_cgi_request()
+        if not callable(call) and not callable(request):
+            return {'ok': False, 'error': '没有可用的 OneBot 连接（QQ 空间读取需要 NapCat 或 SnowLuma）。'}
+        target = str(payload.get('targetUin') or payload.get('target_uin') or '').strip()
+        count = payload.get('count')
+        try:
+            count_value = int(count) if count not in (None, '') else 10
+        except (TypeError, ValueError):
+            count_value = 10
+        cgi_action = 'feed' if kind == 'feed' else 'moods'
+        cgi_params: dict[str, Any] = {'count': max(1, min(50, count_value)), 'page': 1}
+        if target:
+            cgi_params['targetUin'] = target
+        if kind == 'feed':
+            rows = await self._qzone_run_action(call, 'get_qzone_feeds', cgi_params, cgi_action)
+            items = _as_list(rows.get('feeds') if isinstance(rows, dict) else rows)
+            return {'ok': True, 'error': '', 'feeds': items, 'count': len(items),
+                    'channel': 'napcat' if callable(request) else 'snowluma'}
+        if not target and not include_self:
+            return {'ok': False, 'error': '读取某人的说说需要 target_uin（留空时只表示"她自己"）。'}
+        rows = await self._qzone_run_action(call, 'get_qzone_msg_list', cgi_params, cgi_action)
+        items = _as_list(rows.get('posts') if isinstance(rows, dict) else rows)
+        return {'ok': True, 'error': '', 'posts': items, 'count': len(items),
+                'channel': 'napcat' if callable(request) else 'snowluma'}
+
+    async def _qzone_run_action(
+        self, call: Any, action: str, params: dict[str, Any], cgi_action: str = '',
+    ) -> Any:
+        """执行一次空间动作：**优先 NapCat WebSocket 方案**（get_cookies + QZone CGI），
+        拿不到 cookie（没装 NapCat / 没登录 / 不是 OneBot）才回退到 SnowLuma 扩展动作。
+
+        参考实现 `Eganchiyu/qzone-sdk` 的 NapCat 认证：AstrBot 本来就用 WebSocket 连着
+        NapCat，所以 `get_cookies` 直通即可，**不需要额外依赖、也不需要 SnowLuma**。
+        """
+        cgi_action = cgi_action or QZONE_CGI_BY_ID.get(action, '')
+        request = self._qzone_cgi_request()
+        if cgi_action and callable(request):
+            try:
+                data = await call_qzone_cgi(request, call, cgi_action, params)
+                self.report_standalone(
+                    'debug', 'QQ 空间动作走 NapCat WS 通道 动作=%s', cgi_action,
+                )
+                return data
+            except QzoneCgiUnavailable as error:
+                # 没 cookie 是**预期**情况（例如平台不是 NapCat）——静默回退，
+                # 只在真的两个通道都不可用时才让上层报错。
+                self.report_standalone(
+                    'debug', 'QQ 空间 NapCat 通道不可用，回退扩展动作 动作=%s 原因=%s', action, error,
+                )
+        return await call_qzone_action(call, action, params)
 
     def _qzone_call_onebot(self) -> Any:
         """`Transport.call_onebot` 的绑定方法；传输层没这个能力时返回 None。"""
@@ -377,7 +458,7 @@ class ServiceChunk13(ServiceBase):
                 target_uin = _target_uin_param(payload.get('targetUin'))
                 if target_uin is not None:
                     params['target_uin'] = target_uin
-                await call_qzone_action(call, 'comment_qzone', params)
+                await self._qzone_run_action(call, 'comment_qzone', params, 'comment')
                 await self._qzone_set_status(pending_id, {
                     'status': 'confirmed', 'postedAt': self.now(),
                 })
@@ -395,11 +476,36 @@ class ServiceChunk13(ServiceBase):
                     'QQ 空间评论已发出 tid=%s 归属=%s', payload.get('tid') or '', payload.get('targetUin') or '自己',
                 )
                 return {'ok': True, 'tid': payload.get('tid') or '', 'error': ''}
+            if kind == 'forward':
+                forward_params: dict[str, Any] = {'tid': payload.get('tid') or ''}
+                if payload.get('content'):
+                    forward_params['content'] = payload.get('content')
+                forward_target = _target_uin_param(payload.get('targetUin'))
+                if forward_target is not None:
+                    forward_params['target_uin'] = forward_target
+                await self._qzone_run_action(call, 'forward_qzone', forward_params, 'forward')
+                await self._qzone_set_status(pending_id, {
+                    'status': 'confirmed', 'postedAt': self.now(),
+                })
+                await self.append_entry(story_id, {
+                    'kind': 'system', 'actor': 'character',
+                    'content': '[空间动态] 她转发了一条说说%s' % (
+                        '：%s' % clip(payload.get('content'), QZONE_COMMENT_SUMMARY_CHARS)
+                        if payload.get('content') else '',
+                    ),
+                    'occurredAt': iso(now),
+                    'metadata': {'qzone_kind': 'forward', 'tid': payload.get('tid') or ''},
+                }, now)
+                self.report_operation(
+                    'standard', 'info', story, 'user-message',
+                    'QQ 空间转发已发出 tid=%s', payload.get('tid') or '',
+                )
+                return {'ok': True, 'tid': payload.get('tid') or '', 'error': ''}
             params = {'tid': payload.get('tid') or ''}
             target_uin = _target_uin_param(payload.get('targetUin'))
             if target_uin is not None:
                 params['target_uin'] = target_uin
-            await call_qzone_action(call, 'like_qzone', params)
+            await self._qzone_run_action(call, 'like_qzone', params, 'like')
             await self._qzone_set_status(pending_id, {
                 'status': 'confirmed', 'postedAt': self.now(),
             })

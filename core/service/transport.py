@@ -164,6 +164,23 @@ class Transport(Protocol):
         """
         ...
 
+    async def request_text(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        data: Optional[dict[str, str]] = None,
+        timeout_ms: int = 20_000,
+    ) -> Optional[str]:
+        """发一次**原始 HTTP** 并回文本（QQ 空间 CGI 用：要自带 Cookie / Referer）。
+
+        `method` 只认 `'GET'` / `'POST'`；POST 用 `application/x-www-form-urlencoded`
+        编码 `data`（腾讯那几个 CGI 就是这个形状）。失败返回 `None` 并记日志 —— 
+        **绝不抛**：QQ 空间是可选能力，不能拖垮叙事主链。
+        """
+        raise NotImplementedError
+
     async def call_onebot(self, action: str, params: dict[str, Any]) -> SendResult:
         """原生 OneBot / SnowLuma 动作直通（QQ 空间的 `send_qzone_msg` 等走这里）。
 
@@ -278,6 +295,18 @@ class NullTransport:
     async def platform_action(self, action: str, params: dict[str, Any]) -> SendResult:
         log_fallback('debug', 'Transport 未安装：平台动作已跳过 动作=%s', action)
         return {'ok': False, 'error': 'transport-unavailable', 'data': None}
+
+    async def request_text(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        data: Optional[dict[str, str]] = None,
+        timeout_ms: int = 20_000,
+    ) -> Optional[str]:
+        log_fallback('debug', '无传输层实现，原始 HTTP 请求被忽略 %s %s', method, url)
+        return None
 
     async def call_onebot(self, action: str, params: dict[str, Any]) -> SendResult:
         log_fallback('debug', 'Transport 未安装：OneBot 动作已跳过 动作=%s', action)

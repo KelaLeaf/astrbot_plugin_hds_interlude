@@ -1,5 +1,5 @@
 /**
- * 「动作」面板的纯逻辑：分组、参数摘要、档位/风险文案。
+ * 「动作」面板的纯逻辑：分组、参数摘要、档位/风险文案、后端标注与筛选。
  *
  * 零依赖（不 import preact、不碰宿主），所以能直接用 Node 的 TS 剥离跑断言：
  *     cd plugin/frontend && pnpm test:unit      # scripts/check-actions-view.ts
@@ -7,6 +7,9 @@
  * 为什么值得单独一个模块：档位与风险的**文案来源只有一个**（后端 payload 里的
  * `tiers` / `risk_labels`），这里只负责"取不到就回落成原值"——下拉里出现空标签
  * 或徽章写错一个字（"危险" vs "敏感"）都是安全事故级别的显示错误。
+ *
+ * 后端标注（`backends` / `napcat_only`）同理：**顺序 = 通道优先级**是 core 的语义，
+ * 这里只负责"把首选与回退分开、标准 OneBot 不显示"。
  */
 import type { ActionParamBrief, PermissionTierBrief, PlatformActionRow } from './types'
 
@@ -104,4 +107,108 @@ export function rowState(row: PlatformActionRow): {
   if (row.enabled) return { text: '已启用', tone: 'ok' }
   if (row.config_enabled === false) return { text: '配置开关已关闭', tone: 'warn' }
   return { text: '已关闭', tone: 'neutral' }
+}
+
+/* ------------------------------------------------------------------ 后端标注 */
+
+/**
+ * 后端标签（**逐字 = core `BACKEND_LABELS` 的值**）。
+ *
+ * 为什么在前端再钉一遍字面量：徽章要按后端种类给语气（NapCat 醒目），而 payload 里
+ * 只有人话标签、没有后端 id。改 core 的文案必须同时改这里，Python 侧
+ * `test_qzone_napcat_channel.BackendCatalogTests` 与这里的断言互为对账。
+ */
+export const BACKEND_ONEBOT = '标准 OneBot'
+export const BACKEND_NAPCAT = 'NapCat 专属'
+export const BACKEND_SNOWLUMA = '需要 SnowLuma 扩展'
+
+/** 回退通道的前缀：`回退：需要 SnowLuma 扩展`（首选通道是 NapCat 那条）。 */
+export const BACKEND_FALLBACK_PREFIX = '回退：'
+
+export interface BackendBadge {
+  label: string
+  tone: 'accent' | 'warn' | 'neutral'
+  title: string
+  /** 首选通道（`backends[0]`）才是 primary，其余是回退。 */
+  primary: boolean
+}
+
+/** 后端标签 → 徽章语气：NapCat 醒目、SnowLuma 次之、其余中性。 */
+export function backendTone(label: string): 'accent' | 'warn' | 'neutral' {
+  if (label === BACKEND_NAPCAT) return 'accent'
+  if (label === BACKEND_SNOWLUMA) return 'warn'
+  return 'neutral'
+}
+
+/**
+ * 一行的后端徽章。规则：
+ *
+ * 1. **只有「标准 OneBot」= 不显示**（目录里绝大多数动作都是它，显示了全是噪音）；
+ * 2. 首选通道（`backends[0]`）用醒目语气，其余挂「回退：」前缀并用中性语气——
+ *    两个平级徽章并排会读成"既要 NapCat 又要 SnowLuma"；
+ * 3. 缺 `backends`（老后端）当作标准 OneBot，同样不显示。
+ */
+export function backendBadges(row: PlatformActionRow): BackendBadge[] {
+  const labels = (row?.backends ?? []).filter((label): label is string => Boolean(label))
+  if (!labels.length) return []
+  if (labels.length === 1 && labels[0] === BACKEND_ONEBOT) return []
+  const [first, ...rest] = labels
+  const badges: BackendBadge[] = [{
+    label: first,
+    tone: backendTone(first),
+    title: `优先走这条通道：${first}`,
+    primary: true,
+  }]
+  for (const label of rest) {
+    badges.push({
+      label: label === BACKEND_ONEBOT ? label : `${BACKEND_FALLBACK_PREFIX}${label}`,
+      tone: 'neutral',
+      title: `首选通道不可用时回退到：${label}`,
+      primary: false,
+    })
+  }
+  return badges
+}
+
+/** NapCat 专属：后端里没有标准 OneBot（`napcat_only` 缺省时按标签回推）。 */
+export function isNapcatOnly(row: PlatformActionRow): boolean {
+  if (typeof row?.napcat_only === 'boolean') return row.napcat_only
+  const labels = row?.backends ?? []
+  return labels.length > 0 && !labels.includes(BACKEND_ONEBOT)
+}
+
+/** 「只看 NapCat 专属」筛选：`on=false` 时原样返回（不重排）。 */
+export function filterNapcatOnly(actions: PlatformActionRow[], on: boolean): PlatformActionRow[] {
+  if (!on) return actions
+  return actions.filter(isNapcatOnly)
+}
+
+/**
+ * 行内那句「这条动作走什么通道」。空间动作与改状态各自说清，别只挂一枚徽章了事。
+ *
+ * 空间那 7 条的机制是两步：先经 NapCat WebSocket 调 `get_cookies`
+ * （`domain=user.qzone.qq.com`）与 `get_login_info`，再用 cookie 里的 `p_skey` 算
+ * `g_tk` 去打腾讯 QZone 的 CGI 接口——装了 SnowLuma 时它只当回退。
+ */
+export function backendNote(row: PlatformActionRow): string {
+  if (!isNapcatOnly(row)) return ''
+  if (row.category === 'qzone') {
+    return '走 NapCat WebSocket 方案：先用 get_cookies（domain=user.qzone.qq.com）'
+      + '+ get_login_info 拿登录态，再由 p_skey 算出 g_tk 直接打 QZone 接口；'
+      + '装了 SnowLuma 扩展时回退到它的对应动作。只读动作不占空间配额。'
+  }
+  if (row.id === 'update_qq_status') {
+    return '只有 NapCat 有这条动作（set_online_status / set_diy_online_status），标准 OneBot 没有。'
+  }
+  return '这条动作只有 NapCat 后端提供。'
+}
+
+/** 「只看 NapCat 专属」按钮上的条数：优先用后端统计，缺了按行数。 */
+export function napcatOnlyCount(
+  actions: PlatformActionRow[],
+  stats?: { napcat_only?: number },
+): number {
+  const declared = stats?.napcat_only
+  if (typeof declared === 'number' && declared >= 0) return declared
+  return (actions ?? []).filter(isNapcatOnly).length
 }

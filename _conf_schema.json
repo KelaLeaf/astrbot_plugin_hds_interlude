@@ -2627,7 +2627,7 @@
   "actions_qzone": {
     "type": "object",
     "title": "QQ 空间动作",
-    "description": "【动作 25】QQ 空间动作：发说说、评论与点赞的独立开关（上限在「QQ 空间」组）。",
+    "description": "【动作 25】QQ 空间动作：发说说、评论、点赞、看说说与好友动态、转发的独立开关（上限在「QQ 空间」组）。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -2658,8 +2658,21 @@
         "description": "看空间说说",
         "default": true,
         "hint": "看自己或好友的空间说说列表（只读；好友动态也靠它对齐正文）。"
+      },
+      "list_qzone_feeds": {
+        "type": "bool",
+        "description": "允许「看好友动态」",
+        "default": true,
+        "hint": "只读：看好友动态信息流，不占发帖/互动配额"
+      },
+      "forward_qzone_post": {
+        "type": "bool",
+        "description": "允许「转发说说」",
+        "default": true,
+        "hint": "转会计入「评论」配额（互动配额，不是发帖配额）"
       }
-    }
+    },
+    "hint": "空间动作优先走 NapCat WebSocket 方案（拿登录态后直接调 QZone 接口），装了 SnowLuma 时作为回退；「看说说 / 看动态」是只读，不占配额。"
   },
   "actions_risks": {
     "type": "object",

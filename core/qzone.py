@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from datetime import datetime, timezone
@@ -66,7 +67,7 @@ __all__ = [
 
 #: 真正的空间动作（`post` / `comment` / `like`）。`feed-seen` 是只读感知标记，
 #: **不**参与限流计数与最小间隔（上游 `ACTION_KINDS`；上游没有导出它）。
-QZONE_ACTION_KINDS = frozenset({'post', 'comment', 'like'})
+QZONE_ACTION_KINDS = frozenset({'post', 'comment', 'like', 'forward'})
 
 #: 审计与剧本条目用的可见性档位白名单（上游 `QZONE_UGC_RIGHT_VALUES`）。
 QZONE_UGC_RIGHT_VALUES = frozenset({1, 4, 16, 64, 128})
@@ -346,7 +347,9 @@ def evaluate_qzone_gate(
     today = day_key(now_dt)
     if kind == 'post':
         cap = _config_int(config, 'daily_post_cap', DEFAULT_QZONE_CONFIG['daily_post_cap'])
-    elif kind == 'comment':
+    elif kind in ('comment', 'forward'):
+        # 转发按**评论类互动**计配额：它是互动不是发帖，跟点赞同一档更宽的上限
+        # 也不合适（转发会出现在别人动态里，比点赞重）。
         cap = _config_int(config, 'daily_comment_cap', DEFAULT_QZONE_CONFIG['daily_comment_cap'])
     else:
         cap = _config_int(config, 'daily_like_cap', DEFAULT_QZONE_CONFIG['daily_like_cap'])
@@ -551,6 +554,177 @@ async def call_qzone_action(call: Any, action: str, params: Any = None) -> Any:
         raise QzoneActionError(message, action, retcode, _frame_ambiguous(row))
     data = frame.get('data')
     return {} if data is None else data
+
+
+# --------------------------------------------------------------------------- #
+# NapCat WebSocket 方案（本移植版新增，参考 Eganchiyu/qzone-sdk 的 NapCat 认证）
+# --------------------------------------------------------------------------- #
+
+#: 取 Cookie 的域（腾讯只认这个域下的 p_skey）。
+QZONE_COOKIE_DOMAIN = 'user.qzone.qq.com'
+
+#: 走 "NapCat WS 方案" 的 qzone 动作 → CGI 动作名（`core/qzone_cgi.py` 里的构造函数）。
+QZONE_CGI_ACTIONS = {
+    'publish_qzone_post': 'publish',
+    'delete_qzone_post': 'delete',
+    'comment_qzone_post': 'comment',
+    'like_qzone_post': 'like',
+    'forward_qzone_post': 'forward',
+    'list_qzone_posts': 'moods',       # 指定 QQ = 那个人的说说
+    'list_qzone_feeds': 'feed',        # 不指定 = 好友动态
+}
+
+#: 平台动作名 → CGI 动作名。Chunk13 用它决定"这条动作能不能走 NapCat WS 通道"。
+#: （`QZONE_CGI_ACTIONS` 是**目录 id** → CGI，两者别混。）
+QZONE_CGI_BY_ID = {
+    'send_qzone_msg': 'publish',
+    'delete_qzone_msg': 'delete',
+    'comment_qzone': 'comment',
+    'like_qzone': 'like',
+    'forward_qzone': 'forward',
+    'get_qzone_msg_list': 'moods',
+    'get_qzone_feeds': 'feed',
+}
+
+#: 这几个动作**只有** NapCat 的 `get_cookies` 通道能做——SnowLuma 那套扩展动作
+#: 在我们这里只当回退，纯 NapCat 环境下也能工作。
+QZONE_NAPCAT_ONLY_ACTIONS = frozenset({
+    'forward_qzone_post', 'list_qzone_feeds',
+})
+
+
+class QzoneCgiUnavailable(QzoneActionError):
+    """拿不到 NapCat cookie（没装 NapCat / 没登录 / 平台不是 OneBot）。"""
+
+
+async def qzone_cgi_auth(call: Any, login_call: Any = None) -> dict[str, Any]:
+    """按 qzone-sdk 的 NapCat 方案取认证：`get_cookies` + `get_login_info`。
+
+    `call` 是 OneBot 直通（`Transport.call_onebot`）；`login_call` 缺省复用 `call`。
+    拿不到 `p_skey` 一律抛 `QzoneCgiUnavailable`（**不静默降级**：QQ 空间写动作
+    没有 cookie 就是做不了，得让上层说清楚）。
+    """
+    from .qzone_cgi import qzone_auth_from_cookies
+
+    if not callable(call):
+        raise QzoneCgiUnavailable('QQ 空间（NapCat 通道）不可用：传输层没接上', None, None, False)
+    try:
+        cookie_frame = await call('get_cookies', {'domain': QZONE_COOKIE_DOMAIN})
+    except Exception as error:  # noqa: BLE001 - 平台异常收敛成"不可用"
+        raise QzoneCgiUnavailable(
+            'QQ 空间（NapCat 通道）不可用：get_cookies 失败（%s）' % error, 'get_cookies', None, True,
+        ) from error
+    if not _is_ok_frame(cookie_frame):
+        head, detail = _frame_status_text(cookie_frame if _is_mapping(cookie_frame) else {})
+        raise QzoneCgiUnavailable(
+            'QQ 空间（NapCat 通道）不可用：%s %s' % (head, detail), 'get_cookies', None, False,
+        )
+    cookies = _pick(_pick(cookie_frame, 'data') or {}, 'cookies') or ''
+    if not str(cookies).strip():
+        raise QzoneCgiUnavailable('QQ 空间（NapCat 通道）不可用：平台没回 cookie', 'get_cookies', None, False)
+    uin = ''
+    info_call = login_call if callable(login_call) else call
+    try:
+        info_frame = await info_call('get_login_info', {})
+        uin = str(_pick(_pick(info_frame, 'data') or {}, 'user_id') or '')
+    except Exception:  # noqa: BLE001 - 取不到 uin 时下面的 cookie 解析还能兜
+        uin = ''
+    try:
+        return qzone_auth_from_cookies(str(cookies), uin)
+    except Exception as error:  # noqa: BLE001
+        raise QzoneCgiUnavailable(
+            'QQ 空间（NapCat 通道）不可用：%s' % error, 'get_cookies', None, False,
+        ) from error
+
+
+def qzone_cgi_request(action: str, auth: Any, params: Mapping[str, Any]) -> tuple[str, str, dict[str, str], dict[str, str]]:
+    """把一次 qzone 动作翻成 `(method, url, headers, data)`（纯函数，方便单测）。"""
+    from . import qzone_cgi as cgi
+
+    params = dict(params or {})
+    if action == 'publish':
+        return cgi.build_publish_request(
+            auth, str(params.get('content') or ''),
+            visible=int(_js_int_or(params.get('ugcRight', params.get('ugc_right')), 1) or 1),
+            richval=str(params.get('richval') or ''), pic_bo=str(params.get('pic_bo') or ''),
+        )
+    if action == 'delete':
+        return cgi.build_delete_request(
+            auth, str(params.get('tid') or ''),
+            str(params.get('curkey') or ''), int(_js_int_or(params.get('timestamp'), 0) or 0),
+        )
+    if action == 'comment':
+        return cgi.build_comment_request(
+            auth, str(params.get('targetUin', params.get('target_uin')) or ''),
+            str(params.get('tid') or params.get('topicId') or ''), str(params.get('content') or ''),
+        )
+    if action == 'like':
+        return cgi.build_like_request(
+            auth, str(params.get('targetUin', params.get('target_uin')) or ''),
+            str(params.get('fid') or ''), str(params.get('curKey', params.get('cur_key')) or ''),
+            str(params.get('uniKey', params.get('uni_key')) or ''),
+        )
+    if action == 'forward':
+        return cgi.build_forward_request(
+            auth, str(params.get('targetUin', params.get('target_uin')) or ''),
+            str(params.get('tid') or ''), str(params.get('content') or ''),
+        )
+    if action == 'moods':
+        return cgi.build_mood_list_request(
+            auth, str(params.get('targetUin', params.get('target_uin')) or ''),
+            int(_js_int_or(params.get('count'), 10) or 10),
+        )
+    if action == 'feed':
+        return cgi.build_feed_request(
+            auth, int(_js_int_or(params.get('page'), 1) or 1),
+            int(_js_int_or(params.get('count'), 10) or 10),
+        )
+    raise QzoneActionError('QQ 空间（NapCat 通道）不支持的动作：%s' % action, action, None, False)
+
+
+async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = None,
+                        login_call: Any = None) -> dict[str, Any]:
+    """走 "NapCat WS 方案" 执行一次 QQ 空间动作。
+
+    `request` 是 `Transport.request_text` 的绑定方法（原始 HTTP）。返回形状与
+    `call_qzone_action` 对齐（成功回动作结果，失败抛 `QzoneActionError`），
+    这样上层的限流/审计/剧本留痕那一套**不用改**。
+    """
+    from . import qzone_cgi as cgi
+
+    if not callable(request):
+        raise QzoneCgiUnavailable('QQ 空间（NapCat 通道）不可用：传输层没有原始 HTTP 能力', action, None, False)
+    auth = await qzone_cgi_auth(call, login_call)
+    method, url, headers, data = qzone_cgi_request(action, auth, params or {})
+    text = await request(method, url, headers=headers, data=data)
+    if text is None:
+        raise QzoneActionError('%s 失败：请求没有回执（网络或平台拦截）' % action, action, None, True)
+    if action == 'feed':
+        items = cgi.feed_items_from_text(text)
+        return {'feeds': items, 'count': len(items)}
+    if action == 'moods':
+        parsed = cgi.parse_moods_response(text)
+        # `parse_moods_response` 回的是 `{'code': …, 'moods': [...]}`：**保留 code**
+        # （它是区分"没登录/被风控"与"这人没发过说说"的唯一依据），列表在 `moods` 里。
+        rows = parsed.get('moods') if isinstance(parsed, Mapping) else None
+        rows = list(rows) if isinstance(rows, list) else []
+        return {'posts': rows, 'count': len(rows), 'code': parsed.get('code') if isinstance(parsed, Mapping) else None}
+    result = cgi.success_or_error(cgi.parse_jsonp(text) if text.lstrip().startswith('_preloadCallback') else _json_or_none(text))
+    if not result.get('success'):
+        raise QzoneActionError(
+            '%s 失败：%s' % (action, result.get('message') or '未知错误'),
+            action, result.get('code'), False,
+        )
+    return result
+
+
+def _json_or_none(text: Any) -> Any:
+    """CGI 回 JSON 时直接解析；不是 JSON 就交给 jsonp 解析器（它自己会容错）。"""
+    try:
+        return json.loads(text)
+    except Exception:  # noqa: BLE001
+        from .qzone_cgi import parse_jsonp
+        return parse_jsonp(text)
 
 
 async def probe_qzone_available(call: Any) -> bool:

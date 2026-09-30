@@ -161,15 +161,8 @@ export function TokenStats({ refreshKey }: PanelProps) {
           <Panel title="说明" icon="info">
             <div class="text-xs text-muted leading-relaxed space-y-1">
               <p>
-                <Badge>账本</Badge> 数据来自 <span class="font-mono">interlude_token_usage</span>
-                表，按「日期 + 剧本 + 任务 + 模型」聚合，插件重载、机器人重启都不会丢。
-              </p>
-              <p>
                 <Badge>命中率</Badge> = 缓存输入 ÷ 总输入。网关不回缓存字段时这一列是 0，
                 不代表没有命中缓存。
-              </p>
-              <p>
-                <Badge>范围</Badge> 最近 7 / 30 天都含今天；自选范围最长 366 天。
               </p>
             </div>
           </Panel>

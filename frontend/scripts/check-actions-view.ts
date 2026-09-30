@@ -2,12 +2,14 @@
  * 「动作」面板纯逻辑的断言（`pnpm test:unit`）。
  *
  * 这些规则出错的后果都是"看不出来的错"：下拉变成空标签、危险动作被显示成敏感、
- * 档位分布少算一类——真机上看只是"有点怪"，没人会去核对。
+ * 档位分布少算一类、"NapCat 专属"被标成普通动作——真机上看只是"有点怪"，
+ * 没人会去核对。
  */
 import assert from 'node:assert/strict'
 import {
-  describeParam, groupActions, paramSummary, riskLabel, riskTone, rowState, tierBreakdown,
-  tierDescription, tierLabel, tierOptions,
+  BACKEND_NAPCAT, BACKEND_ONEBOT, BACKEND_SNOWLUMA, backendBadges, backendNote, backendTone,
+  describeParam, filterNapcatOnly, groupActions, isNapcatOnly, napcatOnlyCount, paramSummary,
+  riskLabel, riskTone, rowState, tierBreakdown, tierDescription, tierLabel, tierOptions,
 } from '../src/actions-view.ts'
 
 const tiers = [
@@ -82,4 +84,80 @@ assert.deepEqual(rowState({ ...base, enabled: true } as never), { text: '已启�
 assert.deepEqual(rowState({ ...base, enabled: false, config_enabled: false } as never), { text: '配置开关已关闭', tone: 'warn' })
 assert.deepEqual(rowState({ ...base, enabled: false, permission: 'disabled' } as never), { text: '已关闭', tone: 'neutral' })
 
-console.log('actions-view ok（分组 / 参数摘要 / 档位文案 / 风险语气 / 行状态）')
+// 后端标注：标签逐字 = core 的 BACKEND_LABELS（Python 侧 test_qzone_napcat_channel 对账）。
+assert.equal(BACKEND_ONEBOT, '标准 OneBot')
+assert.equal(BACKEND_NAPCAT, 'NapCat 专属')
+assert.equal(BACKEND_SNOWLUMA, '需要 SnowLuma 扩展')
+assert.equal(backendTone(BACKEND_NAPCAT), 'accent')
+assert.equal(backendTone(BACKEND_SNOWLUMA), 'warn')
+assert.equal(backendTone(BACKEND_ONEBOT), 'neutral')
+assert.equal(backendTone('某个新后端'), 'neutral')
+
+// 标准 OneBot / 没声明后端 = 不打徽章（目录里绝大多数动作，显示了全是噪音）。
+assert.deepEqual(backendBadges({ backends: [BACKEND_ONEBOT] } as never), [])
+assert.deepEqual(backendBadges({} as never), [])
+assert.deepEqual(backendBadges({ backends: [] } as never), [])
+assert.deepEqual(backendBadges({ backends: ['', null] } as never), [])
+// 空字符串/空值不能变成一枚空标签的徽章。
+assert.deepEqual(backendBadges({ backends: [undefined, BACKEND_NAPCAT] } as never).map((b) => b.label), [BACKEND_NAPCAT])
+// 纯 NapCat：一枚醒目徽章，没有回退。
+assert.deepEqual(
+  backendBadges({ backends: [BACKEND_NAPCAT], napcat_only: true } as never),
+  [{ label: BACKEND_NAPCAT, tone: 'accent', title: `优先走这条通道：${BACKEND_NAPCAT}`, primary: true }],
+)
+// NapCat 优先 + SnowLuma 回退：首选醒目、回退带前缀且是中性语气（别读成"两个都要"）。
+assert.deepEqual(
+  backendBadges({ backends: [BACKEND_NAPCAT, BACKEND_SNOWLUMA], napcat_only: true } as never),
+  [
+    { label: BACKEND_NAPCAT, tone: 'accent', title: `优先走这条通道：${BACKEND_NAPCAT}`, primary: true },
+    { label: `回退：${BACKEND_SNOWLUMA}`, tone: 'neutral', title: `首选通道不可用时回退到：${BACKEND_SNOWLUMA}`, primary: false },
+  ],
+)
+// 混合里出现标准 OneBot：它是回退，保留但不加前缀（"回退：标准 OneBot"读起来别扭）。
+assert.deepEqual(
+  backendBadges({ backends: [BACKEND_NAPCAT, BACKEND_ONEBOT] } as never).map((b) => b.label),
+  [BACKEND_NAPCAT, BACKEND_ONEBOT],
+)
+// 顺序就是优先级：首选必须原样取 `backends[0]`，不许重排。
+assert.equal(backendBadges({ backends: [BACKEND_SNOWLUMA, BACKEND_NAPCAT] } as never)[0].label, BACKEND_SNOWLUMA)
+
+// NapCat 专属判定：后端给的布尔优先，缺了按"没有标准 OneBot"回推。
+assert.equal(isNapcatOnly({ backends: [BACKEND_NAPCAT], napcat_only: true } as never), true)
+assert.equal(isNapcatOnly({ backends: [BACKEND_NAPCAT], napcat_only: false } as never), false)
+assert.equal(isNapcatOnly({ backends: [BACKEND_NAPCAT, BACKEND_SNOWLUMA] } as never), true)
+assert.equal(isNapcatOnly({ backends: [BACKEND_ONEBOT] } as never), false)
+assert.equal(isNapcatOnly({ backends: [] } as never), false)
+assert.equal(isNapcatOnly({} as never), false)
+
+// 筛选：打开后只剩这 8 类（这里用 3 行样本），顺序不变；关掉时原样返回。
+const sample = [
+  { id: 'send_poke', backends: [BACKEND_ONEBOT] },
+  { id: 'like_qzone_post', backends: [BACKEND_NAPCAT, BACKEND_SNOWLUMA], napcat_only: true },
+  { id: 'update_qq_status', backends: [BACKEND_NAPCAT], napcat_only: true },
+] as never
+assert.deepEqual(filterNapcatOnly(sample, false), sample)
+assert.deepEqual(filterNapcatOnly(sample, true).map((row) => row.id), ['like_qzone_post', 'update_qq_status'])
+assert.deepEqual(filterNapcatOnly([], true), [])
+
+// 条数：后端统计优先（筛选按钮上的 N 与目录统计必须同源），没有就按行数。
+assert.equal(napcatOnlyCount(sample, { napcat_only: 8 }), 8)
+assert.equal(napcatOnlyCount(sample, { napcat_only: 0 }), 0)
+assert.equal(napcatOnlyCount(sample, undefined), 2)
+assert.equal(napcatOnlyCount(sample, {}), 2)
+
+// 通道说明：空间动作要说清两步机制（get_cookies → p_skey → g_tk），改状态说清"只有 NapCat 有"。
+const qzoneNote = backendNote({ id: 'like_qzone_post', category: 'qzone', backends: [BACKEND_NAPCAT, BACKEND_SNOWLUMA], napcat_only: true } as never)
+assert.match(qzoneNote, /get_cookies/)
+assert.match(qzoneNote, /p_skey/)
+assert.match(qzoneNote, /g_tk/)
+assert.match(qzoneNote, /SnowLuma/)
+const statusNote = backendNote({ id: 'update_qq_status', category: 'status', backends: [BACKEND_NAPCAT], napcat_only: true } as never)
+assert.match(statusNote, /set_online_status/)
+assert.match(statusNote, /标准 OneBot/)
+assert.equal(backendNote({ id: 'send_poke', category: 'interaction', backends: [BACKEND_ONEBOT] } as never), '')
+assert.equal(
+  backendNote({ id: 'some_new_napcat_action', category: 'misc', backends: [BACKEND_NAPCAT], napcat_only: true } as never),
+  '这条动作只有 NapCat 后端提供。',
+)
+
+console.log('actions-view ok（分组 / 参数摘要 / 档位文案 / 风险语气 / 行状态 / 后端标注与筛选）')

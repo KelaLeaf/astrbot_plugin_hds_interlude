@@ -657,7 +657,7 @@ class StrategyModuleHygieneTests(unittest.TestCase):
         for name in imported:
             self.assertFalse(name.startswith('astrbot'), name)
             self.assertTrue(
-                name.split('.')[0] in {'__future__', 'math', 're', 'datetime', 'typing'}
+                name.split('.')[0] in {'__future__', 'json', 'math', 're', 'datetime', 'typing'}
                 or name.startswith('.'),
                 '只许标准库与 core 内模块：%s' % name,
             )
@@ -673,8 +673,9 @@ class StrategyModuleHygieneTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(hasattr(q, name), name)
 
-    def test_action_kinds_are_exactly_the_three_writes(self):
-        self.assertEqual(q.QZONE_ACTION_KINDS, frozenset({'post', 'comment', 'like'}))
+    def test_action_kinds_are_exactly_the_write_actions(self):
+        # v1.7.1 起多了 `forward`（转发按评论类互动计配额，见 `evaluate_qzone_gate`）。
+        self.assertEqual(q.QZONE_ACTION_KINDS, frozenset({'post', 'comment', 'like', 'forward'}))
         self.assertNotIn('feed-seen', q.QZONE_ACTION_KINDS)
         self.assertEqual(q.QZONE_FEED_APPID_TALK, 311)
 

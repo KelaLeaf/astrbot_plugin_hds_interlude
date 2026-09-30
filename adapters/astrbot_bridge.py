@@ -1231,6 +1231,12 @@ _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
         'comment_qzone', {'tid': 'tid', 'content': 'content', 'target_uin': 'target_uin'},
     ),
     'like_qzone_post': ('like_qzone', {'tid': 'tid', 'target_uin': 'target_uin'}),
+    # v1.7.1：转发与"看好友动态"。**首选 NapCat WebSocket 方案**（chunk13 里 CGI 优先），
+    # 这里的 SnowLuma 名只是回退通道；映射必须存在（目录动作不许有"没有出口"的）。
+    'forward_qzone_post': (
+        'forward_qzone', {'tid': 'tid', 'content': 'content', 'target_uin': 'target_uin'},
+    ),
+    'list_qzone_feeds': ('get_qzone_feeds', {'count': 'num'}),
     # 指了归属 QQ = 看那个人的说说列表；没指 = 看好友动态（见 `_resolve_platform_call`）。
     'list_qzone_posts': ('get_qzone_msg_list', {'target_uin': 'target_uin', 'count': 'num'}),
     'delete_qzone_post': ('delete_qzone_msg', {'tid': 'tid'}),
@@ -2104,6 +2110,20 @@ class AstrbotTransport:
         if isinstance(frame, Mapping) and frame.get('retcode') is not None:
             result['retcode'] = frame.get('retcode')
         return result
+
+    async def request_text(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        data: Optional[dict[str, str]] = None,
+        timeout_ms: int = 20_000,
+    ) -> Optional[str]:
+        """原始 HTTP（QQ 空间的 NapCat WebSocket 方案要用：自带 Cookie / Referer）。"""
+        return await self.bridge.request_text(
+            method, url, headers=headers, data=data, timeout_ms=timeout_ms,
+        )
 
     async def call_onebot(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         """原生 OneBot / SnowLuma 动作直通（QQ 空间等扩展动作走这里）。"""
@@ -4251,6 +4271,33 @@ class AstrbotBridge:
             return response.content
         except Exception as error:  # noqa: BLE001
             log_fallback('debug', '下载失败 URL=%s 错误=%s', _text(url)[:120], error)
+            return None
+
+    async def request_text(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        data: Optional[dict[str, str]] = None,
+        timeout_ms: int = 20_000,
+    ) -> Optional[str]:
+        """原始 HTTP（QQ 空间 CGI 走这里）：**自带 Cookie / Referer / UA**，表单编码。
+
+        腾讯那几个 CGI 只认 `application/x-www-form-urlencoded`，所以这里不用
+        `post_json`。失败只记 debug 并返回 `None`（QQ 空间是可选能力，不进叙事主链）。
+        """
+        verb = _text(method).strip().upper() or 'GET'
+        try:
+            timeout = max(1.0, int(timeout_ms) / 1000.0)
+            if verb == 'POST':
+                response = await self._client().post(url, data=data or {}, headers=headers or {}, timeout=timeout)
+            else:
+                response = await self._client().get(url, params=data or None, headers=headers or {}, timeout=timeout)
+            response.raise_for_status()
+            return response.text
+        except Exception as error:  # noqa: BLE001
+            log_fallback('debug', '原始 HTTP 失败 %s %s 错误=%s', verb, _text(url)[:120], error)
             return None
 
     async def http_get_text(self, url: str, timeout_ms: int = 15_000) -> Optional[str]:

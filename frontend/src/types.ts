@@ -527,6 +527,10 @@ export interface PlatformActionRow {
   /** 配置开关的原始值；`null` = 该分组/键不存在（未配置 = 不限制）。 */
   config_enabled: boolean | null
   group: string
+  /** 后端标签（人话，**顺序 = 通道优先级**）；缺省 = 后端是标准 OneBot。 */
+  backends?: string[]
+  /** NapCat 专属：后端里没有标准 OneBot 的那几条（不装 NapCat 就用不了）。 */
+  napcat_only?: boolean
   returns?: string
   params: ActionParamBrief[]
 }
@@ -546,6 +550,10 @@ export interface ActionsCatalogPayload {
   risk_warning: string
   /** 全部危险动作 id。 */
   risky: string[]
+  /** NapCat 专属动作 id（含走 NapCat WS 的空间动作），顺序与 core 一致。 */
+  napcat_only?: string[]
+  /** 后端 id → 人话标签（core 的 `BACKEND_LABELS` 原文）。 */
+  backend_labels?: Record<string, string>
   /** 与权限表无关的只读页面（例如 「Token 统计」）。 */
   permissionless_panels: string[]
   permissions_path: string
@@ -555,6 +563,8 @@ export interface ActionsCatalogPayload {
     disabled: number
     risky: number
     risky_enabled: number
+    /** NapCat 专属动作条数（筛选按钮上的那个 N）。 */
+    napcat_only?: number
     risk: Record<string, number>
     permissions: Record<string, number>
   }

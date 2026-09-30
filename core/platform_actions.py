@@ -123,6 +123,16 @@ class PlatformAction:
     scopes: tuple[str, ...] = ('private', 'group')
     returns: str = ''
     aliases: tuple[str, ...] = field(default=())
+    #: 能承载这条动作的后端，**顺序 = 优先级**。语义见 `BACKEND_LABELS`：
+    #: `onebot` = 任何 OneBot 实现都有的标准动作；`napcat` = 只有 NapCat 有
+    #: （含"用 NapCat 的 WebSocket 拿 cookie 再打 QZone CGI"这条路）；
+    #: `snowluma` = 需要 SnowLuma 扩展动作。
+    backends: tuple[str, ...] = ('onebot',)
+
+    @property
+    def napcat_only(self) -> bool:
+        """NapCat 专属：不装 NapCat 就用不了。控制台据此打标、聚在一起。"""
+        return bool(self.backends) and 'onebot' not in self.backends
 
     def param(self, name: str) -> Optional[ActionParam]:
         for item in self.params:
@@ -299,6 +309,8 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='sensitive',
         returns='生效状态',
+        # `set_online_status` / `set_diy_online_status` 是 NapCat 的动作，标准 OneBot 没有。
+        backends=('napcat',),
     ),
     PlatformAction(
         'get_qq_status', 'status', '查 QQ 状态', '看机器人账号当前的在线状态。',
@@ -571,6 +583,9 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='sensitive',
         returns='说说 tid + 可见性',
+        # 首选 NapCat WebSocket 方案（`get_cookies` + QZone CGI）；装了 SnowLuma 时
+        # `send_qzone_msg` 作为回退。**排在前面的是优先通道**。
+        backends=('napcat', 'snowluma'),
     ),
     PlatformAction(
         'comment_qzone_post', 'qzone', '评论说说',
@@ -581,12 +596,14 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('target_uin', '归属 QQ'),
         ),
         risk='sensitive',
+        backends=('napcat', 'snowluma'),
     ),
     PlatformAction(
         'like_qzone_post', 'qzone', '点赞说说',
         '给一条空间说说点赞。',
         params=(_p('tid', '说说 tid', required=True), _p('target_uin', '归属 QQ')),
         risk='sensitive',
+        backends=('napcat', 'snowluma'),
     ),
     PlatformAction(
         'list_qzone_posts', 'qzone', '看空间说说',
@@ -596,6 +613,28 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('count', '条数', type='int', minimum=1, maximum=50),
         ),
         risk='safe',
+        backends=('napcat', 'snowluma'),
+    ),
+    PlatformAction(
+        'list_qzone_feeds', 'qzone', '看好友动态',
+        '看好友动态信息流（只读）：她可以自己决定要不要了解别人最近在说什么。',
+        params=(
+            _p('page', '页码', type='int', minimum=1, maximum=20),
+            _p('count', '条数', type='int', minimum=1, maximum=30),
+        ),
+        risk='safe',
+        backends=('napcat', 'snowluma'),
+    ),
+    PlatformAction(
+        'forward_qzone_post', 'qzone', '转发说说',
+        '转发一条说说（可带一句附言）。',
+        params=(
+            _p('tid', '说说 tid', required=True),
+            _p('target_uin', '原作者 QQ'),
+            _p('content', '转发附言'),
+        ),
+        risk='sensitive',
+        backends=('napcat', 'snowluma'),
     ),
     PlatformAction(
         'delete_qzone_post', 'qzone', '删说说',
@@ -603,6 +642,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('tid', '说说 tid', required=True),),
         risk='dangerous',
         default_permission='disabled',
+        backends=('napcat', 'snowluma'),
     ),
     # ---------------- 联系人与群 ----------------
     PlatformAction(
@@ -668,6 +708,32 @@ ACTIONS: dict[str, PlatformAction] = {item.id: item for item in _ACTION_LIST}
 
 if len(ACTIONS) != len(_ACTION_LIST):  # pragma: no cover - 目录写错时立刻炸
     raise RuntimeError('平台动作目录里存在重复 id')
+
+
+#: 后端 → 人话标签（控制台与文档共用一处，别再各写一遍）。
+BACKEND_LABELS: dict[str, str] = {
+    'onebot': '标准 OneBot',
+    'napcat': 'NapCat 专属',
+    'snowluma': '需要 SnowLuma 扩展',
+}
+
+
+def napcat_actions() -> list[PlatformAction]:
+    """NapCat 专属动作（`backends` 里没有 `onebot` 的那些），按 id 排序。
+
+    控制台「只显示 NapCat 专属」与文档的"NapCat 后端专属功能"清单都用它。
+    """
+    return sorted((a for a in ACTIONS.values() if a.napcat_only), key=lambda a: a.id)
+
+
+def backend_labels(action: PlatformAction) -> list[str]:
+    """一条动作的后端标签（按优先级顺序，去重）。"""
+    seen: list[str] = []
+    for name in action.backends:
+        label = BACKEND_LABELS.get(name, name)
+        if label not in seen:
+            seen.append(label)
+    return seen
 
 
 def actions_by_category() -> dict[str, list[PlatformAction]]:

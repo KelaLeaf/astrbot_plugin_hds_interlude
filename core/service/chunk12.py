@@ -60,7 +60,10 @@ CORE_HANDLED_ACTIONS = frozenset({
     # 动作 → 剧本条目），直通传输层会绕过风控与账本（上游这三个动作在叙事路径上
     # 也是走 `qzoneExecute`）。只读的 `list_qzone_posts` / 危险的 `delete_qzone_post`
     # 上游没有对应服务成员，直通传输层。
-    'publish_qzone_post', 'comment_qzone_post', 'like_qzone_post',
+    'publish_qzone_post', 'comment_qzone_post', 'like_qzone_post', 'forward_qzone_post',
+    # v1.7.1：读类也收进本机——NapCat WebSocket 方案（get_cookies + QZone CGI）
+    # 要按账号端点解析、并且**不能**让只读动作去撞限流门。
+    'list_qzone_posts', 'list_qzone_feeds',
 })
 
 #: 目录动作 id → `qzone_execute` 的 kind。
@@ -68,6 +71,9 @@ QZONE_ACTION_KINDS_BY_ID = {
     'publish_qzone_post': 'post',
     'comment_qzone_post': 'comment',
     'like_qzone_post': 'like',
+    # v1.7.1：转发说说也是**写**动作（受限流门与账本管）。只读的
+    # `list_qzone_feeds` / `list_qzone_posts` 与危险的 `delete_qzone_post` 直通传输层。
+    'forward_qzone_post': 'forward',
 }
 
 #: 定时消息在 intent 表里的类型名（内部调度账，控制台「承诺与意图」面板会标成内部）。
@@ -524,6 +530,19 @@ class ServiceChunk12(ServiceBase):
     ) -> dict[str, Any]:
         if action_id in QZONE_ACTION_KINDS_BY_ID:
             return await self._run_qzone_action(story, action_id, params)
+        if action_id in ('list_qzone_posts', 'list_qzone_feeds'):
+            runner = getattr(self, 'qzone_read', None)
+            if not callable(runner):
+                return {'ok': False, 'error': 'qzone-unavailable'}
+            kind = 'moods' if action_id == 'list_qzone_posts' else 'feed'
+            include_self = action_id == 'list_qzone_posts' and not (
+                params.get('target_uin') or params.get('targetUin')
+            )
+            result = await runner(story, kind, params, include_self=include_self)
+            if not isinstance(result, dict):
+                return {'ok': False, 'error': 'bad-qzone-result'}
+            data = {k: v for k, v in result.items() if k not in ('ok', 'error')}
+            return {'ok': bool(result.get('ok')), 'error': str(result.get('error') or ''), 'data': data or {}}
         if action_id == 'schedule_message':
             return await self._schedule_message(story, params, session=session, target=target, now=now)
         if action_id == 'list_scheduled_messages':
