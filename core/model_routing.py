@@ -58,6 +58,8 @@ __all__ = [
     'uses_remote_providers',
     'provider_key',
     'provider_reachable',
+    'connection_row_names',
+    'match_usable_connection_row',
     'is_assigned_to',
     'format_model_routing',
 ]
@@ -233,6 +235,38 @@ def provider_reachable(provider: ProviderConfig) -> bool:
     return bool(_truthy(provider.get('endpoint')) or _truthy(provider.get('transport_target')))
 
 
+def connection_row_names(provider: ProviderConfig) -> set[str]:
+    """一条连接行可以被「点名」的那几个名字：`id` / `model` / `label`。
+
+    v1.7.9 抽出：共同作品写手模型有两套填法（点一条连接行 / 指名一个 AstrBot
+    Provider），"这个值点到的是不是连接行"必须在 core 与适配层给出**同一个答案**
+    ——两处各写一遍必然漂移（老用户的值会一边认一边不认）。
+    """
+    return {
+        name for name in (
+            _trim(provider.get('id')), _trim(provider.get('model')), _trim(provider.get('label')),
+        ) if name
+    }
+
+
+def match_usable_connection_row(providers: list[ProviderConfig], value: Any) -> list[ProviderConfig]:
+    """按名字（`id` / `model` / `label`）挑出**当前可用**的连接行。
+
+    口径与 `service/chunk14.py` 挑写手连接的老口径一致：`enabled` 缺省算开
+    （只有显式 `false` 才算关，见坑 36）、且 `provider_reachable`（有 http
+    endpoint 或适配层塞的 `transport_target`）。两处共用这一份实现，免得
+    "这个值点到的是不是连接行"在两侧得出不同结论。
+    """
+    wanted = _trim(value)
+    if not wanted:
+        return []
+    return [
+        provider for provider in providers
+        if provider.get('enabled') is not False and provider_reachable(provider)
+        and wanted in connection_row_names(provider)
+    ]
+
+
 def is_assigned_to(provider: ProviderConfig, task: str) -> bool:
     """上游 `isAssignedTo()`：这条连接是否被显式指派给该任务。
 
@@ -253,6 +287,10 @@ def is_assigned_to(provider: ProviderConfig, task: str) -> bool:
     if task == 'world_seeding':
         # 上游 1.0.1-rc24：世界播种器的模型选择并入连接行的用途勾选。
         return provider.get('use_for_world_seeding') is True
+    if task == 'works':
+        # v1.7.9（本移植版）：共同作品的独立写手也是一类旁路任务，
+        # 适配层为「指名 AstrBot Provider」合成的那条连接行只挂这个标志。
+        return provider.get('use_for_works') is True
     return provider.get('use_for_vision') is True
 
 
@@ -372,6 +410,9 @@ def is_exclusively_non_chat(provider: ProviderConfig) -> bool:
         or _truthy(provider.get('use_for_alter'))
     sidecar = _truthy(provider.get('use_for_embedding')) or _truthy(provider.get('use_for_stickers')) \
         or _truthy(provider.get('use_for_vision'))
+    # v1.7.9（本移植版）：只指派给"共同作品写手"的连接行同样是旁路连接——它必须
+    # **不能**被当成主叙事/紧凑化的兜底候选，否则用户给写手选个模型会把叙事也换掉。
+    sidecar = sidecar or _truthy(provider.get('use_for_works'))
     return bool(sidecar and not chat)
 
 
@@ -425,6 +466,9 @@ def normalize_provider(provider: ProviderConfig) -> ProviderConfig:
         'use_for_stickers': provider.get('use_for_stickers') is True,
         'use_for_vision': provider.get('use_for_vision') is True,
         'use_for_world_seeding': provider.get('use_for_world_seeding') is True,
+        # v1.7.9（本移植版）：共同作品写手（只有适配层合成的那条指名连接行会挂它，
+        # 用户的连接编辑器里没有这个勾选——它不是一个用户可配的用途）。
+        'use_for_works': provider.get('use_for_works') is True,
     })
     return normalized
 

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -104,13 +105,43 @@ class ServiceChunk12(ServiceBase):
     # 权限与可用集
     # ------------------------------------------------------------------ #
 
+    def interlude_data_dir(self) -> str:
+        """插件数据目录（`<数据目录>/action_permissions.json` 的根）。
+
+        按**生产上真的挂着的那一个**取：`ServiceBase.__init__` 存的是 `self.ctx`
+        （`chunk2` 读表情库目录、`chunk13` 读写跳闸标志都是这么取的），而 `self.context`
+        在 core 里**根本不存在**——那是适配层 `AstrbotInterludeContext` 自己的属性（指宿主
+        Context），core 拿不到。三种情形都有定义：
+
+        * `ctx.base_dir` → 用它；
+        * `ctx` 存在但**没有** `base_dir` / 完全没 `ctx` → 退到宿主注入的
+          `context.base_dir`（单测的裸宿主常这么塞）→ 自己的 `base_dir`；
+        * 一个都拿不到 → 回空串 = 回落空表 / 目录默认档，**绝不抛**。
+        """
+        for holder in (getattr(self, 'ctx', None), getattr(self, 'context', None), None):
+            base = getattr(self, 'base_dir', '') if holder is None else getattr(holder, 'base_dir', '')
+            if base:
+                return str(base)
+        return ''
+
+    def timer_host(self) -> Any:
+        """能排定时器的那个对象（生产上是 `ServiceBase.ctx` = `InterludeContext`）。
+
+        `ctx` 存在但**没有** `set_timeout`（裸宿主）时退到宿主注入的 `context`；
+        都没有就回 `None` = 兜底定时器不生效（绝不抛、也绝不影响投递）。
+        """
+        for holder in (getattr(self, 'ctx', None), getattr(self, 'context', None)):
+            if callable(getattr(holder, 'set_timeout', None)):
+                return holder
+        return None
+
     def action_permission_table(self) -> dict[str, str]:
         """读独立权限表（`<数据目录>/action_permissions.json`）。
 
         坏文件/缺文件都只回落空表（= 全部走目录默认档），绝不抛——权限表是**运行期**
         的东西，不该因为一个手改坏的 JSON 让整条叙事链起不来。读取失败会留一条 warn。
         """
-        base = self.context.base_dir if getattr(self, 'context', None) is not None else ''
+        base = self.interlude_data_dir()
         if not base:
             return {}
         path = Path(base) / ACTION_PERMISSIONS_FILE
@@ -547,6 +578,10 @@ class ServiceChunk12(ServiceBase):
         熄灭仍由投递那一刻的 `end_typing` 负责；额外挂一个**兜底定时器**：万一投递
         路径异常，输入状态也会在 `expected_ms + 30s` 后自动熄灭（对方那头永远停在
         "正在输入"最糟）。群聊一律不点亮。
+
+        两条定时器都排在 `ctx.set_timeout` 上（生产上的 `InterludeContext`，v1.7.9 之前
+        写成 core 里根本不存在的 `self.context` → 两条兜底一起静默失效）；参数用
+        `functools.partial` 自己绑，因为它的签名就是 `(callback, delay_ms)` 两个参数。
         """
         config = self.input_status_config()
         if config.get('enabled') is False:
@@ -558,8 +593,11 @@ class ServiceChunk12(ServiceBase):
         delay = max(0, int(delay_ms or 0))
         if delay > 0:
             # 窗口还没开始：排一条定时器到点再亮。排期失败就当没点亮（绝不影响投递）。
+            host = self.timer_host()
+            if host is None:
+                return False
             try:
-                self.context.set_timeout(self._typing_light_later, delay, target, expected)
+                host.set_timeout(functools.partial(self._typing_light_later, target, expected), delay)
             except Exception:  # noqa: BLE001 - 定时器只是锦上添花
                 return False
             return True
@@ -589,14 +627,16 @@ class ServiceChunk12(ServiceBase):
         key = self._typing_key(target)
         self._typing_lit()[key] = target
         timeout_ms = max(5_000, int(expected_ms or 0) + 30_000)
-        try:
-            self.context.set_timeout(self._clear_typing_later, timeout_ms, key)
-        except Exception:  # noqa: BLE001 - 定时器只是兜底
-            pass
+        host = self.timer_host()
+        if host is not None:
+            try:
+                host.set_timeout(functools.partial(self._clear_typing_later, key), timeout_ms)
+            except Exception:  # noqa: BLE001 - 定时器只是兜底
+                pass
         return True
 
     def _typing_light_later(self, target: dict[str, Any], expected_ms: int = 0) -> None:
-        """到点才点亮（由 `context.set_timeout` 调用；同步回调里起一个即发任务）。"""
+        """到点才点亮（由 `ctx.set_timeout` 调用；同步回调里起一个即发任务）。"""
         try:
             asyncio.ensure_future(self._light_typing(target, max(0, int(expected_ms or 0))))
         except Exception:  # noqa: BLE001 - 事件循环已关就放弃
@@ -616,7 +656,12 @@ class ServiceChunk12(ServiceBase):
         )
 
     def _clear_typing_later(self, key: str = '') -> None:
-        """兜底熄灭（由 `context.set_timeout` 调用；同步回调里起一个即发任务）。"""
+        """兜底熄灭（由 `ctx.set_timeout` 调用；同步回调里起一个即发任务）。
+
+        **刻意保留**（v1.7.9 复核，不是历史残留）：`end_typing` 只在投递路径正常走到
+        时才熄灯，投递中途异常/被取消时全靠这条兜底把灯熄掉——对方那头永远停在
+        "正在输入"是最糟的表现。它只影响"多一次熄灭调用"，不影响逐条亮灭的语义。
+        """
         target = self._typing_lit().pop(key, None)
         if not target:
             return

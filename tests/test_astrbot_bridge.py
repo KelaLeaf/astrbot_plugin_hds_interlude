@@ -3121,6 +3121,221 @@ class RoutingRowInjectionTests(unittest.TestCase):
         self.assertNotIn('audio', by_task)
 
 
+class _RecordingFakeContext(FakeContext):
+    """真桥 + 真 `AstrbotHttpClient` 用的桩宿主：记下 `llm_generate` 收到的 Provider。"""
+
+    def __init__(self, provider_id='session-default'):
+        super().__init__()
+        self.provider_id = provider_id
+        self.calls: list[dict] = []
+
+    def get_provider_by_id(self, provider_id):
+        return _FakeProvider(provider_id, ['text'])
+
+    async def get_current_chat_provider_id(self, umo):  # noqa: ARG002
+        return self.provider_id
+
+    async def llm_generate(self, **kwargs):
+        self.calls.append(kwargs)
+
+        class _Response:
+            completion_text = '写手草稿'
+            usage = {}
+
+        return _Response()
+
+
+class _ProviderStub:
+    """宿主 Provider 的最小桩：只有 `meta().id`（`get_all_providers()` 那条读法用）。"""
+
+    def __init__(self, provider_id):
+        self._id = provider_id
+
+    def meta(self):
+        return type('Meta', (), {'id': self._id})()
+
+
+class _RecordingFallback:
+    """记下"直连 endpoint"那条路收到的 URL（测试环境里没有 httpx）。"""
+
+    def __init__(self):
+        self.urls: list[str] = []
+
+    async def post_json(self, url, headers=None, body=None, timeout=None):  # noqa: ARG002
+        self.urls.append(url)
+        return {'choices': [{'message': {'content': '直连回复'}}]}
+
+
+class WorksWriterBindingTests(unittest.TestCase):
+    """共同作品的写手模型（v1.7.9）：配置页的选择器 ↔ `works.model_id` 的双读接线。
+
+    这个键有两套填法——老口径"点名模型中心里的一条连接行"（core 按 `id` / 模型名 /
+    标签匹配）与新口径"指名一个 AstrBot Provider"（配置页的选择器写的就是它）。
+    适配层必须：① 为指名合成一条挂了 `use_for_works` 的连接行（否则 core 只认
+    `endpoint`，指派了也走不到传输层——坑 26）；② 老口径的值**一个都不许失效**。
+    """
+
+    def _named_bridge(self, works_model_id, providers=()):
+        bridge = _make_bridge({
+            'works': {'enabled': True, 'generation_mode': 'separate', 'model_id': works_model_id},
+            'model_center': {'providers': [dict(row) for row in providers]},
+        })
+        # 桩宿主没有 Provider 管理器：默认"模型还没装上"（坑 23 的真实启动早期）。
+        bridge.any_provider_loaded = lambda: False  # type: ignore[method-assign]
+        return bridge
+
+    @staticmethod
+    def _row(**overrides):
+        row = {
+            'id': 'writer-conn', 'label': '写手连接', 'enabled': True, 'model': 'writer-model',
+            'endpoint': 'https://example.invalid/v1/chat/completions',
+        }
+        row.update(overrides)
+        return row
+
+    @staticmethod
+    def _loaded(bridge, *ids):
+        """把"宿主已经装好这些聊天 Provider"桩进去（走 `get_all_providers` 那条读法）。"""
+        bridge.loaded_chat_provider_ids = lambda: set(ids)  # type: ignore[method-assign]
+        return bridge
+
+    def test_the_task_table_points_at_the_works_section(self):
+        bridge = self._named_bridge('ollama')
+        self.assertEqual(bridge.TASK_MODEL_PATHS['works'], ('works', 'model_id'))
+        self.assertEqual(bridge.task_model_id('works'), 'ollama')
+
+    def test_a_named_provider_becomes_a_works_row(self):
+        bridge = self._loaded(self._named_bridge('ollama', [self._row()]), 'ollama')
+        self.assertEqual(bridge.works_writer_named_provider(), 'ollama')
+        rows = bridge.routing_config()['model']['providers']
+        works = [row for row in rows if row['id'] == '%sworks' % bridge_module.ROUTING_ROW_PREFIX]
+        self.assertEqual(len(works), 1, rows)
+        self.assertTrue(works[0]['use_for_works'])
+        self.assertFalse(works[0]['use_for_main'], '写手的指名不能变成主叙事的指派')
+        self.assertEqual(works[0]['transport_target'], 'astrbot:ollama')
+        # 用户那份配置不能被污染（导出 / 落盘读的都是它）
+        clean = bridge.section('model')['providers']
+        self.assertFalse(any(bridge_module.is_routing_row(item) for item in clean))
+
+    def test_a_works_row_never_becomes_the_narrative_fallback(self):
+        """给写手选个模型不能把主叙事也换掉（合成行排在候选最前，必须被隔离）。"""
+        from plugin.core.model_routing import resolve_model_routing
+
+        bridge = self._loaded(self._named_bridge('ollama', [self._row()]), 'ollama')
+        routing = resolve_model_routing(bridge.routing_config()['model'])
+        self.assertEqual([item['id'] for item in routing['main']['providers']], ['writer-conn'])
+        self.assertEqual(routing['main']['reason'], 'legacy-fallback')
+
+    def test_a_value_naming_a_connection_row_keeps_the_old_meaning(self):
+        """老口径：值点到一条可用连接行 → 不合成指名行，core 照旧按连接行解析。"""
+        bridge = self._named_bridge('writer-conn', [self._row()])
+        self.assertEqual(bridge.works_writer_named_provider(), '')
+        rows = bridge.routing_config()['model']['providers']
+        self.assertFalse(any(row.get('use_for_works') for row in rows), rows)
+        self.assertIs(bridge.routing_config(), bridge.config, '没有别的指名时零开销原样返回')
+
+    def test_a_connection_row_can_also_be_named_by_model_or_label(self):
+        row = self._row(id='x')
+        for value in ('writer-model', '写手连接'):
+            bridge = self._named_bridge(value, [row])
+            self.assertEqual(bridge.works_writer_named_provider(), '', value)
+
+    def test_models_not_loaded_yet_still_bind_the_named_provider(self):
+        """坑 23：AstrBot 插件先、模型后。那时按新口径处理，否则用户选的模型要等到
+        下次保存配置才生效。"""
+        bridge = self._named_bridge('ollama', [self._row()])
+        self.assertFalse(bridge.any_provider_loaded())
+        self.assertEqual(bridge.works_writer_named_provider(), 'ollama')
+
+    def test_a_missing_provider_with_models_loaded_keeps_the_legacy_failure(self):
+        """已就绪却没有这个 id、也不是连接行 → 老口径（保留原来那句报错）。"""
+        bridge = self._named_bridge('nope', [self._row()])
+        bridge.any_provider_loaded = lambda: True  # type: ignore[method-assign]
+        bridge.provider_by_id = lambda pid: None  # type: ignore[method-assign]
+        self.assertEqual(bridge.works_writer_named_provider(), '')
+        rows = bridge.routing_config()['model']['providers']
+        self.assertFalse(any(bridge_module.is_routing_row(row) for row in rows),
+                         '不合成任何行（老口径的「指名不存在」由 core 报）')
+        self.assertEqual(bridge.task_model_id('works'), 'nope', '值本身不动，core 才报得出名字')
+
+    def test_a_loaded_provider_wins_over_a_same_named_connection_row(self):
+        """值同时是连接行名与已加载 Provider id → 按 Provider 解释（"指名 → 生效"）。"""
+        bridge = self._loaded(self._named_bridge('ollama', [self._row(id='ollama', model='ollama-local')]), 'ollama')
+        self.assertEqual(bridge.works_writer_named_provider(), 'ollama')
+        rows = bridge.routing_config()['model']['providers']
+        self.assertTrue(any(row.get('use_for_works') for row in rows), rows)
+
+    def test_the_provider_lookup_never_pokes_the_host_with_a_legacy_value(self):
+        """坑 23：`get_provider_by_id()` 对不存在的 id 会打一条误导性的宿主警告。
+
+        老口径的值（连接行名）每保存一次配置判一次，所以装了模型时判断"是不是
+        Provider"必须走 `get_all_providers()`——`provider_by_id` 一次都不该被调到。
+        """
+        bridge = self._named_bridge('writer-conn', [self._row()])
+        calls: list[str] = []
+        bridge.provider_by_id = lambda pid: calls.append(pid) or None  # type: ignore[method-assign]
+        bridge.any_provider_loaded = lambda: True  # type: ignore[method-assign]
+        bridge.context.get_all_providers = lambda: [_ProviderStub('ollama')]
+        self.assertEqual(bridge.works_writer_named_provider(), '')
+        self.assertEqual(calls, [])
+
+    def test_loaded_chat_provider_ids_reads_the_host_list(self):
+        bridge = self._named_bridge('ollama')
+        self.assertEqual(bridge.loaded_chat_provider_ids(), set(), '桩宿主没有列表 → 空集合')
+        bridge.context.get_all_providers = lambda: [_ProviderStub('ollama'), _ProviderStub(''), 'not-a-provider']
+        self.assertEqual(bridge.loaded_chat_provider_ids(), {'ollama'})
+
+        def _boom():
+            raise RuntimeError('host exploded')
+
+        bridge.context.get_all_providers = _boom
+        self.assertEqual(bridge.loaded_chat_provider_ids(), set(), '拿不到列表不能抛')
+
+    def test_the_transport_lands_the_works_task_on_the_named_provider(self):
+        """端到端的那一跳：`task='works'` → `chat_provider_id` = `works.model_id`。
+
+        `SIDE_TASK_ROUTES['作品创作'] = 'works'`（见 `test_works_wiring`）负责把任务键
+        传下来，这里负责证明它真的落到那个 Provider；留空时仍走会话默认模型。
+        """
+        context = _RecordingFakeContext()
+        bridge = _make_bridge({
+            'works': {'enabled': True, 'generation_mode': 'separate', 'model_id': 'ollama'},
+            'model_center': {'providers': []},
+        }, context=context)
+        body = {'model': 'ollama', 'messages': [{'role': 'user', 'content': '写点什么'}]}
+        response = asyncio.run(bridge_module.AstrbotHttpClient(bridge).post_json('', None, body, None, task='works'))
+        self.assertEqual(context.calls[0]['chat_provider_id'], 'ollama')
+        self.assertEqual(response['model'], 'ollama')
+
+        plain_context = _RecordingFakeContext('session-default')
+        plain = _make_bridge({'model_center': {'providers': []}}, context=plain_context)
+        fallback = _RecordingFallback()
+        asyncio.run(bridge_module.AstrbotHttpClient(plain, fallback=fallback).post_json(
+            'https://gw.example.invalid/v1/chat/completions', None, body, None, task='works'))
+        self.assertEqual(fallback.urls, ['https://gw.example.invalid/v1/chat/completions'],
+                         '留空 = 直连连接行（与历史行为一致，不改道宿主 Provider）')
+        self.assertEqual(plain_context.calls, [])
+
+    def test_an_empty_value_changes_nothing(self):
+        bridge = _make_bridge({'works': {'enabled': True}, 'model_center': {'providers': []}})
+        self.assertEqual(bridge.task_model_id('works'), '')
+        self.assertEqual(bridge.works_writer_named_provider(), '')
+        self.assertIs(bridge.routing_config(), bridge.config)
+
+    def test_the_startup_log_says_works_only_when_it_is_a_provider(self):
+        bridge = self._loaded(self._named_bridge('ollama', [self._row()]), 'ollama')
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            asyncio.run(bridge.log_model_capabilities())
+        messages = [item.args[1] % tuple(item.args[2:]) for item in logged.call_args_list if item.args]
+        self.assertTrue(any('works → AstrBot Provider ollama' in item for item in messages), messages)
+        # 老口径的值不能被报成"某个 AstrBot Provider"（那会让用户去宿主里找一个不存在的东西）
+        legacy = self._named_bridge('writer-conn', [self._row()])
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            asyncio.run(legacy.log_model_capabilities())
+        messages = [item.args[1] % tuple(item.args[2:]) for item in logged.call_args_list if item.args]
+        self.assertFalse(any('works' in item for item in messages), messages)
+
+
 class ModelCapabilitySelfCheckTests(unittest.TestCase):
     """启动自检 + `hdsi_status` 的能力提示。"""
 

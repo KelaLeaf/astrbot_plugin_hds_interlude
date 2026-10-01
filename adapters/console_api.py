@@ -672,18 +672,27 @@ class ConsoleApi:
         vision = section.get('vision') or {}
         audio = section.get('audio') or {}
 
+        task_models = {
+            key: {
+                'label': label,
+                'astrbot_provider': self.bridge.task_model_id(key),
+                'modalities': sorted(self.bridge.task_provider_modalities(key)),
+            }
+            for key, label in (*CONSOLE_TASKS, ('audio', '语音转写'))
+        }
+        # v1.7.9：共同作品的独立写手也能指名 AstrBot Provider，但它的值还有一套
+        # "点名连接行"的老口径——所以这里用双读判定，老口径的值不会被报成 Provider。
+        task_models['works'] = {
+            'label': '共同作品写手',
+            'astrbot_provider': self.bridge.works_writer_named_provider(),
+            'modalities': sorted(self.bridge.task_provider_modalities('works')),
+        }
+
         return {
             'tasks': self._routing_rows(),
             # `audio` 不是聊天任务（它是"语音→文字"的转写模型，不参与叙事路由），
             # 所以不进 `tasks`，但页面要显示它，仍然放进 task_models。
-            'task_models': {
-                key: {
-                    'label': label,
-                    'astrbot_provider': self.bridge.task_model_id(key),
-                    'modalities': sorted(self.bridge.task_provider_modalities(key)),
-                }
-                for key, label in (*CONSOLE_TASKS, ('audio', '语音转写'))
-            },
+            'task_models': task_models,
             'connections': connections,
             'astrbot_providers': self._astrbot_providers(),
             'embedding': {
@@ -2532,10 +2541,21 @@ class ConsoleApi:
                 'provider_type': _text(config.get('provider_type')) if isinstance(config, dict) else '',
                 'modalities': sorted(self.bridge.provider_modalities(provider)),
                 'used_by': [
-                    label for key, label in CONSOLE_TASKS if self.bridge.task_model_id(key) == identifier
+                    label for key, label in (*CONSOLE_TASKS, ('works', '共同作品写手'))
+                    if self._task_uses_provider(key, identifier)
                 ],
             })
         return rows
+
+    def _task_uses_provider(self, task: str, identifier: str) -> bool:
+        """该任务是不是指名了这个 AstrBot Provider（`used_by` 用）。
+
+        `works` 要过双读判定：它的值还有一套"点名连接行"的老口径，那种值不该被算成
+        "用了某个 AstrBot Provider"（否则控制台会指着一个不存在的东西说它在用）。
+        """
+        if task == 'works':
+            return bool(identifier) and self.bridge.works_writer_named_provider() == identifier
+        return self.bridge.task_model_id(task) == identifier
 
     def _note(self, kind: str) -> str:
         try:

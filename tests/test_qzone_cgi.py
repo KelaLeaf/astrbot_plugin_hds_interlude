@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import inspect
 import json
 import re
 import subprocess
@@ -978,55 +979,54 @@ class ImageUploadTests(unittest.TestCase):
 
 
 class RichTextUpdateTests(unittest.TestCase):
-    """`emotion_cgi_update` 带富文本块（带图说说改可见范围）的字段映射。"""
+    """改可见范围的请求**永远不带富文本块**（v1.7.9 的 H1 裁定）。
+
+    参考实现的 `build_edit_message_params` 就是"改可见范围"用的构造器，它的
+    `pic_template` / `richtype` / `richval` / `subrichtype` / `special_url` 全是空串
+    ——"空串 = 不改动富文本"。所以这里钉两件事：① 这些槽位**在**字段清单里且**恒为空**；
+    ② 构造器**根本不给**调用方塞 `richval` / `pic_bo` 的口子（旧版本那条口子会把
+    "重新上传原图"接回来）。见 `docs/PORTING_NOTES.md` §43。
+    """
 
     def setUp(self):
         self.auth = _auth()
 
     def test_text_path_is_byte_identical_to_the_reference_list(self):
-        """不给 richval：字段集合与顺序**逐字**还是参考实现那一份（回归）。"""
+        """字段集合与顺序**逐字**是参考实现那一份（回归）。"""
         body = build_update_visibility_request(self.auth, "tid-1", "正文", 4)[3]
         self.assertEqual(tuple(body), UPDATE_KEYS)
         self.assertNotIn("pic_bo", body)
+
+    def test_the_update_never_fills_a_rich_text_slot(self):
+        """五个富文本槽位恒为空串——这是"不改动图片 / 视频"的全部依据。"""
+        body = build_update_visibility_request(self.auth, "tid-1", "正文", 4)[3]
+        self.assertEqual(body["pic_template"], "")
         self.assertEqual(body["richtype"], "")
         self.assertEqual(body["subrichtype"], "")
         self.assertEqual(body["richval"], "")
+        self.assertEqual(body["special_url"], "")
 
-    def test_rich_text_block_fills_the_slots_the_reference_provides(self):
-        body = build_update_visibility_request(
-            self.auth, "tid-1", "正文", 4,
-            richval=",A,B,C,1,2,3,,2,3", pic_bo="BO",
-        )[3]
-        self.assertEqual(body["richtype"], "1", "照发布分支（richtype / subrichtype = 1）")
-        self.assertEqual(body["subrichtype"], "1")
-        self.assertEqual(body["richval"], ",A,B,C,1,2,3,,2,3")
-        self.assertEqual(body["pic_bo"], "BO")
-        # 其余字段与顺序不受影响，`pic_bo` 只追加在末尾。
-        self.assertEqual(tuple(body), UPDATE_KEYS + ("pic_bo",))
-        self.assertEqual(body["con"], "正文")
-        self.assertEqual(body["ugc_right"], "4")
+    def test_the_builder_has_no_rich_text_parameters(self):
+        """构造器**不接收** `richval` / `pic_bo`：想在编辑路径上塞富文本只能改这个签名。"""
+        parameters = inspect.signature(build_update_visibility_request).parameters
+        self.assertEqual(
+            tuple(parameters),
+            ("auth", "tid", "content", "visible", "target_uins", "ugcright_id"),
+        )
 
-    def test_pic_bo_is_only_sent_when_there_is_one(self):
-        """`pic_bo` 是受控偏离（参考实现的编辑清单里没有它）——空值绝不发。"""
-        body = build_update_visibility_request(
-            self.auth, "tid-1", "正文", 4, richval=",A,B,C,1,2,3,,2,3",
-        )[3]
-        self.assertEqual(tuple(body), UPDATE_KEYS)
-        self.assertNotIn("pic_bo", body)
-
-    def test_the_targeted_tiers_keep_allow_uins_with_a_rich_text_block(self):
+    def test_the_targeted_tiers_keep_allow_uins_and_still_no_rich_text(self):
         body = build_update_visibility_request(
             self.auth, "tid-1", "正文", 16, ["10001", "10002"],
-            richval=",A,B,C,1,2,3,,2,3",
         )[3]
         self.assertEqual(body["allow_uins"], "10001|10002")
-        self.assertEqual(body["richval"], ",A,B,C,1,2,3,,2,3")
+        self.assertEqual(body["richval"], "")
+        self.assertEqual(body["richtype"], "")
 
-    def test_an_empty_content_still_raises_with_a_rich_text_block(self):
-        with self.assertRaises(QZoneAuthError):
-            build_update_visibility_request(
-                self.auth, "tid-1", "", 4, richval=",A,B,C,1,2,3,,2,3",
-            )
+    def test_an_empty_content_still_raises(self):
+        for content in ("", "   ", None):
+            with self.subTest(content=content):
+                with self.assertRaises(QZoneAuthError):
+                    build_update_visibility_request(self.auth, "tid-1", content, 4)
 
 
 # ── JSONP ──────────────────────────────────────────────────────────────
@@ -1262,7 +1262,7 @@ class MoodParsingTests(unittest.TestCase):
         mood = parse_mood(MOOD_RAW)
         self.assertEqual(tuple(mood), (
             "tid", "content", "created_time", "createTime", "cmtnum", "fwdnum",
-            "name", "uin", "lbs", "pic", "rt_tid", "rt_uin", "rt_content",
+            "name", "uin", "lbs", "pic", "video", "rt_tid", "rt_uin", "rt_content",
         ))
         self.assertEqual(mood["tid"], "TID1")
         self.assertEqual(mood["content"], "今天很好")
@@ -1273,6 +1273,33 @@ class MoodParsingTests(unittest.TestCase):
         self.assertEqual(mood["name"], "小明")
         self.assertEqual(mood["uin"], 123456789)
         self.assertEqual(mood["lbs"], {"name": "北京市", "pos_x": "1.0"})
+        self.assertEqual(mood["video"], [], "没有 video 字段时是空列表（不是缺失）")
+
+    def test_parse_mood_video_maps_the_reference_fields(self):
+        """`video` 六个字段逐字照抄参考实现 `html_parser.py::parse_feed_data`。
+
+        加这个字段是为了**改可见范围后的回读校验**能数出视频（视频不在正文里，
+        只看 `pic` 会把"视频被删"漏成"什么都没变"）。
+        """
+        mood = parse_mood({"tid": "t", "video": [
+            {"url3": "https://video.invalid/v.mp4", "url1": "https://video.invalid/c.jpg",
+             "video_id": "VID-1", "video_time": "12345",
+             "cover_width": 640, "cover_height": 480},
+            "坏元素",
+        ]})
+        self.assertEqual(mood["video"], [{
+            "url": "https://video.invalid/v.mp4",
+            "cover": "https://video.invalid/c.jpg",
+            "video_id": "VID-1",
+            "duration_ms": "12345",
+            "width": 640,
+            "height": 480,
+        }])
+
+    def test_parse_mood_video_tolerates_bad_shapes(self):
+        for raw in (None, "字符串", 7, {"a": 1}):
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_mood({"tid": "t", "video": raw})["video"], [])
 
     def test_parse_mood_pic_maps_url1(self):
         mood = parse_mood(MOOD_RAW)

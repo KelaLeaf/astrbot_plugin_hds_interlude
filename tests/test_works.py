@@ -1263,6 +1263,73 @@ class WorksWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started['modelId'], 'writer-model')
         self.assertEqual(service.narrator.calls[0]['provider']['id'], 'writer-conn')
 
+    async def test_start_work_generation_uses_the_named_astrbot_provider(self) -> None:
+        """v1.7.9：指名 AstrBot Provider → 用适配层合成的那条连接行（双轨①）。
+
+        合成行长这样（`astrbot_bridge._binding_row('works', 'ollama')`）：只挂
+        `use_for_works`、没有 endpoint、靠 `transport_target` 让 core 认为它可用——
+        真正的目标是哪个 Provider 由传输层按 `task='works'` 解析。
+        """
+        config = works_config(generation_mode='separate', model_id='ollama')
+        config['model']['providers'] = [
+            {'id': 'writer-conn', 'model': 'writer-model', 'enabled': True,
+             'endpoint': 'http://192.168.1.9/v1/chat/completions'},
+            {'id': 'hdsi-astrbot-works', 'label': 'AstrBot · ollama', 'enabled': True,
+             'endpoint': '', 'transport_target': 'astrbot:ollama',
+             'model': 'qwen2.5', 'use_for_works': True},
+        ]
+        service = self.make_service(config)
+        service.narrator = _FakeNarrator()
+        await service.create_work('s', 'p', '短篇', '原稿')
+        head = await self.head_of(service)
+        started = await service.start_work_generation('s', 'p', {'baseRevisionId': head, 'brief': 'b'}, 4)
+        self.assertTrue(started['ok'], started)
+        self.assertEqual(started['modelId'], 'qwen2.5', '落库的 modelId 来自那条指名行')
+        self.assertEqual(service.narrator.calls[0]['provider']['id'], 'hdsi-astrbot-works')
+        self.assertEqual(service.narrator.calls[0]['task'], '作品创作')
+        # 请求体里的 `model` 仍是用户填的那个值（老口径逐字保留）；走 AstrBot Provider
+        # 这条路时传输层不吃它——用的是 `chat_provider_id`（= task_model_id('works')）。
+        self.assertEqual(service.narrator.calls[0]['model'], 'ollama')
+
+    async def test_the_works_flag_selects_the_synthesized_row(self) -> None:
+        """core 按 `use_for_works` 认那条行（不看值本身）。
+
+        生产里这两者永远一致：适配层只在"这个值该按 Provider id 解释"时才合成
+        （`astrbot_bridge.works_writer_named_provider`：值点到一条可用连接行就不合成），
+        而且每次 `routing_config()` 都按**当前值**重造。这条用例钉的就是"core 认标志"
+        这个机制本身。
+        """
+        config = works_config(generation_mode='separate', model_id='writer-model')
+        config['model']['providers'].append(
+            {'id': 'hdsi-astrbot-works', 'label': 'AstrBot · other', 'enabled': True,
+             'endpoint': '', 'transport_target': 'astrbot:other', 'model': 'other-model',
+             'use_for_works': True},
+        )
+        service = self.make_service(config)
+        service.narrator = _FakeNarrator()
+        await service.create_work('s', 'p', '短篇', '原稿')
+        head = await self.head_of(service)
+        started = await service.start_work_generation('s', 'p', {'baseRevisionId': head, 'brief': 'b'}, 5)
+        self.assertTrue(started['ok'], started)
+        self.assertEqual(service.narrator.calls[0]['provider']['id'], 'hdsi-astrbot-works')
+
+    async def test_a_stray_works_row_is_ignored_when_no_model_is_named(self) -> None:
+        """留空 → 跟随主叙事连接（**逐字**与今天一致），合成行不参与。"""
+        config = works_config(generation_mode='separate')
+        config['model']['providers'].insert(0, {
+            'id': 'hdsi-astrbot-works', 'label': 'AstrBot · ollama', 'enabled': True,
+            'endpoint': '', 'transport_target': 'astrbot:ollama', 'model': 'qwen2.5',
+            'use_for_works': True,
+        })
+        service = self.make_service(config)
+        service.narrator = _FakeNarrator()
+        await service.create_work('s', 'p', '短篇', '原稿')
+        head = await self.head_of(service)
+        started = await service.start_work_generation('s', 'p', {'baseRevisionId': head, 'brief': 'b'}, 6)
+        self.assertTrue(started['ok'], started)
+        self.assertEqual(started['modelId'], 'main-model', '留空 = 跟随主叙事连接')
+        self.assertEqual(service.narrator.calls[0]['provider']['id'], 'main-conn')
+
     async def test_work_generation_status_and_cancel(self) -> None:
         service = self.make_service(works_config(generation_mode='separate'))
         blocked = asyncio.get_running_loop().create_future()

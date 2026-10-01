@@ -5,12 +5,15 @@
 
 1. `narrator_prompts.work_instruction()` 按工作模式选上游那两段英文原文（逐字）；
 2. 决策字段 `workProposal` / `workRequest` 进双拼写表（坑 41 的同族：只写一种拼写 = 静默失效）；
-3. 配置组 `works` 的读取口径（缺失按默认、只有显式 false 才算关）。
+3. 配置组 `works` 的读取口径（缺失按默认、只有显式 false 才算关）；
+4. 「写手模型」的 AstrBot 模型选择器（v1.7.9）：schema 的 `_special` + 侧任务的
+   传输层任务键（`SIDE_TASK_ROUTES`）——少一处，"指名了也不生效"。
 """
 
 from __future__ import annotations
 
 import ast
+import json
 import pathlib
 import sys
 import unittest
@@ -18,8 +21,46 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from plugin.core import works as works_module  # noqa: E402
+from plugin.core.narrator import SIDE_TASK_ROUTES  # noqa: E402
 from plugin.core.narrator_prompts import work_instruction  # noqa: E402
 from plugin.core.service import chunk4 as chunk4_module  # noqa: E402
+
+PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+class WriterModelSelectorTests(unittest.TestCase):
+    """「写手模型」= AstrBot 模型选择器（v1.7.9）的两处**纯接线**。
+
+    第三条「合成指名连接行 + 双读兜底」需要 AstrBot 桩，在
+    `test_astrbot_bridge.WorksWriterBindingTests`；服务层怎么用它见
+    `test_works.WorksWiringTests`。这里钉的是不需要宿主就能验的两点：
+    配置页渲染成选择器（schema），以及请求真的带上 `works` 这个任务键
+    （`SIDE_TASK_ROUTES`——没有它，指名的 Provider 不会被用到）。
+    """
+
+    def schema(self) -> dict:
+        return json.loads((PLUGIN_ROOT / '_conf_schema.json').read_text(encoding='utf-8-sig'))
+
+    def test_the_key_becomes_a_provider_selector_without_changing_its_name_or_default(self):
+        field = self.schema()['works']['items']['model_id']
+        self.assertEqual(field['_special'], 'select_provider', '配置页才会渲染成 AstrBot 模型下拉框')
+        self.assertEqual(field['default'], '', '默认值不能动（留空 = 用默认 Provider）')
+        self.assertEqual(field['description'], '写手模型')
+
+    def test_the_hint_documents_both_spellings(self):
+        """两种填法都要写清，否则老用户不知道手填的值还算不算数。"""
+        hint = self.schema()['works']['items']['model_id']['hint']
+        self.assertIn('从 AstrBot 已配置的模型中选一个', hint)
+        self.assertIn('留空则用默认 Provider', hint)
+        self.assertIn('连接的 id / 模型名 / 标签', hint)
+
+    def test_the_side_task_carries_the_works_task_key(self):
+        """`_side_task_json` 的传输层任务键：`作品创作` 必须有独立的一条。
+
+        没有它就会落到默认的 `compaction` → 适配层读的是 `compaction_provider_id`，
+        用户给写手选的模型一次都不会被调用（"指名了也不生效"）。
+        """
+        self.assertEqual(SIDE_TASK_ROUTES['作品创作'], 'works')
 
 
 class WorkInstructionTests(unittest.TestCase):

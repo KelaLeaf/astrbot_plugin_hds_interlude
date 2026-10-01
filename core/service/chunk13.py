@@ -39,9 +39,10 @@
 
 from __future__ import annotations
 
-import base64
+import json
 import math
-from typing import Any, Mapping, Optional, Sequence
+from pathlib import Path
+from typing import Any, Mapping, Optional
 
 from ..endpoints import endpoint_account_key
 from ..qzone import (
@@ -56,7 +57,6 @@ from ..qzone import (
     normalize_qzone_feed_entry,
     normalize_qzone_msg_entry,
     probe_qzone_available,
-    qzone_cgi_auth,
     qzone_feed_candidates,
     qzone_intent_from_payload,
     qzone_records_for_endpoint,
@@ -85,13 +85,17 @@ QZONE_ERROR_MAX_CHARS = 500
 QZONE_AUTO_FEED_NOTE_INTERVAL_MS = 60 * 60 * 1000
 #: 剧本条目正文的截断长度（上游 `clip(content, 120)` / `clip(content, 80)`）。
 QZONE_POST_SUMMARY_CHARS = 120
-#: 改可见范围前回看多少条说说找"当前正文"（`emotion_cgi_update` 会按整条重建）。
+#: 改可见范围前回看多少条说说找"当前正文"（update 要把正文原样带回去），
+#: 以及改完之后回读校验时同样回看多少条。
 QZONE_VISIBILITY_LOOKUP_COUNT = 30
-#: 改带图说说的可见范围时，最多肯**重新上传**几张图（v1.7.7）。
+#: **改可见范围的跳闸标志**（落在插件数据目录，照 `action_permissions.json` 的做法）。
 #:
-#: 一条说说的相册上限就是 9 张；超过这个数不可能来自一条正常说说（列表被拼坏 /
-#: 字段被污染），此时**明确拒绝**而不是"只传前 9 张"——静默少传一张就是丢内容。
-QZONE_UPLOAD_MAX_PICS = 9
+#: 只有一种情况会写下它：回读校验实测到"改完可见范围后这条说说的**附件变少**"
+#: ——那就说明"富文本字段留空 = 不改动图片/视频"这个前提（见 §43 的 H1 裁定）
+#: 至少在这条说说不成立。此后**带附件**的说说一律拒绝改可见范围（纯文字不受影响），
+#: 直到用户**删掉这个文件**（日志里会写明路径与做法）。绝不允许静默毁第二条说说。
+QZONE_VISIBILITY_GUARD_FILE = 'qzone_visibility_guard.json'
+#: 回读校验比对附件时，附件 = 图片 + 视频（`parse_mood` 的 `pic` / `video`）。
 QZONE_COMMENT_SUMMARY_CHARS = 80
 
 _MILLISECONDS_PER_MINUTE = 60_000
@@ -611,21 +615,34 @@ class ServiceChunk13(ServiceBase):
     ) -> dict[str, Any]:
         """改一条**自己发的**说说的可见范围（v1.7.5，本移植版新增的动作）。
 
-        为什么这么绕（先读再写）：QZone 的 `emotion_cgi_update` 是"**编辑说说**"接口，
-        服务端按整条重建——只改可见性也要把**当前正文**原样带回去（`build_update_visibility_request`
-        对空正文直接抛错）。所以：
+        **只发可见性 + 既有字段，富文本字段照参考实现传空串**（v1.7.9 的 H1 裁定）。
 
-        1. 用 `moods`（说说列表）按 `tid` 找回当前正文；
-        2. **带配图的说说先把原图重新上传一遍**（v1.7.7）：图片不在正文里，而在上传时由服务端
-           生成的 `richval`（`albumid` / `lloc` / `sloc` / …）里，说说列表只回图片 URL，拿不回
-           那串原文——所以走"下载原图 → 重新上传 → 用新回执拼 `richval` → 带着它 update"
-           这条路。代价是**图片在腾讯侧变成新上传的副本**（地址与相册记录都换了，点赞 / 评论 /
-           发布时间不受影响），用户已知并接受；这一步成功与失败都留**看得见**的记录。
-           **上传链上任何一步没成（下载失败 / 上传失败 / 回执字段不全 / 张数超限）一律明确拒绝**，
-           绝不带着空 `richval` 硬发——那等于让服务端按残缺的富文本块重建，是静默丢图的入口。
-        3. **转发的说说直接拒绝**——转发目标（`rt_con` / `rt_tid`）同样没法从列表里还原；
-        4. 这条动作**只有** NapCat WS 通道能做（NapCat / SnowLuma 都没有原生动作），
-           拿不到 cookie 就明确失败，**不**回落平台。
+        参考实现的 `qzone_api/api/api_parms.py::build_edit_message_params` 就是**专门改可见
+        范围**的构造器（docstring：「tid 为说说 id；ugcright_id 取自说说列表里该条的
+        ``ugcright_id``」），而它的 `pic_template` / `richtype` / `richval` / `subrichtype` /
+        `special_url` **全是空串**——即"**空串 = 不改动富文本**"，服务端只更新给到的那几个
+        字段。v1.7.7 / v1.7.8 那套"下载原图 → 逐张重新上传 → 用新回执拼 `richval`"是建立在
+        "`emotion_cgi_update` 按整条重建"这个**推断**上的，它**有副作用**（腾讯侧变成新副本、
+        原图 URL 换掉、混排的视频会丢），已整条删除。证据原文与裁定过程见
+        `docs/PORTING_NOTES.md` §43。
+
+        步骤：
+
+        1. 用 `moods`（说说列表）按 `tid` 找回这条说说——正文要原样带回去（`con` 是参考实现
+           里**必带**的字段，空正文等于把正文清掉，所以读不回来就拒绝）；
+        2. **转发的说说继续拒绝**（`rt_tid` 非空）：编辑的字段清单里**没有** `rt_con` /
+           `rt_tid` 这一组，转发目标还原不了，宁可不做（这条与本轮的 H1 无关，是"我们手上
+           根本没有重建转发所需的字段"）；
+        3. 过**跳闸门**（见下）与正文非空检查，再发 update；
+        4. update 成功后**立刻回读这条说说**，比对附件（图片数 / 视频数）与正文——这是
+           **观测**，不是猜测：H1 成不成立，每改一次就当场验一次。
+
+        **跳闸（`QZONE_VISIBILITY_GUARD_FILE`）**：一旦回读发现附件变少，就落一个持久标志，
+        此后带附件的说说一律拒绝改可见范围（纯文字不受影响），直到用户删掉那个文件——
+        "绝不允许静默毁第二条说说"。上次的 tid / 时间 / 解除办法都写在日志与拒绝理由里。
+
+        这条动作**只有** NapCat WS 通道能做（NapCat / SnowLuma 都没有原生动作），
+        拿不到 cookie 就明确失败，**不**回落平台。
 
         成功会：写剧本条目（她自己记得改了谁能看）+ 审计行 `confirmed` + 一条标准日志。
         """
@@ -646,7 +663,7 @@ class ServiceChunk13(ServiceBase):
                 '改一条说说的可见范围只能走 NapCat WebSocket 通道（QZone 的 '
                 'emotion_cgi_update），当前传输层没有这个能力。'
             )
-        # ① 找回当前正文（列表接口按 tid 精确命中；找不到就不敢改）。
+        # ① 找回这条说说（列表接口按 tid 精确命中；找不到就不敢改）。
         lookup = await self.qzone_read(
             story, 'moods', {'targetUin': account_self_id, 'count': QZONE_VISIBILITY_LOOKUP_COUNT},
         )
@@ -666,135 +683,213 @@ class ServiceChunk13(ServiceBase):
                 '不带上正文直接改会把正文清掉，所以这次不做。' % QZONE_VISIBILITY_LOOKUP_COUNT
             )
         if str(pick(post, 'rt_tid') or '').strip():
-            # 这条判断**必须在重新上传之前**：转发说说一样会被拒，而重传是**有副作用的**
-            # （腾讯侧真的多出一张副本）——先拒后传，别白传一趟。
             return await fail(
-                '这条是转发的说说：接口要求把整条说说重建回去，转发目标没法还原，所以不做。'
+                '这条是转发的说说：编辑的字段清单里没有转发目标（rt_con / rt_tid）那一组，'
+                '转发没法还原，所以不做。'
             )
-        pics = _rows(pick(post, 'pic'))
-        richval = ''
-        pic_bo = ''
-        shared_auth: Any = None
-        if pics:
-            # 带图：先把原图重新上传一遍，拿到新 `richval` 再 update（见方法 docstring）。
-            if len(pics) > QZONE_UPLOAD_MAX_PICS:
-                return await fail(
-                    '这条说说读回 %d 张配图，超过一条说说最多 %d 张的上限（列表数据可能被拼坏）：'
-                    '不敢猜哪几张是真的，所以不做。' % (len(pics), QZONE_UPLOAD_MAX_PICS)
-                )
-            try:
-                # 取一次凭据给整条链（N 张上传 + 一次 update）复用，省掉 N 次 get_cookies。
-                shared_auth = await qzone_cgi_auth(self._qzone_call_onebot())
-            except Exception as error:  # noqa: BLE001 - 拿不到凭据 = 这一步没成，明确拒绝
-                return await fail(
-                    '这条说说配了图：改可见范围前要把原图重新上传一次，但拿不到 QZone 凭证（%s），'
-                    '所以不做。' % error
-                )
-            richval, pic_bo, problem = await self._qzone_reupload_images(request, shared_auth, pics)
-            if not richval:
-                return await fail(
-                    '这条说说配了 %d 张图：接口要求把整条说说重建回去，原图的 `richval` 只能'
-                    '靠"重新上传一次"拿到，而这一步没成（%s）。为了不把图弄丢，这次不做。'
-                    % (len(pics), problem)
-                )
+        before_pics = len(_rows(pick(post, 'pic')))
+        before_videos = len(_rows(pick(post, 'video')))
+        # 跳闸门：上一次实测到"改完附件变少"之后，带附件的说说一律不碰（纯文字照常）。
+        guard = self._qzone_visibility_guard_reason()
+        if guard and (before_pics or before_videos):
+            return await fail(
+                '这条说说带 %d 个附件（图片 %d / 视频 %d），而**上一次**改可见范围时实测到附件'
+                '被删——在弄清原因前，带附件的说说一律不改（纯文字说说不受影响）。%s'
+                % (before_pics + before_videos, before_pics, before_videos, guard)
+            )
         content = str(pick(post, 'content') or '')
         if not content.strip():
             return await fail('这条说说读回来的正文是空的，不敢拿空正文去改（会把正文清掉）。')
-        # ② 改可见范围（NapCat WS 通道；`QzoneCgiUnavailable` / CGI 失败由外层
-        #    统一记 failed / unknown——"请求可能已到达"不自动重试）。
-        update_params: dict[str, Any] = {
-            'tid': tid, 'content': content, 'ugcRight': right, 'targetUins': target_uins,
-        }
-        if richval:
-            update_params['richval'] = richval
-            if pic_bo:
-                update_params['pic_bo'] = pic_bo
+        # ② 改可见范围（NapCat WS 通道；只发可见性 + 既有字段，富文本字段照参考实现留空）。
+        #    `QzoneCgiUnavailable` / CGI 失败由外层统一记 failed / unknown——"请求可能已
+        #    到达"不自动重试。
         await call_qzone_cgi(
-            request, self._qzone_call_onebot(), 'update_visibility', update_params,
-            auth=shared_auth,
+            request, self._qzone_call_onebot(), 'update_visibility',
+            {'tid': tid, 'content': content, 'ugcRight': right, 'targetUins': target_uins},
         )
         self.report_standalone('debug', 'QQ 空间动作走 NapCat WS 通道 动作=update_visibility')
         await self._qzone_set_status(pending_id, {
             'tid': tid, 'status': 'confirmed', 'postedAt': self.now(),
         })
-        if pics:
-            # 这是一笔**代价**（图片在腾讯侧变成新副本、地址与相册记录都换了），必须让用户
-            # 看得见——按坑 25 的口径走 warn，别塞进 diagnostic/debug。
+        # ③ 回读校验（**观测**，不是猜测）：H1 说"留空富文本字段 = 附件与正文原样保留"，
+        #    那就每改一次当场验一次；不成立时把代价写进日志与剧本条目，并落下跳闸标志。
+        try:
+            readback, note = await self._qzone_visibility_readback(
+                story, account_self_id, tid, (before_pics, before_videos, content),
+            )
+        except Exception as error:  # noqa: BLE001 - 校验自己崩了不该影响"改已成功"这件事
+            readback, note = 'unverified', '回读校验自身出错：%s' % error
+        if readback == 'lost':
+            # 按坑 25 的口径走 warn：这是**丢内容**，必须让用户看得见。
             self.report_standalone(
                 'warn',
-                'QQ 空间改可见范围：这条说说配了 %d 张图，已把原图**重新上传**一遍'
-                '（腾讯侧变成新上传的副本，图片地址已换）再重建了说说 tid=%s',
-                len(pics), tid,
+                'QQ 空间改可见范围的**回读校验不通过**：%s（tid=%s）。'
+                '「富文本字段留空 = 不改动图片 / 视频」这个前提在这条说说不成立，'
+                '请检查这条说说的配图是否被删。%s',
+                note, tid, self._qzone_visibility_trip_guard(tid, now, note),
+            )
+        elif readback == 'changed':
+            self.report_standalone(
+                'warn',
+                'QQ 空间改可见范围的**回读校验不通过**：%s（tid=%s）。'
+                '请检查这条说说 tid=%s。',
+                note, tid, tid,
+            )
+        elif readback == 'unverified':
+            self.report_standalone(
+                'warn',
+                'QQ 空间改可见范围已完成，但**回读校验没做成**（%s），无法确认附件还在不在：'
+                '请自行看一眼这条说说 tid=%s。',
+                note, tid,
+            )
+        else:
+            self.report_standalone(
+                'debug',
+                'QQ 空间改可见范围回读校验通过 tid=%s（改前附件 %d 图 / %d 视频，H1 当场成立）',
+                tid, before_pics, before_videos,
             )
         # 改的是"谁能看见"，对这段关系是有意义的事，所以进剧本（评论/点赞那种过细的才不进）。
         metadata: dict[str, Any] = {'qzone_kind': 'visibility', 'tid': tid, 'ugc_right': right}
-        if pics:
-            # 事后追溯用：这条说说的配图被重新上传过（不是原图记录了）。
-            metadata['qzone_images_reuploaded'] = len(pics)
+        if readback == 'lost':
+            # 事后追溯用：这条说说的附件在改可见范围时变少了（H1 不成立的那一次）。
+            metadata['qzone_visibility_attachment_loss'] = True
         await self.append_entry(story_id, {
             'kind': 'system', 'actor': 'character',
-            'content': '[空间动态] 她把说说的可见范围改成了「%s」：%s%s' % (
+            'content': '[空间动态] 她把说说的可见范围改成了「%s」：%s' % (
                 label, clip(content, QZONE_POST_SUMMARY_CHARS),
-                '（配图 %d 张已重新上传为新副本）' % len(pics) if pics else '',
             ),
             'occurredAt': iso(now),
             'metadata': metadata,
         }, now)
         self.report_operation(
             'standard', 'info', story, 'user-message',
-            'QQ 空间说说可见范围已改 tid=%s 可见性=%s（%s）%s', tid, right, label,
-            '配图 %d 张已重新上传' % len(pics) if pics else '',
+            'QQ 空间说说可见范围已改 tid=%s 可见性=%s（%s）', tid, right, label,
         )
         return {'ok': True, 'tid': tid, 'error': ''}
 
-    async def _qzone_reupload_images(
-        self, request: Any, auth: Any, pics: Sequence[Any],
-    ) -> tuple[str, str, str]:
-        """把这条说说原来的配图**重新上传**一遍，拼出新的 `richval` / `pic_bo`（v1.7.7）。
+    async def _qzone_visibility_readback(
+        self, story: Any, account_self_id: str, tid: str, before: tuple[int, int, str],
+    ) -> tuple[str, str]:
+        """update 之后**回读这条说说**，比对附件与正文（v1.7.9 的观测点）。
 
-        为什么非要重传：`emotion_cgi_update` 按整条重建，而图片不在正文里——它在**上传时**
-        由服务端生成的 `richval`（`albumid` / `lloc` / `sloc` / …）里，说说列表只回图片 URL，
-        拿不回那串原文。于是"下载原图 → 重新上传 → 用新回执拼 richval"。
+        `before` 是改之前的 `(图片数, 视频数, 正文)`。返回 `(状态, 说明)`：
 
-        返回 `(richval, pic_bo, 原因)`：`richval` 非空才算成功；失败时第三项是**给人看的
-        具体原因**（第几张、哪一步、什么错），由调用方写进审计行与 warn。
-        任何一步失败都立即回头，**绝不**"少一张也照发"——少一张就是静默丢内容。
+        * `ok`——附件与正文都对得上（H1 当场被证实）；
+        * `lost`——**附件变少**（图片或视频少了）：这是事故，调用方据此告警 + 跳闸；
+        * `changed`——附件没少但正文对不上（同样要告警，但不属于"附件被删"那条跳闸规则）；
+        * `unverified`——回读本身没成（读失败 / 最近 N 条里找不到它）：**不改判** update 的成败，
+          只说明这次没验成，调用方打一条 warn 让用户自己看一眼。
 
-        多图按参考实现（`build_image_richval`）逐张拼、`\\t` 连接，组图与单图同一条路径；
-        `QZONE_UPLOAD_MAX_PICS` 以上的张数由调用方提前拒绝（这里不再截断）。
+        **为什么要有它**：「空富文本字段 = 不改动附件」来自参考实现的参数清单，是**推断**而非
+        抓包；回读把它变成"每改一次就实测一次"。附件的口径 = 图片（`pic`）+ 视频（`video`）
+        ——视频不在正文里，只在 `parse_mood` 的 `video` 里，所以两个都要数。
         """
-        from ..qzone_cgi import build_image_richval
-
-        fetch = getattr(getattr(self, 'transport', None), 'fetch_image', None)
-        if not callable(fetch):
-            return '', '', '当前传输层没有下载图片的能力（fetch_image）'
-        receipts: list[Any] = []
-        for index, pic in enumerate(pics, start=1):
-            url = str(pick(pic, 'url', 'url1') or pick(pic, 'smallurl') or '').strip()
-            if not url:
-                return '', '', '第 %d 张图的地址是空的' % index
-            try:
-                raw = await fetch(url)
-            except Exception as error:  # noqa: BLE001 - 下载失败一律转成"这一步没成"
-                return '', '', '第 %d 张图下载失败：%s' % (index, error)
-            if not isinstance(raw, (bytes, bytearray)):
-                return '', '', '第 %d 张图下载失败（没拿到字节）' % index
-            try:
-                receipt = await call_qzone_cgi(
-                    request, self._qzone_call_onebot(), 'upload_image',
-                    {'picBase64': base64.b64encode(bytes(raw)).decode('ascii')},
-                    auth=auth,
-                )
-            except Exception as error:  # noqa: BLE001
-                return '', '', '第 %d 张图重新上传失败：%s' % (index, error)
-            receipts.append(receipt)
-        rich = build_image_richval(receipts)
-        if not rich:
-            return '', '', (
-                '上传回执里缺少拼 richval 需要的字段'
-                '（albumid/lloc/sloc/type/height/width）'
+        before_pics, before_videos, before_content = before
+        try:
+            lookup = await self.qzone_read(
+                story, 'moods',
+                {'targetUin': account_self_id, 'count': QZONE_VISIBILITY_LOOKUP_COUNT},
             )
-        return str(rich.get('richval') or ''), str(rich.get('pic_bo') or ''), ''
+        except Exception as error:  # noqa: BLE001 - 读不到 ≠ 改失败
+            return 'unverified', '回读失败：%s' % error
+        if not (isinstance(lookup, Mapping) and lookup.get('ok')):
+            return 'unverified', '回读失败：%s' % (
+                (lookup.get('error') if isinstance(lookup, Mapping) else '') or '未知原因'
+            )
+        post: Any = None
+        for row in _rows(lookup.get('posts') if isinstance(lookup, Mapping) else None):
+            if str(pick(row, 'tid') or '') == tid:
+                post = row
+                break
+        if post is None:
+            return 'unverified', '回读时在最近 %d 条里没找到这条说说' % QZONE_VISIBILITY_LOOKUP_COUNT
+        after_pics = len(_rows(pick(post, 'pic')))
+        after_videos = len(_rows(pick(post, 'video')))
+        after_content = str(pick(post, 'content') or '')
+        problems: list[str] = []
+        if after_pics < before_pics:
+            problems.append('配图从 %d 张变成 %d 张' % (before_pics, after_pics))
+        if after_videos < before_videos:
+            problems.append('视频从 %d 个变成 %d 个' % (before_videos, after_videos))
+        if after_content.strip() != before_content.strip():
+            problems.append('正文对不上（改前 %d 字 → 改后 %d 字）' % (
+                len(before_content.strip()), len(after_content.strip()),
+            ))
+        if not problems:
+            return 'ok', ''
+        if after_pics < before_pics or after_videos < before_videos:
+            return 'lost', '；'.join(problems)
+        return 'changed', '；'.join(problems)
+
+    def _qzone_visibility_guard_path(self) -> Optional[Path]:
+        """跳闸标志文件（`<数据目录>/qzone_visibility_guard.json`）的路径。
+
+        数据目录按**生产上真的挂着的那一个**取：`ServiceBase.__init__` 存的是 `self.ctx`
+        （`chunk2` 读表情库目录就是这么取的 `getattr(self.ctx, 'base_dir', '')`），
+        `self.context` 在生产里**根本不存在**（那是适配层 `AstrbotInterludeContext` 自己的
+        属性，指的是宿主 Context，core 拿不到）。顺序：`ctx.base_dir` → 宿主注入的
+        `context.base_dir`（单测的裸宿主常这么塞）→ 自己的 `base_dir`。
+
+        一个数据目录都拿不到就回 `None` = 跳闸机制不生效——写不下去的时候，宁可照常做
+        也不能凭空把动作锁死。
+        """
+        for holder in (getattr(self, 'ctx', None), getattr(self, 'context', None), None):
+            base = getattr(self, 'base_dir', '') if holder is None else getattr(holder, 'base_dir', '')
+            if base:
+                return Path(str(base)) / QZONE_VISIBILITY_GUARD_FILE
+        return None
+
+    def _qzone_visibility_guard_reason(self) -> str:
+        """跳闸是否生效：生效就回"给用户看的上一回事故 + 解除办法"，否则回空串。
+
+        判定只看一个字段：文件里的 `attachmentLoss` 为真。**文件不存在 / 空文件 / 坏 JSON
+        一律当"没跳闸"**——用户的解除办法就是删掉或清空它，不能因为一个手改坏的文件把
+        整条动作永久锁死（坏 JSON 会留一条 warn 说明"这次按没跳闸处理"）。
+        """
+        path = self._qzone_visibility_guard_path()
+        if path is None:
+            return ''
+        try:
+            raw = path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            return ''
+        except Exception as error:  # noqa: BLE001 - 读不到就当没跳闸，但要留痕
+            self.report_standalone(
+                'warn', '改可见范围的跳闸标志读取失败（本次按未跳闸处理）：%s', error,
+            )
+            return ''
+        data: Any = {}
+        if raw.strip():
+            try:
+                data = json.loads(raw)
+            except Exception as error:  # noqa: BLE001
+                self.report_standalone(
+                    'warn', '改可见范围的跳闸标志不是合法 JSON（本次按未跳闸处理）：%s', error,
+                )
+                return ''
+        if not (isinstance(data, Mapping) and data.get('attachmentLoss')):
+            return ''
+        return (
+            '上次在 tid=%s 上实测到附件被删（%s）；要恢复对带附件说说的操作，'
+            '删掉文件 %s 即可' % (
+                data.get('tid') or '未知', data.get('detectedAt') or '时间未知', path,
+            )
+        )
+
+    def _qzone_visibility_trip_guard(self, tid: str, now: Any, note: str) -> str:
+        """落下跳闸标志（只在**实测到附件变少**时调）。回一句给日志看的话（写没写成都说清）。"""
+        path = self._qzone_visibility_guard_path()
+        if path is None:
+            return ''
+        payload = {
+            'attachmentLoss': True, 'tid': tid, 'detectedAt': iso(now), 'detail': note,
+        }
+        try:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as error:  # noqa: BLE001 - 写不下去也必须让用户知道，别静默
+            self.report_standalone('warn', '改可见范围的跳闸标志写不下去（%s）：%s', path, error)
+            return ''
+        return '已跳闸：以后带附件的说说一律拒绝改可见范围（恢复：删掉 %s）' % path
 
     async def qzone_available(self, prefer_self_id: str = '') -> bool:
         """通道能力探测（上游 `qzoneAvailable`，只读）：`get_qzone_msg_list` 通不通。"""

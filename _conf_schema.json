@@ -2827,7 +2827,8 @@
         "type": "string",
         "description": "写手模型",
         "default": "",
-        "hint": "只有\"另起写手\"模式用；留空则用默认 Provider。"
+        "_special": "select_provider",
+        "hint": "从 AstrBot 已配置的模型中选一个承担共同作品的独立写作；留空则用默认 Provider（主叙事连接）。只有\"另起写手\"模式用；也可以填模型中心里某条连接的 id / 模型名 / 标签。"
       }
     }
   },

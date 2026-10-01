@@ -1155,6 +1155,39 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await silent.describe_images(images))
 
 
+class SideTaskRouteTests(unittest.IsolatedAsyncioTestCase):
+    """`SIDE_TASK_ROUTES`：侧任务带下去的**传输层任务键**。
+
+    这个键直接决定宿主用哪个 AstrBot Provider（`AstrbotHttpClient._chat` 按它读
+    `task_model_id`），所以它属于接线，不是日志字段。v1.7.9：共同作品的独立写手有
+    自己的一条（`作品创作 → works`）——没有它，写手请求会带着默认的 `compaction`
+    去问宿主要压缩模型，用户在「写手模型」里选的那个一次都不会被用到。
+    """
+
+    async def _post_side_task(self, task):
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '草稿'}}]}])
+        client = OpenAICompatibleNarrator(http, make_config(), silent_logs=True)
+
+        def build_body(capped):  # noqa: ARG001 - 这里只关心任务键
+            return {'model': 'm1', 'messages': [{'role': 'user', 'content': '写点什么'}]}
+
+        text = await client._side_task_json(  # noqa: SLF001 - 就是被测的那个旁路入口
+            make_provider(), 'm1', task, None, build_body, lambda raw: raw,
+        )
+        return text, http.posts[0]
+
+    async def test_the_works_writer_carries_the_works_task_key(self):
+        text, post = await self._post_side_task('作品创作')
+        self.assertEqual(text, '草稿')
+        self.assertEqual(post['task'], 'works')
+
+    async def test_tasks_without_their_own_route_still_fall_back_to_compaction(self):
+        """上游 timeline / 日程预排 / Overlay 整理都跟随压缩（不要顺手给它们各开一条）。"""
+        for task in ('压缩', '时间导演', '日程预排', 'Overlay 整理'):
+            _text, post = await self._post_side_task(task)
+            self.assertEqual(post['task'], 'compaction', task)
+
+
 class EmbedderClientTests(unittest.IsolatedAsyncioTestCase):
     def make_embedding_config(self, **overrides):
         config = make_config(

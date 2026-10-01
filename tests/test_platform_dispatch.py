@@ -29,6 +29,28 @@ from plugin.core.service.chunk12 import ServiceChunk12  # noqa: E402
 ANCHOR = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
 
 
+class _HostContext:
+    """最小 ctx，持有点与签名都照**生产**来。
+
+    `ServiceBase.__init__` 存的是 `self.ctx`（`test_astrbot_bridge` 里那句
+    `assertIs(bridge.service.ctx, bridge.interlude_context)` 就是它），而 `set_timeout`
+    在生产上的签名是 **`(callback, delay_ms)` 两个参数**（`core.service.base.InterludeContext`）。
+
+    这里刻意不收 `*args`：夹具多收一个参数，就等于把"多传参数"这类错误一起藏起来——
+    v1.7.8 加的两条兜底定时器正是这样被 `except Exception` 吞掉的（属性名错 + 参数个数错，
+    两个错一个都测不出来）。下面有 `test_the_fixture_ctx_matches_the_production_signature`
+    把签名钉死。
+    """
+
+    def __init__(self, base_dir: str, timers: list) -> None:
+        self.base_dir = base_dir
+        self._timers = timers
+
+    def set_timeout(self, callback, delay_ms):
+        self._timers.append((callback, delay_ms))
+        return None
+
+
 class _Host(ServiceChunk12):
     """最小宿主：只实现 chunk12 用到的底座（不碰真实 service 的其它分块）。"""
 
@@ -41,37 +63,30 @@ class _Host(ServiceChunk12):
         self.intents: list[dict] = []
         self.commands: list[dict] = []
         self.reports: list[tuple[str, str]] = []
-        #: 排出去的定时器 `(callback, delay_ms, args)`——测试里手动触发（分段气泡的
+        #: 排出去的定时器 `(callback, delay_ms)`——测试里手动触发（分段气泡的
         #: "到点才点亮"就是靠它）。
         self.timers: list[tuple] = []
         self._next_id = 0
         self._random = 0.5
         self._now = ANCHOR
-        self._base_dir = base_dir
+        #: **生产同名**的持有点（`self.ctx`）。早期这里造的是 `self.context`——core 里
+        #: 根本不存在的属性，于是权限表与两条兜底定时器一起静默失效、测试却全绿。
+        self.ctx = _HostContext(base_dir, self.timers)
 
     # ---- 底座 ----
-    @property
-    def context(self):
-        host = self
-
-        class _Ctx:
-            base_dir = host._base_dir
-
-            @staticmethod
-            def set_timeout(callback, delay_ms, *args):
-                host.timers.append((callback, delay_ms, args))
-                return None
-
-        return _Ctx()
+    @staticmethod
+    def _callback_name(callback) -> str:
+        """`functools.partial` 也认（排定时器时参数是 core 自己绑的）。"""
+        return getattr(getattr(callback, 'func', callback), '__name__', '')
 
     def fire_timers(self, callback_name: str = '') -> None:
         """触发已排的定时器（可选只挑某个回调名），模拟宿主到点回调。"""
         pending, self.timers = self.timers, []
-        for callback, _delay, args in pending:
-            if callback_name and getattr(callback, '__name__', '') != callback_name:
-                self.timers.append((callback, _delay, args))
+        for callback, _delay in pending:
+            if callback_name and self._callback_name(callback) != callback_name:
+                self.timers.append((callback, _delay))
                 continue
-            callback(*args)
+            callback()
 
     def now(self):
         return self._now
@@ -241,6 +256,81 @@ class SwitchAndPermissionTests(unittest.TestCase):
             host = _Host(base_dir=folder)
             self.assertEqual(host.action_permission_table(), {})
 
+    # ------------------------------------------------------------------ #
+    # v1.7.9：权限表**真的生效**（读的是生产持有点 `ctx`，不是夹具造出来的属性）
+    # ------------------------------------------------------------------ #
+
+    def test_the_users_permission_table_really_beats_the_catalog_default(self):
+        """写一份 `action_permissions.json` → 读出来 → 档位判定按**表里的**，不是目录默认。
+
+        这条是 v1.7.9 的核心回归：`action_permission_table()` 曾读 `self.context`
+        ——core 里根本不存在的属性（生产存的是 `ctx`）→ 恒回空表 → 控制台「动作」页
+        写的权限表在运行期被完全忽略。夹具当时也造了同名的假属性，所以测试全绿。
+        """
+        # ① 危险动作：目录默认 disabled，表里写 global → 真的放行
+        folder = self._write_permissions({'set_group_kick': 'global'})
+        host = _Host(config={'actions_group': {'enabled': True, 'set_group_kick': True}}, base_dir=folder)
+        table = host.action_permission_table()
+        self.assertEqual(table, {'set_group_kick': 'global'}, '权限表必须真的读出来')
+        self.assertEqual(pa.permission_for('set_group_kick', table), 'global', '读到的是表里的档')
+        self.assertTrue(pa.resolve_permission('set_group_kick', table, True, 'admin'))
+        self.assertEqual(
+            pa.permission_for('set_group_kick'), 'disabled',
+            '对照：不读表时就是目录默认档（表真的在起作用，不是"本来就放行"）',
+        )
+        self.assertIn('set_group_kick', host.available_platform_actions('', ('group',), table))
+        self.assertEqual(host.risky_actions_in_use(), ['set_group_kick'])
+
+        # ② 反方向：默认 global 的动作被表里降到 disabled → 真的拦住
+        downgraded = _Host(base_dir=self._write_permissions({'send_poke': 'disabled'}))
+        down_table = downgraded.action_permission_table()
+        self.assertEqual(pa.permission_for('send_poke', down_table), 'disabled')
+        self.assertFalse(pa.resolve_permission('send_poke', down_table, None, ''))
+        self.assertNotIn('send_poke', downgraded.available_platform_actions('', ('private',), down_table))
+        self.assertIn('send_like', downgraded.available_platform_actions('', ('private',), down_table),
+                      '同一条链上没被点名的动作照旧')
+
+    def test_the_data_dir_is_read_from_the_production_ctx_holder(self):
+        """三种情形都要有定义，且**绝不抛**：`ctx.base_dir` / `ctx` 没 `base_dir` / 没 `ctx`。
+
+        `ctx` 是生产持有点（`ServiceBase.__init__` 的 `self.ctx`）；`context` 只是
+        宿主注入的兜底、`self.base_dir` 是最后一档。一个都拿不到 = 回落空表（目录默认档），
+        不是异常。
+        """
+        import types
+
+        folder = self._write_permissions({'set_group_kick': 'global'})
+        # ① ctx.base_dir（生产形状，主断言走这条）
+        prod = _Host(base_dir=folder)
+        self.assertEqual(prod.interlude_data_dir(), folder)
+        self.assertEqual(prod.action_permission_table(), {'set_group_kick': 'global'})
+        # ② ctx 存在但没有 base_dir → 退到宿主注入的 context.base_dir
+        partial = _Host(base_dir=folder)
+        partial.ctx = types.SimpleNamespace()  # 没有 base_dir
+        partial.context = types.SimpleNamespace(base_dir=folder)
+        self.assertEqual(partial.interlude_data_dir(), folder)
+        self.assertEqual(partial.action_permission_table(), {'set_group_kick': 'global'})
+        # ③ 完全没有 ctx / context → 自己的 base_dir
+        bare = _Host()
+        del bare.ctx
+        bare.base_dir = folder
+        self.assertEqual(bare.interlude_data_dir(), folder)
+        self.assertEqual(bare.action_permission_table(), {'set_group_kick': 'global'})
+        # ④ 一个都没有 → 空表、不抛
+        orphan = _Host()
+        del orphan.ctx
+        self.assertEqual(orphan.interlude_data_dir(), '')
+        self.assertEqual(orphan.action_permission_table(), {})
+
+    def test_a_missing_permission_file_is_silent_and_never_raises(self):
+        """缺文件 = 空表、**不**告警（没配过权限表是正常状态）；坏文件才有 warn。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            host = _Host(base_dir=folder)
+            self.assertEqual(host.action_permission_table(), {})
+            self.assertEqual(host.reports, [], '没写过权限表不算异常')
+
     @staticmethod
     def _write_permissions(table):
         import tempfile, os, json as _json
@@ -249,6 +339,37 @@ class SwitchAndPermissionTests(unittest.TestCase):
         with open(os.path.join(folder, 'action_permissions.json'), 'w', encoding='utf-8') as handle:
             _json.dump(table, handle)
         return folder
+
+
+class ProductionHostAlignmentTests(unittest.TestCase):
+    """夹具必须用**生产写入方**的写法（坑 46 的同一条纪律）。
+
+    早期 `_Host` 造的是 `self.context` = core 里根本不存在的属性名，于是权限表与两条
+    兜底定时器一起静默失效、测试照样全绿。这里把"夹具的 ctx 与生产同签名"钉死，
+    下次谁再改夹具的签名就会当场红。
+    """
+
+    def test_the_fixture_ctx_matches_the_production_signature(self):
+        import inspect
+
+        from plugin.core.service.base import InterludeContext
+
+        production = inspect.signature(InterludeContext.set_timeout)
+        fixture = inspect.signature(_HostContext.set_timeout)
+        self.assertEqual(
+            [(p.name, p.kind, p.default) for p in fixture.parameters.values()],
+            [(p.name, p.kind, p.default) for p in production.parameters.values()],
+            '夹具的 ctx.set_timeout 必须与生产同签名（多收 *args 会把"多传参数"藏起来）',
+        )
+        self.assertFalse(
+            any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in fixture.parameters.values()),
+            '生产不收 *args：夹具也不许收',
+        )
+
+    def test_the_fixture_holds_the_ctx_attribute_production_actually_sets(self):
+        host = _Host()
+        self.assertTrue(hasattr(host, 'ctx'), '生产持有点是 ctx（ServiceBase.__init__）')
+        self.assertFalse(hasattr(host, 'context'), '夹具不许再造生产里不存在的持有点')
 
 
 class DispatchTests(unittest.IsolatedAsyncioTestCase):
@@ -693,7 +814,7 @@ class TypingIndicatorTests(unittest.IsolatedAsyncioTestCase):
             [typing for _t, typing in transport.status], [True],
             '窗口还没开始：这条气泡此刻不许点亮',
         )
-        delayed = [item for item in host.timers if getattr(item[0], '__name__', '') == '_typing_light_later']
+        delayed = [item for item in host.timers if host._callback_name(item[0]) == '_typing_light_later']
         self.assertEqual(len(delayed), 1, '正好排了一条"到点才点亮"')
         self.assertEqual(delayed[0][1], 900)
         host.fire_timers('_typing_light_later')
@@ -702,6 +823,99 @@ class TypingIndicatorTests(unittest.IsolatedAsyncioTestCase):
             [typing for _t, typing in transport.status], [True, True],
             '第 2 条气泡的窗口开始时才点亮',
         )
+
+    # ------------------------------------------------------------------ #
+    # v1.7.9：两条兜底定时器**真的注册了**（不是"没抛异常就算过"）
+    # ------------------------------------------------------------------ #
+
+    async def test_both_fallback_timers_are_really_registered_on_the_production_ctx(self):
+        """**v1.7.9 回归**：`begin_typing(delay_ms>0)` 的"到点才点亮"与 `_light_typing`
+        的"兜底熄灭"都必须排到 `ctx.set_timeout` 上。
+
+        这两处原先写的是 `self.context.set_timeout(...)`——core 里没有 `context`（生产是
+        `ctx`），而且多传了两个参数（生产签名只有 `(callback, delay_ms)`）→ 两个错都被
+        `except Exception` 吞掉，兜底定时器在生产里**从来没跑过**。夹具当时也造了 `context`
+        并多收 `*args`，所以全绿。这里按**精确的**形状断言，不看"有没有抛"。
+        """
+        transport = _Transport()
+        host = self._host(transport, {'input_status': {
+            'enabled': True, 'min_visible_ms': 0, 'beat_chance': 0,
+        }})
+        session = {'userId': '1', 'groupId': ''}
+        self.assertIs(host.timer_host(), host.ctx, '排定时器要用生产持有点 ctx')
+
+        # ① 到点才点亮
+        self.assertTrue(await host.begin_typing(session, 900, delay_ms=900))
+        lit_later = [item for item in host.timers if host._callback_name(item[0]) == '_typing_light_later']
+        self.assertEqual(len(lit_later), 1, '"到点才点亮"必须真的排出去')
+        self.assertEqual(lit_later[0][1], 900, '延迟 = 这条气泡自己的窗口起点')
+
+        # ② 兜底熄灭：延迟 = 预期打字时长 + 30s，至少 5s
+        self.assertTrue(await host.begin_typing(session, 1234, delay_ms=0))
+        clear = [item for item in host.timers if host._callback_name(item[0]) == '_clear_typing_later']
+        self.assertEqual(len(clear), 1, '"兜底熄灭"必须真的排出去')
+        self.assertEqual(clear[0][1], 1234 + 30_000)
+        self.assertEqual(len(host._typing_lit()), 1, '点亮状态已登记（end_typing 与兜底共用）')
+
+        # ③ 到点触发：兜底熄灭**真的把灯熄了**（不只是"注册了"）
+        before = len(transport.status)
+        host.fire_timers('_clear_typing_later')
+        await asyncio.sleep(0.01)
+        self.assertEqual(host._typing_lit(), {}, '兜底触发后不该还挂着"点亮中"')
+        self.assertEqual(len(transport.status), before + 1, '兜底触发必须真的发一次平台调用')
+        self.assertIs(transport.status[-1][1], False, '兜底定时器必须真的发出"停止输入"')
+
+    async def test_a_host_without_any_timer_holder_degrades_quietly(self):
+        """没有能排定时器的持有点（裸宿主）：不抛、不点亮、投递照旧。
+
+        "拿不到就回落"是这两处的既有语义（定时器只是锦上添花），但**状态登记**这条
+        不能跟着一起丢：`_light_typing` 照旧工作，只是少一层兜底。
+        """
+        transport = _Transport()
+        host = self._host(transport, {'input_status': {'enabled': True, 'min_visible_ms': 0}})
+        del host.ctx
+        self.assertIsNone(host.timer_host())
+        session = {'userId': '1', 'groupId': ''}
+        self.assertFalse(await host.begin_typing(session, 500, delay_ms=500), '排不了就不算点亮')
+        self.assertEqual(host.timers, [])
+        # 立刻点亮这条路不依赖定时器
+        self.assertTrue(await host.begin_typing(session, 500))
+        self.assertEqual([typing for _t, typing in transport.status], [True])
+        self.assertEqual(len(host._typing_lit()), 1)
+        await host.end_typing(session)
+        self.assertEqual([typing for _t, typing in transport.status], [True, False])
+
+    async def test_the_fake_ctx_no_longer_accepts_extra_arguments(self):
+        """夹具的 `set_timeout` 与生产同签名：多传参数**当场** TypeError。
+
+        这条把"测试替身比生产宽容"这条老毛病钉死——夹具宽容一次，生产就静默失效一次。
+        """
+        host = _Host()
+        with self.assertRaises(TypeError):
+            host.ctx.set_timeout(host._typing_light_later, 1, {'user_id': '1'}, 0)
+
+    async def test_the_real_interlude_context_really_lights_on_time(self):
+        """**端到端（不换替身）**：把 `ctx` 换成生产真品 `InterludeContext`。
+
+        前面的用例用的是与生产同签名的夹具；这一条干脆用**生产对象本身**跑一遍"到点才点亮"，
+        证明 `ctx.set_timeout` 这条链子在真实实现上真的会到点回调（真写的 `asyncio.call_later`）。
+        """
+        from plugin.core.service.base import InterludeContext
+
+        transport = _Transport()
+        host = self._host(transport, {'input_status': {
+            'enabled': True, 'min_visible_ms': 0, 'beat_chance': 0,
+        }})
+        host.ctx = InterludeContext(base_dir='/base')
+        session = {'userId': '1', 'groupId': ''}
+        self.assertTrue(await host.begin_typing(session, 500, delay_ms=1))
+        self.assertEqual(transport.status, [], '窗口还没开始：此刻不许点亮')
+        await asyncio.sleep(0.05)
+        self.assertEqual(
+            [typing for _t, typing in transport.status], [True],
+            '真实 ctx 的定时器到点必须真的把灯点亮',
+        )
+        self.assertEqual(host.interlude_data_dir(), '/base', '真品 ctx 的 base_dir 也认')
 
     async def test_a_real_failure_is_a_debug_line_and_an_unsupported_platform_warns_once_per_session(self):
         """**新用例（用户点名）**：真实失败只留一条 debug（原文不丢）；只有"确实不支持"

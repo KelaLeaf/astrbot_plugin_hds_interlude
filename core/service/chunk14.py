@@ -40,17 +40,20 @@
    （读回来的 `generation` 不匹配就返回 `False`）；同时 `db_set` 的 `where` 里再带一次
    `generation`，用受影响行数确认写入——读与写之间被别人抢先时也**绝不覆盖**。
 2. **模型 ID 落实到"连接"**：上游 `generate(..., modelId, generate)` 由调用方自己解释
-   `modelId`；这里 `generation_mode='separate'` + `model_id` 时按 id / 模型名 / 标签在
-   `model_center.providers` 里指名一条连接，**指名了却找不到就不偷偷回落到别的模型**
-   （与 `qzone` 的 `prefer_self_id` 同一条纪律）；未指名时跟随主叙事连接。
+   `modelId`；这里 `generation_mode='separate'` + `model_id` 时先按**指名 AstrBot
+   Provider**（v1.7.9：配置页的选择器写的就是 Provider id，适配层为它合成一条挂了
+   `use_for_works` 的连接行），再按 id / 模型名 / 标签在 `model_center.providers` 里
+   指名一条连接（本移植版最初的口径，逐字保留）；**指名了却找不到就不偷偷回落到别的
+   模型**（与 `qzone` 的 `prefer_self_id` 同一条纪律）；未指名时跟随主叙事连接。
 3. **写手提示词是本移植版新增的**（上游没有接线、也就没有这段）：`WORK_INSTRUCTION` /
    `ASYNC_WORK_INSTRUCTION` 两个常量仍逐字保留在 `core/works.py`，供**叙事侧**注入
    （由 chunk4 / narrator_prompts 那侧接线）；侧任务这边要的是"直接给成品正文"，
    所以另有一段只要求正文的英文系统提示词，并且同样**不承诺"已保存/已接受"**。
 4. **侧任务走 `narrator._side_task_json`**：与 `world_seeder` 同一条旁路（`response_format`
-   不带 json、思考型网关截断时去掉 `max_tokens` 重试一次、用量照常记账）。任务名用
-   `'作品创作'`；`narrator.SIDE_TASK_ROUTES` 里没有这个名字，记账回落 `compaction`
-   （不新增 narrator 成员，避免动别人正在改的文件）。
+   不带 json、思考型网关截断时去掉 `max_tokens` 重试一次）。任务名用 `'作品创作'`，
+   传输层任务键由 `narrator.SIDE_TASK_ROUTES['作品创作'] = 'works'` 给出（v1.7.9：
+   "指名 AstrBot Provider 就落到那个 Provider"全靠它，见偏离 2），不新增 narrator 成员
+   （避免动别人正在改的文件）。
 5. **可见日志**：上游这层不存在，凡是"没生效 / 失败 / 降级"都要看得见（坑 25/45/48）。
    成功用 `info`，失败与被跳过用 `warn`，"没启用所以没干活"用节流 warn
    （`note_access_skip`，同一原因 10 分钟一条）。
@@ -64,7 +67,11 @@ import hashlib
 import json
 from typing import Any, Mapping, Optional
 
-from ..model_routing import provider_reachable
+from ..model_routing import (
+    is_assigned_to,
+    match_usable_connection_row,
+    provider_reachable,
+)
 from ..works import (
     DUMP_PART_MAX_LEN,
     MAX_REVISIONS,
@@ -85,7 +92,7 @@ WORK_TABLE = 'interlude_work'
 WORK_CONFIG_DEFAULTS = {'enabled': False, 'generation_mode': 'main', 'model_id': ''}
 #: 生成模式取值。
 WORK_GENERATION_MODES = ('main', 'separate')
-#: 侧任务的中文任务名（用量账本按它记账；`narrator.SIDE_TASK_ROUTES` 没有这一项）。
+#: 侧任务的中文任务名（用量与日志按它记账；传输层任务键见 `narrator.SIDE_TASK_ROUTES`）。
 WORK_WRITER_TASK = '作品创作'
 #: 侧任务默认 `max_tokens`（首轮带 cap，截断时 `_side_task_json` 去掉它重试一次）。
 WORK_WRITER_MAX_TOKENS = 4000
@@ -442,7 +449,18 @@ class ServiceChunk14(ServiceBase):
     # ------------------------------------------------------------------ #
 
     def _works_writer_providers(self, model_id: str = '') -> list[dict[str, Any]]:
-        """挑写手用的连接：指名了就用那一条（找不到**不回落**），否则跟随主叙事连接。"""
+        """挑写手用的连接：指名了就用那一条（找不到**不回落**），否则跟随主叙事连接。
+
+        指名的两种口径（v1.7.9）：
+
+        ① **AstrBot Provider**（配置页的选择器写的就是它）——适配层为它合成一条
+           挂了 `use_for_works` 的连接行：`transport_target` 让 core 认为它可用，
+           真正的目标由传输层按 `task='works'`（`narrator.SIDE_TASK_ROUTES`）解析。
+           这一口径**排在前面**：合成那条行本身就意味着适配层已判定这个值该按
+           Provider id 解释（`astrbot_bridge.works_writer_named_provider`）。
+        ② **模型中心里的一条连接**（老口径，逐字保留）——按 `id` / `model` / `label`
+           点名；实现在 `model_routing.match_usable_connection_row`（与适配层共用）。
+        """
         model_config = _mapping(pick(self.config, 'model', 'model_center'))
         providers = [dict(item) for item in _rows(model_config.get('providers')) if isinstance(item, Mapping)]
         usable = [
@@ -450,15 +468,10 @@ class ServiceChunk14(ServiceBase):
             if item.get('enabled') is not False and provider_reachable(item)
         ]
         if model_id:
-            for provider in usable:
-                names = {
-                    str(provider.get('id') or '').strip(),
-                    str(provider.get('model') or '').strip(),
-                    str(provider.get('label') or '').strip(),
-                }
-                if model_id in names:
-                    return [provider]
-            return []
+            bound = [item for item in usable if is_assigned_to(item, 'works')]
+            if bound:
+                return bound
+            return match_usable_connection_row(providers, model_id)
         narrator = getattr(self, 'narrator', None)
         assigned = getattr(narrator, '_assigned_providers', None)
         if callable(assigned):

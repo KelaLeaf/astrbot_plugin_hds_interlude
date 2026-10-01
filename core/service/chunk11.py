@@ -508,7 +508,13 @@ class ServiceChunk11(ServiceBase):
             pass
         row['enabled'] = False
         owner_id = str(pick(row, 'ownerId', 'owner_id') or '')
-        participant = await self.get_participant_by_id(owner_id) if hasattr(self, 'get_participant_by_id') else None
+        # v1.7.9：原先读的 `self.get_participant_by_id` 在 core 里**根本不存在**
+        # （真名是 chunk7 的 `get_participant`），于是这条 if 永远走 else → 解除链接
+        # 的那条剧本留痕被静默丢掉。同 `action_permission_table` 一类错，只是这里多一层
+        # `hasattr` 把错误藏得更深（不抛、也不出声）。上游这里直接
+        # `row.ownerId.split(':')[0]`，而 ownerId 是 `平台:机器人:用户`（`participantIdFor`），
+        # 拿它当 storyId 是上游自己的问题；本移植版按代码原意取**参与者的故事**。
+        participant = await self.get_participant(owner_id) if hasattr(self, 'get_participant') else None
         story_id = pick(participant, 'storyId', 'story_id') if participant else ''
         if story_id:
             await self._endpoint_migration_entry(

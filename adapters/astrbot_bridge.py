@@ -82,6 +82,7 @@ from ..core.forward_message import (
     forward_read_ids,
     forward_read_limits,
 )
+from ..core.model_routing import match_usable_connection_row
 from ..core.narrator import HttpxHttpClient
 from ..core.schedule_preplan import resolve_schedule_preplan_config, schedule_preplan_window
 from ..core.service import (
@@ -4079,6 +4080,10 @@ class AstrbotBridge:
         'stickers': ('stickers', 'provider_id'),
         # 上游 1.0.1-rc24：世界播种器也是独立任务（这里让它同样能指名 AstrBot 模型）。
         'world_seeding': ('model', 'world_seeding_provider_id'),
+        # v1.7.9：共同作品的独立写手（`works.model_id`）。这个键的老口径是"点名模型
+        # 中心里的一条连接行"，所以它在 `routing_config()` 里要先过
+        # `works_writer_named_provider()` 的双读判定，不无条件合成指名连接行。
+        'works': ('works', 'model_id'),
     }
 
     def task_model_id(self, task: Optional[str]) -> str:
@@ -4131,7 +4136,86 @@ class AstrbotBridge:
             'use_for_stickers': task == 'stickers',
             'use_for_embedding': task == 'embedding',
             'use_for_world_seeding': task == 'world_seeding',
+            # v1.7.9：共同作品写手（core 的 `is_assigned_to(provider, 'works')` 认它）。
+            'use_for_works': task == 'works',
         }
+
+    def works_writer_named_provider(self) -> str:
+        """`works.model_id` 该不该按「AstrBot Provider id」解释；是就返回它，否则空串。
+
+        v1.7.9 起配置页把这个键渲染成 **AstrBot 模型选择器**（写的是 Provider id），
+        而它在本移植版里的老口径是"点名模型中心里的一条连接行"（core 按 `id` /
+        `model` / `label` 匹配，见 `service/chunk14.py::_works_writer_providers`）。
+        读取侧**双读兜底**，老用户填过的值一个都不许失效：
+
+        1. 命中宿主的某个已加载 Provider → 新口径（改道 AstrBot，走"双轨"的①）；
+        2. 点到当前可用的某条连接行 → 老口径（逐字不变）；
+        3. 两条判据都够不着、而宿主的 Provider 列表**还没装好**（AstrBot 4.28 里
+           插件先、模型后，见 AGENTS 坑 23）→ 按新口径处理：否则用户在选择器里选好
+           的模型要等到下次保存配置才生效（重启后一直不生效）；
+        4. 已就绪却没有这个 Provider、也不是连接行 → 老口径，保留原来那句
+           「指名的作品写手模型不存在或不可用」的报错。
+
+        第 2 步的"连接行优先"只影响"**不是**已加载 Provider、却点到了一条可用连接行"
+        的值——也就是历史配置里那种"手填一条连接行的 id / 模型名 / 标签"。一个值
+        同时是连接行名与已加载 Provider id 时按 Provider 解释（第 1 步）：那正是用户在
+        选择器里能选到的东西，改道才符合"指名 → 生效"。
+        """
+        value = self.task_model_id('works')
+        if not value:
+            return ''
+        ids = self.loaded_chat_provider_ids()
+        # 没拿到列表的宿主（少见）才逐个问 `provider_by_id`，而且只在"模型已经装上"时问。
+        loaded = bool(ids) or self.any_provider_loaded()
+        hit = value in ids if ids else (loaded and self.provider_by_id(value) is not None)
+        if hit:
+            return value
+        if self._names_usable_connection_row(value):
+            return ''
+        if not loaded:
+            return value
+        return ''
+
+    def loaded_chat_provider_ids(self) -> set[str]:
+        """宿主当前装好的**聊天** Provider id 集合（拿不到返回空集合）。
+
+        判断"这个值是不是一个 AstrBot Provider"时用它，而不是逐个 `provider_by_id()`：
+        `context.get_provider_by_id()` 对**不存在**的 id 会打一条误导性的宿主警告
+        （AGENTS 坑 23），而这里每保存一次配置都要判一个普通的老口径值（连接行名）
+        ——那会变成"每次保存配置都报一个找不到的 Provider"。顺带也避开了
+        `get_provider_by_id` 在某些宿主版本上是协程的问题（`provider_by_id` 对协程
+        一律返回 `None`，那会让新口径在这些宿主上静默失效）。
+        """
+        getter = getattr(self.context, 'get_all_providers', None)
+        if not callable(getter):
+            return set()
+        try:
+            providers = list(getter() or [])
+        except Exception:  # noqa: BLE001 - 拿不到列表就当"还没装好"
+            return set()
+        ids: set[str] = set()
+        for provider in providers:
+            meta = getattr(provider, 'meta', None)
+            if not callable(meta):
+                continue
+            try:
+                identifier = _text(getattr(meta(), 'id', ''))
+            except Exception:  # noqa: BLE001
+                continue
+            if identifier:
+                ids.add(identifier)
+        return ids
+
+    def _names_usable_connection_row(self, value: str) -> bool:
+        """`value` 是不是点名了当前可用的某条连接行（`works.model_id` 的老口径）。
+
+        判定直接用 core 的 `match_usable_connection_row`：与 core 挑写手连接时同一个
+        实现，免得"这个值点到的是不是连接行"两侧给出不同结论。
+        """
+        section = self.section('model')
+        rows = section.get('providers') if isinstance(section, dict) else None
+        candidates = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        return bool(match_usable_connection_row(candidates, value))
 
     def routing_config(self, config: Any = None) -> dict[str, Any]:
         """给 `InterludeService` 用的配置副本：补上指名的任务用合成连接行。
@@ -4143,10 +4227,15 @@ class AstrbotBridge:
         if not isinstance(base, dict):
             return base if isinstance(base, dict) else {}
         rows = []
-        for task in ('main', 'compaction', 'alter', 'vision', 'stickers', 'embedding', 'world_seeding'):
+        for task in ('main', 'compaction', 'alter', 'vision', 'stickers', 'embedding', 'world_seeding', 'works'):
             provider_id = self.task_model_id(task)
-            if provider_id:
-                rows.append(self._binding_row(task, provider_id))
+            if not provider_id:
+                continue
+            # `works.model_id` 还有一套"点名连接行"的老口径：那种值不合成指名行，
+            # 交给 core 按连接行解析（逐字保留老行为）。
+            if task == 'works' and not self.works_writer_named_provider():
+                continue
+            rows.append(self._binding_row(task, provider_id))
         if not rows:
             return base
         result = dict(base)
@@ -4234,6 +4323,11 @@ class AstrbotBridge:
             bound = self.task_model_id(task)
             if bound:
                 log_fallback('info', '模型来源：%s → AstrBot Provider %s', task, bound)
+        # 共同作品的写手模型要过双读判定：老口径里这个值点的是连接行，不能报成
+        # "AstrBot Provider x"（那会让用户去宿主的模型列表里找一个不存在的东西）。
+        works_bound = self.works_writer_named_provider()
+        if works_bound:
+            log_fallback('info', '模型来源：works → AstrBot Provider %s', works_bound)
         for note in (self.image_capability_note(), self.audio_capability_note()):
             if note:
                 log_fallback('warn', '%s', note)

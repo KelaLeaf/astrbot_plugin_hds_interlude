@@ -16,7 +16,13 @@ from pathlib import Path
 from unittest import mock
 
 # 复用桥接测试里的 AstrBot 桩与夹具（导入即装桩）
-from plugin.tests.test_astrbot_bridge import TEST_DATA_DIR, FakeContext, _make_bridge, bridge_module
+from plugin.tests.test_astrbot_bridge import (
+    TEST_DATA_DIR,
+    FakeContext,
+    _ProviderStub,
+    _make_bridge,
+    bridge_module,
+)
 from plugin.adapters import console_api as console_module
 from plugin.adapters.console_api import ConsoleApi, ConsoleError, CONSOLE_TASKS, mask_endpoint
 from plugin.core import platform_actions
@@ -344,6 +350,38 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(row['permission'], 'admin')
         self.assertEqual(payload['stats']['permissions']['admin'], 1)
 
+    def test_the_service_reads_the_table_the_panel_writes(self):
+        """**接线用例（v1.7.9）**：面板写的那份权限表，服务层必须读得到。
+
+        写侧落点是 `bridge.data_dir`（= 构造 `AstrbotInterludeContext` 时给的 `base_dir`），
+        读侧原先读的是 core 里**根本不存在**的 `self.context` → 恒回空表，
+        于是"界面能改、运行期不生效"（真 bug）。这里两侧都走**真实对象**：
+        目录同源 + 真写文件 + 真读回来。
+        """
+        service = self.bridge.service
+        self.assertEqual(
+            service.interlude_data_dir(), str(self.bridge.data_dir),
+            '写侧（bridge.data_dir）与读侧（ctx.base_dir）必须同源',
+        )
+        path = Path(self.bridge.data_dir) / 'action_permissions.json'
+        backup = path.read_text(encoding='utf-8') if path.exists() else None
+
+        def restore():
+            if backup is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(backup, encoding='utf-8')
+
+        self.addCleanup(restore)
+        # 默认档：`send_poke` 是 global（私聊可用）
+        self.assertIn('send_poke', service.available_platform_actions('', ('private',)))
+        path.write_text(json.dumps({'send_poke': 'admin'}), encoding='utf-8')
+        self.assertEqual(service.action_permission_table(), {'send_poke': 'admin'})
+        self.assertNotIn(
+            'send_poke', service.available_platform_actions('', ('private',)),
+            '表里降到「仅管理员」之后，普通私聊会话就不该再拿得到这条动作',
+        )
+
     def test_permission_write_rejects_unknown_action_and_tier(self):
         path = self._temp_permissions()
         for action, tier in (('send_poke', 'owner'), ('send_poke', ''), ('nope', 'global'), ('', 'global')):
@@ -474,6 +512,40 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(payload['vision']['mode'], 'sidecar')
         self.assertEqual(payload['embedding']['dimensions'], 1024)
         self.assertTrue(payload['failover']['enabled'])
+
+    def test_models_shows_the_works_writer_task_with_the_dual_read_binding(self):
+        """v1.7.9：写手模型也进「模型」页，但它有两套填法——老口径的值不能被报成
+        「某个 AstrBot Provider」（那会让用户去宿主的模型列表里找一个不存在的东西）。"""
+        row = _run(self.api.models())['task_models']['works']
+        self.assertEqual(row['label'], '共同作品写手')
+        self.assertEqual(row['astrbot_provider'], '', '夹具里没配写手模型')
+
+        # 新口径：指名了一个真实 Provider → 显示它，并算进那个 Provider 的 used_by。
+        bridge = _make_bridge({'works': {'enabled': True, 'model_id': 'ollama'}})
+        bridge.context.get_all_providers = lambda: [_ProviderStub('ollama')]
+        api = ConsoleApi(bridge)
+        self.assertEqual(_run(api.models())['task_models']['works']['astrbot_provider'], 'ollama')
+
+        # 老口径：值点的是一条连接行 → 不报成 Provider（值本身仍在配置里）。
+        legacy = _make_bridge({
+            'works': {'enabled': True, 'model_id': 'writer-conn'},
+            'model_center': {'providers': [{
+                'id': 'writer-conn', 'label': '写手连接', 'enabled': True, 'model': 'w',
+                'endpoint': 'https://gw.example.com/v1/chat/completions',
+            }]},
+        })
+        legacy.context.get_all_providers = lambda: [_ProviderStub('ollama')]
+        payload = _run(ConsoleApi(legacy).models())
+        self.assertEqual(payload['task_models']['works']['astrbot_provider'], '')
+        self.assertEqual(legacy.task_model_id('works'), 'writer-conn', '值本身不动')
+
+    def test_the_astrbot_provider_list_names_the_works_writer_task(self):
+        """「这个 Provider 被哪些任务在用」也要认写手（否则用户看到的是"没人用它"）。"""
+        bridge = _make_bridge({'works': {'enabled': True, 'model_id': 'ollama'}})
+        bridge.context.get_all_providers = lambda: [_ProviderStub('ollama')]
+        bridge.provider_by_id = lambda pid: _ProviderStub(pid)  # type: ignore[method-assign]
+        row = _run(ConsoleApi(bridge).models())['astrbot_providers'][0]
+        self.assertIn('共同作品写手', row['used_by'])
 
     def test_usage_buffer_starts_empty_and_accumulates(self):
         self.assertEqual(_run(self.api.models())['usage']['sum']['calls'], 0)

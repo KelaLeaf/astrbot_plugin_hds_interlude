@@ -762,8 +762,8 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
     ),
     PlatformAction(
         'set_qzone_visibility', 'qzone', '改说说可见范围',
-        '改一条**她自己发的**说说的可见范围（谁能看见）。带图的说说会把原图**重新上传一次**'
-        '再改（图片在腾讯侧变成新副本）；转发的改不了。',
+        '改一条**她自己发的**说说的可见范围（谁能看见）。带图 / 带视频的说说照常改'
+        '（不会动她的图片与视频）；转发的改不了。',
         params=(
             _p('tid', '说说 tid', required=True),
             _p('visible', '可见范围', required=True, choices=QZONE_VISIBILITY_LABELS),

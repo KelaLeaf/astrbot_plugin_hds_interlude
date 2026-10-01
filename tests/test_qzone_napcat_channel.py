@@ -10,10 +10,11 @@
 | 只读的 `qzone_read` 不落审计行、不占配额 | 她"看一眼好友动态"就把当天的评论额度花光 | `QzoneReadTests` |
 | `napcat_actions()` = 那 9 条；`backend_labels` 顺序 = `backends` 顺序 | 面板把 NapCat 专属标丢 / 标签顺序与运行期优先级不一致 | `BackendCatalogTests` |
 | `forward` 走**评论**配额（不是点赞） | 转发把点赞额度吃掉 | `ForwardGateTests` |
-| 带图改可见范围：**先重传原图拿新 `richval`，再 update**；这条链上任何一步没成都拒绝 | 用空 `richval` 硬发 = 把用户的图**静默删掉** | `SetVisibilityTests`（`..._is_reuploaded_then_updated` / `..._upload_failure_refuses...`） |
+| 带附件（图片 / 视频）改可见范围：**只发可见性 + 既有字段、零上传零下载** | 又去重传一遍 = 腾讯侧多出副本、原图 URL 换掉、混排视频被丢 | `SetVisibilityTests`（`..._updates_without_uploading_or_downloading`） |
+| update 之后**回读校验**附件与正文；变少 → warn + metadata + **跳闸**（此后带附件的拒绝、纯文字照常） | 服务端真删了附件却没人知道 = 静默毁第二条说说 | `SetVisibilityTests`（`..._attachment_loss...` / `..._guard_refuses...`） |
 
 传输层按契约 stub（`call_onebot` + `request_text` + `fetch_image`），**绝不真实联网**；
-夹具里的 QQ 号 / tid / cookie / 图片字节全是编的。
+夹具里的 QQ 号 / tid / cookie 全是编的（`fetch_image` 留着是为了**断言它一次都没被调**）。
 
 运行：`python3 -m unittest plugin.tests.test_qzone_napcat_channel -v`
 """
@@ -21,10 +22,11 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import pathlib
 import sys
+import tempfile
+import types
 import unittest
 from datetime import timedelta
 
@@ -58,7 +60,7 @@ MOODS_TEXT = (
     '_preloadCallback({"code":0,"msglist":['
     '{"tid":"TID-0001","content":"\u665a\u5b89","created_time":1700000000}]});'
 )
-#: 带**配图**的同一条说说：改可见范围时必须被拒（`richval` 还原不了，硬改可能丢图）。
+#: 带**配图**的同一条说说（v1.7.9：照常改，**不上传、不下载**，只发可见性）。
 MOODS_TEXT_WITH_PIC = (
     '_preloadCallback({"code":0,"msglist":[{"tid":"TID-0001","content":"\u665a\u5b89",'
     '"pic":[{"url1":"https://example.invalid/a.jpg","width":1,"height":1}]}]});'
@@ -74,40 +76,41 @@ MOODS_TEXT_OTHER_TID = (
 )
 
 
-#: 上传回执（编的）：`build_image_richval` 要的六个字段 + `url` 里的 `bo`。
-UPLOAD_RECEIPT = (
-    '{"code":0,"data":{"albumid":"ALB-1","lloc":"LLOC-1","sloc":"SLOC-1","type":1,'
-    '"height":480,"width":640,"url":"https://example.invalid/p?bo=BO-1&x=1"}}'
-)
-#: 参考实现 `build_image_richval` 对上面那张图的**逐字**产物。
-RICHVAL_ONE = ",ALB-1,LLOC-1,SLOC-1,1,480,640,,480,640"
-PIC_BO_ONE = "BO-1"
-#: 第二张图（组图：两段 `richval` 用 `\t` 连接，`pic_bo` 同样）。
-UPLOAD_RECEIPT_2 = (
-    '{"code":0,"data":{"albumid":"ALB-2","lloc":"LLOC-2","sloc":"SLOC-2","type":1,'
-    '"height":100,"width":200,"url":"https://example.invalid/p?bo=BO-2&x=1"}}'
-)
-RICHVAL_TWO = "\t".join([RICHVAL_ONE, ",ALB-2,LLOC-2,SLOC-2,1,100,200,,100,200"])
-#: 一条带**两张**图的说说（组图；`url1` 是原图地址，重新上传就用它）。
-MOODS_TEXT_TWO_PICS = (
+#: 一条**带视频**的说说（v1.7.9）：视频与图片一样不在正文里，只有 `video` 能看见它。
+MOODS_TEXT_WITH_VIDEO = (
     '_preloadCallback({"code":0,"msglist":[{"tid":"TID-0001","content":"\u665a\u5b89",'
-    '"pic":[{"url1":"https://example.invalid/a.jpg"},'
-    '{"url1":"https://example.invalid/b.jpg"}]}]});'
+    '"video":[{"url3":"https://example.invalid/v.mp4","url1":"https://example.invalid/c.jpg",'
+    '"video_id":"VID-1"}]}]});'
+)
+#: 同一条说说**改完之后**一个附件都不剩了（回读校验要抓的那种事故）。
+MOODS_TEXT_NO_ATTACHMENTS = (
+    '_preloadCallback({"code":0,"msglist":[{"tid":"TID-0001","content":"\u665a\u5b89"}]});'
+)
+#: 同一条说说**改完之后正文对不上**（附件没少，正文被改掉了）。
+MOODS_TEXT_REWRITTEN = (
+    '_preloadCallback({"code":0,"msglist":[{"tid":"TID-0001","content":"\u665a\u5b89\u554a",'
+    '"pic":[{"url1":"https://example.invalid/a.jpg","width":1,"height":1}]}]});'
 )
 
 
 def _visibility_http(moods: str = MOODS_TEXT, result: str = '{"code":0}',
-                     upload: str = UPLOAD_RECEIPT):
-    """按 URL 分派：`msglist`（读正文）→ `moods`；`cgi_upload_image` → `upload`；
-    `emotion_cgi_update` → `result`。"""
+                     later: object = None):
+    """按 URL 分派：`msglist` → `moods`（**第二次起**用 `later`，默认还是 `moods`）；
+    `emotion_cgi_update` → `result`。
+
+    这里**刻意没有上传分支**：v1.7.9 起改可见范围这条路上不该再出现任何上传，
+    真出现了就是 `calls` 里多一条 `cgi_upload_image`（用例据此挂掉）。
+    """
     calls: list[dict] = []
+    reads = {'n': 0}
 
     def handler(method: str, url: str, headers: object, data: object) -> str:
         calls.append({'method': method, 'url': url, 'data': dict(data or {})})
         if 'emotion_cgi_msglist_v6' in url:
+            reads['n'] += 1
+            if reads['n'] > 1 and later is not None:
+                return later
             return moods
-        if 'cgi_upload_image' in url:
-            return upload
         return result
 
     return handler, calls
@@ -129,10 +132,12 @@ def _napcat_handler(calls: list) -> object:
 
 class _NapcatTransport(_StubTransport):
     """`call_onebot`（OneBot 直通 = NapCat WS）+ `request_text`（QZone CGI 的 HTTP）
-    + `fetch_image`（原图字节，改带图说说的可见范围时要用）。
+    + `fetch_image`（原图字节）。
 
+    v1.7.9 起改可见范围**不许**再下载原图，`fetch_image` 留在桩上就是为了让
+    `self.fetch_calls == []` 这条断言有意义（能力还在，只是这条路不该用）。
     `has_http=False` 模拟"传输层没接原始 HTTP"（纯 SnowLuma 环境）；
-    `has_fetch=False` 模拟"传输层不能下载图片"。
+    `has_fetch=False` 模拟"传输层不能下载图片"（改可见范围应当照常成功）。
     """
 
     def __init__(self, handler: object = None, http: object = None, has_http: bool = True,
@@ -560,24 +565,46 @@ class FeedSweepChannelTests(unittest.IsolatedAsyncioTestCase):
 class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
     """`set_qzone_visibility`：**只有** NapCat WS 通道能做，且必须先读回正文。
 
-    三条边界各有一个用例，因为它们在真机上都不出声：
+    v1.7.9 的裁定（H1）：**只发可见性 + 既有字段，富文本字段照参考实现传空串**——
+    不带富文本字段是**无副作用**的那条路；"必须重传原图才能改带图说说"只是个推断，
+    已连整条下载 + 重传链路一起删掉。留下的边界与**观测**（都能在真机上出声）：
 
     | 边界 | 出错的样子 |
     | --- | --- |
-    | 带图 → **先重新上传原图，再带新 `richval` update**（v1.7.8） | 用空 `richval` 硬发 = 图被静默删掉 |
-    | 上传链上任何一步没成（下载 / 上传 / 回执字段 / 张数） → 拒绝 | 半成品富文本块被服务端按残缺重建 |
-    | 转发 → 拒绝 | 转发目标还原不了，重建等于改掉转发 |
-    | 正文找不回来 → 拒绝 | 服务端按整条重建，空 `con` = 把正文清掉 |
+    | 带图 / 带视频：**零上传、零下载**，只发 update | 又去重传一遍 = 腾讯侧多出副本、原图 URL 换掉、混排视频被丢 |
+    | update 后**回读校验**附件与正文 | 服务端真删了附件却没人知道 = 静默毁第二条说说 |
+    | 回读发现附件变少 → warn + 剧本 metadata + **跳闸** | 第二次、第三次接着毁 |
+    | 跳闸后带附件的说说被拒、**纯文字照常** | 一刀切把功能关死，或者继续冒险 |
+    | 转发 → 拒绝 | 编辑的字段清单里没有转发目标那一组，改完等于改掉转发 |
+    | 正文找不回来 → 拒绝 | 空 `con` = 把正文清掉 |
     | 没有 CGI 通道 → 明确失败 | 回落到平台打一个不存在的动作名，报错看不懂 |
     """
 
-    def _host(self, moods: str = MOODS_TEXT, result: str = '{"code":0}',
-              upload: str = UPLOAD_RECEIPT, image: object = None,
-              has_fetch: bool = True) -> tuple:
+    def setUp(self) -> None:
+        # 跳闸标志落在"数据目录"里；单测给它一个临时目录（生产是插件数据目录）。
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _guard_path(self) -> pathlib.Path:
+        return pathlib.Path(self._tmp.name) / 'qzone_visibility_guard.json'
+
+    def _write_guard(self, payload: object) -> None:
+        self._guard_path().write_text(json.dumps(payload), encoding='utf-8')
+
+    def _host(self, moods: str = MOODS_TEXT, result: object = '{"code":0}',
+              later: object = None, has_fetch: bool = True) -> tuple:
+        """`moods` = 改之前读回的那条说说；`later` = 之后每次**回读校验**的响应
+        （默认与 `moods` 相同 = 附件与正文一点没变）。
+
+        数据目录**按生产的样子挂**：`ServiceBase` 存的是 `self.ctx`（`chunk2` 读表情库
+        目录就是这么取的），而 `self.context` 在生产里根本不存在——这里故意只用 `ctx`，
+        免得"跳闸文件写到测试塞的假属性上"这种错误被测试放过。
+        """
         host = _Host(config=dict(BASE_CONFIG, daily_post_cap=5, min_interval_minutes=0))
-        handler, calls = _visibility_http(moods, result, upload)
+        host.ctx = types.SimpleNamespace(base_dir=self._tmp.name)
+        handler, calls = _visibility_http(moods, result, later)
         host.transport = _NapcatTransport(
-            _napcat_handler([]), http=handler, image=image, has_fetch=has_fetch,
+            _napcat_handler([]), http=handler, has_fetch=has_fetch,
         )
         return host, calls
 
@@ -585,6 +612,14 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
         payload = {'tid': TID, 'visible': '部分人可见', 'targetUins': ['10002']}
         payload.update(overrides)
         return payload
+
+    @staticmethod
+    def _updates(calls: list) -> list:
+        return [call for call in calls if 'emotion_cgi_update' in call['url']]
+
+    @staticmethod
+    def _uploads(calls: list) -> list:
+        return [call for call in calls if 'cgi_upload_image' in call['url']]
 
     async def test_five_tiers_map_onto_the_ugc_right_values(self):
         """五档标签 → `ugc_right`，并且只有 16/128 带 `allow_uins`。"""
@@ -599,7 +634,7 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
                     params.pop('targetUins')
                 result = await host.qzone_execute(STORY, 'visibility', params)
                 self.assertTrue(result['ok'], result)
-                update = [call for call in calls if 'emotion_cgi_update' in call['url']][0]
+                update = self._updates(calls)[0]
                 self.assertEqual(update['data']['ugc_right'], str(expected))
                 self.assertEqual(update['data']['con'], '晚安', '正文必须原样带回去')
                 self.assertEqual(update['data']['tid'], TID)
@@ -639,12 +674,12 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
         host, calls = self._host()
         result = await host.qzone_execute(STORY, 'visibility', self._payload())
         self.assertTrue(result['ok'], result)
-        update = [call for call in calls if 'emotion_cgi_update' in call['url']][0]
+        update = self._updates(calls)[0]
         self.assertEqual(update['method'], 'POST')
         self.assertIn('g_tk=%d' % cgi.compute_g_tk(P_SKEY), update['url'])
         self.assertTrue(update['url'].startswith('https://user.qzone.qq.com/proxy/domain/'))
-        # 平台侧**只**被问了 cookie / 登录信息（读正文一次 + 改可见范围一次；
-        # 没有"改可见范围"这条原生动作可打）。
+        # 平台侧**只**被问了 cookie / 登录信息（读正文一次 + 回读校验一次 + 改可见范围
+        # 一次；没有"改可见范围"这条原生动作可打）。
         self.assertEqual(
             {name for name, _ in host.transport.calls}, {'get_cookies', 'get_login_info'},
         )
@@ -653,158 +688,178 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
             '通道选择要有一条 debug 记录（排查"到底走没走 NapCat"靠它）：%s' % host.standalone,
         )
 
-    async def test_a_post_with_images_is_reuploaded_then_updated(self):
-        """带图：**先重新上传原图 → 拿新 richval → 再 update**（v1.7.8）。
+    # ---- 带附件：只发可见性，零上传零下载（v1.7.9 的核心正向断言） -------
 
-        这条用例钉三件事：① 顺序（上传在 update 之前，且 `richval` 来自上传回执）；
-        ② `richval` / `pic_bo` 的**字面量**（照参考实现 `build_image_richval`）；
-        ③ "图片被重新上传"这件事在日志与剧本条目里**看得见**。
+    async def test_a_post_with_images_updates_without_uploading_or_downloading(self):
+        """带图：**只发可见性 + 既有字段**，富文本槽位全空、零上传、零下载。
+
+        这条取代了 v1.7.8 的"先重传原图再 update"——重传是**有副作用**的那条路
+        （腾讯侧多出副本、原图 URL 换掉、混排视频被丢），而"不带富文本字段"没有副作用。
         """
         host, calls = self._host(moods=MOODS_TEXT_WITH_PIC)
         result = await host.qzone_execute(STORY, 'visibility', self._payload())
         self.assertTrue(result['ok'], result)
-
-        urls = [call['url'] for call in calls]
-        upload_index = next(i for i, url in enumerate(urls) if 'cgi_upload_image' in url)
-        update_index = next(i for i, url in enumerate(urls) if 'emotion_cgi_update' in url)
-        self.assertLess(upload_index, update_index, '必须先上传，再 update')
-
-        # 原图是用 `fetch_image` 从列表里的 `url1` 下载的（字节再 base64 进 picfile）。
-        self.assertEqual(host.transport.fetch_calls, ['https://example.invalid/a.jpg'])
-        upload = calls[upload_index]
-        self.assertEqual(upload['method'], 'POST')
-        self.assertIn('g_tk=%d' % cgi.compute_g_tk(P_SKEY), upload['url'])
-        self.assertEqual(upload['data']['skey'], '@abc123', 'skey 直接从 Cookie 带进表单')
-        self.assertEqual(upload['data']['p_skey'], P_SKEY)
-        self.assertEqual(upload['data']['base64'], '1')
-        self.assertEqual(
-            upload['data']['picfile'], base64.b64encode(b'\x89PNG-fake-bytes').decode('ascii'),
-        )
-
-        update = calls[update_index]
-        self.assertEqual(update['data']['richval'], RICHVAL_ONE, 'richval 必须来自上传回执')
-        self.assertEqual(update['data']['pic_bo'], PIC_BO_ONE)
-        self.assertEqual(update['data']['richtype'], '1')
-        self.assertEqual(update['data']['subrichtype'], '1')
+        update = self._updates(calls)[0]
+        self.assertEqual(update['data']['richval'], '', '富文本字段照参考实现留空')
+        self.assertEqual(update['data']['richtype'], '')
+        self.assertEqual(update['data']['subrichtype'], '')
+        self.assertEqual(update['data']['pic_template'], '')
+        self.assertNotIn('pic_bo', update['data'])
         self.assertEqual(update['data']['con'], '晚安')
         self.assertEqual(update['data']['tid'], TID)
-
-        # 代价必须看得见：一条 warn（坑 25）+ 剧本条目里的追溯字段。
-        self.assertTrue(
-            any('重新上传' in text for _level, text in host.standalone),
-            '重新上传这件事要有可见记录：%s' % host.standalone,
-        )
-        self.assertTrue(
-            any(level == 'warn' and '重新上传' in text for level, text in host.standalone),
-            '按坑 25 这条走 warn，别塞进 debug：%s' % host.standalone,
-        )
-        self.assertEqual(host.entries[-1]['metadata']['qzone_images_reuploaded'], 1)
-        self.assertIn('配图 1 张已重新上传', host.entries[-1]['content'])
+        self.assertEqual(self._uploads(calls), [], '这条路上不许再出现任何上传')
+        self.assertEqual(host.transport.fetch_calls, [], '也不许再去下载原图')
         self.assertEqual(host.rows[-1]['status'], 'confirmed')
+        # 旧版本那套"重新上传"的痕迹一个都不许留。
+        self.assertNotIn('qzone_images_reuploaded', host.entries[-1]['metadata'])
+        self.assertNotIn('重新上传', host.entries[-1]['content'])
+        self.assertNotIn('重新上传', ' '.join(text for _level, text in host.standalone))
+        self.assertEqual(host.notes('warn'), [], '这一轮没有代价，不该有 warn：%s' % host.standalone)
 
-    async def test_a_multi_picture_post_reuploads_every_picture(self):
-        """组图：逐张上传，`richval` / `pic_bo` 按参考实现用 `\\t` 连接。"""
-        host, calls = self._host(moods=MOODS_TEXT_TWO_PICS, upload=UPLOAD_RECEIPT)
-        # 两张图两次上传：第二次换一份回执（同一个 handler 会回同一份，所以按调用序改）。
-        receipts = [UPLOAD_RECEIPT, UPLOAD_RECEIPT_2]
-        seen: list[int] = []
-
-        def handler(method: str, url: str, headers: object, data: object) -> str:
-            calls.append({'method': method, 'url': url, 'data': dict(data or {})})
-            if 'emotion_cgi_msglist_v6' in url:
-                return MOODS_TEXT_TWO_PICS
-            if 'cgi_upload_image' in url:
-                index = len(seen)
-                seen.append(index)
-                return receipts[min(index, len(receipts) - 1)]
-            return '{"code":0}'
-
-        host.transport.http_handler = handler
-        calls.clear()
-        result = await host.qzone_execute(STORY, 'visibility', self._payload())
-        self.assertTrue(result['ok'], result)
-        self.assertEqual(
-            host.transport.fetch_calls,
-            ['https://example.invalid/a.jpg', 'https://example.invalid/b.jpg'],
-        )
-        self.assertEqual(len(seen), 2, '两张图要传两次')
-        update = [call for call in calls if 'emotion_cgi_update' in call['url']][0]
-        self.assertEqual(update['data']['richval'], RICHVAL_TWO)
-        self.assertEqual(update['data']['pic_bo'], PIC_BO_ONE + "\t" + 'BO-2')
-        self.assertEqual(host.entries[-1]['metadata']['qzone_images_reuploaded'], 2)
-
-    async def test_an_upload_failure_refuses_instead_of_sending_a_broken_richval(self):
-        """**最重要的一条**：上传失败 → 明确拒绝、**不发 update**、绝不用空 richval 硬发。"""
-        host, calls = self._host(
-            moods=MOODS_TEXT_WITH_PIC,
-            upload='{"code":-3000,"message":"\u4e0a\u4f20\u5931\u8d25"}',
-        )
-        result = await host.qzone_execute(STORY, 'visibility', self._payload())
-        self.assertFalse(result['ok'], result)
-        self.assertIn('图', result['error'])
-        self.assertIn('重新上传', result['error'])
-        self.assertIn('上传失败', result['error'], '要把真实原因带出来：%s' % result['error'])
-        self.assertEqual(
-            [call for call in calls if 'emotion_cgi_update' in call['url']], [],
-            '上传失败时**绝不能**发出编辑请求（空 richval = 静默丢图）',
-        )
-        self.assertEqual(host.rows[-1]['status'], 'failed')
-        self.assertEqual(host.entries, [], '失败不写剧本条目')
-
-    async def test_a_download_failure_refuses_before_uploading_anything(self):
-        """原图下载不到（`fetch_image` 回 None）→ 连上传都不发，明确拒绝。"""
-        host, calls = self._host(moods=MOODS_TEXT_WITH_PIC, image=None, has_fetch=True)
-        host.transport.image_bytes = None
-        result = await host.qzone_execute(STORY, 'visibility', self._payload())
-        self.assertFalse(result['ok'], result)
-        self.assertEqual([call for call in calls if 'cgi_upload_image' in call['url']], [])
-        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [])
-        self.assertEqual(host.rows[-1]['status'], 'failed')
-
-    async def test_a_receipt_without_the_richval_fields_refuses(self):
-        """回执缺 `albumid` 之类的字段 → 拼不出 richval → 拒绝（不许拼半个发出去）。"""
-        host, calls = self._host(
-            moods=MOODS_TEXT_WITH_PIC, upload='{"code":0,"data":{"lloc":"LLOC-1"}}',
-        )
-        result = await host.qzone_execute(STORY, 'visibility', self._payload())
-        self.assertFalse(result['ok'], result)
-        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [])
-        self.assertEqual(host.rows[-1]['status'], 'failed')
-
-    async def test_a_transport_without_fetch_image_refuses(self):
-        """传输层没有 `fetch_image` 能力 → 明确拒绝（旧行为：带图不做）。"""
+    async def test_a_transport_without_fetch_image_still_updates(self):
+        """传输层没有 `fetch_image` 也照常改（旧版本会因此拒绝带图说说）。"""
         host, calls = self._host(moods=MOODS_TEXT_WITH_PIC, has_fetch=False)
         result = await host.qzone_execute(STORY, 'visibility', self._payload())
-        self.assertFalse(result['ok'], result)
-        self.assertIn('图', result['error'])
-        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [])
-        self.assertEqual(host.rows[-1]['status'], 'failed')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(len(self._updates(calls)), 1)
+        self.assertEqual(host.rows[-1]['status'], 'confirmed')
 
-    async def test_too_many_pictures_are_refused_without_uploading(self):
-        """超过一条说说 9 张的上限（列表被拼坏）→ 不猜、不上传、明确拒绝。"""
-        pics = ','.join(
-            '{"url1":"https://example.invalid/%d.jpg"}' % index for index in range(10)
+    # ---- 回读校验：把"留空字段不改动附件"这个推断变成每次实测 -----------
+
+    async def test_the_readback_confirms_that_the_attachments_survived(self):
+        """附件没变 → 按成功记账，不写 `attachment_loss`、不跳闸。"""
+        host, calls = self._host(moods=MOODS_TEXT_WITH_PIC)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(len(self._updates(calls)), 1)
+        self.assertEqual(
+            len(host.transport.http_calls), 3,
+            '改前读一次 + update 一次 + 改后回读一次',
         )
-        moods = (
-            '_preloadCallback({"code":0,"msglist":[{"tid":"TID-0001","content":"\u665a\u5b89",'
-            '"pic":[%s]}]});' % pics
+        self.assertTrue(
+            any('回读校验通过' in text for _level, text in host.standalone),
+            '校验通过也要留一条 debug（"H1 当场成立"是这么攒出来的）：%s' % host.standalone,
         )
-        host, calls = self._host(moods=moods)
+        self.assertNotIn('qzone_visibility_attachment_loss', host.entries[-1]['metadata'])
+        self.assertFalse(self._guard_path().exists(), '没实测到丢附件就不该跳闸')
+
+    async def test_an_attachment_loss_warns_trips_the_guard_and_is_recorded(self):
+        """**最重要的一条**：回读发现配图没了 → warn + 剧本 metadata + 跳闸标志。"""
+        host, _calls = self._host(moods=MOODS_TEXT_WITH_PIC, later=MOODS_TEXT_NO_ATTACHMENTS)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], 'update 本身是成功的：%s' % result)
+        self.assertEqual(host.rows[-1]['status'], 'confirmed')
+        warns = host.notes('warn')
+        self.assertTrue(
+            any('回读校验不通过' in text and '配图从 1 张变成 0 张' in text for text in warns),
+            '要说清是"哪一项"变了：%s' % warns,
+        )
+        self.assertTrue(any('请检查' in text for text in warns), warns)
+        self.assertTrue(host.entries[-1]['metadata']['qzone_visibility_attachment_loss'])
+        guard = json.loads(self._guard_path().read_text(encoding='utf-8'))
+        self.assertTrue(guard['attachmentLoss'])
+        self.assertEqual(guard['tid'], TID)
+        self.assertIn('配图从 1 张变成 0 张', guard['detail'])
+
+    async def test_a_video_loss_also_trips_the_guard(self):
+        """视频与图片一样算附件（视频不在正文里，只看 `pic` 会把它漏掉）。"""
+        host, _calls = self._host(moods=MOODS_TEXT_WITH_VIDEO, later=MOODS_TEXT_NO_ATTACHMENTS)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(
+            any('视频从 1 个变成 0 个' in text for text in host.notes('warn')),
+            host.notes('warn'),
+        )
+        self.assertTrue(host.entries[-1]['metadata']['qzone_visibility_attachment_loss'])
+        self.assertTrue(json.loads(self._guard_path().read_text(encoding='utf-8'))['attachmentLoss'])
+
+    async def test_a_content_mismatch_warns_without_tripping_the_guard(self):
+        """附件没少但正文对不上 → 同样要看见，但不算"附件被删"（不跳闸）。"""
+        host, _calls = self._host(
+            moods=MOODS_TEXT_WITH_PIC, later=MOODS_TEXT_REWRITTEN,
+        )
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(
+            any('正文对不上' in text for text in host.notes('warn')), host.notes('warn'),
+        )
+        self.assertNotIn('qzone_visibility_attachment_loss', host.entries[-1]['metadata'])
+        self.assertFalse(self._guard_path().exists())
+
+    async def test_an_unavailable_readback_warns_but_the_update_still_counts(self):
+        """回读本身没成（读通道炸了）→ 不改判 update 的成败，但要一条 warn 让用户自己看。"""
+        host, _calls = self._host(moods=MOODS_TEXT_WITH_PIC, later=RuntimeError('socket closed'))
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(host.rows[-1]['status'], 'confirmed')
+        self.assertTrue(
+            any('回读校验没做成' in text for text in host.notes('warn')), host.notes('warn'),
+        )
+        self.assertNotIn('qzone_visibility_attachment_loss', host.entries[-1]['metadata'])
+
+    # ---- 跳闸：实测过一次丢附件之后，带附件的一律不碰 -------------------
+
+    async def test_the_guard_refuses_attachment_posts_and_text_still_works(self):
+        """跳闸 → 带附件的说说被拒（零 update），**纯文字照常**；删掉文件即恢复。"""
+        self._write_guard({
+            'attachmentLoss': True, 'tid': 'OLD-1', 'detectedAt': '2026-01-01T00:00:00+08:00',
+            'detail': '配图从 3 张变成 0 张',
+        })
+        # ① 带附件：明确拒绝，且**不发** update。
+        host, calls = self._host(moods=MOODS_TEXT_WITH_PIC)
         result = await host.qzone_execute(STORY, 'visibility', self._payload())
         self.assertFalse(result['ok'], result)
-        self.assertIn('9', result['error'])
-        self.assertEqual(host.transport.fetch_calls, [])
-        self.assertEqual([call for call in calls if 'cgi_upload_image' in call['url']], [])
+        self.assertIn('附件', result['error'])
+        self.assertIn('纯文字', result['error'])
+        self.assertIn('删掉文件', result['error'], '解除办法必须写在拒绝理由里：%s' % result['error'])
+        self.assertEqual(self._updates(calls), [])
         self.assertEqual(host.rows[-1]['status'], 'failed')
+        self.assertEqual(host.entries, [], '被拒的动作不进剧本')
+        # ② 纯文字：不受跳闸影响。
+        host2, calls2 = self._host()
+        ok = await host2.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(ok['ok'], ok)
+        self.assertEqual(len(self._updates(calls2)), 1)
+        self.assertEqual(host2.rows[-1]['status'], 'confirmed')
+        # ③ 删掉标志文件 = 恢复。
+        self._guard_path().unlink()
+        host3, calls3 = self._host(moods=MOODS_TEXT_WITH_PIC)
+        self.assertTrue(
+            (await host3.qzone_execute(STORY, 'visibility', self._payload()))['ok'],
+        )
+        self.assertEqual(len(self._updates(calls3)), 1)
+
+    async def test_a_broken_guard_file_does_not_lock_the_action(self):
+        """坏 JSON 的跳闸文件按"没跳闸"处理（用户的解除办法就是删掉 / 清空它），但要留 warn。"""
+        self._guard_path().write_text('{ not json', encoding='utf-8')
+        host, calls = self._host(moods=MOODS_TEXT_WITH_PIC)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(len(self._updates(calls)), 1)
+        self.assertTrue(
+            any('不是合法 JSON' in text for text in host.notes('warn')), host.notes('warn'),
+        )
+
+    async def test_an_explicitly_released_guard_file_lets_attachments_through(self):
+        """`attachmentLoss` 为假 / 缺这个键 = 用户已解除：带附件的照常改。"""
+        for payload in ({'attachmentLoss': False}, {}, {'note': '看过了，没事'}):
+            with self.subTest(payload=payload):
+                self._write_guard(payload)
+                host, calls = self._host(moods=MOODS_TEXT_WITH_PIC)
+                result = await host.qzone_execute(STORY, 'visibility', self._payload())
+                self.assertTrue(result['ok'], result)
+                self.assertEqual(len(self._updates(calls)), 1)
+
+    # ---- 其余边界（v1.7.5 起就有，v1.7.9 一字未改） ---------------------
 
     async def test_the_text_path_still_sends_no_rich_text_block(self):
-        """回归：纯文字路径**一个字节都没变**（没有 richval / pic_bo / 上传调用）。"""
+        """纯文字路径**一个字节都没变**（字段集合与顺序仍是参考实现那一份）。"""
         host, calls = self._host()
         result = await host.qzone_execute(STORY, 'visibility', self._payload())
         self.assertTrue(result['ok'], result)
         self.assertEqual(host.transport.fetch_calls, [])
-        self.assertEqual([call for call in calls if 'cgi_upload_image' in call['url']], [])
-        update = [call for call in calls if 'emotion_cgi_update' in call['url']][0]
+        self.assertEqual(self._uploads(calls), [])
+        update = self._updates(calls)[0]
         self.assertNotIn('pic_bo', update['data'])
         self.assertEqual(update['data']['richval'], '')
         self.assertEqual(update['data']['richtype'], '')
@@ -823,7 +878,7 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
         result = await host.qzone_execute(STORY, 'visibility', self._payload())
         self.assertFalse(result['ok'], result)
         self.assertIn('正文', result['error'])
-        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [])
+        self.assertEqual(self._updates(calls), [])
         self.assertEqual(host.rows[-1]['status'], 'failed')
 
     async def test_a_failed_lookup_surfaces_the_real_reason(self):
@@ -843,12 +898,40 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_without_the_cgi_channel_it_fails_instead_of_falling_back(self):
         """没有原始 HTTP 能力（纯 SnowLuma 环境）：明确失败，**不**回落平台动作。"""
         host = _Host(config=dict(BASE_CONFIG, daily_post_cap=5, min_interval_minutes=0))
+        host.ctx = types.SimpleNamespace(base_dir=self._tmp.name)
         host.transport = _NapcatTransport(_napcat_handler([]), has_http=False)
         result = await host.qzone_execute(STORY, 'visibility', self._payload())
         self.assertFalse(result['ok'], result)
         self.assertIn('NapCat', result['error'])
         self.assertEqual(host.transport.calls, [], '不该往平台打任何动作（根本没有这条动作）')
         self.assertEqual(host.rows[-1]['status'], 'failed')
+
+    async def test_the_guard_file_lands_in_the_data_dir_the_production_host_exposes(self):
+        """跳闸文件真的落在 `ctx.base_dir` 里（生产挂的就是它），并且三种持有点都认。
+
+        这条是因为"数据目录读错属性"在本仓库有前科（读法一错就是**静默失效**）：
+        `ServiceBase` 存的是 `self.ctx`；若照抄 `self.context`（生产里根本没有这个属性），
+        跳闸会永远写不出去、也永远拦不住。
+        """
+        for holder in ('ctx', 'context', 'self'):
+            with self.subTest(holder=holder):
+                host, _calls = self._host(
+                    moods=MOODS_TEXT_WITH_PIC, later=MOODS_TEXT_NO_ATTACHMENTS,
+                )
+                if holder != 'ctx':
+                    del host.ctx
+                    if holder == 'context':
+                        host.context = types.SimpleNamespace(base_dir=self._tmp.name)
+                    else:
+                        host.base_dir = self._tmp.name
+                self.assertTrue(
+                    (await host.qzone_execute(STORY, 'visibility', self._payload()))['ok'],
+                )
+                self.assertTrue(
+                    self._guard_path().exists(),
+                    '跳闸标志必须落在数据目录里（持有点=%s）' % holder,
+                )
+                self._guard_path().unlink()
 
     async def test_a_transport_error_is_recorded_as_unknown_not_failed(self):
         """传输层异常 → `unknown`（v1.7.6 改口径）。
@@ -865,6 +948,45 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('socket closed', result['error'])
         self.assertIn('结果未知', result['error'])
         self.assertIn('不会自动重试', result['error'])
+
+    async def test_the_service_layer_never_reaches_for_an_upload_or_a_download(self):
+        """源码哨兵：`ServiceChunk13` 的**代码**里不许再出现下载 / 上传 / `richval` 入口。
+
+        v1.7.8 那条路是"下载原图 → 逐张重传 → 拼新 `richval`"，它的副作用是真的
+        （腾讯侧多出副本），所以这里钉住它不会悄悄长回来——要重新引入必须先改这条断言。
+        只扫**代码**（AST 的标识符 / 属性 / 字符串字面量），文档与注释里解释这段历史的
+        文字不算（那是必须留下的记录）。
+        """
+        import ast
+        import inspect
+
+        from plugin.core.service.chunk13 import ServiceChunk13
+
+        tree = ast.parse(inspect.getsource(ServiceChunk13))
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+                body = getattr(node, 'body', [])
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    docstrings.add(id(body[0].value))
+        symbols: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                symbols.append(node.attr)
+            elif isinstance(node, ast.Name):
+                symbols.append(node.id)
+            elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docstrings):
+                symbols.append(node.value)
+        for needle in ('fetch_image', 'cgi_upload_image', 'upload_image', 'richval', 'pic_bo'):
+            with self.subTest(needle=needle):
+                self.assertFalse(
+                    [symbol for symbol in symbols if needle in symbol],
+                    'v1.7.9 起改可见范围这条路上不许再出现 %s（要接回来先改这条断言）' % needle,
+                )
 
 
 # --------------------------------------------------------------------------- #

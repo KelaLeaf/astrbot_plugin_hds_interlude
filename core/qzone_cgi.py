@@ -54,34 +54,32 @@ ok = success_or_error(parse_jsonp(raw) if isinstance(raw, str) else raw)
   （`packages/napcat-test/qzone.test.ts`）钉着 `'10001|10002'` ——用 **`|`**；
 * 编辑请求要不要 `who`：参考实现的编辑构造器**没有** `who`（发布有），照它，不加。
 
-**第九、十条接口 `upload_image` / 带图的 `update`（v1.7.7 新增）**，同样出自上面那份
-参考实现（`._ref/qzone_api-1.1.0`，**同一份**，逐字对照）：
+**第九、十条接口 `upload_image` / 上传回执 → `richval`（v1.7.7 新增，v1.7.9 起**没有
+生产调用方**）**，同样出自上面那份参考实现（`._ref/qzone_api-1.1.0`，**同一份**，逐字对照）：
 
 | 本模块 | 参考实现 | 用途 |
 | --- | --- | --- |
 | `build_upload_image_request` | `api_parms.py::build_upload_image_params` + `api_zone.py` 的 `upload_url` | 把一张图的 base64 传进说说相册 |
 | `image_upload_receipt` / `build_image_richval` | `api_parms.py::build_image_richval`（+ `api_feed.py::publish_image_message` 的用法） | 把上传回执拼成 `richval` / `pic_bo` |
 
-依据强度**必须说清**（这条链上有一处是推断，不是抓包）：
+这两条的实现仍然**逐字**照抄参考实现（字段与顺序都来自它的 dict 字面量 ✅，
+`richval` 的字面量 `",{albumid},{lloc},{sloc},{type},{height},{width},,{height},{width}"`、
+多张 `\t` 连接、`pic_bo` 取回执 `url` 里的 `bo=` ✅），但 **v1.7.9 起没有任何生产调用方**：
+它们当初唯一的用途是"改带图说说的可见范围时把原图重传一遍拿新 `richval`"，而那条路已经
+整条删除（裁定见 `docs/PORTING_NOTES.md` §43：不带富文本字段才是**无副作用**的那条路）。
+保留它们是**有意为之**：一是参考实现的逐字移植（将来若真有一份抓包证明 H2/H3，材料现成），
+二是它们仍被单测钉着，删掉反而丢掉"参考实现长什么样"的对照物。**不要**在没有新证据之前
+把它们接回 `build_update_visibility_request` / `update_visibility` 这条路上——
+那条路的契约是"富文本字段一律留空"。
 
-* **上传请求**：逐字照抄，字段与顺序都来自参考实现的 dict 字面量 ✅；
-* **`richval` / `pic_bo` 的构造**：逐字照抄 `build_image_richval`
-  （每张图 `",{albumid},{lloc},{sloc},{type},{height},{width},,{height},{width}"`，
-  多张 `\t` 连接；`pic_bo` 取回执 `url` 里的 `bo=`）✅；
-* **`emotion_cgi_update` 带 `richval`**：参考实现的 `build_edit_message_params`
-  **没有**图片分支（它只是文本版构造器），所以"这条接口收下 `richval` 就照它重建图片"
-  是**推断**，没有任何参考实现或抓包直接覆盖它 ⚠️。可用的间接依据有三条：
-  ① 该构造器的字段清单里**就有** `pic_template` / `richtype` / `richval` /
-  `special_url` / `subrichtype` 这一整块富文本槽位（纯文本编辑用不到它们）；
-  ② 发布分支（`build_publish_image_params`、以及本项目 `build_publish_request`
-  的图片分支）用的就是这几个字段名，值 `richtype=1` / `subrichtype=1`；
-  ③ 调用方（`chunk13`）只在**上传成功、回执字段齐全**时才带上它们——
-  任何一步失败都明确拒绝，**绝不**用空 `richval` 硬发。
-
-`pic_bo` 是本模块对参考实现的**一处受控偏离**：参考实现的编辑字段清单里没有这个键，
-而发布带图时有，所以这里**只在拿到 `bo` 时才追加**（文本路径的字段集合与顺序一个字节都没动，
-`test_qzone_cgi.RequestBuilderTests` 钉着）。判断依据是风险不对称：少发一个服务端真要的
-字段 = 静默丢图；多发一个它不认的字段 = 大概率被忽略。这一条待真机确认。
+**曾经的一处推断已经作废**（v1.7.7/v1.7.8 记在这里的"唯一推断"）：当时认为
+`emotion_cgi_update` **收** `richval` 就按整条重建、因此必须重传原图。用户直接质疑了这个
+前提，复查参考实现的 `build_edit_message_params` 后发现：那份构造器**本来就是改可见范围用
+的**（docstring：`ugcright_id` 取自说说列表里该条），而它把 `pic_template` / `richtype` /
+`richval` / `subrichtype` / `special_url` **全留空串**——即"空串 = 不改动富文本"。据此裁定
+走 H1（只发可见性 + 既有字段），并把"附件到底有没有被留空字段改动"变成**每次实测**：
+`chunk13` 在 update 成功后回读这条说说比对附件与正文，实测到附件变少就告警 + 跳闸。
+`pic_bo` 那处"受控偏离"（编辑清单里没有、发布有）随之作废——编辑路径不再发任何富文本字段。
 
 刻意不做的事：重试 / 限流 / 审计（属于调用方的策略层）、任何网络动作
 （图片字节的下载由调用方的 `Transport.fetch_image` 负责，这里只收 base64）。
@@ -376,33 +374,29 @@ def build_update_visibility_request(
     visible: int,
     target_uins: Any = (),
     ugcright_id: str = "",
-    richval: str = "",
-    pic_bo: str = "",
 ) -> QZoneRequest:
     """改一条**已发出**的说说的可见范围（`emotion_cgi_update`，v1.7.5）。
 
     参数与字段顺序**逐字**来自参考实现 `qzone_api/api/api_parms.py::build_edit_message_params`
     （来源见模块 docstring）。四件事必须说清：
 
-    * `content` 是**必填**的：这条接口是"编辑说说"，服务端按整条重建——想只改可见性也得
-      把当前正文原样带回去（调用方从说说列表里读到它）。传空串会把正文清掉，所以这里
-      空串直接**抛 `QZoneAuthError`**（它继承 `ValueError`，属于"取参错误"那一类），
-      宁可让上层报错，也不要把用户的正文擦掉。
-    * `richval` 是**带图说说**的富文本块（`build_image_richval` 的产物，来自把原图
-      **重新上传**拿到的新回执；v1.7.7）。给了它就照发布分支填 `richtype=1` /
-      `subrichtype=1`——这两个槽位本来就在参考实现的编辑字段清单里（默认空串）。
-      **留空时请求与 v1.7.5 逐字一致**（文本路径一个字节没动）。
-      ⚠️ 调用方**必须**先确认"这条说说没有配图"或者"richval 是完整拼出来的"再调本函数：
-      "有图却发空 richval"是静默丢图的入口，这一层不替调用方兜底（也兜不了）。
-    * `pic_bo` 只在**非空**时追加（参考实现的编辑字段清单里没有这个键，发布带图有；
-      这是本模块的一处受控偏离，依据与风险权衡见模块 docstring）。追加位置在字段末尾，
-      文本路径仍与参考实现逐字对齐。
+    * `content` 是**必填**的：`con` 在参考实现的编辑清单里是无条件带的字段，空正文等于
+      把正文清掉，所以这里空串直接**抛 `QZoneAuthError`**（它继承 `ValueError`，属于
+      "取参错误"那一类），宁可让上层报错，也不要把用户的正文擦掉。
+    * **富文本字段一律留空串**（v1.7.9 的 H1 裁定）：`pic_template` / `richtype` /
+      `richval` / `subrichtype` / `special_url` 与参考实现逐字一致地传空——那份构造器
+      就是"改可见范围"用的（docstring 写明 `ugcright_id` 取自说说列表里该条），它把这几个
+      槽位全留空，说明**空串 = 不改动富文本**。本函数因此**不接收** `richval` / `pic_bo`：
+      v1.7.7 / v1.7.8 那条"重新下载原图 + 重新上传拿新 `richval`"的路**有副作用**（图片在
+      腾讯侧变成新副本、原图 URL 换掉、混排的视频会丢），已整条删除。证据与裁定见
+      `docs/PORTING_NOTES.md` §43；改完之后的**回读校验**在调用方（`chunk13`）做。
+    * `ugcright_id` 取自说说列表里该条的 `ugcright_id`（参考实现的原话）；可留空。
     * `target_uins` 只在 `visible` 为 16（部分人可见）/ 128（部分人不可见）时有意义，
       拼成 `allow_uins`（**`|` 分隔**，见 `QZONE_ALLOW_UINS_SEPARATOR` 的说明）；其余
       三档即使给了名单也**不带**这个字段（服务端不看，带了只会让请求更容易被判非法）。
     """
     if not str(content or "").strip():
-        raise QZoneAuthError("改可见范围必须带上说说正文（服务端会按整条重建，空正文等于清空）")
+        raise QZoneAuthError("改可见范围必须带上说说正文（`con` 是必带字段，空正文等于清空）")
     uin = _auth_field(auth, "uin")
     referer = f"https://user.qzone.qq.com/{uin}"
     data: Dict[str, str] = {
@@ -425,13 +419,6 @@ def build_update_visibility_request(
         "format": "fs",
         "qzreferrer": referer,
     }
-    if richval:
-        # 照发布分支（`build_publish_request` 的图片分支）填同一组值。
-        data["richtype"] = "1"
-        data["subrichtype"] = "1"
-        data["richval"] = str(richval)
-        if pic_bo:
-            data["pic_bo"] = str(pic_bo)
     uins = _allow_uins(target_uins) if visible in QZONE_VISIBLE_TARGETED else ""
     if uins:
         data["allow_uins"] = uins
@@ -824,8 +811,13 @@ def feed_items_from_text(raw: Any) -> List[Dict[str, Any]]:
 def parse_mood(msg: Any) -> Dict[str, Any]:
     """把说说列表里的一条原始记录整理成结构化字段（照抄 `utils/feed.py::parse_mood`）。
 
-    宽容处理：`pic` 缺失 / 为 `None` / 元素不是 dict、`rt_con` 是字符串、`msg` 本身
-    不是 dict —— 一律退化成空值，不抛。这些字段来自腾讯的接口，形状并不稳定。
+    宽容处理：`pic` / `video` 缺失 / 为 `None` / 元素不是 dict、`rt_con` 是字符串、
+    `msg` 本身不是 dict —— 一律退化成空值，不抛。这些字段来自腾讯的接口，形状并不稳定。
+
+    `video`（v1.7.9 补）同样逐字照抄参考实现 `utils/html_parser.py::parse_feed_data`
+    对 `msg.get('video')` 的处理（六个字段：`url3` / `url1` / `video_id` / `video_time` /
+    `cover_width` / `cover_height`）。加它的理由是**改可见范围后的回读校验**要能数出视频：
+    视频与图片一样不在正文里，只留空富文本字段到底动没动它们，只能靠回读比对。
     """
     item: Dict[str, Any] = {
         "tid": "",
@@ -838,6 +830,7 @@ def parse_mood(msg: Any) -> Dict[str, Any]:
         "uin": "",
         "lbs": {},
         "pic": [],
+        "video": [],
         "rt_tid": "",
         "rt_uin": "",
         "rt_content": "",
@@ -857,7 +850,9 @@ def parse_mood(msg: Any) -> Dict[str, Any]:
         lbs=msg.get("lbs", {}),
     )
 
-    for p in msg.get("pic") or []:
+    # `pic` / `video` 可能是 None、字符串、数字（腾讯的形状不稳定）：**不是列表就当空**，
+    # 否则 `for ... in 数字` 会直接抛。
+    for p in msg.get("pic") if isinstance(msg.get("pic"), (list, tuple)) else []:
         if not isinstance(p, Mapping):
             continue
         item["pic"].append({
@@ -865,6 +860,18 @@ def parse_mood(msg: Any) -> Dict[str, Any]:
             "smallurl": p.get("smallurl", ""),
             "width": p.get("width", 0),
             "height": p.get("height", 0),
+        })
+
+    for v in msg.get("video") if isinstance(msg.get("video"), (list, tuple)) else []:
+        if not isinstance(v, Mapping):
+            continue
+        item["video"].append({
+            "url": v.get("url3", ""),
+            "cover": v.get("url1", ""),
+            "video_id": v.get("video_id", ""),
+            "duration_ms": v.get("video_time", "0"),
+            "width": v.get("cover_width", 0),
+            "height": v.get("cover_height", 0),
         })
 
     rt_con = msg.get("rt_con")

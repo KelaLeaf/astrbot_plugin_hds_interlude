@@ -503,8 +503,12 @@ class ChatRequestOverrides(TypedDict, total=False):
 #: 宿主适配层据此判断"这个旁路任务该用哪个 AstrBot 模型"。上游的 `timeline` /
 #: 日程预排 / Overlay 整理都跟随 `compaction` 的连接（`isAssignedTo` 里没有独立
 #: 开关），所以这里统一映射到 `compaction`。
+#: `'作品创作'`（共同作品的独立写手，v1.7.9）有自己的一条：适配层为"指名了 AstrBot
+#: Provider"合成的那条连接行挂着 `use_for_works`，而**落到哪个 Provider 就靠这个键**
+#: ——没有它，请求会带着 `compaction` 的键走回会话默认模型。
 SIDE_TASK_ROUTES: dict[str, str] = {
     '世界播种': 'world_seeding',
+    '作品创作': 'works',
     '压缩': 'compaction',
     '时间导演': 'compaction',
     '日程预排': 'compaction',

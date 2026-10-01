@@ -681,18 +681,18 @@ def qzone_cgi_request(action: str, auth: Any, params: Mapping[str, Any]) -> tupl
             richval=str(params.get('richval') or ''), pic_bo=str(params.get('pic_bo') or ''),
         )
     if action == 'update_visibility':
+        # v1.7.9：只发可见性 + 既有字段（正文原样带回、名单按档位拼）——**没有**富文本
+        # 参数可传：参考实现的编辑构造器把那几个槽位全留空串（= 不改动富文本），
+        # "重新下载 + 重新上传拿新 richval"那条路已整条删除（见 `docs/PORTING_NOTES.md` §43）。
         return cgi.build_update_visibility_request(
             auth, str(params.get('tid') or ''), str(params.get('content') or ''),
             int(_js_int_or(params.get('ugcRight', params.get('ugc_right')), 4) or 4),
             target_uins=params.get('targetUins', params.get('target_uins')) or (),
-            # v1.7.8：带图的说说在改可见范围前会把原图**重新上传**一次，这里带上新拼的
-            # 富文本块（空 = 纯文本路径，请求与 v1.7.5 逐字一致）。
-            richval=str(params.get('richval') or ''),
-            pic_bo=str(params.get('pic_bo') or ''),
         )
     if action == 'upload_image':
-        # v1.7.8：图片上传（改带图说说的可见范围时，先把原图重新传一遍拿新 richval）。
-        # 内部动作——不在 `QZONE_CGI_ACTIONS` / `QZONE_CGI_BY_ID` 里（模型看不到它）。
+        # 图片上传构造器：参考实现的逐字移植，**v1.7.9 起生产路径上没有调用方**
+        # （当初唯一用途是重传原图拿新 richval）。内部动作——不在
+        # `QZONE_CGI_ACTIONS` / `QZONE_CGI_BY_ID` 里（模型看不到它）。
         return cgi.build_upload_image_request(
             auth, str(params.get('picBase64', params.get('pic_base64')) or ''),
             str(params.get('filename') or 'filename'),
@@ -739,9 +739,9 @@ async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = Non
     `call_qzone_action` 对齐（成功回动作结果，失败抛 `QzoneActionError`），
     这样上层的限流/审计/剧本留痕那一套**不用改**。
 
-    `auth` 是给"一次动作要连打好几个 CGI"的场合准备的（v1.7.8 的带图改可见范围：
-    先上传 N 张图、再 update）：传进来就复用，不传就自己取一次（`qzone_cgi_auth`）
-    ——**不传时的行为与加这个参数之前逐字一致**。
+    `auth` 是给"一次动作要连打好几个 CGI"的场合准备的（当初的用例是 v1.7.8 的带图改
+    可见范围：先上传 N 张图、再 update；**那条路 v1.7.9 已删**）：传进来就复用，不传就
+    自己取一次（`qzone_cgi_auth`）——**不传时的行为与加这个参数之前逐字一致**。
 
     **失败分类与 `call_qzone_action` 同一套口径**（别在这里另造词汇）：
 
@@ -751,7 +751,7 @@ async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = Non
       接口明确拒绝（没登录 / 风控 / 参数不对），重试是安全的；
     * 成功 → 回动作结果。`upload_image` 回的是上传回执里的 `data`（一张图的描述：
       `albumid` / `lloc` / `sloc` / `type` / `height` / `width` / `url`）——拿不到就
-      按失败抛（缺了它拼不出 `richval`，调用方必须能当场停下而不是硬发）。
+      按失败抛。这条分支同样**没有生产调用方**（与 `upload_image` 构造器一起保留）。
     """
     from . import qzone_cgi as cgi
 
