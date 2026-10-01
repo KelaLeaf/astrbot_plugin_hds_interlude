@@ -43,7 +43,7 @@
 
 from __future__ import annotations
 
-from .platform_actions import ACTION_CONFIG_GROUPS, ACTION_RISK_GROUP
+from .platform_actions import ACTION_CONFIG_GROUPS
 from .service.config import LEGACY_SECTION_MERGES
 
 import copy
@@ -86,8 +86,8 @@ KNOWN_SECTIONS = frozenset({
     # 本移植版新增：QQ 空间（v1.6.0 由隐藏兼容位转正）、输入状态、以及动作开关分组。
     # 动作分组名从目录派生，**不要手抄**——加动作时这里自动跟上。
     'qzone', 'input_status', 'world_seeder', 'works', 'forward_message', 'forward_message_compat',
-    *sorted(set(ACTION_CONFIG_GROUPS.values()) | {ACTION_RISK_GROUP}),
-    # v1.7.2 收敛动作开关组后留下的旧分组（藏在 schema 里当只读兼容位）：老导出文件
+    *sorted(set(ACTION_CONFIG_GROUPS.values())),
+    # 收敛 / 取消「风险操作」组后留下的旧分组（藏在 schema 里当只读兼容位）：老导出文件
     # 里只有这些组名，认得出来才不会报"未知顶层键"。组名从归并表派生，别手抄。
     *sorted({name for sources in LEGACY_SECTION_MERGES.values() for name in sources}),
     # 上游 Koishi Console 的分组名（老导出文件里会出现）

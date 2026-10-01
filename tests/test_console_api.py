@@ -138,21 +138,21 @@ class ConsoleApiTests(unittest.TestCase):
                     self.assertEqual(sorted(param), sorted(
                         ['name', 'label', 'type', 'required', 'minimum', 'maximum', 'choices', 'note'],
                     ))
-        # 四档 + 中文说明；分组表覆盖风险组（面板要说明"开关在哪一组"）
+        # 四档 + 中文说明；分组表覆盖全部可见动作组（面板要说明"开关在哪一组"）
         self.assertEqual([tier['id'] for tier in payload['tiers']],
                          list(platform_actions.PERMISSION_TIERS))
         self.assertTrue(all(tier['label'] and tier['description'] for tier in payload['tiers']))
-        self.assertEqual(payload['groups'][platform_actions.ACTION_RISK_GROUP],
-                         console_module.RISK_GROUP_LABEL)
         for row in rows:
             self.assertIn(row['group'], payload['groups'])
-        # v1.7.2 收敛成四个开关组：文案必须是**合并后**的组名，而不是"先到的类别"
-        # （`actions_chat` 里坐着互动/消息/历史/状态/资料/语音/联系人七类，叫「互动」是错的）。
+        # v1.7.2 收敛成三个开关组（v1.7.3 又取消了独立的风险组）：文案必须是**合并后**的
+        # 组名，而不是"先到的类别"（`actions_chat` 里坐着互动/消息/历史/状态/资料/语音/
+        # 联系人七类，叫「互动」是错的），危险动作也不再有自己的组。
         self.assertEqual(payload['groups'],
                          dict(platform_actions.ACTION_CONFIG_GROUP_LABELS))
         self.assertEqual(sorted(payload['groups']),
-                         ['actions_chat', 'actions_group', 'actions_qzone', 'actions_risks'])
-        self.assertEqual(payload['groups']['actions_chat'], '会话动作')
+                         ['actions_chat', 'actions_group', 'actions_qzone'])
+        self.assertEqual(payload['groups']['actions_chat'], '动作：会话')
+        self.assertNotIn('actions_risks', {row['group'] for row in rows})
         # 各 risk 计数与档位分布都要对得上
         counts = {}
         for row in rows:
@@ -177,7 +177,8 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(payload['stats']['risky'], len(risky))
         self.assertEqual(payload['stats']['risky_enabled'], 0, '默认没有任何危险动作在跑')
         # 警示语必须是 core 里那一句原文，不许在控制台另写一句
-        self.assertEqual(platform_actions.RISK_WARNING, '以下功能包含风险操作不建议开启')
+        self.assertEqual(platform_actions.RISK_WARNING,
+                         '此标签下功能具有一定风险，易误操作，请谨慎开启。')
         self.assertEqual(payload['risk_warning'], platform_actions.RISK_WARNING)
 
     def test_catalog_survives_an_unconfigured_empty_plugin(self):
@@ -204,15 +205,17 @@ class ConsoleApiTests(unittest.TestCase):
                          len(payload['actions']) - payload['stats']['risky'] - 1)
 
     def test_enabling_a_dangerous_action_drives_the_warning_counter(self):
-        self.bridge.config['actions_risks'] = {'set_group_kick': True}
+        """危险动作的开关现在落在它自己类别所属的组里（群管理类 → `actions_group`）。"""
+        self.bridge.config['actions_group'] = {'set_group_kick': True}
         _run(self.api.set_action_permission('set_group_kick', 'admin'))
         payload = _run(self.api.actions_catalog())
         row = next(item for item in payload['actions'] if item['id'] == 'set_group_kick')
         self.assertEqual(row['permission'], 'admin')
+        self.assertEqual(row['group'], 'actions_group')
         self.assertTrue(row['enabled'])
         self.assertEqual(payload['stats']['risky_enabled'], 1)
 
-    # ---- v1.7.2 分组收敛：旧格式配置仍要读得到（升级不丢配置） ----
+    # ---- v1.7.2 分组收敛 / v1.7.3 取消风险组：旧格式配置仍要读得到 ----
 
     def test_action_switches_read_old_format_groups(self):
         """旧格式：开关写在 `actions_interaction` 等旧组里，没有 `actions_chat`。
@@ -235,7 +238,7 @@ class ConsoleApiTests(unittest.TestCase):
         for row in payload['actions']:
             with self.subTest(action=row['id']):
                 self.assertNotIn(row['group'], ('actions_interaction', 'actions_voice'),
-                                 '落点必须是收敛后的四个组之一')
+                                 '落点必须是收敛后的三个组之一')
 
         # ② 直接改内存里的旧组（`bridge.section()` 自己会归并，不依赖归一化）
         self.bridge.config.pop('actions_chat', None)
@@ -244,6 +247,65 @@ class ConsoleApiTests(unittest.TestCase):
                    if item['id'] == 'send_poke')
         self.assertIs(row['config_enabled'], False)
         self.assertEqual(row['group'], 'actions_chat')
+
+    def test_risk_group_switches_read_through_their_new_groups(self):
+        """**回归用例（用户点名）**：开关落在 `actions_risks` 的配置，读取侧仍读得到。
+
+        面板报告的落点是新组名（群管理 / 空间 / 会话），`config_enabled` 是旧组里的值，
+        而旧组自己一个键都没动——回退到上一个版本时它才是真源。
+        """
+        bridge = _make_bridge({'actions_risks': {
+            'enabled': True, 'set_group_kick': True, 'delete_qzone_post': True,
+            'delete_friend': True,
+        }})
+        bridge.db = self.bridge.db
+        payload = _run(ConsoleApi(bridge).actions_catalog())
+        rows = {row['id']: row for row in payload['actions']}
+        for action_id, group in (('set_group_kick', 'actions_group'),
+                                 ('delete_qzone_post', 'actions_qzone'),
+                                 ('delete_friend', 'actions_chat')):
+            with self.subTest(action=action_id):
+                self.assertIs(rows[action_id]['config_enabled'], True)
+                self.assertEqual(rows[action_id]['group'], group)
+        self.assertIsNone(rows['send_poke']['config_enabled'],
+                          '旧风险组里的键不许流进别的动作')
+
+    def test_writing_a_new_group_switch_syncs_the_shared_legacy_group(self):
+        """控制台把危险开关**改回默认值**（关掉）时，旧组那一份要跟着改。
+
+        折叠不清空共用源，所以"新组里 == 默认值"仍有歧义；写的时候同步一份，用户在新组里
+        关掉危险动作才会真的生效（§35.4 的"改了没反应"）。
+        """
+        from plugin.core.service.config import apply_section_aliases  # noqa: PLC0415
+
+        self.bridge.raw_config = lambda: {
+            'actions_risks': {'enabled': True, 'set_group_kick': True},
+            'actions_group': {'enabled': True, 'set_group_kick': True},
+        }
+        written: dict[str, Any] = {}
+
+        async def fake_save(target):
+            written.clear()
+            written.update(target)
+            return 'test'
+
+        self.bridge.save_raw_config = fake_save
+        _run(self.api.set_config_value('actions_group.set_group_kick', False))
+        self.assertIs(written['actions_group']['set_group_kick'], False)
+        self.assertIs(written['actions_risks']['set_group_kick'], False,
+                      '旧组那一份必须一起改（否则读取侧会回落到旧的 true）')
+        # 写完之后读取侧的合成值必须是用户刚写的那个（改回默认值真的生效）。
+        self.assertIs(apply_section_aliases(written)['actions_group']['set_group_kick'], False)
+
+    def test_sync_never_creates_a_retired_group_or_touches_exclusive_ones(self):
+        """同步只碰**已经存在**的共用源键；独占旧组照旧交给折叠清空。"""
+        target = {'actions_group': {'enabled': True, 'set_group_kick': False},
+                  'actions_interaction': {'send_poke': False}}
+        console_module._sync_shared_legacy_switches(target, 'actions_group.set_group_kick', False)
+        self.assertNotIn('actions_risks', target, '旧的共用组不存在时不许凭空造出来')
+        console_module._sync_shared_legacy_switches(target, 'actions_chat.send_poke', True)
+        self.assertIs(target['actions_interaction']['send_poke'], False,
+                      '独占旧组不参与同步（它由折叠清空）')
 
     def test_config_page_shows_the_merged_value_of_the_new_action_group(self):
         """配置页显示的必须是运行期**真正生效**的值（含旧分组归并），见坑 34。"""
@@ -296,9 +358,13 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(row['permission'], 'global', '清空后回目录默认档')
 
     def test_read_only_console_pages_have_no_permission_entry(self):
-        """「Token 统计」这类只读页面不属于权限表：目录里没有它，写入也会被拒。"""
+        """「Token 统计」这类只读页面不属于权限表：目录里没有它，写入也会被拒。
+
+        v1.7.3 起「动作」页不再解释"只读页面"这件事，`permissionless_panels` 也随之
+        下线（前端那段说明整段删掉了）——边界本身仍然钉在这里。
+        """
         payload = _run(self.api.actions_catalog())
-        self.assertIn('tokens', payload['permissionless_panels'])
+        self.assertNotIn('permissionless_panels', payload)
         for name in ('tokens', 'token-stats', 'token_stats'):
             with self.subTest(name=name):
                 self.assertNotIn(name, platform_actions.ACTIONS)
@@ -1377,6 +1443,38 @@ class ConfigEditorTests(unittest.TestCase):
         _run(self.api.set_config_value('actions_chat.send_poke', True))
         self.assertIs(self.bridge.section('actions_chat')['send_poke'], True)
         self.assertIs(self._read()['actions_chat']['send_poke'], True)
+
+    def test_startup_migration_keeps_the_retired_risk_group_readable(self):
+        """v1.7.3 升级现场：开关落在退休的 `actions_risks` 里，启动迁移后**两份都能读**。
+
+        退休的那一组是**共用源**（键分属三个新组），所以折叠不清空它：清掉等于把另外两个
+        新组的数据一起删了，而且回退到 v1.7.2 时那个版本只认这一组（用户要求来回升级不丢）。
+        新组这一份由折叠写实，于是宿主配置页与运行期读到的是同一个值。
+        """
+        with open(self.path, 'w', encoding='utf-8') as handle:
+            handle.write('\ufeff' + json.dumps({
+                'actions_group': {'enabled': True, 'set_group_kick': False},
+                'actions_risks': {'enabled': True, 'set_group_kick': True,
+                                  'delete_qzone_post': True, 'delete_friend': True},
+            }, ensure_ascii=False))
+        self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 1)
+        data = self._read()
+        self.assertIs(data['actions_group']['set_group_kick'], True, '用户的选择折进新组')
+        self.assertIs(data['actions_qzone']['delete_qzone_post'], True)
+        self.assertIs(data['actions_chat']['delete_friend'], True)
+        self.assertIs(data['actions_risks']['set_group_kick'], True,
+                      '共用源不许被清空（回退到 v1.7.2 时它才是真源）')
+        # 运行期读到的是同一份
+        self.assertIs(self.bridge.section('actions_group')['set_group_kick'], True)
+        # 幂等：没有可折的东西了，不写盘
+        self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 0)
+        self.assertEqual(self._read(), data)
+        # 用户在新组里把它关掉：新组与共用源一起改，"改了没反应"不会发生
+        _run(self.api.set_config_value('actions_group.set_group_kick', False))
+        stored = self._read()
+        self.assertIs(stored['actions_group']['set_group_kick'], False)
+        self.assertIs(stored['actions_risks']['set_group_kick'], False)
+        self.assertIs(self.bridge.section('actions_group')['set_group_kick'], False)
 
 
 # =========================================================================== #

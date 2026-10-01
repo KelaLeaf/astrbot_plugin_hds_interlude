@@ -23,10 +23,8 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from ..platform_actions import (
-    ACTION_RISK_GROUP,
     ACTIONS,
     PLATFORM_ACTION_FIELD,
-    RISK_WARNING,
     action_config_group,
     describe_actions,
     effective_permission,
@@ -121,9 +119,9 @@ class ServiceChunk12(ServiceBase):
           `AstrbotBridge` 的成员，见 chunk14 的同款说明），所以宿主注入了 `section`
           就用它、否则读 `self.config`。早期版本只走 `self.section`，异常被吞掉后
           恒回 `{}` —— 配置页里的开关看着能点，运行期其实一条都不生效。
-        * **N:1 旧分组归并**（`LEGACY_SECTION_MERGES`）：动作开关组 v1.7.2 由十个
-          收敛成四个，用户升级前设过的键还在旧分组里；新分组的键优先、缺的键从旧
-          分组补，所以新旧配置读出来是同一份。
+        * **N:1 旧分组归并**（`LEGACY_SECTION_MERGES`）：动作开关组 v1.7.2 由十个收敛成
+          三个（v1.7.3 又取消了「风险操作」组），用户升级前设过的键还在旧分组里；新分组的
+          键优先、缺的键从旧分组补，所以新旧配置读出来是同一份。
         """
         values: dict[str, Any] = {}
         reader = getattr(self, 'section', None)

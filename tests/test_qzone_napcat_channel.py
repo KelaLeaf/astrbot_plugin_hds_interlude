@@ -453,13 +453,21 @@ QZONE_IDS = frozenset(NAPCAT_ONLY_IDS - {'update_qq_status'})
 
 
 class BackendCatalogTests(unittest.TestCase):
-    def test_backend_labels_are_the_three_literals_the_panel_pins(self):
-        """前端 `actions-view.ts` 也钉了这三条字面量（徽章语气按后端种类分）。"""
+    def test_backend_labels_are_the_two_literals_the_panel_pins(self):
+        """前端 `actions-view.ts` 也钉了这两条字面量（徽章语气按后端种类分）。
+
+        v1.7.3：界面上只有**正式通道**——回退实现（SnowLuma 那套动作名）留在适配层的
+        `_PLATFORM_CALLS` 里当运行期兜底，**不进这张表**，也就不可能被下发到面板上。
+        """
         self.assertEqual(pa.BACKEND_LABELS, {
             'onebot': '标准 OneBot',
             'napcat': 'NapCat 专属',
-            'snowluma': '需要 SnowLuma 扩展',
         })
+        self.assertNotIn('snowluma', pa.BACKEND_LABELS)
+        for action in pa.ACTIONS.values():
+            with self.subTest(action=action.id):
+                self.assertNotIn('snowluma', action.backends,
+                                 '回退通道不许写进目录（界面上不承诺它）')
 
     def test_every_action_declares_at_least_one_known_backend(self):
         for action in pa.ACTIONS.values():
@@ -474,8 +482,8 @@ class BackendCatalogTests(unittest.TestCase):
             with self.subTest(action=action.id):
                 expected = [pa.BACKEND_LABELS[name] for name in action.backends]
                 self.assertEqual(pa.backend_labels(action), expected, '顺序 = 优先级，不许重排')
-        pending = pa.PlatformAction('x', 'qzone', 'l', 's', backends=('napcat', 'napcat', 'snowluma'))
-        self.assertEqual(pa.backend_labels(pending), ['NapCat 专属', '需要 SnowLuma 扩展'])
+        pending = pa.PlatformAction('x', 'qzone', 'l', 's', backends=('napcat', 'napcat', 'onebot'))
+        self.assertEqual(pa.backend_labels(pending), ['NapCat 专属', '标准 OneBot'])
 
     def test_napcat_only_is_exactly_those_eight_actions(self):
         self.assertEqual(len(pa.ACTIONS), 61)
@@ -487,12 +495,18 @@ class BackendCatalogTests(unittest.TestCase):
             with self.subTest(action=action.id):
                 self.assertEqual(action.napcat_only, action.id in NAPCAT_ONLY_IDS)
 
-    def test_the_qzone_actions_are_napcat_first_with_snowluma_as_the_fallback(self):
+    def test_the_qzone_actions_are_napcat_only(self):
+        """空间动作**只有** NapCat 这一条通道（界面上不再宣传别的回退）。
+
+        执行期的回退（`chunk13` 拿不到 cookie 时改打另一个扩展的动作名）照旧存在，
+        有它自己的用例；这里钉的是**目录/界面**这一侧不声明它。
+        """
         for action_id in QZONE_IDS:
             with self.subTest(action=action_id):
                 action = pa.ACTIONS[action_id]
-                self.assertEqual(action.backends, ('napcat', 'snowluma'))
-                self.assertEqual(pa.backend_labels(action), ['NapCat 专属', '需要 SnowLuma 扩展'])
+                self.assertEqual(action.backends, ('napcat',))
+                self.assertEqual(pa.backend_labels(action), ['NapCat 专属'])
+                self.assertTrue(action.napcat_only)
         self.assertEqual(pa.ACTIONS['update_qq_status'].backends, ('napcat',))
         self.assertEqual(pa.backend_labels(pa.ACTIONS['update_qq_status']), ['NapCat 专属'])
 

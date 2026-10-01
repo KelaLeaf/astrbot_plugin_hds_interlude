@@ -22,8 +22,15 @@
 - `dangerous`：不可逆或影响真实社交关系（踢人、禁言、全员禁言、设管理、删好友、
   改群名/群公告之外的破坏性操作、群文件删除）。
 
-`dangerous` 的默认档位一律是 `disabled`，且它们的开关**集中在 `action_risks` 组**，
-该组描述就是那句警告：`以下功能包含风险操作不建议开启`。
+`dangerous` 的默认档位一律是 `disabled`，而且**开关默认关着**；开关落在它自己类别所属
+的那个组里（群管理类进 `actions_group`、空间类进 `actions_qzone`、其余进 `actions_chat`），
+每个危险开关的 `hint` 就是那句警告 `RISK_WARNING`。
+
+v1.7.2 曾把危险动作单独收进一个"风险操作"组，随后按用户要求取消了这个分组：
+「都在机器人动作配置组，然后分类会话动作 / 群管理动作 / QQ 空间动作，这里不用单独把
+风险操作分离一个类，因为控制台动作页已经有标注了」。**危险是动作的属性**（控制台
+「动作」页给它们打红色徽章），不是配置页里独立的一类分组。旧组名仍留在 schema 里当
+隐藏兼容位（读配置时照旧认它里面的键），细节见 `docs/PORTING_NOTES.md` §36。
 """
 
 from __future__ import annotations
@@ -36,7 +43,6 @@ __all__ = [
     'ACTION_CATEGORIES',
     'ACTION_CONFIG_GROUPS',
     'ACTION_CONFIG_GROUP_LABELS',
-    'ACTION_RISK_GROUP',
     'action_config_group',
     'PERMISSION_TIERS',
     'PLATFORM_ACTION_FIELD',
@@ -64,8 +70,8 @@ PERMISSION_TIERS = ('global', 'groupadmin', 'admin', 'disabled')
 
 RISK_LEVELS = ('safe', 'sensitive', 'dangerous')
 
-#: 风险组开关的说明文案（用户指定的原句，逐字）。
-RISK_WARNING = '以下功能包含风险操作不建议开启'
+#: 危险动作开关的说明文案（用户指定的原句，逐字）。
+RISK_WARNING = '此标签下功能具有一定风险，易误操作，请谨慎开启。'
 
 
 class ActionParam:
@@ -126,8 +132,9 @@ class PlatformAction:
     aliases: tuple[str, ...] = field(default=())
     #: 能承载这条动作的后端，**顺序 = 优先级**。语义见 `BACKEND_LABELS`：
     #: `onebot` = 任何 OneBot 实现都有的标准动作；`napcat` = 只有 NapCat 有
-    #: （含"用 NapCat 的 WebSocket 拿 cookie 再打 QZone CGI"这条路）；
-    #: `snowluma` = 需要 SnowLuma 扩展动作。
+    #: （含"用 NapCat 的 WebSocket 拿 cookie 再打 QZone CGI"这条路）。
+    #: 目录**只声明正式通道**：执行期若还有别的回退实现（见适配层
+    #: `_PLATFORM_CALLS` 里的历史动作名），那是运行期的兜底，不在这里承诺、也不在界面上显示。
     backends: tuple[str, ...] = ('onebot',)
 
     @property
@@ -158,12 +165,14 @@ ACTION_CATEGORIES: dict[str, str] = {
 
 
 #: 动作类别 → 配置分组（**schema 与运行期共用这一条映射**，避免"开关在哪"两处各写一遍）。
-#: 危险动作不在这里：它们的开关集中在 `ACTION_RISK_GROUP`。
 #:
-#: **v1.7.2 收敛成四组**（`actions_chat` / `actions_group` / `actions_qzone` / `actions_risks`）：
-#: 原先十个 `actions_*` 组在配置页是十张"开关卡片"，用户要滚很久才找得到想要的那条。
-#: 收敛只动**分组名**，不动键名（键逐字 = 动作 id），旧分组由读取侧的 N:1 合并兜底
+#: **v1.7.2 收敛成三组**（`actions_chat` / `actions_group` / `actions_qzone`）：原先十个
+#: `actions_*` 组在配置页是十张"开关卡片"，用户要滚很久才找得到想要的那条。收敛只动
+#: **分组名**，不动键名（键逐字 = 动作 id），旧分组由读取侧的 N:1 合并兜底
 #: （`core/service/config.py` 的 `LEGACY_SECTION_MERGES`）。
+#:
+#: **危险动作没有单独的组**：它们按 `category` 落进上面这三组之一（用户明确要求不把
+#: 危险动作单独分成一类，见模块 docstring）。
 ACTION_CONFIG_GROUPS: dict[str, str] = {
     'interaction': 'actions_chat',
     'message': 'actions_chat',
@@ -177,28 +186,22 @@ ACTION_CONFIG_GROUPS: dict[str, str] = {
     'qzone': 'actions_qzone',
 }
 
-#: 危险动作的开关组（该组描述就是 `RISK_WARNING`）。
-ACTION_RISK_GROUP = 'actions_risks'
-
-#: 配置分组 → 中文标签（控制台「动作」页用来说明"这个开关在哪一组"）。
+#: 配置分组 → 组标题（控制台「动作」页用来说明"这个开关在哪一组"，与 schema 的 `title` 同源）。
 #:
 #: 为什么单列一张表而不是按类别推：多个类别并进同一组之后，"先到的类别定标签"会
 #: 把 `actions_chat` 标成「互动」，而那一组里还有消息/历史/状态/资料/语音/联系人。
-#: 组名仍然只有一个来源（`ACTION_CONFIG_GROUPS` + `ACTION_RISK_GROUP`），
-#: `test_configuration.py` 断言两张表的键集合完全相等，改一处漏一处当场红。
+#: 组名仍然只有一个来源（`ACTION_CONFIG_GROUPS`），`test_configuration.py` 断言两张表的
+#: 键集合完全相等，改一处漏一处当场红。三个标题写成「动作：X」——一眼看出是一家的。
 ACTION_CONFIG_GROUP_LABELS: dict[str, str] = {
-    'actions_chat': '会话动作',
-    'actions_group': '群管理动作',
-    'actions_qzone': 'QQ 空间动作',
-    ACTION_RISK_GROUP: '风险操作',
+    'actions_chat': '动作：会话',
+    'actions_group': '动作：群管理',
+    'actions_qzone': '动作：QQ 空间',
 }
 
 
 def action_config_group(action: 'PlatformAction') -> str:
-    """某动作的开关落在哪个配置分组（危险动作一律进风险组）。"""
-    return ACTION_RISK_GROUP if action.risk == 'dangerous' else ACTION_CONFIG_GROUPS.get(
-        action.category, 'actions_chat',
-    )
+    """某动作的开关落在哪个配置分组（**按类别**，危险动作也回自己的类别组）。"""
+    return ACTION_CONFIG_GROUPS.get(action.category, 'actions_chat')
 
 
 def _p(*args: Any, **kwargs: Any) -> ActionParam:
@@ -632,9 +635,8 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='sensitive',
         returns='说说 tid + 可见性',
-        # 首选 NapCat WebSocket 方案（`get_cookies` + QZone CGI）；装了 SnowLuma 时
-        # `send_qzone_msg` 作为回退。**排在前面的是优先通道**。
-        backends=('napcat', 'snowluma'),
+        # 空间动作统一走 NapCat WebSocket 方案（`get_cookies` + QZone CGI 拿登录态）。
+        backends=('napcat',),
     ),
     PlatformAction(
         'comment_qzone_post', 'qzone', '评论说说',
@@ -645,14 +647,14 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('target_uin', '归属 QQ'),
         ),
         risk='sensitive',
-        backends=('napcat', 'snowluma'),
+        backends=('napcat',),
     ),
     PlatformAction(
         'like_qzone_post', 'qzone', '点赞说说',
         '给一条空间说说点赞。',
         params=(_p('tid', '说说 tid', required=True), _p('target_uin', '归属 QQ')),
         risk='sensitive',
-        backends=('napcat', 'snowluma'),
+        backends=('napcat',),
     ),
     PlatformAction(
         'list_qzone_posts', 'qzone', '看空间说说',
@@ -662,7 +664,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('count', '条数', type='int', minimum=1, maximum=50),
         ),
         risk='safe',
-        backends=('napcat', 'snowluma'),
+        backends=('napcat',),
     ),
     PlatformAction(
         'list_qzone_feeds', 'qzone', '看好友动态',
@@ -672,7 +674,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('count', '条数', type='int', minimum=1, maximum=30),
         ),
         risk='safe',
-        backends=('napcat', 'snowluma'),
+        backends=('napcat',),
     ),
     PlatformAction(
         'forward_qzone_post', 'qzone', '转发说说',
@@ -683,7 +685,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('content', '转发附言'),
         ),
         risk='sensitive',
-        backends=('napcat', 'snowluma'),
+        backends=('napcat',),
     ),
     PlatformAction(
         'delete_qzone_post', 'qzone', '删说说',
@@ -691,7 +693,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         params=(_p('tid', '说说 tid', required=True),),
         risk='dangerous',
         default_permission='disabled',
-        backends=('napcat', 'snowluma'),
+        backends=('napcat',),
     ),
     # ---------------- 联系人与群 ----------------
     PlatformAction(
@@ -760,10 +762,10 @@ if len(ACTIONS) != len(_ACTION_LIST):  # pragma: no cover - 目录写错时立�
 
 
 #: 后端 → 人话标签（控制台与文档共用一处，别再各写一遍）。
+#: **只有正式通道**：执行期的回退实现不进这张表，也就不可能被下发到面板上。
 BACKEND_LABELS: dict[str, str] = {
     'onebot': '标准 OneBot',
     'napcat': 'NapCat 专属',
-    'snowluma': '需要 SnowLuma 扩展',
 }
 
 
@@ -794,7 +796,11 @@ def actions_by_category() -> dict[str, list[PlatformAction]]:
 
 
 def risky_actions() -> list[PlatformAction]:
-    """全部危险动作（给 `action_risks` 配置组与控制台警示区用）。"""
+    """全部危险动作（给控制台警示区与文档的"危险动作"清单用）。
+
+    它们的开关不再有专门的组，落在各自类别所属的那个 `actions_*` 里
+    （`action_config_group()`），且默认 `false` + 默认档位 `disabled`。
+    """
     return [item for item in _ACTION_LIST if item.risk == 'dangerous']
 
 

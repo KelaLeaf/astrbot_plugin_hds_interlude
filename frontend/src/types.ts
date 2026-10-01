@@ -548,7 +548,7 @@ export interface PermissionTierBrief {
 export interface ActionsCatalogPayload {
   actions: PlatformActionRow[]
   tiers: PermissionTierBrief[]
-  /** 配置分组 id → 中文标签（说明每个开关在哪一组）。 */
+  /** 配置分组 id → 组标题（说明每个开关在哪一组）。 */
   groups: Record<string, string>
   /** 危险动作的警示语（core 里的原文，逐字）。 */
   risk_warning: string
@@ -558,8 +558,6 @@ export interface ActionsCatalogPayload {
   napcat_only?: string[]
   /** 后端 id → 人话标签（core 的 `BACKEND_LABELS` 原文）。 */
   backend_labels?: Record<string, string>
-  /** 与权限表无关的只读页面（例如 「Token 统计」）。 */
-  permissionless_panels: string[]
   permissions_path: string
   stats: {
     total: number

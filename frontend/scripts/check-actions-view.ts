@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict'
 import {
-  BACKEND_NAPCAT, BACKEND_ONEBOT, BACKEND_SNOWLUMA, backendBadges, backendNote, backendTone,
+  BACKEND_NAPCAT, BACKEND_ONEBOT, backendBadges, backendNote, backendTone,
   describeParam, filterNapcatOnly, groupActions, isNapcatOnly, napcatOnlyCount, paramSummary,
   riskLabel, riskTone, rowState, scopeLabel, tierBreakdown, tierDescription, tierLabel,
   tierOptions, tierOptionsFor,
@@ -88,9 +88,7 @@ assert.deepEqual(rowState({ ...base, enabled: false, permission: 'disabled' } as
 // 后端标注：标签逐字 = core 的 BACKEND_LABELS（Python 侧 test_qzone_napcat_channel 对账）。
 assert.equal(BACKEND_ONEBOT, '标准 OneBot')
 assert.equal(BACKEND_NAPCAT, 'NapCat 专属')
-assert.equal(BACKEND_SNOWLUMA, '需要 SnowLuma 扩展')
 assert.equal(backendTone(BACKEND_NAPCAT), 'accent')
-assert.equal(backendTone(BACKEND_SNOWLUMA), 'warn')
 assert.equal(backendTone(BACKEND_ONEBOT), 'neutral')
 assert.equal(backendTone('某个新后端'), 'neutral')
 
@@ -101,31 +99,31 @@ assert.deepEqual(backendBadges({ backends: [] } as never), [])
 assert.deepEqual(backendBadges({ backends: ['', null] } as never), [])
 // 空字符串/空值不能变成一枚空标签的徽章。
 assert.deepEqual(backendBadges({ backends: [undefined, BACKEND_NAPCAT] } as never).map((b) => b.label), [BACKEND_NAPCAT])
-// 纯 NapCat：一枚醒目徽章，没有回退。
+// 纯 NapCat：一枚醒目徽章；**没有**"回退"这种第二枚徽章（core 只声明正式通道）。
 assert.deepEqual(
   backendBadges({ backends: [BACKEND_NAPCAT], napcat_only: true } as never),
-  [{ label: BACKEND_NAPCAT, tone: 'accent', title: `优先走这条通道：${BACKEND_NAPCAT}`, primary: true }],
+  [{ label: BACKEND_NAPCAT, tone: 'accent', title: `这条动作走这个后端：${BACKEND_NAPCAT}` }],
 )
-// NapCat 优先 + SnowLuma 回退：首选醒目、回退带前缀且是中性语气（别读成"两个都要"）。
-assert.deepEqual(
-  backendBadges({ backends: [BACKEND_NAPCAT, BACKEND_SNOWLUMA], napcat_only: true } as never),
-  [
-    { label: BACKEND_NAPCAT, tone: 'accent', title: `优先走这条通道：${BACKEND_NAPCAT}`, primary: true },
-    { label: `回退：${BACKEND_SNOWLUMA}`, tone: 'neutral', title: `首选通道不可用时回退到：${BACKEND_SNOWLUMA}`, primary: false },
-  ],
-)
-// 混合里出现标准 OneBot：它是回退，保留但不加前缀（"回退：标准 OneBot"读起来别扭）。
+// 多个后端就平铺多枚（同权重，读不出"谁是谁的回退"）。
 assert.deepEqual(
   backendBadges({ backends: [BACKEND_NAPCAT, BACKEND_ONEBOT] } as never).map((b) => b.label),
   [BACKEND_NAPCAT, BACKEND_ONEBOT],
 )
-// 顺序就是优先级：首选必须原样取 `backends[0]`，不许重排。
-assert.equal(backendBadges({ backends: [BACKEND_SNOWLUMA, BACKEND_NAPCAT] } as never)[0].label, BACKEND_SNOWLUMA)
+// 文案里不许再出现"回退"这类通道承诺。
+for (const row of [
+  { backends: [BACKEND_NAPCAT] },
+  { backends: [BACKEND_ONEBOT, BACKEND_NAPCAT] },
+] as never[]) {
+  for (const badge of backendBadges(row)) {
+    assert.doesNotMatch(badge.label, /回退/)
+    assert.doesNotMatch(badge.title, /回退/)
+  }
+}
 
 // NapCat 专属判定：后端给的布尔优先，缺了按"没有标准 OneBot"回推。
 assert.equal(isNapcatOnly({ backends: [BACKEND_NAPCAT], napcat_only: true } as never), true)
 assert.equal(isNapcatOnly({ backends: [BACKEND_NAPCAT], napcat_only: false } as never), false)
-assert.equal(isNapcatOnly({ backends: [BACKEND_NAPCAT, BACKEND_SNOWLUMA] } as never), true)
+assert.equal(isNapcatOnly({ backends: [BACKEND_NAPCAT, '某个新后端'] } as never), true)
 assert.equal(isNapcatOnly({ backends: [BACKEND_ONEBOT] } as never), false)
 assert.equal(isNapcatOnly({ backends: [] } as never), false)
 assert.equal(isNapcatOnly({} as never), false)
@@ -133,7 +131,7 @@ assert.equal(isNapcatOnly({} as never), false)
 // 筛选：打开后只剩这 8 类（这里用 3 行样本），顺序不变；关掉时原样返回。
 const sample = [
   { id: 'send_poke', backends: [BACKEND_ONEBOT] },
-  { id: 'like_qzone_post', backends: [BACKEND_NAPCAT, BACKEND_SNOWLUMA], napcat_only: true },
+  { id: 'like_qzone_post', backends: [BACKEND_NAPCAT], napcat_only: true },
   { id: 'update_qq_status', backends: [BACKEND_NAPCAT], napcat_only: true },
 ] as never
 assert.deepEqual(filterNapcatOnly(sample, false), sample)
@@ -146,12 +144,13 @@ assert.equal(napcatOnlyCount(sample, { napcat_only: 0 }), 0)
 assert.equal(napcatOnlyCount(sample, undefined), 2)
 assert.equal(napcatOnlyCount(sample, {}), 2)
 
-// 通道说明：空间动作要说清两步机制（get_cookies → p_skey → g_tk），改状态说清"只有 NapCat 有"。
-const qzoneNote = backendNote({ id: 'like_qzone_post', category: 'qzone', backends: [BACKEND_NAPCAT, BACKEND_SNOWLUMA], napcat_only: true } as never)
+// 通道说明：空间动作要说清两步机制（get_cookies → p_skey → g_tk）且只承诺 NapCat 后端。
+const qzoneNote = backendNote({ id: 'like_qzone_post', category: 'qzone', backends: [BACKEND_NAPCAT], napcat_only: true } as never)
 assert.match(qzoneNote, /get_cookies/)
 assert.match(qzoneNote, /p_skey/)
 assert.match(qzoneNote, /g_tk/)
-assert.match(qzoneNote, /SnowLuma/)
+assert.match(qzoneNote, /空间动作需要 NapCat 后端/)
+assert.doesNotMatch(qzoneNote, /回退/)
 const statusNote = backendNote({ id: 'update_qq_status', category: 'status', backends: [BACKEND_NAPCAT], napcat_only: true } as never)
 assert.match(statusNote, /set_online_status/)
 assert.match(statusNote, /标准 OneBot/)

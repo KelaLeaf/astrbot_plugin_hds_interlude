@@ -187,7 +187,8 @@ UPSTREAM_COMPAT_FIELDS = {
     "runtime_compat": ["pauseAfterConversationMinutes", "staleNarrativeRequestWindowSeconds"],
 }
 
-#: v1.7.2 动作开关分组收敛（10 → 4）后**留在 schema 里当隐藏兼容位**的旧分组 → 原键集合。
+#: v1.7.2 动作开关分组收敛（10 → 4）、v1.7.3 取消「风险操作」组后**留在 schema 里当隐藏
+#: 兼容位**的旧分组 → 原键集合。
 #:
 #: 为什么必须留着、而且键一个都不能少：宿主每次加载都按 `_conf_schema.json` 重建配置，
 #: schema 里没有的分组会被**直接删掉**（AGENTS 坑 22）。所以"把 `actions_interaction`
@@ -209,6 +210,27 @@ LEGACY_ACTION_COMPAT_GROUPS = {
         "enabled", "list_contacts", "search_contacts", "get_user_profile", "get_group_info",
         "handle_friend_request", "handle_group_request", "auto_learn",
     ),
+    # v1.7.3：危险动作的开关搬回各自类别组，这一组随之退休——但它**同时供给三个新组**
+    # （群管理 / 空间 / 联系人各有一批），读取侧按键分流，所以它的键分散在三个新组里。
+    "actions_risks": (
+        "enabled", "set_group_special_title", "set_group_add_option", "set_group_portrait",
+        "set_group_name", "set_group_ban", "set_group_whole_ban", "set_group_kick",
+        "set_group_admin", "delete_group_file", "upload_group_file", "rename_group_file",
+        "move_group_file", "create_group_file_folder", "delete_group_folder",
+        "trans_group_file", "delete_qzone_post", "delete_friend",
+    ),
+}
+
+#: 每个隐藏兼容位供给哪些新分组（与 `LEGACY_SECTION_MERGES` 同源，别手抄）。
+LEGACY_ACTION_COMPAT_TARGETS = {
+    "actions_interaction": ("actions_chat",),
+    "actions_message": ("actions_chat",),
+    "actions_history": ("actions_chat",),
+    "actions_status": ("actions_chat",),
+    "actions_profile": ("actions_chat",),
+    "actions_voice": ("actions_chat",),
+    "actions_contact": ("actions_chat",),
+    "actions_risks": ("actions_chat", "actions_group", "actions_qzone"),
 }
 
 #: 上游深度字段（嵌套 / 列表项）的默认值断言：(节点路径..., 键, 期望默认值)
@@ -952,8 +974,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
         # 键名逐字 = 动作 id）。上游 Console 里没有这一层，整组由本移植版新增；
         # 逐项覆盖与落点由 `test_every_catalog_action_has_exactly_one_switch` 盯着。
         #
-        # v1.7.2：十个动作组收敛成**四个**（`actions_chat` 收互动 / 消息 / 历史 / 状态 /
-        # 资料 / 语音 / 联系人）。可见组只记在下面；七个旧组转成隐藏兼容位，它们的
+        # v1.7.2：十个动作组收敛成**三个**（`actions_chat` 收互动 / 消息 / 历史 / 状态 /
+        # 资料 / 语音 / 联系人）；v1.7.3 又取消了独立的「风险操作」组，危险动作的开关回到
+        # 各自类别组。可见组只记在下面；八个旧组转成隐藏兼容位，它们的
         # 键集合单独钉在 `LEGACY_ACTION_COMPAT_GROUPS`。
         "actions_chat": {
             "enabled", "send_poke", "send_like", "recall_message",
@@ -967,25 +990,28 @@ class ConfigurationSchemaTest(unittest.TestCase):
             "send_voice", "list_voices", "tts_provider_id", "default_voice",
             "list_contacts", "search_contacts", "get_user_profile", "get_group_info",
             "handle_friend_request", "handle_group_request", "auto_learn",
+            # v1.7.3：联系人里的危险动作（默认关闭）也回这一组。
+            "delete_friend",
         },
         "actions_group": {
             "enabled", "get_group_members_info", "get_user_group_role", "get_group_honor_info",
             "get_group_shut_list", "get_group_notice_list", "get_group_at_all_remain",
             "list_group_files", "send_group_notice", "delete_group_notice", "set_essence_msg",
             "delete_essence_msg", "send_group_sign", "set_group_card",
+            # v1.7.3：十五个群管理类的危险动作（默认关闭）回这一组。
+            "set_group_special_title", "set_group_add_option", "set_group_portrait",
+            "set_group_name", "set_group_ban", "set_group_whole_ban", "set_group_kick",
+            "set_group_admin", "delete_group_file", "upload_group_file", "rename_group_file",
+            "move_group_file", "create_group_file_folder", "delete_group_folder",
+            "trans_group_file",
         },
         "actions_qzone": {
             "enabled", "publish_qzone_post", "comment_qzone_post", "like_qzone_post",
             "list_qzone_posts",
             # v1.7.1：走 NapCat WebSocket 方案（get_cookies + QZone CGI）新增的两条。
             "list_qzone_feeds", "forward_qzone_post",
-        },
-        "actions_risks": {
-            "enabled", "set_group_special_title", "set_group_add_option", "set_group_portrait",
-            "set_group_name", "set_group_ban", "set_group_whole_ban", "set_group_kick",
-            "set_group_admin", "delete_group_file", "upload_group_file", "rename_group_file",
-            "move_group_file", "create_group_file_folder", "delete_group_folder",
-            "trans_group_file", "delete_qzone_post", "delete_friend",
+            # v1.7.3：「删说说」这条危险动作（默认关闭）回这一组。
+            "delete_qzone_post",
         },
         "input_status": {"enabled", "min_visible_ms", "beat_chance"},
     }
@@ -1045,21 +1071,57 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
     # -- v1.6.0：平台动作目录 ↔ 配置开关的对账（防漏断言） ---------------------
 
-    def test_actions_risks_group_uses_the_user_warning_verbatim(self):
-        """风险组的说明就是用户原话；每个危险开关都要写清后果 + 默认关闭。"""
+    def test_every_dangerous_switch_wears_the_user_warning_verbatim(self):
+        """危险开关的 `hint` 逐字是用户那句警告，默认值一律 `false`。
+
+        v1.7.3 起危险动作**没有**独立分组：开关落在各自类别组里（落点由
+        `action_config_group()` 决定），警示语从"组描述"改成"每个开关的 hint"。
+        退休的那一组仍在 schema 里当隐藏兼容位，但它的 description 是"已弃用"说明，
+        不再是那句警示语。
+        """
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
 
-        self.assertEqual(self.schema[catalog.ACTION_RISK_GROUP]["description"],
-                         catalog.RISK_WARNING)
-        items = self.section(catalog.ACTION_RISK_GROUP)
+        self.assertEqual(catalog.RISK_WARNING,
+                         '此标签下功能具有一定风险，易误操作，请谨慎开启。')
+        retired = self.schema["actions_risks"]
+        self.assertIs(retired.get("invisible"), True)
+        self.assertTrue(retired["description"].startswith("【已弃用】"))
+        self.assertNotIn(catalog.RISK_WARNING, retired["description"])
         for action in catalog.risky_actions():
             with self.subTest(action=action.id):
-                switch = items[action.id]
-                self.assertIs(switch["default"], False)
-                hint = switch.get("hint", "")
-                self.assertIn("默认关闭", hint, f"{action.id} 的 hint 没写默认关闭：{hint!r}")
-                self.assertGreater(len(hint), len("默认关闭"),
-                                   f"{action.id} 的 hint 没写清后果：{hint!r}")
+                group = catalog.action_config_group(action)
+                switch = self.section(group)[action.id]
+                self.assertIs(switch["default"], False, "危险动作默认关闭")
+                self.assertEqual(switch.get("hint"), catalog.RISK_WARNING,
+                                 f"{action.id} 的 hint 不是那句警示语")
+
+    def test_every_action_switch_description_is_the_chinese_label(self):
+        """每个动作开关的 `description` = 该动作的**中文名**（不许空白、不许英文键名）。
+
+        配置页把 `description` 当开关的标题渲染；空着或者写成键名，用户看到的就是
+        `set_group_ban` 这种英文 id。这一条是"开关名字是空的"那个问题的对账用例：
+        再加动作（或搬动开关）时忘了补中文名，这里当场红。
+        """
+        from plugin.core import platform_actions as catalog  # noqa: PLC0415
+
+        hidden_roots = {key for key, spec in self.schema.items() if spec.get("invisible")}
+        checked = 0
+        for path, key, spec in iter_fields(self.schema):
+            root = path.split(".", 1)[0]
+            if root in hidden_roots or root not in set(catalog.ACTION_CONFIG_GROUPS.values()):
+                continue
+            action = catalog.ACTIONS.get(key)
+            if action is None:
+                continue
+            checked += 1
+            with self.subTest(path=path):
+                description = spec.get("description")
+                self.assertTrue(description, f"{path} 没有 description（配置页会显示成空标题）")
+                self.assertEqual(description, action.label,
+                                 f"{path} 的显示名该是动作中文名 {action.label!r}")
+                self.assertNotIn(key, str(description), f"{path} 的显示名像是英文键名")
+        self.assertGreaterEqual(checked, len(catalog.ACTIONS),
+                                "每个目录动作都该在可见分组里被查到一次")
 
     def test_every_catalog_action_has_exactly_one_switch(self):
         """目录里的动作在**可见分组**里恰好有一个开关，且正好落在它该在的那个组。
@@ -1068,8 +1130,8 @@ class ConfigurationSchemaTest(unittest.TestCase):
         在 `_conf_schema.json` 里补开关，这里当场红——否则那个动作要么永远调不动
         （开关读不出来），要么被塞进别的分组、被另一个总开关连坐。
 
-        v1.7.2 起还要认第二种合法出现：**隐藏的旧分组里的兼容副本**（用户升级前设过的
-        开关就写在那里）。副本只允许落在"归并进这个组"的旧组里，别的旧组出现同名键
+        v1.7.2/v1.7.3 起还要认第二种合法出现：**隐藏的旧分组里的兼容副本**（用户升级前
+        设过的开关就写在那里）。副本只允许落在"归并进这个组"的旧组里，别的旧组出现同名键
         一律红——那说明有动作被搬进了不相干的分组。
         """
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
@@ -1118,14 +1180,13 @@ class ConfigurationSchemaTest(unittest.TestCase):
                     self.assertEqual(catalog.action_config_group(catalog.ACTIONS[key]),
                                      group_key, f"{key} 不该落在 {group_key}")
 
-        # 3) 危险动作（含风险组总开关）默认必须关着。
-        risks = self.section(catalog.ACTION_RISK_GROUP)
-        self.assertIs(risks["enabled"]["default"], False)
+        # 3) 危险动作的开关默认必须关着（开关落在各自类别组里，没有独立的风险组了）。
         for action in catalog.risky_actions():
             with self.subTest(risky=action.id):
-                self.assertIs(risks[action.id]["default"], False)
+                group = catalog.action_config_group(action)
+                self.assertIs(self.section(group)[action.id]["default"], False)
 
-    # -- v1.7.2：动作开关分组收敛（10 → 4）-------------------------------------
+    # -- v1.7.2 分组收敛 / v1.7.3 取消风险组 -----------------------------------
 
     def test_legacy_action_groups_stay_hidden_and_keep_every_key(self):
         """旧动作分组必须留在 schema 里、隐藏、且**键一个不少**（升级不丢配置）。
@@ -1133,6 +1194,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
         宿主每次加载都按 schema 重建配置：schema 里没有的分组会被直接删掉（坑 22）。
         所以旧组只能"留着 + 隐藏 + 读取侧归并"，不能改名或删掉。同时旧键必须都还在
         **可见的**新组里——只留在旧组的话，用户在配置页里根本改不到它。
+
+        `actions_risks` 是**共用源**：它的键分散在三个新组里（群管理 / 空间 / 联系人），
+        所以逐个键检查"至少有一个目标组认得它"。
         """
         from plugin.core.service.config import LEGACY_SECTION_MERGES  # noqa: PLC0415
 
@@ -1140,7 +1204,12 @@ class ConfigurationSchemaTest(unittest.TestCase):
                           for name in sources}
         self.assertEqual(merged_sources, set(LEGACY_ACTION_COMPAT_GROUPS),
                          "归并表与隐藏兼容位表必须完全一致")
-        chat_keys = set(self.section("actions_chat"))
+        self.assertEqual(set(LEGACY_ACTION_COMPAT_TARGETS), set(LEGACY_ACTION_COMPAT_GROUPS),
+                         "兼容位目标表必须覆盖每一个旧组")
+        for target, sources in LEGACY_SECTION_MERGES.items():
+            for source in sources:
+                self.assertIn(target, LEGACY_ACTION_COMPAT_TARGETS[source],
+                              f"{source} → {target} 的归并没有登记在目标表里")
         for group, keys in LEGACY_ACTION_COMPAT_GROUPS.items():
             with self.subTest(group=group):
                 self.assertIn(group, self.schema, f"{group} 不能从 schema 里消失")
@@ -1150,24 +1219,38 @@ class ConfigurationSchemaTest(unittest.TestCase):
                                 f"{group} 的说明要写明已弃用")
                 self.assertEqual(set(self.section(group)), set(keys),
                                  f"{group} 的键集合变了（用户配置会被宿主清掉）")
-                missing = set(keys) - chat_keys
-                self.assertEqual(missing, set(),
-                                 f"{group} 的键没全进可见的 actions_chat：{sorted(missing)}")
+                targets = LEGACY_ACTION_COMPAT_TARGETS[group]
+                for key in keys:
+                    with self.subTest(group=group, key=key):
+                        self.assertTrue(
+                            any(key in self.section(target) for target in targets),
+                            f"{group}.{key} 没进任何可见的新组：{targets}",
+                        )
 
     def test_visible_action_groups_are_exactly_the_catalog_groups(self):
-        """可见的 `actions_*` 组 = 目录声明的四组；分组标签表的键与之逐字相等。
+        """可见的 `actions_*` 组 = 目录声明的三组；分组标题表的键与之逐字相等。
 
-        组名只有两个来源（`ACTION_CONFIG_GROUPS` + `ACTION_RISK_GROUP`），标签表跟着它
-        走——两处漂移会让「动作」页把开关指到不存在的分组。
+        组名只有一个来源（`ACTION_CONFIG_GROUPS`），标题表跟着它走——两处漂移会让
+        「动作」页把开关指到不存在的分组。
         """
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
 
-        expected = set(catalog.ACTION_CONFIG_GROUPS.values()) | {catalog.ACTION_RISK_GROUP}
+        expected = set(catalog.ACTION_CONFIG_GROUPS.values())
         self.assertEqual(set(catalog.ACTION_CONFIG_GROUP_LABELS), expected)
         visible = {key for key, spec in self.schema.items()
                    if key.startswith("actions_") and not spec.get("invisible")}
         self.assertEqual(visible, expected)
-        self.assertEqual(len(visible), 4, "动作开关组收敛成四个（v1.7.2）")
+        self.assertEqual(len(visible), 3,
+                         "动作开关组收敛成三个（v1.7.2 四组，v1.7.3 取消风险组）")
+        # 三个标题写成一家人的样子（用户点名：「动作：会话」这种写法）。
+        self.assertEqual(set(catalog.ACTION_CONFIG_GROUP_LABELS.values()),
+                         {"动作：会话", "动作：群管理", "动作：QQ 空间"})
+        for group in expected:
+            self.assertEqual(self.schema[group]["title"],
+                             catalog.ACTION_CONFIG_GROUP_LABELS[group],
+                             f"{group} 的 schema 标题与目录不一致")
+        # 退休的风险组不许再以可见分组的形式出现。
+        self.assertNotIn("actions_risks", visible)
 
     def test_legacy_action_groups_are_never_referenced_as_new_targets(self):
         """新落点只能是四组之一：目录里不许再出现旧组名（否则又写回作废的键）。"""
@@ -1324,6 +1407,60 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
         "actions_voice": {"default_voice": "zh-CN-YunxiNeural", "send_voice": False},
         "actions_contact": {"auto_learn": True},
     }
+
+    #: 一份"开关落在 `actions_risks`"的配置——v1.7.2 升级上来的用户就是这样。
+    RISK_CONFIG = {
+        "actions_risks": {
+            "enabled": True,
+            "set_group_kick": True,
+            "set_group_ban": False,
+            "delete_qzone_post": True,
+            "delete_friend": True,
+        },
+    }
+
+    def test_risk_group_switches_still_read_through_their_new_groups(self):
+        """v1.7.3 取消独立风险组后，旧配置里的危险开关照旧读得到（**按键分流**）。
+
+        回归用例（用户点名要的）：一份开关落在 `actions_risks` 的配置，读取侧必须仍然
+        读得到——群管理类的进 `actions_group`、空间类进 `actions_qzone`、联系人进
+        `actions_chat`，而且**不许串味**（群管理的键流进会话组会让总开关跟着乱）。
+        """
+        from plugin.core.service.config import apply_section_aliases  # noqa: PLC0415
+
+        merged = apply_section_aliases(self.RISK_CONFIG)
+        self.assertIs(merged["actions_group"]["set_group_kick"], True)
+        self.assertIs(merged["actions_group"]["set_group_ban"], False)
+        self.assertIs(merged["actions_qzone"]["delete_qzone_post"], True)
+        self.assertIs(merged["actions_chat"]["delete_friend"], True)
+        # 按键分流：不属于这个新组的键不许补进去。
+        for group, foreign in (
+            ("actions_chat", "set_group_kick"), ("actions_qzone", "set_group_kick"),
+            ("actions_group", "delete_friend"), ("actions_chat", "delete_qzone_post"),
+        ):
+            with self.subTest(group=group, key=foreign):
+                self.assertNotIn(foreign, merged[group])
+        # 旧分组本身原样保留（回退到上一个版本时它才是真源）。
+        self.assertEqual(merged["actions_risks"], self.RISK_CONFIG["actions_risks"])
+
+    def test_the_retired_risk_master_switch_never_gates_the_new_groups(self):
+        """`actions_risks.enabled` 默认 `false`：别把那个"没写过"的 false 当成"关掉整组"。
+
+        这是真机形状：宿主按 schema 把四个组都补成默认值，用户从没碰过风险组。
+        归并若拿**目标组**的默认值（`true`）去比，那个 `false` 会被读成"用户关掉了这一组"，
+        于是会话 / 群管理 / 空间三组的总开关全被关掉——所有动作静默失效。
+        """
+        from plugin.core.service.config import (  # noqa: PLC0415
+            apply_section_aliases, schema_group_defaults,
+        )
+
+        host = {group: dict(schema_group_defaults(group))
+                for group in ("actions_chat", "actions_group", "actions_qzone", "actions_risks")}
+        merged = apply_section_aliases(host)
+        for group in ("actions_chat", "actions_group", "actions_qzone"):
+            with self.subTest(group=group):
+                self.assertIs(merged[group]["enabled"], True,
+                              "总开关被旧风险组补出来的默认值关掉了")
 
     def test_apply_section_aliases_merges_old_groups_into_the_new_one(self):
         from plugin.core.service.config import apply_section_aliases  # noqa: PLC0415
@@ -1508,9 +1645,44 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
 
         self.assertEqual(merge_legacy_section_values(None, "actions_chat", None), {})
         self.assertEqual(merge_legacy_section_values({"runtime": {}}, "runtime", None), {})
+        # 按键分流：目标分组 schema 里没有的旧键不补（共享源里的别的类别的键）。
         self.assertEqual(merge_legacy_section_values(
             {"actions_history": {"x": 1}}, "actions_chat", {"y": 2}),
-            {"y": 2, "x": 1})
+            {"y": 2})
+
+    # -- 共用源（`actions_risks`）的折叠：不清空 --------------------------------
+
+    def test_fold_keeps_the_shared_legacy_group_for_a_downgrade(self):
+        """折叠**不清空**共用源：回退到上一个版本时那 17 个危险开关还读得到。
+
+        `actions_risks` 的键分属三个新组，清掉等于把另外两个组的数据一起删了；而且
+        用户回退到 v1.7.2 时那个版本只认这个组（用户明确要求来回升级不丢开关）。
+        """
+        from plugin.core.service.config import fold_legacy_section_merges  # noqa: PLC0415
+
+        folded = fold_legacy_section_merges(dict(self.RISK_CONFIG))
+        self.assertIs(folded["actions_group"]["set_group_kick"], True, "值折进了群管理组")
+        self.assertIs(folded["actions_qzone"]["delete_qzone_post"], True)
+        self.assertIs(folded["actions_chat"]["delete_friend"], True)
+        self.assertEqual(folded["actions_risks"], self.RISK_CONFIG["actions_risks"],
+                         "共用源不许被清空（否则回退到旧版本会丢开关）")
+        # 幂等：折完再折一次内容不变（否则每次启动都写盘）。
+        self.assertEqual(fold_legacy_section_merges(dict(folded)), folded)
+        # 独占源照旧清空（那一条"改了没反应"的老病还得靠它兜住）。
+        self.assertEqual(
+            fold_legacy_section_merges({"actions_interaction": {"send_poke": False}})["actions_interaction"],
+            {},
+        )
+
+    def test_fold_leaves_the_risky_switches_alone_when_nothing_was_written(self):
+        """宿主补出来的默认值不算"用户写过"：没东西可折时一个字节都不动。"""
+        from plugin.core.service.config import (  # noqa: PLC0415
+            fold_legacy_section_merges, schema_group_defaults,
+        )
+
+        raw = {group: dict(schema_group_defaults(group))
+               for group in ("actions_chat", "actions_group", "actions_qzone", "actions_risks")}
+        self.assertEqual(fold_legacy_section_merges(dict(raw)), raw)
 
 
 class ReleaseConsistencyTest(unittest.TestCase):

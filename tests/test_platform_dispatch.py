@@ -152,18 +152,26 @@ class SwitchAndPermissionTests(unittest.TestCase):
             self.assertIs(legacy.action_switch('send_poke'), False)
             self.assertIsNone(legacy.action_switch('send_like'), '没写过的键照旧 = 未配置')
 
-    def test_dangerous_actions_need_the_risk_switch_and_the_permission_table(self):
-        host = _Host(config={'actions_risks': {'enabled': True, 'set_group_kick': True}})
+    def test_dangerous_actions_need_their_group_switch_and_the_permission_table(self):
+        """危险动作：开关（在自己类别组里）+ 权限档位，两样都要（v1.7.3 取消风险组）。"""
+        host = _Host(config={'actions_group': {'enabled': True, 'set_group_kick': True}})
         # 开关打开还不够：目录默认档是 disabled。
         self.assertNotIn('set_group_kick', host.available_platform_actions())
         self.assertEqual(host.risky_actions_in_use(), [], '默认档下没有任何危险动作在跑')
         host = _Host(
-            config={'actions_risks': {'enabled': True, 'set_group_kick': True}},
+            config={'actions_group': {'enabled': True, 'set_group_kick': True}},
             base_dir=str(self._write_permissions({'set_group_kick': 'global'})),
         )
         self.assertIn('set_group_kick', host.available_platform_actions())
         self.assertEqual(host.risky_actions_in_use(), ['set_group_kick'])
         self.assertTrue(any('平台动作' in message or '风险' in message for _l, message in host.reports) or True)
+        # 旧形状（开关落在 `actions_risks`）读出来是同一份——升级不丢。
+        legacy = _Host(
+            config={'actions_risks': {'enabled': True, 'set_group_kick': True}},
+            base_dir=str(self._write_permissions({'set_group_kick': 'global'})),
+        )
+        self.assertIs(legacy.action_switch('set_group_kick'), True)
+        self.assertIn('set_group_kick', legacy.available_platform_actions())
 
     def test_private_scope_excludes_group_only_actions(self):
         host = _Host(config={})

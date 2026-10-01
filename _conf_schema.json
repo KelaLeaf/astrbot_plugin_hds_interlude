@@ -2282,8 +2282,8 @@
   },
   "actions_chat": {
     "type": "object",
-    "title": "会话动作",
-    "description": "【动作 17】会话动作：互动、消息与定时、历史消息、QQ 状态、个人资料、语音与联系人的开关。",
+    "title": "动作：会话",
+    "description": "【动作 17】会话动作：互动、消息、历史、状态、资料、语音、联系人，含其中的危险动作（默认关闭）。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -2454,6 +2454,12 @@
         "default": true,
         "hint": "同意或拒绝**别人拉机器人进群**的邀请/申请（不能主动加群）。"
       },
+      "delete_friend": {
+        "type": "bool",
+        "description": "删好友",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
       "auto_learn": {
         "type": "bool",
         "description": "主动了解新联系人",
@@ -2464,8 +2470,8 @@
   },
   "actions_group": {
     "type": "object",
-    "title": "群管理",
-    "description": "【动作 21】群管理：群信息只读查询与低风险的群内写入（危险操作在「风险操作」组）。",
+    "title": "动作：群管理",
+    "description": "【动作 21】群管理动作：群信息只读查询与群内写入，含踢人 / 禁言等危险动作（默认关闭）。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -2550,13 +2556,103 @@
         "description": "改群名片",
         "default": true,
         "hint": "改群昵称（默认改自己）。"
+      },
+      "set_group_special_title": {
+        "type": "bool",
+        "description": "设专属头衔",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "set_group_add_option": {
+        "type": "bool",
+        "description": "改加群方式",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "set_group_portrait": {
+        "type": "bool",
+        "description": "改群头像",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "set_group_name": {
+        "type": "bool",
+        "description": "改群名",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "set_group_ban": {
+        "type": "bool",
+        "description": "禁言",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "set_group_whole_ban": {
+        "type": "bool",
+        "description": "全员禁言",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "set_group_kick": {
+        "type": "bool",
+        "description": "踢人",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "set_group_admin": {
+        "type": "bool",
+        "description": "设管理",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "delete_group_file": {
+        "type": "bool",
+        "description": "删群文件",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "upload_group_file": {
+        "type": "bool",
+        "description": "传群文件",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "rename_group_file": {
+        "type": "bool",
+        "description": "重命名群文件",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "move_group_file": {
+        "type": "bool",
+        "description": "移动群文件",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "create_group_file_folder": {
+        "type": "bool",
+        "description": "建群文件夹",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "delete_group_folder": {
+        "type": "bool",
+        "description": "删群文件夹",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
+      },
+      "trans_group_file": {
+        "type": "bool",
+        "description": "转存群文件",
+        "default": false,
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
       }
     }
   },
   "actions_qzone": {
     "type": "object",
-    "title": "QQ 空间动作",
-    "description": "【动作 25】QQ 空间动作：发说说、评论、点赞、看说说与好友动态、转发的独立开关（上限在「QQ 空间」组）。",
+    "title": "动作：QQ 空间",
+    "description": "【动作 25】QQ 空间动作：发说说、评论、点赞、看说说与动态、转发、删说说（默认关闭）。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -2590,133 +2686,24 @@
       },
       "list_qzone_feeds": {
         "type": "bool",
-        "description": "允许「看好友动态」",
+        "description": "看好友动态",
         "default": true,
         "hint": "只读：看好友动态信息流，不占发帖/互动配额"
       },
       "forward_qzone_post": {
         "type": "bool",
-        "description": "允许「转发说说」",
+        "description": "转发说说",
         "default": true,
         "hint": "转会计入「评论」配额（互动配额，不是发帖配额）"
-      }
-    },
-    "hint": "空间动作优先走 NapCat WebSocket 方案（拿登录态后直接调 QZone 接口），装了 SnowLuma 时作为回退；「看说说 / 看动态」是只读，不占配额。"
-  },
-  "actions_risks": {
-    "type": "object",
-    "title": "风险操作",
-    "description": "以下功能包含风险操作不建议开启",
-    "items": {
-      "enabled": {
-        "type": "bool",
-        "description": "启用风险操作",
-        "default": false,
-        "hint": "总开关，默认关闭：只有打开后本组动作才可能被调用"
-      },
-      "set_group_special_title": {
-        "type": "bool",
-        "description": "设专属头衔",
-        "default": false,
-        "hint": "会改动成员在群里的专属头衔；默认关闭。"
-      },
-      "set_group_add_option": {
-        "type": "bool",
-        "description": "改加群方式",
-        "default": false,
-        "hint": "会改掉全群的加群验证方式，改错可能放陌生人进群或挡住正常入群；默认关闭。"
-      },
-      "set_group_portrait": {
-        "type": "bool",
-        "description": "改群头像",
-        "default": false,
-        "hint": "会换掉全群可见的群头像；默认关闭。"
-      },
-      "set_group_name": {
-        "type": "bool",
-        "description": "改群名",
-        "default": false,
-        "hint": "会改掉全群可见的群名；默认关闭。"
-      },
-      "set_group_ban": {
-        "type": "bool",
-        "description": "禁言",
-        "default": false,
-        "hint": "会让成员在设定时长内无法发言（0 秒 = 解除禁言）；默认关闭。"
-      },
-      "set_group_whole_ban": {
-        "type": "bool",
-        "description": "全员禁言",
-        "default": false,
-        "hint": "会让整个群在一段时间里没人能发言；默认关闭。"
-      },
-      "set_group_kick": {
-        "type": "bool",
-        "description": "踢人",
-        "default": false,
-        "hint": "会把成员踢出群，不可撤销；默认关闭。"
-      },
-      "set_group_admin": {
-        "type": "bool",
-        "description": "设管理",
-        "default": false,
-        "hint": "会改变群管理权限（设或撤管理员）；默认关闭。"
-      },
-      "delete_group_file": {
-        "type": "bool",
-        "description": "删群文件",
-        "default": false,
-        "hint": "群文件会被永久删除，不可恢复；默认关闭。"
-      },
-      "upload_group_file": {
-        "type": "bool",
-        "description": "传群文件",
-        "default": false,
-        "hint": "会以机器人身份往群里上传文件；默认关闭。"
-      },
-      "rename_group_file": {
-        "type": "bool",
-        "description": "重命名群文件",
-        "default": false,
-        "hint": "会改掉群文件的名字；默认关闭。"
-      },
-      "move_group_file": {
-        "type": "bool",
-        "description": "移动群文件",
-        "default": false,
-        "hint": "会把群文件移到别的文件夹；默认关闭。"
-      },
-      "create_group_file_folder": {
-        "type": "bool",
-        "description": "建群文件夹",
-        "default": false,
-        "hint": "会在群里新建文件夹；默认关闭。"
-      },
-      "delete_group_folder": {
-        "type": "bool",
-        "description": "删群文件夹",
-        "default": false,
-        "hint": "文件夹连同里面的文件会一起消失，不可恢复；默认关闭。"
-      },
-      "trans_group_file": {
-        "type": "bool",
-        "description": "转存群文件",
-        "default": false,
-        "hint": "会把群文件转存到别处；默认关闭。"
       },
       "delete_qzone_post": {
         "type": "bool",
         "description": "删说说",
         "default": false,
-        "hint": "说说会被永久删除，不可恢复；默认关闭。"
-      },
-      "delete_friend": {
-        "type": "bool",
-        "description": "删好友",
-        "default": false,
-        "hint": "会删掉好友关系（可选同时拉黑），不可撤销；默认关闭。"
+        "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
       }
-    }
+    },
+    "hint": "空间动作需要 NapCat 后端：经已经连着的 NapCat 调 get_cookies 与 get_login_info 拿登录态，再直接调 QZone 接口。「看说说 / 看动态」是只读，不占配额。"
   },
   "input_status": {
     "type": "object",
@@ -3315,5 +3302,121 @@
         "hint": "允许她主动了解新联系人/群：看资料卡、群公告、空间动态"
       }
     }
+  },
+  "actions_risks": {
+    "type": "object",
+    "title": "风险操作（已弃用）",
+    "description": "【已弃用】危险动作的开关已并入「动作：会话 / 动作：群管理 / 动作：QQ 空间」，读配置时仍认这里的键。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用风险操作",
+        "default": false,
+        "hint": "总开关，默认关闭：只有打开后本组动作才可能被调用"
+      },
+      "set_group_special_title": {
+        "type": "bool",
+        "description": "设专属头衔",
+        "default": false,
+        "hint": "会改动成员在群里的专属头衔；默认关闭。"
+      },
+      "set_group_add_option": {
+        "type": "bool",
+        "description": "改加群方式",
+        "default": false,
+        "hint": "会改掉全群的加群验证方式，改错可能放陌生人进群或挡住正常入群；默认关闭。"
+      },
+      "set_group_portrait": {
+        "type": "bool",
+        "description": "改群头像",
+        "default": false,
+        "hint": "会换掉全群可见的群头像；默认关闭。"
+      },
+      "set_group_name": {
+        "type": "bool",
+        "description": "改群名",
+        "default": false,
+        "hint": "会改掉全群可见的群名；默认关闭。"
+      },
+      "set_group_ban": {
+        "type": "bool",
+        "description": "禁言",
+        "default": false,
+        "hint": "会让成员在设定时长内无法发言（0 秒 = 解除禁言）；默认关闭。"
+      },
+      "set_group_whole_ban": {
+        "type": "bool",
+        "description": "全员禁言",
+        "default": false,
+        "hint": "会让整个群在一段时间里没人能发言；默认关闭。"
+      },
+      "set_group_kick": {
+        "type": "bool",
+        "description": "踢人",
+        "default": false,
+        "hint": "会把成员踢出群，不可撤销；默认关闭。"
+      },
+      "set_group_admin": {
+        "type": "bool",
+        "description": "设管理",
+        "default": false,
+        "hint": "会改变群管理权限（设或撤管理员）；默认关闭。"
+      },
+      "delete_group_file": {
+        "type": "bool",
+        "description": "删群文件",
+        "default": false,
+        "hint": "群文件会被永久删除，不可恢复；默认关闭。"
+      },
+      "upload_group_file": {
+        "type": "bool",
+        "description": "传群文件",
+        "default": false,
+        "hint": "会以机器人身份往群里上传文件；默认关闭。"
+      },
+      "rename_group_file": {
+        "type": "bool",
+        "description": "重命名群文件",
+        "default": false,
+        "hint": "会改掉群文件的名字；默认关闭。"
+      },
+      "move_group_file": {
+        "type": "bool",
+        "description": "移动群文件",
+        "default": false,
+        "hint": "会把群文件移到别的文件夹；默认关闭。"
+      },
+      "create_group_file_folder": {
+        "type": "bool",
+        "description": "建群文件夹",
+        "default": false,
+        "hint": "会在群里新建文件夹；默认关闭。"
+      },
+      "delete_group_folder": {
+        "type": "bool",
+        "description": "删群文件夹",
+        "default": false,
+        "hint": "文件夹连同里面的文件会一起消失，不可恢复；默认关闭。"
+      },
+      "trans_group_file": {
+        "type": "bool",
+        "description": "转存群文件",
+        "default": false,
+        "hint": "会把群文件转存到别处；默认关闭。"
+      },
+      "delete_qzone_post": {
+        "type": "bool",
+        "description": "删说说",
+        "default": false,
+        "hint": "说说会被永久删除，不可恢复；默认关闭。"
+      },
+      "delete_friend": {
+        "type": "bool",
+        "description": "删好友",
+        "default": false,
+        "hint": "会删掉好友关系（可选同时拉黑），不可撤销；默认关闭。"
+      }
+    },
+    "invisible": true
   }
 }

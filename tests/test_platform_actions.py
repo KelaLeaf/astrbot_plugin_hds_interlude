@@ -34,14 +34,18 @@ class CatalogIntegrityTests(unittest.TestCase):
                          '改 QQ 状态', '禁言', '踢人', '发语音', '改资料', '联系人列表'):
             self.assertIn(expected, labels, '目录缺少：%s' % expected)
 
-    def test_dangerous_actions_default_to_disabled_and_are_listed_for_the_warning_group(self):
+    def test_dangerous_actions_default_to_disabled_and_have_no_separate_group(self):
+        """危险动作默认关闭；**没有**独立的配置组（v1.7.3 取消「风险操作」组）。"""
         risky = pa.risky_actions()
-        self.assertGreaterEqual(len(risky), 10, '危险动作应该是单独一组，不是零星几个')
+        self.assertGreaterEqual(len(risky), 10, '危险动作该有十来个，不是零星几个')
         for action in risky:
             with self.subTest(action=action.id):
                 self.assertEqual(action.default_permission, 'disabled', '危险动作必须默认关闭')
-        self.assertEqual(pa.RISK_WARNING, '以下功能包含风险操作不建议开启')
-        # 用户点名的四个危险操作必须在危险组里。
+                self.assertIn(pa.action_config_group(action),
+                              set(pa.ACTION_CONFIG_GROUPS.values()),
+                              '危险动作的开关回自己类别所属的那一组')
+        self.assertEqual(pa.RISK_WARNING, '此标签下功能具有一定风险，易误操作，请谨慎开启。')
+        # 用户点名的四个危险操作必须在危险清单里。
         for required in ('delete_friend', 'set_group_whole_ban', 'set_group_kick', 'set_group_admin'):
             self.assertIn(required, {item.id for item in risky})
 
