@@ -45,6 +45,8 @@ __all__ = [
     'DEFAULT_QZONE_CONFIG',
     'QZONE_ACTION_KINDS',
     'QZONE_AMBIGUOUS_MARKERS',
+    'QZONE_QUOTA_FAMILY',
+    'QZONE_VISIBILITY_VALUES',
     'QZONE_CONFIG_BOUNDS',
     'QZONE_FEED_APPID_TALK',
     'QZONE_UGC_RIGHT_VALUES',
@@ -62,12 +64,26 @@ __all__ = [
     'qzone_intent_from_payload',
     'qzone_records_for_endpoint',
     'qzone_visibility_label',
+    'qzone_visible_value',
     'resolve_qzone_config',
 ]
 
-#: 真正的空间动作（`post` / `comment` / `like`）。`feed-seen` 是只读感知标记，
+#: 真正的空间动作（`post` / `comment` / `like` / `forward`）。`feed-seen` 是只读感知标记，
 #: **不**参与限流计数与最小间隔（上游 `ACTION_KINDS`；上游没有导出它）。
-QZONE_ACTION_KINDS = frozenset({'post', 'comment', 'like', 'forward'})
+#:
+#: v1.7.5 新增 `visibility`（改已发说说的可见范围，本移植版补的动作，上游没有）：
+#: 它是**写**动作，必须进这张表，否则 `evaluate_qzone_gate` 会把它当只读标记跳过、
+#: 审计行也就不占配额（= 模型可以无限次改可见性）。配额按**发帖**那一档算
+#: （见 `evaluate_qzone_gate`）——改的是她自己发出去的东西，跟发帖同源。
+QZONE_ACTION_KINDS = frozenset({'post', 'comment', 'like', 'forward', 'visibility'})
+
+#: 日额度按 kind 分档；v1.7.5 起 `visibility`（改可见范围）与 `post` **共用一档**。
+#:
+#: 依据：它改的是**她自己已经发出去的那条说说**，与发帖同源；另开一份额度等于
+#: "一天能发 3 条 + 另外改 3 次可见性"，而改可见性同样会打扰好友的动态流。
+#: 共用之后 `post` 与 `visibility` 的审计行都计入同一格 `daily_post_cap`。
+#: 其它 kind 不进这张表 = 各算各的（历史行为不变）。
+QZONE_QUOTA_FAMILY: dict[str, str] = {'visibility': 'post'}
 
 #: 审计与剧本条目用的可见性档位白名单（上游 `QZONE_UGC_RIGHT_VALUES`）。
 QZONE_UGC_RIGHT_VALUES = frozenset({1, 4, 16, 64, 128})
@@ -328,10 +344,13 @@ def evaluate_qzone_gate(
     """空间动作限流门（上游 `evaluateQzoneGate`）。
 
     `records` 传近期审计行（调用方取 48h 窗口）；只有真正的动作
-    （`post`/`comment`/`like`）参与计数与间隔——`feed-seen` 是只读感知标记，不得
-    挤占动作配额。同一本地日内按 kind 计数（`failed` 不计；`pending`/`unknown`
-    计入：在途与结果不明的都按已发生保守对待），且任意两动作间隔不小于
-    `minIntervalMinutes`。
+    （`QZONE_ACTION_KINDS`：`post`/`comment`/`like`/`forward`/`visibility`）参与计数与
+    间隔——`feed-seen` 是只读感知标记，不得挤占动作配额。同一本地日内按 kind 计数
+    （`failed` 不计；`pending`/`unknown` 计入：在途与结果不明的都按已发生保守对待），
+    且任意两动作间隔不小于 `minIntervalMinutes`。
+
+    v1.7.5：`visibility` 与 `post` **共用同一格日额度**（见 `QZONE_QUOTA_FAMILY`），
+    其余 kind 仍各算各的。
 
     `kind` 也可直接传上游形状的 `{'kind': …, 'now': …}`（两种调用方式都收）。
     """
@@ -345,9 +364,13 @@ def evaluate_qzone_gate(
     now_dt = _to_datetime(now) or datetime.now(timezone.utc)
     now_ms = dt_ms(now_dt)
     today = day_key(now_dt)
-    if kind == 'post':
+    family = QZONE_QUOTA_FAMILY.get(kind, kind)
+    if family == 'post':
+        # 改可见范围按**发帖**配额算（`QZONE_QUOTA_FAMILY`）：它动的是"她自己发出去的
+        # 那条说说"，与发帖同源；归到评论/点赞那两档更宽的额度里会让"一天改 12 次
+        # 可见性"变成可能。
         cap = _config_int(config, 'daily_post_cap', DEFAULT_QZONE_CONFIG['daily_post_cap'])
-    elif kind in ('comment', 'forward'):
+    elif family in ('comment', 'forward'):
         # 转发按**评论类互动**计配额：它是互动不是发帖，跟点赞同一档更宽的上限
         # 也不合适（转发会出现在别人动态里，比点赞重）。
         cap = _config_int(config, 'daily_comment_cap', DEFAULT_QZONE_CONFIG['daily_comment_cap'])
@@ -363,7 +386,8 @@ def evaluate_qzone_gate(
             continue
         if _pick(record, 'status') == 'failed':
             continue
-        if _pick(record, 'kind') == kind and local_day_key(_from_ms(at_ms)) == today:
+        if QZONE_QUOTA_FAMILY.get(_pick(record, 'kind'), _pick(record, 'kind')) == family \
+                and local_day_key(_from_ms(at_ms)) == today:
             used_today += 1
         if last_action_at is None or at_ms > last_action_at:
             last_action_at = at_ms
@@ -572,10 +596,18 @@ QZONE_CGI_ACTIONS = {
     'forward_qzone_post': 'forward',
     'list_qzone_posts': 'moods',       # 指定 QQ = 那个人的说说
     'list_qzone_feeds': 'feed',        # 不指定 = 好友动态
+    # v1.7.5：改可见范围（`emotion_cgi_update`）——**没有**平台原生动作，只能走 CGI。
+    'set_qzone_visibility': 'update_visibility',
 }
 
-#: 平台动作名 → CGI 动作名。Chunk13 用它决定"这条动作能不能走 NapCat WS 通道"。
+#: 平台动作名 → CGI 动作名。Chunk13 用它决定"这条动作能不能走 NapCat WS 通道"
+#: （`_qzone_run_action` 不传 `cgi_action` 时的默认查表）。
 #: （`QZONE_CGI_ACTIONS` 是**目录 id** → CGI，两者别混。）
+#:
+#: **唯一例外**：`set_qzone_visibility`（v1.7.5）。NapCat 与 SnowLuma 都**没有**
+#: "改说说可见范围"这条原生动作（NapCat 扩展动作只有 `send_qzone_msg` /
+#: `delete_qzone_msg`），所以这里的键直接用**目录 id**——它没有平台名字可用。
+#: 这个动作也只能走 CGI（`chunk13` 拿不到 cookie 时明确失败，不回落平台）。
 QZONE_CGI_BY_ID = {
     'send_qzone_msg': 'publish',
     'delete_qzone_msg': 'delete',
@@ -584,6 +616,7 @@ QZONE_CGI_BY_ID = {
     'forward_qzone': 'forward',
     'get_qzone_msg_list': 'moods',
     'get_qzone_feeds': 'feed',
+    'set_qzone_visibility': 'update_visibility',
 }
 
 #: 这几个动作**只有** NapCat 的 `get_cookies` 通道能做——SnowLuma 那套扩展动作
@@ -647,6 +680,12 @@ def qzone_cgi_request(action: str, auth: Any, params: Mapping[str, Any]) -> tupl
             auth, str(params.get('content') or ''),
             visible=int(_js_int_or(params.get('ugcRight', params.get('ugc_right')), 1) or 1),
             richval=str(params.get('richval') or ''), pic_bo=str(params.get('pic_bo') or ''),
+        )
+    if action == 'update_visibility':
+        return cgi.build_update_visibility_request(
+            auth, str(params.get('tid') or ''), str(params.get('content') or ''),
+            int(_js_int_or(params.get('ugcRight', params.get('ugc_right')), 4) or 4),
+            target_uins=params.get('targetUins', params.get('target_uins')) or (),
         )
     if action == 'delete':
         return cgi.build_delete_request(
@@ -756,6 +795,30 @@ def qzone_visibility_label(ugc_right: Any) -> str:
     return '好友可见'
 
 
+#: 「改可见范围」动作的**五档中文枚举 → `ugc_right`**（`core/platform_actions.py`
+#: 的 `QZONE_VISIBILITY_LABELS` 是模型/界面看到的那一份，两边的**顺序与键逐字相同**，
+#: `plugin/tests/test_platform_actions.py` 有对账用例）。
+#:
+#: 值取自 `core/qzone_cgi.py::QZONE_VISIBLE`（权威依据见那里的注释：NapCat
+#: `ValidUgcRights = [1, 4, 16, 64, 128]`）。**标签是用户指定的原话**，与
+#: `qzone_visibility_label()`（上游移植的审计标签：4=好友可见、64=仅自己可见）
+#: 措辞不同但指向同一组值——那边是剧本条目里的历史文案，别改它。
+QZONE_VISIBILITY_VALUES: dict[str, int] = {
+    '所有人可见': 1,
+    '仅 QQ 好友可见': 4,
+    '部分人可见': 16,
+    '部分人不可见': 128,
+    '仅自己可见': 64,
+}
+
+
+def qzone_visible_value(label: Any) -> Optional[int]:
+    """五档中文标签 → `ugc_right`；不认识的标签返回 `None`（调用方报错，绝不猜一档）。"""
+    if not isinstance(label, str):
+        return None
+    return QZONE_VISIBILITY_VALUES.get(label.strip())
+
+
 def qzone_intent_from_payload(payload: Any) -> Optional[dict[str, Any]]:
     """意图 payload → 受限动作请求（上游 `qzoneIntentFromPayload`）。
 
@@ -769,6 +832,11 @@ def qzone_intent_from_payload(payload: Any) -> Optional[dict[str, Any]]:
         return None
     action = _nullish_string(payload.get('action'))
     if action not in QZONE_ACTION_KINDS:
+        return None
+    if action == 'visibility':
+        # 改可见范围是**回合内即时**动作：不做延迟意图。理由有二——① 意图表要额外
+        # 记「五档 + 名单」这套参数，而模型在回合内直接调它没有任何损失；② "过三小时
+        # 偷偷改一条老说说的可见性"是用户不会预期的行为，宁可让它只在本轮生效。
         return None
     content = payload.get('content').strip() if isinstance(payload.get('content'), str) else ''
     tid = payload.get('tid').strip() if isinstance(payload.get('tid'), str) else ''

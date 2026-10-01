@@ -674,10 +674,75 @@ class StrategyModuleHygieneTests(unittest.TestCase):
                 self.assertTrue(hasattr(q, name), name)
 
     def test_action_kinds_are_exactly_the_write_actions(self):
-        # v1.7.1 起多了 `forward`（转发按评论类互动计配额，见 `evaluate_qzone_gate`）。
-        self.assertEqual(q.QZONE_ACTION_KINDS, frozenset({'post', 'comment', 'like', 'forward'}))
+        # v1.7.1 多了 `forward`（转发按评论类互动计配额）；v1.7.5 多了 `visibility`
+        # （改可见范围，按**发帖**配额计，见 `evaluate_qzone_gate`）。
+        self.assertEqual(
+            q.QZONE_ACTION_KINDS,
+            frozenset({'post', 'comment', 'like', 'forward', 'visibility'}),
+        )
         self.assertNotIn('feed-seen', q.QZONE_ACTION_KINDS)
         self.assertEqual(q.QZONE_FEED_APPID_TALK, 311)
+
+    def test_visibility_labels_map_onto_the_verified_ugc_right_values(self):
+        """五档中文标签 → `ugc_right`：值域与 `qzone_cgi.QZONE_VISIBLE` **同一张表**。
+
+        这是"模型写的枚举"与"打到腾讯的整数"之间的唯一桥梁；对不上就会出现
+        "选了仅自己可见、实际发成好友可见"这种隐私事故。
+        """
+        from plugin.core import qzone_cgi as cgi  # noqa: PLC0415
+
+        self.assertEqual(q.QZONE_VISIBILITY_VALUES, {
+            '所有人可见': 1, '仅 QQ 好友可见': 4, '部分人可见': 16,
+            '部分人不可见': 128, '仅自己可见': 64,
+        })
+        self.assertEqual(
+            set(q.QZONE_VISIBILITY_VALUES.values()), set(cgi.QZONE_VISIBLE.values()),
+        )
+        self.assertEqual(cgi.QZONE_VISIBLE_TARGETED, (16, 128))
+        # 名单档与 `ugc_right` 的对应关系就是"哪些档要 allow_uins"那一对。
+        self.assertEqual(
+            {q.QZONE_VISIBILITY_VALUES['部分人可见'], q.QZONE_VISIBILITY_VALUES['部分人不可见']},
+            set(cgi.QZONE_VISIBLE_TARGETED),
+        )
+        for label, value in q.QZONE_VISIBILITY_VALUES.items():
+            with self.subTest(label=label):
+                self.assertEqual(q.qzone_visible_value(label), value)
+                # 审计用的历史标签（上游移植）认同一组值——两边不能各说各话。
+                self.assertNotEqual(q.qzone_visibility_label(value), '')
+        self.assertIsNone(q.qzone_visible_value('仅好友可见'))
+        self.assertIsNone(q.qzone_visible_value(None))
+
+    def test_visibility_never_becomes_a_deferred_intent(self):
+        """改可见范围是**回合内即时**动作：不做延迟意图（否则可能出现"三小时后偷偷改"）。"""
+        payload = {
+            'action': 'visibility', 'tid': 'abcdef', 'ugcRight': 16,
+            'targetUins': ['10001'], 'content': '旧正文',
+        }
+        self.assertIsNone(q.qzone_intent_from_payload(payload))
+
+    def test_the_visibility_quota_comes_from_the_post_cap(self):
+        """改可见范围按**发帖**配额算：用满发帖额度时它也一起被拦住。"""
+        config = dict(BASE_CONFIG, daily_post_cap=1, daily_comment_cap=6, min_interval_minutes=0)
+        used = [record(kind='post', createdAt=NOW)]
+        with self.subTest(msg='post 额度用满 → visibility 一起被拦'):
+            gate = q.evaluate_qzone_gate(used, config, 'visibility', NOW)
+            self.assertIs(gate['allowed'], False)
+            self.assertEqual(gate['reason'], 'daily-cap')
+            self.assertEqual(gate['cap'], 1, 'visibility 的额度就是发帖那一档')
+        # 改过可见性的行**要计入**发帖额度（否则模型能无限次改）。
+        rich = dict(config, daily_post_cap=3)
+        edited = [record(kind='visibility', createdAt=NOW)]
+        self.assertEqual(
+            q.evaluate_qzone_gate(edited, rich, 'post', NOW)['used_today'], 1,
+            'visibility 审计行必须计进它所属的那档配额',
+        )
+        self.assertEqual(
+            q.evaluate_qzone_gate(edited, rich, 'visibility', NOW)['used_today'], 1,
+        )
+        # 评论额度是另一档：改可见性不吃它，也不会被它撑大。
+        self.assertEqual(
+            q.evaluate_qzone_gate(edited, rich, 'comment', NOW)['used_today'], 0,
+        )
 
 
 # --------------------------------------------------------------------------- #

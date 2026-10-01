@@ -34,7 +34,7 @@ export function Actions({ refreshKey }: PanelProps) {
   // 正在保存的动作 id（禁用它的下拉，避免连点两次写出中间态）。
   const [saving, setSaving] = useState('')
   const [saveError, setSaveError] = useState('')
-  // 「只看 NapCat 专属」：默认关（日常看全量），打开后只留那不装 NapCat 就用不了的几条。
+  // 「只看 NapCat 专属」：默认关（日常看全量），打开后只留非 NapCat 后端无法使用的几条。
   const [onlyNapcat, setOnlyNapcat] = useState(false)
 
   if (error) return <ErrorNote text={error} onRetry={reload} />
@@ -90,7 +90,7 @@ export function Actions({ refreshKey }: PanelProps) {
         <Stat
           label="NapCat 专属"
           value={napcatTotal}
-          hint="不装 NapCat 就用不了（含走 NapCat WebSocket 的空间动作）"
+          hint="非 NapCat 后端无法使用"
         />
         <Stat
           label="危险动作"
@@ -118,11 +118,9 @@ export function Actions({ refreshKey }: PanelProps) {
         >
           只看 NapCat 专属（{napcatTotal}）
         </Button>
-        <span>
-          {onlyNapcat
-            ? `只列不装 NapCat 就用不了的动作：${shownActions.length} 条。`
-            : '每条动作下方的徽章写的是它走哪个后端；带「NapCat 专属」的那些只列在筛选里。'}
-        </span>
+        {onlyNapcat ? (
+          <span>只列非 NapCat 后端无法使用的动作：{shownActions.length} 条。</span>
+        ) : null}
         <span class="ml-auto" title="所有人 / 群管 / 管理员 / 关闭">
           权限档位：{tierBreakdown(tiers, stats?.permissions)}
         </span>
@@ -223,18 +221,6 @@ export function Actions({ refreshKey }: PanelProps) {
           <p>
             <Badge tone="danger">危险动作</Badge> 默认档位是「关闭」，开关分别在各自的类别组里；
             {data?.risk_warning}
-          </p>
-          <p>
-            <Badge tone="accent">NapCat 专属</Badge> 这几条动作只有 NapCat 后端能做，
-            标准 OneBot 实现里没有。QQ 空间那一组走的是 <span class="text-fg">NapCat WebSocket 方案</span>：
-            先经已经连着的 NapCat 调 <span class="font-mono">get_cookies</span>
-            （<span class="font-mono">domain=user.qzone.qq.com</span>）与
-            <span class="font-mono">get_login_info</span> 拿到登录态，再用 cookie 里的
-            <span class="font-mono">p_skey</span> 算出 <span class="font-mono">g_tk</span>
-            直接打 QZone 的接口——不需要额外依赖。
-            只读的「看空间说说 / 看好友动态」不占空间配额，写动作照旧受
-            <span class="font-mono">qzone</span> 组的每日上限与最小间隔限制，
-            转发计入评论类配额。顶上那个「只看 NapCat 专属」开关能把它们聚在一起看。
           </p>
           <div class="pt-1">
             <Button variant="danger" icon="close" disabled={Boolean(saving)} onClick={resetTable}>

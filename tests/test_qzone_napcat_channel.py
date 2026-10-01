@@ -7,7 +7,7 @@
 | 空间动作优先走 NapCat WS（`get_cookies` + QZone CGI），拿不到 cookie 才回退 SnowLuma | 静默走回退：装了 SnowLuma 的用户以为在走 NapCat，没装的人发现动作"没反应" | `NapcatChannelTests` |
 | CGI **真打出去了**但失败 → **不许**再走回退（否则一次动作写两次） | 重复评论 / 重复点赞 | `test_a_failed_cgi_call_never_falls_back_to_snowluma` |
 | 只读的 `qzone_read` 不落审计行、不占配额 | 她"看一眼好友动态"就把当天的评论额度花光 | `QzoneReadTests` |
-| `napcat_actions()` = 那 8 条；`backend_labels` 顺序 = `backends` 顺序 | 面板把 NapCat 专属标丢 / 标签顺序与运行期优先级不一致 | `BackendCatalogTests` |
+| `napcat_actions()` = 那 9 条；`backend_labels` 顺序 = `backends` 顺序 | 面板把 NapCat 专属标丢 / 标签顺序与运行期优先级不一致 | `BackendCatalogTests` |
 | `forward` 走**评论**配额（不是点赞） | 转发把点赞额度吃掉 | `ForwardGateTests` |
 
 传输层按契约 stub（`call_onebot` + `request_text`），**绝不真实联网**；夹具里的
@@ -55,6 +55,33 @@ MOODS_TEXT = (
     '_preloadCallback({"code":0,"msglist":['
     '{"tid":"TID-0001","content":"\u665a\u5b89","created_time":1700000000}]});'
 )
+#: 带**配图**的同一条说说：改可见范围时必须被拒（`richval` 还原不了，硬改可能丢图）。
+MOODS_TEXT_WITH_PIC = (
+    '_preloadCallback({"code":0,"msglist":[{"tid":"TID-0001","content":"\u665a\u5b89",'
+    '"pic":[{"url1":"https://example.invalid/a.jpg","width":1,"height":1}]}]});'
+)
+#: **转发**的说说：`rt_con` 有值 → 转发目标同样还原不了。
+MOODS_TEXT_FORWARDED = (
+    '_preloadCallback({"code":0,"msglist":[{"tid":"TID-0001","content":"\u8f6c\u4e86",'
+    '"rt_tid":"OTHER-1","rt_uin":"10002","rt_con":{"content":"\u539f\u6587"}}]});'
+)
+#: 列表里**没有**这条 tid（正文找不回来 → 不敢改）。
+MOODS_TEXT_OTHER_TID = (
+    '_preloadCallback({"code":0,"msglist":[{"tid":"OTHER-9","content":"\u53e6\u4e00\u6761"}]});'
+)
+
+
+def _visibility_http(moods: str = MOODS_TEXT, result: str = '{"code":0}'):
+    """按 URL 分派：`msglist`（读正文）→ `moods`；`emotion_cgi_update` → `result`。"""
+    calls: list[dict] = []
+
+    def handler(method: str, url: str, headers: object, data: object) -> str:
+        calls.append({'method': method, 'url': url, 'data': dict(data or {})})
+        if 'emotion_cgi_msglist_v6' in url:
+            return moods
+        return result
+
+    return handler, calls
 
 
 def _napcat_handler(calls: list) -> object:
@@ -385,6 +412,166 @@ class QzoneReadTests(unittest.IsolatedAsyncioTestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 2b. 改说说可见范围（v1.7.5）
+# --------------------------------------------------------------------------- #
+
+
+class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    """`set_qzone_visibility`：**只有** NapCat WS 通道能做，且必须先读回正文。
+
+    三条边界各有一个用例，因为它们在真机上都不出声：
+
+    | 边界 | 出错的样子 |
+    | --- | --- |
+    | 带图 / 转发 → 拒绝 | 图被静默弄丢（`richval` 还原不了） |
+    | 正文找不回来 → 拒绝 | 服务端按整条重建，空 `con` = 把正文清掉 |
+    | 没有 CGI 通道 → 明确失败 | 回落到平台打一个不存在的动作名，报错看不懂 |
+    """
+
+    def _host(self, moods: str = MOODS_TEXT, result: str = '{"code":0}') -> tuple:
+        host = _Host(config=dict(BASE_CONFIG, daily_post_cap=5, min_interval_minutes=0))
+        handler, calls = _visibility_http(moods, result)
+        host.transport = _NapcatTransport(_napcat_handler([]), http=handler)
+        return host, calls
+
+    def _payload(self, **overrides: object) -> dict:
+        payload = {'tid': TID, 'visible': '部分人可见', 'targetUins': ['10002']}
+        payload.update(overrides)
+        return payload
+
+    async def test_five_tiers_map_onto_the_ugc_right_values(self):
+        """五档标签 → `ugc_right`，并且只有 16/128 带 `allow_uins`。"""
+        for label, expected in (
+            ('所有人可见', 1), ('仅 QQ 好友可见', 4), ('部分人可见', 16),
+            ('部分人不可见', 128), ('仅自己可见', 64),
+        ):
+            with self.subTest(label=label):
+                host, calls = self._host()
+                params = self._payload(visible=label)
+                if expected not in (16, 128):
+                    params.pop('targetUins')
+                result = await host.qzone_execute(STORY, 'visibility', params)
+                self.assertTrue(result['ok'], result)
+                update = [call for call in calls if 'emotion_cgi_update' in call['url']][0]
+                self.assertEqual(update['data']['ugc_right'], str(expected))
+                self.assertEqual(update['data']['con'], '晚安', '正文必须原样带回去')
+                self.assertEqual(update['data']['tid'], TID)
+                if expected in (16, 128):
+                    self.assertEqual(update['data']['allow_uins'], '10002')
+                else:
+                    self.assertNotIn('allow_uins', update['data'])
+                self.assertEqual(host.rows[-1]['status'], 'confirmed')
+                self.assertEqual(host.rows[-1]['ugcRight'], expected)
+                self.assertEqual(host.rows[-1]['kind'], 'visibility')
+                self.assertEqual(host.entries[-1]['metadata']['qzone_kind'], 'visibility')
+                self.assertIn(label, host.entries[-1]['content'])
+
+    async def test_the_targeted_tiers_require_a_uin_list(self):
+        """「部分人可见 / 部分人不可见」没带名单 = 参数错，不许落审计行、不许发出请求。"""
+        for label in ('部分人可见', '部分人不可见'):
+            with self.subTest(label=label):
+                host, calls = self._host()
+                result = await host.qzone_execute(STORY, 'visibility', self._payload(
+                    visible=label, targetUins=[],
+                ))
+                self.assertFalse(result['ok'], result)
+                self.assertIn('target_uins', result['error'])
+                self.assertEqual(host.rows, [], '坏参数不该留下审计行')
+                self.assertEqual(calls, [], '坏参数不该发出任何请求')
+
+    async def test_an_unknown_label_is_rejected_before_anything_happens(self):
+        host, calls = self._host()
+        result = await host.qzone_execute(STORY, 'visibility', self._payload(visible='仅好友可见'))
+        self.assertFalse(result['ok'], result)
+        self.assertIn('五档', result['error'])
+        self.assertEqual(host.rows, [])
+        self.assertEqual(calls, [])
+
+    async def test_the_cgi_call_carries_the_g_tk_and_the_update_endpoint(self):
+        """真的走了 NapCat WS 的 CGI（`get_cookies` + `g_tk` 挂 URL），没打平台动作。"""
+        host, calls = self._host()
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], result)
+        update = [call for call in calls if 'emotion_cgi_update' in call['url']][0]
+        self.assertEqual(update['method'], 'POST')
+        self.assertIn('g_tk=%d' % cgi.compute_g_tk(P_SKEY), update['url'])
+        self.assertTrue(update['url'].startswith('https://user.qzone.qq.com/proxy/domain/'))
+        # 平台侧**只**被问了 cookie / 登录信息（读正文一次 + 改可见范围一次；
+        # 没有"改可见范围"这条原生动作可打）。
+        self.assertEqual(
+            {name for name, _ in host.transport.calls}, {'get_cookies', 'get_login_info'},
+        )
+        self.assertTrue(
+            any('update_visibility' in text for _level, text in host.standalone),
+            '通道选择要有一条 debug 记录（排查"到底走没走 NapCat"靠它）：%s' % host.standalone,
+        )
+
+    async def test_a_post_with_images_is_refused_instead_of_losing_the_pictures(self):
+        host, calls = self._host(moods=MOODS_TEXT_WITH_PIC)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertIn('图', result['error'])
+        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [],
+                         '拒绝时必须**没有**发出编辑请求')
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+        self.assertIn('reason', host.rows[-1] if 'reason' in host.rows[-1] else {'reason': ''})
+
+    async def test_a_forwarded_post_is_refused_too(self):
+        host, _calls = self._host(moods=MOODS_TEXT_FORWARDED)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertIn('转发', result['error'])
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+
+    async def test_a_post_we_cannot_read_back_is_refused(self):
+        host, calls = self._host(moods=MOODS_TEXT_OTHER_TID)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertIn('正文', result['error'])
+        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [])
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+
+    async def test_a_failed_lookup_surfaces_the_real_reason(self):
+        """读回正文这一步失败时，报的是"读取失败 + 原因"，不是含糊的"找不到正文"。"""
+        host, _calls = self._host()
+
+        async def broken_read(story, kind, params=None, **kwargs):
+            return {'ok': False, 'error': '没有可用的 OneBot 连接'}
+
+        host.qzone_read = broken_read  # type: ignore[method-assign]
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertIn('读回', result['error'])
+        self.assertIn('没有可用的 OneBot 连接', result['error'])
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+
+    async def test_without_the_cgi_channel_it_fails_instead_of_falling_back(self):
+        """没有原始 HTTP 能力（纯 SnowLuma 环境）：明确失败，**不**回落平台动作。"""
+        host = _Host(config=dict(BASE_CONFIG, daily_post_cap=5, min_interval_minutes=0))
+        host.transport = _NapcatTransport(_napcat_handler([]), has_http=False)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertIn('NapCat', result['error'])
+        self.assertEqual(host.transport.calls, [], '不该往平台打任何动作（根本没有这条动作）')
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+
+    async def test_a_transport_error_is_recorded_as_failed(self):
+        """传输层异常 → `failed`（与其它 CGI 动作一致），这条动作**重试是安全的**。
+
+        为什么不判 `unknown`：`unknown` 的语义是"可能已生效，禁止自动重试"，那是给
+        **非幂等**动作（发帖 / 评论）准备的。改可见范围是幂等的——再改一次结果一样，
+        所以让它留在 `failed` 更诚实：模型可以重试，代价只是再来一次请求。
+        （`call_qzone_cgi` 不给传输层异常打 `ambiguous`，与 `call_qzone_action` 不同；
+        这是既有行为，本用例把它钉住，改口径要连带改发帖/评论那几条。）
+        """
+        host, _calls = self._host(result=RuntimeError('socket closed'))
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+        self.assertIn('socket closed', result['error'])
+
+
+# --------------------------------------------------------------------------- #
 # 3. 转发计入评论配额
 # --------------------------------------------------------------------------- #
 
@@ -430,7 +617,11 @@ class ForwardGateTests(unittest.TestCase):
 
     def test_forward_is_a_first_class_action_kind(self):
         self.assertIn('forward', q.QZONE_ACTION_KINDS)
-        self.assertEqual(q.QZONE_ACTION_KINDS, frozenset({'post', 'comment', 'like', 'forward'}))
+        # v1.7.5：多了 `visibility`（改可见范围），它按 post 那一档计额度。
+        self.assertEqual(
+            q.QZONE_ACTION_KINDS,
+            frozenset({'post', 'comment', 'like', 'forward', 'visibility'}),
+        )
         # 只读感知标记（feed-seen）挤不进任何配额。
         config = {'enabled': True, 'daily_comment_cap': 1, 'daily_like_cap': 1,
                   'daily_post_cap': 1, 'min_interval_minutes': 10}
@@ -443,10 +634,11 @@ class ForwardGateTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
-#: 那 8 条 NapCat 专属（不装 NapCat 就用不了）：空间 7 条 + 改在线状态。
+#: 那 9 条 NapCat 专属（非 NapCat 后端无法使用）：空间 8 条 + 改在线状态。
 NAPCAT_ONLY_IDS = frozenset({
     'publish_qzone_post', 'comment_qzone_post', 'like_qzone_post',
     'list_qzone_posts', 'list_qzone_feeds', 'forward_qzone_post', 'delete_qzone_post',
+    'set_qzone_visibility',
     'update_qq_status',
 })
 QZONE_IDS = frozenset(NAPCAT_ONLY_IDS - {'update_qq_status'})
@@ -485,11 +677,11 @@ class BackendCatalogTests(unittest.TestCase):
         pending = pa.PlatformAction('x', 'qzone', 'l', 's', backends=('napcat', 'napcat', 'onebot'))
         self.assertEqual(pa.backend_labels(pending), ['NapCat 专属', '标准 OneBot'])
 
-    def test_napcat_only_is_exactly_those_eight_actions(self):
-        self.assertEqual(len(pa.ACTIONS), 61)
+    def test_napcat_only_is_exactly_those_nine_actions(self):
+        self.assertEqual(len(pa.ACTIONS), 62)
         napcat = pa.napcat_actions()
         self.assertEqual({action.id for action in napcat}, set(NAPCAT_ONLY_IDS))
-        self.assertEqual(len(napcat), 8)
+        self.assertEqual(len(napcat), 9)
         self.assertEqual([action.id for action in napcat], sorted(NAPCAT_ONLY_IDS), '按 id 排序')
         for action in pa.ACTIONS.values():
             with self.subTest(action=action.id):
@@ -536,6 +728,8 @@ class BackendCatalogTests(unittest.TestCase):
             'comment': 'build_comment_request', 'like': 'build_like_request',
             'forward': 'build_forward_request', 'moods': 'build_mood_list_request',
             'feed': 'build_feed_request',
+            # v1.7.5：改可见范围（`emotion_cgi_update`）。
+            'update_visibility': 'build_update_visibility_request',
         }
         self.assertEqual(set(q.QZONE_CGI_ACTIONS.values()), set(builders))
         for cgi_action, builder in builders.items():
@@ -547,6 +741,10 @@ class BackendCatalogTests(unittest.TestCase):
         self.assertEqual(set(q.QZONE_CGI_BY_ID.values()), set(q.QZONE_CGI_ACTIONS.values()))
         self.assertEqual(q.QZONE_CGI_BY_ID['forward_qzone'], 'forward')
         self.assertEqual(q.QZONE_CGI_BY_ID['get_qzone_feeds'], 'feed')
+        # v1.7.5 的例外：改可见范围两个平台都没有原生动作，键直接用**目录 id**，
+        # 值就是它唯一可达的那条 CGI（`_qzone_run_action` 不传 cgi_action 时的默认查表）。
+        self.assertEqual(q.QZONE_CGI_BY_ID['set_qzone_visibility'], 'update_visibility')
+        self.assertEqual(q.QZONE_CGI_ACTIONS['set_qzone_visibility'], 'update_visibility')
         self.assertEqual(
             q.QZONE_NAPCAT_ONLY_ACTIONS,
             frozenset({'forward_qzone_post', 'list_qzone_feeds'}),
@@ -565,7 +763,7 @@ class BackendCatalogTests(unittest.TestCase):
         bridge.db = None  # 没配数据库也要能出目录（§29 的控制台取数约定）
         payload = asyncio.run(ConsoleApi(bridge).actions_catalog())
 
-        self.assertEqual(payload['stats']['napcat_only'], 8)
+        self.assertEqual(payload['stats']['napcat_only'], 9)
         self.assertEqual(payload['napcat_only'], [action.id for action in pa.napcat_actions()])
         self.assertEqual(payload['backend_labels'], pa.BACKEND_LABELS)
         for row in payload['actions']:

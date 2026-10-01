@@ -549,6 +549,20 @@ def config_at(config: Any, path: str, default: Any = None) -> Any:
     return node
 
 
+#: v1.7.5：用户点名**删掉整句解释**（连 `description` 键一起去掉）的对象。
+#:
+#: 两类：① **隐藏兼容位**（`actions_*` / `input_status`）不再解释"读配置时仍认这里的键"
+#: ——隐藏组不需要解释文案；② 动作开关父组 `robot_actions` 与它的三个子组只留标题
+#: （父组那句"会话、群管理、QQ 空间三大类动作的开关…"整句被点名删掉）。
+#: 它们不是"漏写 description"，所以下面那条通用断言据此放行。
+NO_DESCRIPTION_PATHS = frozenset({
+    "actions_interaction", "actions_message", "actions_history", "actions_status",
+    "actions_profile", "actions_voice", "actions_contact",
+    "actions_chat", "actions_group", "actions_qzone", "actions_risks", "input_status",
+    "robot_actions", "robot_actions.chat", "robot_actions.group", "robot_actions.qzone",
+})
+
+
 def iter_fields(node: dict, path: str = ""):
     """深度遍历 schema，产出 (路径, 字段名, 字段定义)。"""
     for key, spec in node.items():
@@ -1112,8 +1126,8 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
         v1.7.3 起危险动作**没有**独立分组：开关落在各自类别组里（落点由
         `action_config_group()` 决定），警示语从"组描述"改成"每个开关的 hint"。
-        退休的那一组仍在 schema 里当隐藏兼容位，但它的 description 是"已弃用"说明，
-        不再是那句警示语。
+        退休的那一组仍在 schema 里当隐藏兼容位（v1.7.5 起连那句"已弃用"说明也删了：
+        隐藏组不需要解释文案），所以警示语既不在它的 hint 里、也不在它的 description 里。
         """
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
 
@@ -1121,8 +1135,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
                          '此标签下功能具有一定风险，易误操作，请谨慎开启。')
         retired = self.schema["actions_risks"]
         self.assertIs(retired.get("invisible"), True)
-        self.assertTrue(retired["description"].startswith("【已弃用】"))
-        self.assertNotIn(catalog.RISK_WARNING, retired["description"])
+        # v1.7.5：隐藏兼容位不再写解释文案（整句删掉，`description` 键也去掉）。
+        self.assertNotIn("description", retired)
+        self.assertNotIn(catalog.RISK_WARNING, str(retired.get("hint") or ""))
         for action in catalog.risky_actions():
             with self.subTest(action=action.id):
                 group = catalog.action_config_group(action)
@@ -1265,8 +1280,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
                 self.assertIn(group, self.schema, f"{group} 不能从 schema 里消失")
                 self.assertIs(self.schema[group].get("invisible"), True,
                               f"{group} 必须隐藏（invisible=true）")
-                self.assertTrue(self.schema[group]["description"].startswith("【已弃用】"),
-                                f"{group} 的说明要写明已弃用")
+                # v1.7.5：隐藏兼容位不再解释"读配置时仍认这里的键"——整句删掉，
+                # 只留 `title`（下拉里那一行仍然认得出它是旧组）。
+                self.assertNotIn("description", self.schema[group])
                 self.assertEqual(set(self.section(group)), set(keys),
                                  f"{group} 的键集合变了（用户配置会被宿主清掉）")
                 targets = LEGACY_ACTION_COMPAT_TARGETS[group]
@@ -1307,7 +1323,8 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertEqual(nested, legacy,
                          "两处的类型/默认值/hint 必须逐字相同（读取侧按同一套判「用户写过」）")
         self.assertIs(self.schema["input_status"].get("invisible"), True)
-        self.assertTrue(self.schema["input_status"]["description"].startswith("【已弃用】"))
+        # v1.7.5：隐藏兼容位的解释文案整句删掉（含那个 `【已弃用】` 前缀）。
+        self.assertNotIn("description", self.schema["input_status"])
         self.assertEqual(LEGACY_SECTION_MERGES[INPUT_STATUS_COMPAT_TARGET], ("input_status",))
         # `runtime` 现在是**标量键 + 嵌套子对象**混排（同 `model_center` 的形状）。
         self.assertEqual(self.schema["runtime"]["items"]["input_status"]["type"], "object")
@@ -1362,36 +1379,90 @@ class ConfigurationSchemaTest(unittest.TestCase):
     # -- AstrBot 格式铁律（AGENTS.md 坑 1） -------------------------------------
 
     def test_voice_section_picks_a_tts_provider_separately_from_the_voice_name(self):
-        """「语音与声聊」里"选服务商"与"选音色"是两件事，不能混成一个自由文本框。
+        """语音的「选服务商 / 选音色」住在「模型中心 → 语音 / 音频理解设置」里。
 
-        `tts_provider_id` 走宿主配置页的 `select_provider_tts` 选择器（`_special` 随
-        schema 原样下发，不需要额外注册——AGENTS 坑 24 记着可用值清单）；`default_voice`
-        是**服务商内部**的音色名。适配层的接线（指名命中 / 指名但不存在绝不回落 /
-        留空回落默认 / 指名坏了要说得清）在 `test_platform_transport.py` 的
-        `VoiceProviderSelectionTests` 里跑：这里只钉 schema 这一半，免得两边各说各话。
+        v1.7.5 把 `tts_provider_id` / `default_voice` 从「机器人动作 → 会话动作」
+        （`robot_actions.chat`，**可见组**）搬进 `model_center.audio`：它们是"用哪个模型 /
+        哪个音色"，跟"允许她做哪些动作"不是一回事。
 
-        分组名跟动作目录走（v1.7.2 收敛成三个 `actions_*` 之后，「语音」落在
-        `actions_chat`；v1.7.4 起是嵌套路径 `robot_actions.chat`）——写死旧组名会在
-        下一次收敛时静默读空。
+        旧位置**不能**就地删掉：宿主每次加载都按 schema 重建配置，schema 里没有的键会被
+        连值一起删（坑 22/72）——所以旧键留在 schema 里当**字段级 `invisible: true`** 的
+        兼容位（AstrBot 与我们的控制台都按这个字段隐藏，实测两边都认）。读取优先新位置、
+        旧位置兜底、写方向只写新位置：见 `core/service/config.py` 的 `LEGACY_KEY_MERGES`。
+
+        这里钉 schema 这一半；适配层的"指名命中 / 指名但不存在绝不回落 / 留空回落默认"
+        在 `test_platform_transport.py` 的 `VoiceProviderSelectionTests` 里跑。
         """
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
+        from plugin.core.service.config import (  # noqa: PLC0415
+            LEGACY_KEY_MERGES,
+            VOICE_FIELD_KEYS,
+            VOICE_LEGACY_SECTION,
+            VOICE_SECTION,
+        )
 
-        group = catalog.ACTION_CONFIG_GROUPS["voice"]
-        self.assertEqual(group, "robot_actions.chat")
-        self.assertIsNot(self.schema["robot_actions"].get("invisible"), True,
-                         f"{group} 必须可见，否则用户改不到 TTS 服务商")
-        voice = self.section(group)
-        self.assertEqual(voice["tts_provider_id"]["_special"], "select_provider_tts")
-        self.assertEqual(voice["tts_provider_id"]["default"], "")
-        self.assertIn("留空", voice["tts_provider_id"]["hint"])
-        self.assertNotIn("_special", voice["default_voice"])
-        self.assertIn("音色", voice["default_voice"]["hint"])
-        # 旧配置里的那一份也要在（宿主按 schema 重建配置，旧文件靠它兜底）。
-        self.assertEqual(self.section("actions_voice")["tts_provider_id"]["default"], "")
-        # 适配层真的按这个名字读（键名写错 = 配置是摆设）。
+        self.assertEqual(VOICE_SECTION, "model_center.audio")
+        self.assertEqual(VOICE_LEGACY_SECTION, "robot_actions.chat")
+        audio = self.section(VOICE_SECTION)
+        self.assertEqual(audio["tts_provider_id"]["_special"], "select_provider_tts")
+        self.assertEqual(audio["tts_provider_id"]["default"], "")
+        self.assertIn("留空", audio["tts_provider_id"]["hint"])
+        self.assertNotIn("_special", audio["default_voice"])
+        self.assertIn("音色", audio["default_voice"]["hint"])
+        # 旧位置：键还在（宿主按 schema 重建配置，删了就会把用户设过的值一起清掉），
+        # 但**字段级 invisible**——宿主配置页与控制台都不显示它。
+        chat_schema = self.schema["robot_actions"]["items"]["chat"]["items"]
+        legacy = self.section(VOICE_LEGACY_SECTION)
+        for key in VOICE_FIELD_KEYS:
+            with self.subTest(key=key):
+                # 除 `invisible` 外逐字相同（参数表/默认值/hint 都不许漂）。
+                self.assertEqual(
+                    {k: v for k, v in legacy[key].items() if k != "invisible"},
+                    audio[key],
+                    f"{key} 两处必须逐字相同（旧位置只多一个 invisible）",
+                )
+                self.assertIs(chat_schema[key].get("invisible"), True,
+                              f"旧位置的 {key} 必须隐藏（否则可见组里多一个废输入框）")
+        # 更早的隐藏组（v1.6.0 的 `actions_voice`）照旧留着兜底。
+        for key in VOICE_FIELD_KEYS:
+            self.assertIn(key, self.section("actions_voice"))
+        # 动作开关本身仍在会话动作组里（搬走的只有"用哪个 TTS / 音色"）。
+        self.assertEqual(catalog.ACTION_CONFIG_GROUPS["voice"], "robot_actions.chat")
+        # 键级搬迁表必须与 schema 声明逐字对齐：源路径存在、目标键就是那两个。
+        self.assertEqual(
+            tuple(target for target, _source, _key in LEGACY_KEY_MERGES[VOICE_SECTION]),
+            VOICE_FIELD_KEYS,
+        )
+        for _target, source_path, source_key in LEGACY_KEY_MERGES[VOICE_SECTION]:
+            self.assertEqual(source_path, VOICE_LEGACY_SECTION)
+            self.assertIn(source_key, self.section(source_path))
+        # 适配层真的按这个分组读（写死旧组名 = 配置是摆设，坑 66 那类事故）。
         adapter = read(os.path.join(PLUGIN_ROOT, "adapters", "astrbot_bridge.py"))
-        self.assertIn("ACTION_CONFIG_GROUPS.get('voice'", adapter)
-        self.assertIn("'tts_provider_id'", adapter)
+        self.assertIn("VOICE_SECTION", adapter)
+        self.assertNotIn("ACTION_CONFIG_GROUPS.get('voice'", adapter)
+
+    def test_the_stt_switch_is_a_real_gate_not_a_dead_switch(self):
+        """「语音转文字」开关：schema 有它、适配层那条通路上认它。
+
+        为什么必须有一条**真实的**转写通路才配得上这个开关：`_AstrbotLlm._transcribe`
+        会用 `model_center.audio.provider_id` 指名 AstrBot 的 STT Provider 把语音转成
+        文字（`_special: select_provider_stt`）。开关默认 **`true`** = 保持历史行为
+        （配了转写模型就转），关掉后语音按音频证据交给主模型——`audio_capability_note`
+        必须跟着一起认它，否则启动自检会说"已指定转写模型"而实际没转。
+        """
+        audio = self.section("model_center.audio")
+        self.assertIs(audio["stt_enabled"]["default"], True, "默认必须保持现行为（转写开着）")
+        self.assertTrue(audio["stt_enabled"]["description"])
+        hint = audio["stt_enabled"]["hint"]
+        self.assertIn("不", hint)
+        self.assertIn("主模型", hint)
+        adapter = read(os.path.join(PLUGIN_ROOT, "adapters", "astrbot_bridge.py"))
+        self.assertIn("def audio_transcription_enabled", adapter)
+        self.assertIn("audio_transcription_enabled()", adapter)
+        # 开关与转写通路在同一个方法里连着（只写 schema 不接线 = 死开关）。
+        import re  # noqa: PLC0415
+        body = adapter.split("async def _transcribe", 1)[1].split("async def ", 1)[0]
+        self.assertIn("audio_transcription_enabled()", body)
 
     def test_every_type_is_in_the_astrbot_allowed_set(self):
         bad = [(path, spec.get("type")) for path, _, spec in iter_fields(self.schema)
@@ -1456,6 +1527,11 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
     def test_every_field_has_a_short_chinese_description(self):
         for path, _, spec in iter_fields(self.schema):
+            if path in NO_DESCRIPTION_PATHS:
+                # v1.7.5：这些对象的解释文案是用户点名删掉的（见 NO_DESCRIPTION_PATHS），
+                # 但"删干净"本身也要钉住——留个空串或半句残话都算没删对。
+                self.assertNotIn("description", spec, f"{path} 该把 description 键整个去掉")
+                continue
             with self.subTest(path=path):
                 desc = spec.get("description", "")
                 self.assertTrue(desc, "description 不能为空")
@@ -1690,10 +1766,15 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
         chat = config_at(folded, "robot_actions.chat")
         self.assertIs(chat["send_poke"], False, "旧组的用户选择折进新路径")
         self.assertIs(chat["send_voice"], False)
-        self.assertEqual(chat["default_voice"], "zh-CN-YunxiNeural")
         self.assertEqual(folded["actions_interaction"], {}, "折完的旧组必须清空")
         self.assertEqual(folded["actions_voice"], {})
         self.assertEqual(folded["runtime"], {"auto_create": True}, "别的分组不动")
+        # v1.7.5：先折组（actions_voice → robot_actions.chat），再折键
+        # （robot_actions.chat → model_center.audio）。音色走完了两级，旧位置清回默认值
+        # ——这是"写方向只写新位置"的落地（否则旧值会永远压着新位置，改回默认值没反应）。
+        self.assertEqual(config_at(folded, "model_center.audio")["default_voice"],
+                         "zh-CN-YunxiNeural")
+        self.assertEqual(chat["default_voice"], "", "旧位置的键清回 schema 默认值（不删键）")
 
     def test_fold_is_idempotent_and_keeps_new_group_values(self):
         from plugin.core.service.config import fold_legacy_section_merges  # noqa: PLC0415

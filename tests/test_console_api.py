@@ -1438,7 +1438,10 @@ class ConfigEditorTests(unittest.TestCase):
         chat = data['robot_actions']['chat']
         self.assertIs(chat['send_poke'], False)
         self.assertIs(chat['send_voice'], False)
-        self.assertEqual(chat['default_voice'], 'zh-CN-YunxiNeural')
+        # v1.7.5：音色跟着**键级搬迁**走到「模型中心 → 语音 / 音频理解设置」；
+        # 旧位置（可见组）清回 schema 默认值，但键还在（宿主按 schema 重建配置）。
+        self.assertEqual(data['model_center']['audio']['default_voice'], 'zh-CN-YunxiNeural')
+        self.assertEqual(chat['default_voice'], '')
         self.assertEqual(data['actions_chat'], {}, '退休的顶层组折完清空')
         self.assertEqual(data['actions_interaction'], {})
         self.assertEqual(data['actions_voice'], {})

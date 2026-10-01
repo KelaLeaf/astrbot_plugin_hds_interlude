@@ -53,6 +53,7 @@ __all__ = [
     'action_config_group',
     'PERMISSION_TIERS',
     'PLATFORM_ACTION_FIELD',
+    'QZONE_VISIBILITY_LABELS',
     'RISK_LEVELS',
     'RISK_WARNING',
     'PlatformAction',
@@ -146,7 +147,7 @@ class PlatformAction:
 
     @property
     def napcat_only(self) -> bool:
-        """NapCat 专属：不装 NapCat 就用不了。控制台据此打标、聚在一起。"""
+        """NapCat 专属：非 NapCat 后端无法使用。控制台据此打标、聚在一起。"""
         return bool(self.backends) and 'onebot' not in self.backends
 
     def param(self, name: str) -> Optional[ActionParam]:
@@ -155,6 +156,19 @@ class PlatformAction:
                 return item
         return None
 
+
+#: 「改说说可见范围」的五档可见性（**用户指定的原话**，顺序也照它）。
+#:
+#: 这是模型 / 界面看到的枚举；对应的 `ugc_right` 整数值在
+#: `core/qzone.py::QZONE_VISIBILITY_VALUES`（两表顺序与键逐字相同，有对账用例），
+#: 数值本身的权威依据见 `core/qzone_cgi.py::QZONE_VISIBLE`。
+QZONE_VISIBILITY_LABELS: tuple[str, ...] = (
+    '所有人可见',
+    '仅 QQ 好友可见',
+    '部分人可见',
+    '部分人不可见',
+    '仅自己可见',
+)
 
 #: 动作类别 → 中文标签（控制台与提示词分组用）。
 ACTION_CATEGORIES: dict[str, str] = {
@@ -657,7 +671,7 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         ),
         risk='sensitive',
         returns='说说 tid + 可见性',
-        # 空间动作统一走 NapCat WebSocket 方案（`get_cookies` + QZone CGI 拿登录态）。
+        # 空间动作统一走 NapCat WebSocket 方案（`get_cookies` + QZone CGI）。
         backends=('napcat',),
     ),
     PlatformAction(
@@ -707,6 +721,21 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
             _p('content', '转发附言'),
         ),
         risk='sensitive',
+        backends=('napcat',),
+    ),
+    PlatformAction(
+        'set_qzone_visibility', 'qzone', '改说说可见范围',
+        '改一条**她自己发的、纯文字**说说的可见范围（谁能看见）。带图的说说这条动作改不了。',
+        params=(
+            _p('tid', '说说 tid', required=True),
+            _p('visible', '可见范围', required=True, choices=QZONE_VISIBILITY_LABELS),
+            _p('target_uins', '可见性作用的 QQ', type='list',
+               note='visible 为「部分人可见」/「部分人不可见」时必填'),
+        ),
+        risk='sensitive',
+        returns='说说 tid + 生效的可见范围',
+        # 走 NapCat WebSocket 方案（`get_cookies` 后打 QZone CGI）：
+        # `emotion_cgi_update` 两个平台都没有原生动作（见 `qzone_cgi` 模块 docstring）。
         backends=('napcat',),
     ),
     PlatformAction(
@@ -794,7 +823,7 @@ BACKEND_LABELS: dict[str, str] = {
 def napcat_actions() -> list[PlatformAction]:
     """NapCat 专属动作（`backends` 里没有 `onebot` 的那些），按 id 排序。
 
-    控制台「只显示 NapCat 专属」与文档的"NapCat 后端专属功能"清单都用它。
+    控制台「只显示 NapCat 专属」与文档的"非 NapCat 后端无法使用"清单都用它。
     """
     return sorted((a for a in ACTIONS.values() if a.napcat_only), key=lambda a: a.id)
 

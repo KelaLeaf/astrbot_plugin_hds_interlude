@@ -27,7 +27,7 @@ from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
 #: N:1 旧分组归并（配置页显示的当前值必须与运行期读到的一致，见 `config_schema`）。
 from ..core.service.config import (
-    LEGACY_SECTION_MERGES,
+    LEGACY_MERGE_TARGETS,
     merge_legacy_section_values,
     read_section_path,
 )
@@ -1144,10 +1144,13 @@ class ConsoleApi:
                     continue
                 path = '%s.%s' % (group_key, field_key)
                 # 这个字段**本身就是归并目标**时（v1.7.4 起：`robot_actions.chat` /
-                # `runtime.input_status` 这类嵌套子组），当前值也必须取"读取侧看到的那一份"
-                # ——否则内嵌表单会拿磁盘上的默认值渲染，用户在控制台里改一项就把旧分组里
-                # 没读出来的用户选择整块覆盖掉（坑 34 的同款：界面显示与运行期不一致）。
-                if path in LEGACY_SECTION_MERGES:
+                # `runtime.input_status` 这类嵌套子组；v1.7.5 起还有键级搬迁的
+                # `model_center.audio`），当前值也必须取"读取侧看到的那一份"——否则内嵌
+                # 表单会拿磁盘上的默认值渲染，用户在控制台里改一项就把旧位置里没读出来的
+                # 用户选择整块覆盖掉（坑 34 的同款：界面显示与运行期不一致）。
+                if path in LEGACY_MERGE_TARGETS:
+                    # 组级归并 + **键级搬迁**（v1.7.5：语音两项 → `model_center.audio`）
+                    # 共用同一张判定表：配置页显示的必须是运行期真正生效的那一份。
                     field_value = merge_legacy_section_values(
                         raw, path, read_section_path(raw, path),
                     )

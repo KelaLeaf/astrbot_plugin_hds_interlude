@@ -144,21 +144,20 @@ assert.equal(napcatOnlyCount(sample, { napcat_only: 0 }), 0)
 assert.equal(napcatOnlyCount(sample, undefined), 2)
 assert.equal(napcatOnlyCount(sample, {}), 2)
 
-// 通道说明：空间动作要说清两步机制（get_cookies → p_skey → g_tk）且只承诺 NapCat 后端。
-const qzoneNote = backendNote({ id: 'like_qzone_post', category: 'qzone', backends: [BACKEND_NAPCAT], napcat_only: true } as never)
-assert.match(qzoneNote, /get_cookies/)
-assert.match(qzoneNote, /p_skey/)
-assert.match(qzoneNote, /g_tk/)
-assert.match(qzoneNote, /空间动作需要 NapCat 后端/)
-assert.doesNotMatch(qzoneNote, /回退/)
-const statusNote = backendNote({ id: 'update_qq_status', category: 'status', backends: [BACKEND_NAPCAT], napcat_only: true } as never)
-assert.match(statusNote, /set_online_status/)
-assert.match(statusNote, /标准 OneBot/)
+// 通道说明：v1.7.5 起**只留一句结论**（用户指定口径），不再展开握手细节，
+// 也不再按类别写三套文案——每个 NapCat 专属动作都回同一句。
+const NAPCAT_NOTE = '非 NapCat 后端无法使用。'
+for (const row of [
+  { id: 'like_qzone_post', category: 'qzone' },
+  { id: 'update_qq_status', category: 'status' },
+  { id: 'some_new_napcat_action', category: 'misc' },
+] as never[]) {
+  const note = backendNote({ ...row, backends: [BACKEND_NAPCAT], napcat_only: true } as never)
+  assert.equal(note, NAPCAT_NOTE)
+  // 实现细节与"回退通道"都不许再出现在界面上。
+  assert.doesNotMatch(note, /get_cookies|p_skey|g_tk|回退|标准 OneBot/)
+}
 assert.equal(backendNote({ id: 'send_poke', category: 'interaction', backends: [BACKEND_ONEBOT] } as never), '')
-assert.equal(
-  backendNote({ id: 'some_new_napcat_action', category: 'misc', backends: [BACKEND_NAPCAT], napcat_only: true } as never),
-  '这条动作只有 NapCat 后端提供。',
-)
 
 console.log('actions-view ok（分组 / 参数摘要 / 档位文案 / 风险语气 / 行状态 / 后端标注与筛选）')
 

@@ -69,6 +69,75 @@ class CatalogIntegrityTests(unittest.TestCase):
             self.assertIn(required, pa.ACTIONS)
 
 
+class QzoneVisibilityTests(unittest.TestCase):
+    """「改说说可见范围」（v1.7.5）的目录声明与枚举对账。
+
+    这条动作是本移植版补的（上游没有），枚举是用户指定的五档中文标签；整数映射在
+    `core/qzone.py`（打到腾讯的 `ugc_right`）。两边漂移的后果是**隐私事故**：
+    用户选了「仅自己可见」而实际发成「好友可见」。
+    """
+
+    def test_the_action_is_declared_the_way_the_task_asked(self):
+        action = pa.ACTIONS['set_qzone_visibility']
+        self.assertEqual(action.category, 'qzone')
+        self.assertEqual(action.risk, 'sensitive')
+        self.assertEqual(action.backends, ('napcat',))
+        self.assertTrue(action.napcat_only)
+        # 档位与其它空间写动作一致（发布 / 评论 / 点赞 / 转发都是 global 默认）。
+        for other in ('publish_qzone_post', 'comment_qzone_post', 'like_qzone_post',
+                      'forward_qzone_post'):
+            with self.subTest(other=other):
+                self.assertEqual(action.default_permission, pa.ACTIONS[other].default_permission)
+        # 它是**写**动作：必须落进「QQ 空间动作」那个可见子组。
+        self.assertEqual(pa.action_config_group(action), 'robot_actions.qzone')
+
+    def test_the_parameters_are_tid_plus_the_five_tier_enum_plus_the_uin_list(self):
+        action = pa.ACTIONS['set_qzone_visibility']
+        self.assertEqual([param.name for param in action.params],
+                         ['tid', 'visible', 'target_uins'])
+        self.assertTrue(action.param('tid').required)
+        visible = action.param('visible')
+        self.assertTrue(visible.required)
+        self.assertEqual(visible.type, 'string')
+        self.assertEqual(tuple(visible.choices), pa.QZONE_VISIBILITY_LABELS)
+        # 五档就是用户给的那五句（顺序也照它）。
+        self.assertEqual(pa.QZONE_VISIBILITY_LABELS, (
+            '所有人可见', '仅 QQ 好友可见', '部分人可见', '部分人不可见', '仅自己可见',
+        ))
+        self.assertEqual(action.param('target_uins').type, 'list')
+        self.assertFalse(action.param('target_uins').required,
+                         '档次本身决定它要不要，必填校验留给执行侧（16/128 才要）')
+
+    def test_the_choices_match_the_ugc_right_table_in_core(self):
+        """`platform_actions` 的枚举顺序/键与 `core/qzone.py` 的取值表逐字相同。"""
+        from plugin.core import qzone  # noqa: PLC0415
+
+        self.assertEqual(tuple(qzone.QZONE_VISIBILITY_VALUES), pa.QZONE_VISIBILITY_LABELS)
+
+    def test_validation_accepts_the_five_labels_and_rejects_anything_else(self):
+        for label in pa.QZONE_VISIBILITY_LABELS:
+            with self.subTest(label=label):
+                normalized, reason = pa.validate_action('set_qzone_visibility', {
+                    'tid': 'TID-0001', 'visible': label, 'targetUins': ['10002'],
+                })
+                self.assertEqual(reason, '')
+                self.assertEqual(normalized['params']['visible'], label)
+                self.assertEqual(normalized['params']['target_uins'], ['10002'])
+        for bad in ('仅好友可见', 'friends', 4, '', None):
+            with self.subTest(bad=bad):
+                normalized, reason = pa.validate_action('set_qzone_visibility', {
+                    'tid': 'TID-0001', 'visible': bad,
+                })
+                self.assertIsNone(normalized)
+                self.assertIn('visible', reason)
+        # 缺 tid 也拒（改谁的说说必须点名）。
+        normalized, reason = pa.validate_action('set_qzone_visibility', {
+            'visible': '所有人可见',
+        })
+        self.assertIsNone(normalized)
+        self.assertIn('tid', reason)
+
+
 class PermissionTests(unittest.TestCase):
     def test_normalize_drops_unknown_actions_and_unknown_tiers(self):
         table = pa.normalize_permissions({

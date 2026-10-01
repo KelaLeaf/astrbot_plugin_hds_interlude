@@ -44,6 +44,7 @@ from typing import Any, Mapping, Optional
 
 from ..endpoints import endpoint_account_key
 from ..qzone import (
+    QZONE_VISIBILITY_VALUES,
     QzoneActionError,
     call_qzone_action,
     call_qzone_cgi,
@@ -57,6 +58,7 @@ from ..qzone import (
     qzone_feed_candidates,
     qzone_intent_from_payload,
     qzone_records_for_endpoint,
+    qzone_visible_value,
     qzone_visibility_label,
     resolve_qzone_config,
 )
@@ -81,6 +83,8 @@ QZONE_ERROR_MAX_CHARS = 500
 QZONE_AUTO_FEED_NOTE_INTERVAL_MS = 60 * 60 * 1000
 #: 剧本条目正文的截断长度（上游 `clip(content, 120)` / `clip(content, 80)`）。
 QZONE_POST_SUMMARY_CHARS = 120
+#: 改可见范围前回看多少条说说找"当前正文"（`emotion_cgi_update` 会按整条重建）。
+QZONE_VISIBILITY_LOOKUP_COUNT = 30
 QZONE_COMMENT_SUMMARY_CHARS = 80
 
 _MILLISECONDS_PER_MINUTE = 60_000
@@ -138,6 +142,8 @@ def _kind_label(kind: Any) -> str:
         return '评论'
     if kind == 'forward':
         return '转发'
+    if kind == 'visibility':
+        return '改可见范围'
     return '点赞'
 
 
@@ -341,7 +347,9 @@ class ServiceChunk13(ServiceBase):
         传输类异常与"成功帧但无 tid"都记 `unknown`——结果不明按已发生保守计入
         配额，且绝不自动重试非幂等动作。
         """
-        payload = _mapping(input)
+        # 复制一份：可见性那一档要在下面把"五档中文标签"解析成 `ugcRight` 再落审计行，
+        # 改调用方传进来的 Mapping 不是本函数该做的事。
+        payload = dict(_mapping(input))
         runtime = self.qzone_runtime()
         if not runtime.get('enabled'):
             return {'ok': False, 'tid': '', 'error': 'QQ 空间通道未启用（Console → 扩展 → QQ 空间）。'}
@@ -362,6 +370,26 @@ class ServiceChunk13(ServiceBase):
             }
         now = self.now()
         story_id = str(pick(story, 'id') or '')
+
+        if kind == 'visibility':
+            # 五档中文标签 → `ugc_right`（值域与 NapCat 的 `ValidUgcRights` 同表）。
+            # 解析放在 reserve 之前：参数不合法就**不该**留下一条审计行。
+            label = str(payload.get('visible') or '').strip()
+            right = qzone_visible_value(label)
+            if right is None:
+                return {
+                    'ok': False, 'tid': str(payload.get('tid') or ''),
+                    'error': '可见范围只能是这五档之一：%s。' % ' / '.join(QZONE_VISIBILITY_VALUES),
+                }
+            payload['visible'] = label
+            payload['ugcRight'] = right
+            uins = [str(item).strip() for item in _rows(payload.get('targetUins')) if str(item).strip()]
+            payload['targetUins'] = uins
+            if right in (16, 128) and not uins:
+                return {
+                    'ok': False, 'tid': str(payload.get('tid') or ''),
+                    'error': '「%s」必须带上 target_uins（这档可见性作用在哪些 QQ 上）。' % label,
+                }
 
         async def reserve() -> dict[str, Any]:
             """串行队列内完成"过门 + 落 pending 行"，杜绝并发动作双双过门。"""
@@ -384,6 +412,9 @@ class ServiceChunk13(ServiceBase):
                 right = payload.get('ugcRight')
                 if right:  # 上游 `...(input.ugcRight ? { ugcRight } : {})`
                     data['ugcRight'] = right
+            if kind == 'visibility' and payload.get('ugcRight'):
+                # v1.7.5：审计行要记下"改成了哪一档"（上游没有这个 kind）。
+                data['ugcRight'] = payload.get('ugcRight')
             if endpoint_id:
                 data['endpointId'] = endpoint_id
             data['status'] = 'pending'
@@ -450,6 +481,10 @@ class ServiceChunk13(ServiceBase):
                     'QQ 空间说说已发表 tid=%s 可见性=%s', tid, right,
                 )
                 return {'ok': True, 'tid': tid, 'error': ''}
+            if kind == 'visibility':
+                return await self._qzone_apply_visibility(
+                    story, story_id, payload, pending_id, now, account_self_id,
+                )
             if kind == 'comment':
                 params: dict[str, Any] = {
                     'tid': payload.get('tid') or '',
@@ -532,6 +567,103 @@ class ServiceChunk13(ServiceBase):
                 'ok': False, 'tid': '',
                 'error': message + '（结果未知：请求可能已生效，为避免重复不会自动重试。）' if ambiguous else message,
             }
+
+    async def _qzone_apply_visibility(
+        self,
+        story: Any,
+        story_id: str,
+        payload: Mapping[str, Any],
+        pending_id: Any,
+        now: Any,
+        account_self_id: str,
+    ) -> dict[str, Any]:
+        """改一条**自己发的**说说的可见范围（v1.7.5，本移植版新增的动作）。
+
+        为什么这么绕（先读再写）：QZone 的 `emotion_cgi_update` 是"**编辑说说**"接口，
+        服务端按整条重建——只改可见性也要把**当前正文**原样带回去（`build_update_visibility_request`
+        对空正文直接抛错）。所以：
+
+        1. 用 `moods`（说说列表）按 `tid` 找回当前正文；
+        2. **带配图 / 转发的说说直接拒绝**——`richval`（图片）没法从列表里重建
+           （列表只给 url，不给 `albumid` / `lloc`），硬发空 `richval` 有可能把图弄丢，
+           属于"宁可少做也不猜"；拒绝时把原因说清楚，让模型改用「删说说 + 重发」或者
+           请用户手动改；
+        3. 这条动作**只有** NapCat WS 通道能做（NapCat / SnowLuma 都没有原生动作），
+           拿不到 cookie 就明确失败，**不**回落平台。
+
+        成功会：写剧本条目（她自己记得改了谁能看）+ 审计行 `confirmed` + 一条标准日志。
+        """
+        tid = str(payload.get('tid') or '')
+        right = payload.get('ugcRight')
+        label = str(payload.get('visible') or qzone_visibility_label(right))
+        target_uins = _rows(payload.get('targetUins'))
+
+        async def fail(reason: str) -> dict[str, Any]:
+            """明确的失败：写审计行 + 标准 warn（别让"改了没生效"变成悬案）。"""
+            await self._qzone_set_status(pending_id, {'status': 'failed', 'error': reason})
+            self.report_standalone('warn', 'QQ 空间改可见范围失败 tid=%s 原因=%s', tid, reason)
+            return {'ok': False, 'tid': tid, 'error': reason}
+
+        request = self._qzone_cgi_request()
+        if not callable(request):
+            return await fail(
+                '改一条说说的可见范围只能走 NapCat WebSocket 通道（QZone 的 '
+                'emotion_cgi_update），当前传输层没有这个能力。'
+            )
+        # ① 找回当前正文（列表接口按 tid 精确命中；找不到就不敢改）。
+        lookup = await self.qzone_read(
+            story, 'moods', {'targetUin': account_self_id, 'count': QZONE_VISIBILITY_LOOKUP_COUNT},
+        )
+        if not (isinstance(lookup, Mapping) and lookup.get('ok')):
+            # 读不到正文与"这条说说不在最近 N 条里"是两件事：前者说清真实原因。
+            return await fail('读回这条说说的正文失败：%s' % (
+                (lookup.get('error') if isinstance(lookup, Mapping) else '') or '未知原因',
+            ))
+        post: Any = None
+        for row in _rows(lookup.get('posts') if isinstance(lookup, Mapping) else None):
+            if str(pick(row, 'tid') or '') == tid:
+                post = row
+                break
+        if post is None:
+            return await fail(
+                '找不到这条说说的当前正文（只回看最近 %d 条，且必须是她自己发的）；'
+                '不带上正文直接改会把正文清掉，所以这次不做。' % QZONE_VISIBILITY_LOOKUP_COUNT
+            )
+        if _rows(pick(post, 'pic')):
+            return await fail(
+                '这条说说配了图：接口要求把整条说说重建回去，而图片信息（`richval`）'
+                '没法从列表里还原，硬改可能把图弄丢，所以不做。'
+            )
+        if str(pick(post, 'rt_tid') or '').strip():
+            return await fail(
+                '这条是转发的说说：接口要求把整条说说重建回去，转发目标没法还原，所以不做。'
+            )
+        content = str(pick(post, 'content') or '')
+        if not content.strip():
+            return await fail('这条说说读回来的正文是空的，不敢拿空正文去改（会把正文清掉）。')
+        # ② 改可见范围（NapCat WS 通道；`QzoneCgiUnavailable` / CGI 失败由外层
+        #    统一记 failed / unknown——"请求可能已到达"不自动重试）。
+        await call_qzone_cgi(request, self._qzone_call_onebot(), 'update_visibility', {
+            'tid': tid, 'content': content, 'ugcRight': right, 'targetUins': target_uins,
+        })
+        self.report_standalone('debug', 'QQ 空间动作走 NapCat WS 通道 动作=update_visibility')
+        await self._qzone_set_status(pending_id, {
+            'tid': tid, 'status': 'confirmed', 'postedAt': self.now(),
+        })
+        # 改的是"谁能看见"，对这段关系是有意义的事，所以进剧本（评论/点赞那种过细的才不进）。
+        await self.append_entry(story_id, {
+            'kind': 'system', 'actor': 'character',
+            'content': '[空间动态] 她把说说的可见范围改成了「%s」：%s' % (
+                label, clip(content, QZONE_POST_SUMMARY_CHARS),
+            ),
+            'occurredAt': iso(now),
+            'metadata': {'qzone_kind': 'visibility', 'tid': tid, 'ugc_right': right},
+        }, now)
+        self.report_operation(
+            'standard', 'info', story, 'user-message',
+            'QQ 空间说说可见范围已改 tid=%s 可见性=%s（%s）', tid, right, label,
+        )
+        return {'ok': True, 'tid': tid, 'error': ''}
 
     async def qzone_available(self, prefer_self_id: str = '') -> bool:
         """通道能力探测（上游 `qzoneAvailable`，只读）：`get_qzone_msg_list` 通不通。"""

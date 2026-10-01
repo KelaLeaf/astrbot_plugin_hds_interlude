@@ -2636,6 +2636,7 @@ class _RecordingBridge:
         self._current_umo = 'aiocqhttp:FriendMessage:1'
         self.task_models = dict(task_models or {})
         self.vision_mode = vision_mode
+        self.stt_enabled = True
 
     async def resolve_chat_provider_id(self):
         return self.context.provider_id
@@ -2645,6 +2646,14 @@ class _RecordingBridge:
 
     def vision_mode_native(self):
         return self.vision_mode != 'sidecar'
+
+    def audio_transcription_enabled(self):
+        """`model_center.audio.stt_enabled`（v1.7.5）：默认 `True`（= 历史行为）。
+
+        单独有 `test_the_stt_switch_actually_gates_the_transcribe_path` 钉住它真的
+        会拦住 `_transcribe`。
+        """
+        return self.stt_enabled
 
     def provider_by_id(self, provider_id):
         if not provider_id:
@@ -2657,10 +2666,11 @@ class _RecordingBridge:
         return {str(item).lower() for item in values} if isinstance(values, list) else set()
 
 
-def _make_client(context, task_models=None, vision_mode='native'):
+def _make_client(context, task_models=None, vision_mode='native', stt_enabled=True):
     """绕开 `__init__` 直接装配一个只走 chat 路由的 `AstrbotHttpClient`。"""
     client = bridge_module.AstrbotHttpClient.__new__(bridge_module.AstrbotHttpClient)
     client.bridge = _RecordingBridge(context, task_models=task_models, vision_mode=vision_mode)
+    client.bridge.stt_enabled = stt_enabled
     client._fallback = None
     client._modality_warned = set()
     return client
@@ -2858,6 +2868,44 @@ class AstrBotProviderRoutingTests(unittest.TestCase):
             {'type': 'input_audio', 'input_audio': {'data': 'QUJD', 'format': 'mp3'}},
         ]}]}, task='main')
         self.assertEqual(context.calls[0]['audio_urls'], ['data:audio/mp3;base64,QUJD'])
+
+    def test_the_stt_switch_actually_gates_the_transcribe_path(self):
+        """`stt_enabled=False` → **不调**转写模型，语音按音频证据交给主模型（v1.7.5）。
+
+        这是「加了开关没接线」的反面用例：开关必须真的拦在那条通路上，否则用户会以为
+        关掉就不转写了，实际上照转（死开关比没有更糟）。
+        """
+        context = _RecordingContext(provider_id='main-provider', modalities=['text', 'audio'])
+
+        class _Stt:
+            def __init__(self):
+                self.urls = []
+
+            async def get_text(self, url):
+                self.urls.append(url)
+                return '不该被调到的转写结果'
+
+        stt = _Stt()
+        client = _make_client(context, task_models={'audio': 'whisper-local'}, stt_enabled=False)
+        client.bridge.provider_by_id = lambda provider_id: stt  # type: ignore[method-assign]
+        self._run(client, {'model': 'x', 'messages': [{'role': 'user', 'content': [
+            {'type': 'text', 'text': '听一下'},
+            {'type': 'input_audio', 'input_audio': {'data': 'QUJD', 'format': 'mp3'}},
+        ]}]}, task='main')
+        self.assertEqual(stt.urls, [], '关掉开关后不许再调转写模型')
+        self.assertEqual(context.calls[0]['audio_urls'], ['data:audio/mp3;base64,QUJD'],
+                         '语音按音频证据原样交给主模型')
+        self.assertNotIn('不该被调到的转写结果', context.calls[0]['prompt'])
+
+    def test_the_stt_switch_is_missing_key_tolerant(self):
+        """老配置里没有 `stt_enabled` 这个键 → 当作**开着**（历史行为，别偷偷关掉转写）。"""
+        bridge = bridge_module.AstrbotBridge.__new__(bridge_module.AstrbotBridge)
+        bridge.config = {'model_center': {'audio': {}}}
+        self.assertTrue(bridge.audio_transcription_enabled())
+        bridge.config = {'model_center': {'audio': {'stt_enabled': False}}}
+        self.assertFalse(bridge.audio_transcription_enabled())
+        bridge.config = {'model_center': {'audio': {'stt_enabled': True}}}
+        self.assertTrue(bridge.audio_transcription_enabled())
 
     # ---- 流式降级 ----
 

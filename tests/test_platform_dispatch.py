@@ -328,6 +328,45 @@ class CoreActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(host.intents, [])
         self.assertEqual(host.commands, [])
 
+    async def test_set_qzone_visibility_reaches_the_qzone_executor_with_its_five_tier_enum(self):
+        """「改说说可见范围」必须由**本机**办（`qzone_execute`），参数原样带过去。
+
+        它是 v1.7.5 新增的空间写动作：走传输层会绕过限流门/审计行/剧本条目，而且平台
+        根本没有这条原生动作可打（见 AGENTS 坑 67 / 71）。这里钉 chunk12 → chunk13 这一跳：
+        `visible`（五档中文标签）与 `target_uins` 都要到得了 executor，少一个就是静默失效。
+        """
+        from plugin.core.service.chunk12 import CORE_HANDLED_ACTIONS, QZONE_ACTION_KINDS_BY_ID
+
+        self.assertIn('set_qzone_visibility', CORE_HANDLED_ACTIONS)
+        self.assertEqual(QZONE_ACTION_KINDS_BY_ID['set_qzone_visibility'], 'visibility')
+        host = self._host(config={'robot_actions': {'qzone': {'set_qzone_visibility': True}}})
+        seen: list[tuple] = []
+
+        async def fake_execute(story, kind, payload=None, prefer_self_id=''):
+            seen.append((kind, dict(payload or {})))
+            return {'ok': True, 'tid': (payload or {}).get('tid', ''), 'error': ''}
+
+        host.qzone_execute = fake_execute  # type: ignore[method-assign]
+        outcomes = await host.dispatch_platform_actions(STORY, {
+            'platformActions': [{
+                'action': 'set_qzone_visibility',
+                'params': {'tid': 'TID-1', 'visible': '部分人不可见',
+                           'target_uins': ['10002', '10003']},
+            }],
+        })
+        self.assertTrue(outcomes[0]['ok'], outcomes[0])
+        self.assertEqual(seen, [('visibility', {
+            'tid': 'TID-1', 'visible': '部分人不可见', 'targetUins': ['10002', '10003'],
+        })])
+        # 关掉这个开关就调不动（与其它空间动作同一套总闸语义）。
+        off = self._host(config={'robot_actions': {'qzone': {'set_qzone_visibility': False}}})
+        off.qzone_execute = fake_execute  # type: ignore[method-assign]
+        rejected = await off.dispatch_platform_actions(STORY, {
+            'platformActions': [{'action': 'set_qzone_visibility',
+                                 'params': {'tid': 'TID-1', 'visible': '所有人可见'}}],
+        })
+        self.assertEqual(rejected, [])
+
     async def test_list_and_cancel_scheduled_messages(self):
         host = self._host()
         await host.dispatch_platform_actions(STORY, {

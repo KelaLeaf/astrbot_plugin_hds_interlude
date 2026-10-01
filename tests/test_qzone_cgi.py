@@ -39,7 +39,9 @@ from plugin.core.qzone_cgi import (
     QZONE_APP_TYPES,
     QZONE_UA,
     QZONE_URLS,
+    QZONE_ALLOW_UINS_SEPARATOR,
     QZONE_VISIBLE,
+    QZONE_VISIBLE_TARGETED,
     QZoneAuth,
     QZoneAuthError,
     build_comment_request,
@@ -49,6 +51,7 @@ from plugin.core.qzone_cgi import (
     build_like_request,
     build_mood_list_request,
     build_publish_request,
+    build_update_visibility_request,
     compute_g_tk,
     extract_cookie,
     feed_items_from_text,
@@ -303,10 +306,10 @@ class ConstantsTests(unittest.TestCase):
         self.assertIn("Chrome/120.0.0.0", QZONE_UA)
         self.assertTrue(QZONE_UA.startswith("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"))
 
-    def test_urls_are_the_seven_cgi_endpoints(self):
+    def test_urls_are_the_eight_cgi_endpoints(self):
         self.assertEqual(
             sorted(QZONE_URLS),
-            ["comment", "delete", "feed", "forward", "like", "mood_list", "publish"],
+            ["comment", "delete", "feed", "forward", "like", "mood_list", "publish", "update"],
         )
         prefix = "https://user.qzone.qq.com/proxy/domain/"
         for name, url in QZONE_URLS.items():
@@ -352,7 +355,18 @@ class ConstantsTests(unittest.TestCase):
         })
 
     def test_visible_ranges(self):
-        self.assertEqual(QZONE_VISIBLE, {"public": 1, "friends": 3, "private": 4})
+        """五档可见范围（v1.7.5 修正：原先照抄 qzone-sdk 的 `{1,3,4}` 是错的）。
+
+        权威依据是 NapCat 的 `ValidUgcRights = [1, 4, 16, 64, 128]`
+        （`packages/napcat-core/data/qzone.ts`，注释逐字写了每档含义），上游 Koishi 的
+        `QZONE_UGC_RIGHT_VALUES` 与 qzone-sdk 仓库内附带的参考实现同表。`3` 从来不是
+        合法取值——留着它会让"好友可见"这条配置静默落到一个服务端不认识的值上。
+        """
+        self.assertEqual(QZONE_VISIBLE, {
+            "public": 1, "friends": 4, "partial": 16, "exclude": 128, "private": 64,
+        })
+        self.assertEqual(QZONE_VISIBLE_TARGETED, (16, 128))
+        self.assertEqual(QZONE_ALLOW_UINS_SEPARATOR, "|")
 
 
 # ── 请求构造 ───────────────────────────────────────────────────────────
@@ -362,6 +376,14 @@ PUBLISH_KEYS = (
     "syn_tweet_verson", "paramstr", "pic_template", "richtype", "richval",
     "special_url", "subrichtype", "pic_bo", "who", "con", "feedversion", "ver",
     "ugc_right", "to_sign", "hostuin", "code_version", "format", "qzreferrer",
+)
+#: `emotion_cgi_update` 的字段与顺序：逐字抄自参考实现
+#: `qzone_api/api/api_parms.py::build_edit_message_params` 的 dict 字面量
+#: （`allow_uins` 是条件追加的，见下面专门的用例）。
+UPDATE_KEYS = (
+    "syn_tweet_verson", "tid", "paramstr", "pic_template", "richtype", "richval",
+    "special_url", "subrichtype", "con", "feedversion", "ver", "ugc_right",
+    "to_sign", "ugcright_id", "hostuin", "code_version", "format", "qzreferrer",
 )
 DELETE_KEYS = (
     "uin", "topicId", "feedsType", "feedsFlag", "feedsKey", "feedsAppid",
@@ -394,7 +416,7 @@ GET_HEADER_KEYS = ("Cookie", "User-Agent", "Referer")
 
 
 class RequestBuilderTests(unittest.TestCase):
-    """七个 `build_*_request`：`(method, url, headers, body)`。
+    """八个 `build_*_request`：`(method, url, headers, body)`。
 
     body 是**有序 dict**：POST 是表单字段，GET 是查询参数。键顺序逐字对齐参考实现。
     """
@@ -420,6 +442,7 @@ class RequestBuilderTests(unittest.TestCase):
     def test_post_urls_carry_g_tk_and_get_urls_do_not(self):
         posts = [
             build_publish_request(self.auth, "hi"),
+            build_update_visibility_request(self.auth, "tid", "正文", 4),
             build_delete_request(self.auth, "tid"),
             build_like_request(self.auth, "1", "fid", "ck", "uk"),
             build_comment_request(self.auth, "1", "fid", "c"),
@@ -437,9 +460,65 @@ class RequestBuilderTests(unittest.TestCase):
                 self.assertEqual(url, expected)
                 self.assertNotIn("g_tk=", url, "读操作的 g_tk 在 body 里")
 
+    # 改可见范围（v1.7.5 新增：`emotion_cgi_update`） ---------------------
+
+    def test_update_visibility_body_matches_the_reference_field_list(self):
+        """字段与**顺序**逐字来自参考实现的 `build_edit_message_params`。"""
+        method, url, headers, body = build_update_visibility_request(
+            self.auth, "tid-1", "今天天气不错", 4,
+        )
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, f"{QZONE_URLS['update']}?g_tk={self.g_tk}")
+        self.assertIn("emotion_cgi_update", url)
+        self.assertTrue(url.endswith(f"?g_tk={self.g_tk}"), "写操作的 g_tk 挂 URL")
+        self._assert_common_headers(headers, expect_post=True)
+        self.assertEqual(tuple(body), UPDATE_KEYS)
+        self.assertEqual(body["tid"], "tid-1")
+        self.assertEqual(body["con"], "今天天气不错")
+        self.assertEqual(body["ugc_right"], "4")
+        self.assertEqual(body["hostuin"], self.auth.uin)
+        self.assertEqual(body["ugcright_id"], "", "参考实现缺省就是空串")
+        self.assertEqual(body["format"], "fs")
+        # 参考实现的编辑构造器**没有** `who`（发布有），照它，不加。
+        self.assertNotIn("who", body)
+
+    def test_update_visibility_target_uins_are_pipe_joined(self):
+        """`allow_uins` 用 `|` 分隔（NapCat 的 `data/qzone.ts` + 它自己的单测钉的）。"""
+        for right in (16, 128):
+            with self.subTest(right=right):
+                body = build_update_visibility_request(
+                    self.auth, "t", "正文", right, ["10001", 10002, " 10003 "],
+                )[3]
+                self.assertEqual(body["ugc_right"], str(right))
+                self.assertEqual(body["allow_uins"], "10001|10002|10003")
+
+    def test_update_visibility_drops_the_uins_for_the_other_three_tiers(self):
+        """1 / 4 / 64 三档不带 `allow_uins`（带了只会让请求更容易被判非法）。"""
+        for right in (1, 4, 64):
+            with self.subTest(right=right):
+                body = build_update_visibility_request(
+                    self.auth, "t", "正文", right, ["10001"],
+                )[3]
+                self.assertNotIn("allow_uins", body)
+        # 16/128 但名单是空的 / 不是列表：同样不带（服务端看不懂空名单）。
+        for empty in ((), [], None, "", "10001"):
+            with self.subTest(empty=empty):
+                body = build_update_visibility_request(
+                    self.auth, "t", "正文", 16, empty,
+                )[3]
+                self.assertNotIn("allow_uins", body)
+
+    def test_update_visibility_refuses_an_empty_body_text(self):
+        """空正文直接抛：这条接口按整条重建，空 `con` 等于把正文清掉。"""
+        for content in ("", "   ", None):
+            with self.subTest(content=content):
+                with self.assertRaises(QZoneAuthError):
+                    build_update_visibility_request(self.auth, "t", content, 4)
+
     def test_every_builder_returns_a_four_tuple_of_the_right_types(self):
         requests = (
             build_publish_request(self.auth, "hi"),
+            build_update_visibility_request(self.auth, "tid", "正文", 4),
             build_delete_request(self.auth, "tid"),
             build_like_request(self.auth, "1", "fid", "ck", "uk"),
             build_comment_request(self.auth, "1", "fid", "c"),

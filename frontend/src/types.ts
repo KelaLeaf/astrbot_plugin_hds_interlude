@@ -530,7 +530,7 @@ export interface PlatformActionRow {
   group: string
   /** 后端标签（人话，**顺序 = 通道优先级**）；缺省 = 后端是标准 OneBot。 */
   backends?: string[]
-  /** NapCat 专属：后端里没有标准 OneBot 的那几条（不装 NapCat 就用不了）。 */
+  /** NapCat 专属：后端里没有标准 OneBot 的那几条（非 NapCat 后端无法使用）。 */
   napcat_only?: boolean
   /** 适用范围：`private` / `group`（两者都有时都给）。 */
   scopes?: string[]

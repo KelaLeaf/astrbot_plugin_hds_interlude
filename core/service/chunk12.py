@@ -60,6 +60,10 @@ CORE_HANDLED_ACTIONS = frozenset({
     # 也是走 `qzoneExecute`）。只读的 `list_qzone_posts` / 危险的 `delete_qzone_post`
     # 上游没有对应服务成员，直通传输层。
     'publish_qzone_post', 'comment_qzone_post', 'like_qzone_post', 'forward_qzone_post',
+    # v1.7.5：改说说可见范围（`emotion_cgi_update`）同样是**本机办**的写动作——
+    # 它要先读回正文、过限流门、落审计行；直通传输层会绕过这一切（而且平台根本没有
+    # 这条原生动作名可打）。
+    'set_qzone_visibility',
     # v1.7.1：读类也收进本机——NapCat WebSocket 方案（get_cookies + QZone CGI）
     # 要按账号端点解析、并且**不能**让只读动作去撞限流门。
     'list_qzone_posts', 'list_qzone_feeds',
@@ -73,6 +77,8 @@ QZONE_ACTION_KINDS_BY_ID = {
     # v1.7.1：转发说说也是**写**动作（受限流门与账本管）。只读的
     # `list_qzone_feeds` / `list_qzone_posts` 与危险的 `delete_qzone_post` 直通传输层。
     'forward_qzone_post': 'forward',
+    # v1.7.5：改可见范围（配额按**发帖**那一档算，见 `core/qzone.evaluate_qzone_gate`）。
+    'set_qzone_visibility': 'visibility',
 }
 
 #: 定时消息在 intent 表里的类型名（内部调度账，控制台「承诺与意图」面板会标成内部）。
@@ -608,6 +614,13 @@ class ServiceChunk12(ServiceBase):
         ugc_right = params.get('ugc_right') or params.get('ugcRight')
         if isinstance(ugc_right, int) and not isinstance(ugc_right, bool):
             payload['ugcRight'] = ugc_right
+        # v1.7.5：可见范围那一档传的是**五档中文标签**（`visible`），由 `qzone_execute`
+        # 译成 `ugc_right`；`target_uins` 只在「部分人可见 / 部分人不可见」两档必填。
+        visible = params.get('visible')
+        if isinstance(visible, str) and visible.strip():
+            payload['visible'] = visible.strip()
+        if params.get('target_uins'):
+            payload['targetUins'] = list(params['target_uins'])
         result = await runner(story, kind, payload)
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'bad-qzone-result'}

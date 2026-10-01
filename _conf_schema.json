@@ -169,6 +169,12 @@
             "description": "语音转写模型",
             "hint": "用 AstrBot 的语音转文字模型把语音转成文本再交给主叙事；留空则把语音原样交给主模型（要求主模型支持音频）。"
           },
+          "stt_enabled": {
+            "type": "bool",
+            "description": "语音转文字",
+            "default": true,
+            "hint": "关掉后不再调语音转写模型：语音按音频证据原样交给主模型（要求主模型支持音频输入；它没声明音频能力时这条语音会被丢掉）。"
+          },
           "out_format": {
             "type": "string",
             "description": "转码输出格式",
@@ -192,6 +198,19 @@
             "type": "int",
             "description": "每个事件音频数上限",
             "default": 1
+          },
+          "tts_provider_id": {
+            "type": "string",
+            "default": "",
+            "_special": "select_provider_tts",
+            "description": "文字转语音模型",
+            "hint": "从 AstrBot 已配置的语音服务商里选一个发语音；留空则用当前默认 TTS。"
+          },
+          "default_voice": {
+            "type": "string",
+            "description": "默认音色",
+            "default": "",
+            "hint": "上面那个服务商内部的音色名（例如 zh-CN-YunxiNeural）；留空用它自己配的音色。"
           }
         }
       },
@@ -1283,7 +1302,7 @@
       "input_status": {
         "type": "object",
         "title": "输入状态",
-        "description": "【输入 27】输入状态：回复前先亮「正在输入」，让节奏更像真人。",
+        "description": "输入状态：回复前先亮「正在输入」，让节奏更像真人。",
         "items": {
           "enabled": {
             "type": "bool",
@@ -2318,12 +2337,10 @@
   "robot_actions": {
     "type": "object",
     "title": "机器人动作",
-    "description": "【动作 17】机器人动作：会话、群管理、QQ 空间三大类动作的开关，含其中的危险动作（默认关闭）。",
     "items": {
       "chat": {
         "type": "object",
         "title": "会话动作",
-        "description": "【已弃用】动作开关已并进「机器人动作 → 会话动作」，读配置时仍认这里的键。",
         "items": {
           "enabled": {
             "type": "bool",
@@ -2445,19 +2462,6 @@
             "default": true,
             "hint": "列出宿主 TTS 能用的音色。"
           },
-          "tts_provider_id": {
-            "type": "string",
-            "default": "",
-            "_special": "select_provider_tts",
-            "description": "文字转语音模型",
-            "hint": "从 AstrBot 已配置的语音服务商里选一个发语音；留空则用当前默认 TTS。"
-          },
-          "default_voice": {
-            "type": "string",
-            "description": "默认音色",
-            "default": "",
-            "hint": "上面那个服务商内部的音色名（例如 zh-CN-YunxiNeural）；留空用它自己配的音色。"
-          },
           "list_contacts": {
             "type": "bool",
             "description": "联系人列表",
@@ -2505,13 +2509,27 @@
             "description": "主动了解新联系人",
             "default": false,
             "hint": "允许她主动了解新联系人/群：看资料卡、群公告、空间动态"
+          },
+          "tts_provider_id": {
+            "invisible": true,
+            "type": "string",
+            "default": "",
+            "_special": "select_provider_tts",
+            "description": "文字转语音模型",
+            "hint": "从 AstrBot 已配置的语音服务商里选一个发语音；留空则用当前默认 TTS。"
+          },
+          "default_voice": {
+            "invisible": true,
+            "type": "string",
+            "description": "默认音色",
+            "default": "",
+            "hint": "上面那个服务商内部的音色名（例如 zh-CN-YunxiNeural）；留空用它自己配的音色。"
           }
         }
       },
       "group": {
         "type": "object",
         "title": "群管理动作",
-        "description": "【已弃用】动作开关已并进「机器人动作 → 群管理动作」，读配置时仍认这里的键。",
         "items": {
           "enabled": {
             "type": "bool",
@@ -2692,8 +2710,7 @@
       "qzone": {
         "type": "object",
         "title": "QQ 空间动作",
-        "description": "【已弃用】动作开关已并进「机器人动作 → QQ 空间动作」，读配置时仍认这里的键。",
-        "hint": "空间动作需要 NapCat 后端：经已经连着的 NapCat 调 get_cookies 与 get_login_info 拿登录态，再直接调 QZone 接口。「看说说 / 看动态」是只读，不占配额。",
+        "hint": "非 NapCat 后端无法使用",
         "items": {
           "enabled": {
             "type": "bool",
@@ -2736,6 +2753,12 @@
             "description": "转发说说",
             "default": true,
             "hint": "转会计入「评论」配额（互动配额，不是发帖配额）"
+          },
+          "set_qzone_visibility": {
+            "type": "bool",
+            "description": "改说说可见范围",
+            "default": true,
+            "hint": "改的是一条说说的「谁能看见」：保存后立刻生效，原先看不到的人可能因此看到它，反过来也一样。只对纯文字说说生效。"
           },
           "delete_qzone_post": {
             "type": "bool",
@@ -2924,7 +2947,6 @@
   "chat_rhythm": {
     "type": "object",
     "title": "节奏反定型（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：节奏反定型不再统计或干预写作。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -2957,12 +2979,12 @@
         "default": 6
       }
     },
-    "invisible": true
+    "invisible": true,
+    "description": "【已弃用】仅兼容旧配置：节奏反定型不再统计或干预写作。"
   },
   "black_box": {
     "type": "object",
     "title": "失明模式（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：请改用盲区模式。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -2975,12 +2997,12 @@
         "default": 10
       }
     },
-    "invisible": true
+    "invisible": true,
+    "description": "【已弃用】仅兼容旧配置：请改用盲区模式。"
   },
   "shared_story_compat": {
     "type": "object",
     "title": "用户白名单兼容位（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：请改用 QQ 接入的用户白名单。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -2998,12 +3020,12 @@
         "hint": "新配置请使用 QQ 接入的用户白名单"
       }
     },
-    "invisible": true
+    "invisible": true,
+    "description": "【已弃用】仅兼容旧配置：请改用 QQ 接入的用户白名单。"
   },
   "runtime_compat": {
     "type": "object",
     "title": "补写时间表兼容位（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：已被明确的补写时间表替代。",
     "items": {
       "pause_after_conversation_minutes": {
         "type": "int",
@@ -3016,12 +3038,12 @@
         "default": 0
       }
     },
-    "invisible": true
+    "invisible": true,
+    "description": "【已弃用】仅兼容旧配置：已被明确的补写时间表替代。"
   },
   "model_compat": {
     "type": "object",
     "title": "群聊筛选模型兼容位（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：群聊快速筛选模型已移除。",
     "items": {
       "group_gate": {
         "type": "object",
@@ -3041,12 +3063,12 @@
         }
       }
     },
-    "invisible": true
+    "invisible": true,
+    "description": "【已弃用】仅兼容旧配置：群聊快速筛选模型已移除。"
   },
   "actions_interaction": {
     "type": "object",
     "title": "互动动作（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
     "invisible": true,
     "items": {
       "enabled": {
@@ -3078,7 +3100,6 @@
   "actions_message": {
     "type": "object",
     "title": "消息与定时（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
     "invisible": true,
     "items": {
       "enabled": {
@@ -3128,7 +3149,6 @@
   "actions_history": {
     "type": "object",
     "title": "历史消息（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
     "invisible": true,
     "items": {
       "enabled": {
@@ -3154,7 +3174,6 @@
   "actions_status": {
     "type": "object",
     "title": "QQ 状态（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
     "invisible": true,
     "items": {
       "enabled": {
@@ -3186,7 +3205,6 @@
   "actions_profile": {
     "type": "object",
     "title": "个人资料（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
     "invisible": true,
     "items": {
       "enabled": {
@@ -3218,7 +3236,6 @@
   "actions_voice": {
     "type": "object",
     "title": "语音与声聊（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
     "invisible": true,
     "items": {
       "enabled": {
@@ -3257,7 +3274,6 @@
   "actions_contact": {
     "type": "object",
     "title": "联系人与群（已弃用）",
-    "description": "【已弃用】仅兼容旧配置：动作开关已并入「会话动作」组，读配置时仍认这里的键。",
     "invisible": true,
     "items": {
       "enabled": {
@@ -3313,7 +3329,6 @@
   "actions_chat": {
     "type": "object",
     "title": "会话动作（已弃用）",
-    "description": "【已弃用】动作开关已并进「机器人动作 → 会话动作」，读配置时仍认这里的键。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -3502,7 +3517,6 @@
   "actions_group": {
     "type": "object",
     "title": "群管理动作（已弃用）",
-    "description": "【已弃用】动作开关已并进「机器人动作 → 群管理动作」，读配置时仍认这里的键。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -3684,7 +3698,6 @@
   "actions_qzone": {
     "type": "object",
     "title": "QQ 空间动作（已弃用）",
-    "description": "【已弃用】动作开关已并进「机器人动作 → QQ 空间动作」，读配置时仍认这里的键。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -3735,13 +3748,12 @@
         "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
       }
     },
-    "hint": "空间动作需要 NapCat 后端：经已经连着的 NapCat 调 get_cookies 与 get_login_info 拿登录态，再直接调 QZone 接口。「看说说 / 看动态」是只读，不占配额。",
+    "hint": "非 NapCat 后端无法使用",
     "invisible": true
   },
   "actions_risks": {
     "type": "object",
     "title": "风险操作（已弃用）",
-    "description": "【已弃用】危险动作的开关已并入「动作：会话 / 动作：群管理 / 动作：QQ 空间」，读配置时仍认这里的键。",
     "items": {
       "enabled": {
         "type": "bool",
@@ -3857,7 +3869,6 @@
   "input_status": {
     "type": "object",
     "title": "输入状态（已弃用）",
-    "description": "【已弃用】输入状态已挪进「运行时」当子配置，读配置时仍认这里的键。",
     "items": {
       "enabled": {
         "type": "bool",

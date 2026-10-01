@@ -1236,6 +1236,12 @@ _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
     'forward_qzone_post': (
         'forward_qzone', {'tid': 'tid', 'content': 'content', 'target_uin': 'target_uin'},
     ),
+    # v1.7.5：改说说可见范围（`emotion_cgi_update`）。**NapCat 与 SnowLuma 都没有**
+    # 这条原生动作（NapCat 的扩展动作只有 `send_qzone_msg` / `delete_qzone_msg`），
+    # 它只能走本机的 QZone CGI 通道（`chunk13` 的 `qzone_execute`，需要
+    # `get_cookies`）。这里显式标 `@unsupported`：万一它绕到传输层，
+    # 会拿到 `unsupported-platform-action`，而不是往平台打一个不存在的动作名。
+    'set_qzone_visibility': (_PLATFORM_ACTION_UNSUPPORTED, {}),
     'list_qzone_feeds': ('get_qzone_feeds', {'count': 'num'}),
     # 指了归属 QQ = 看那个人的说说列表；没指 = 看好友动态（见 `_resolve_platform_call`）。
     'list_qzone_posts': ('get_qzone_msg_list', {'target_uin': 'target_uin', 'count': 'num'}),
@@ -2406,22 +2412,27 @@ class AstrbotTransport:
                 return value.strip()
         return ''
 
-    # ---- 指名的宿主 TTS 服务商（「语音与声聊」组的 `tts_provider_id`） ----
+    # ---- 指名的宿主 TTS 服务商（「模型中心 → 语音 / 音频理解设置」的 `tts_provider_id`） ----
     #
     # 与模型侧的「任务指名 AstrBot Provider」是同一件事：用户在配置里明确选了哪一个
-    # 宿主服务商，就用哪一个；没选就沿用宿主当前的那个。区别只在段位——TTS 服务商
-    # 跟着「语音」这个动作类别走（`ACTION_CONFIG_GROUPS['voice']`），因为它只服务
-    # `send_voice` / `list_voices` 两条动作，不属于模型任务路由。
+    # 宿主服务商，就用哪一个；没选就沿用宿主当前的那个。
+    #
+    # v1.7.5：`tts_provider_id` / `default_voice` 从「机器人动作 → 会话动作」
+    # （`robot_actions.chat`，**可见组**）搬到了「模型中心 → 语音 / 音频理解设置」
+    # （`model_center.audio`）——它们是"用哪个模型/音色"，跟"允许她做哪些动作"不是一回事。
+    # 旧位置留在 schema 里当**字段级 `invisible: true`** 的兼容位（宿主不删、界面不显示），
+    # 读取优先新位置、旧位置兜底，写方向只写新位置：单一实现源是
+    # `core/service/config.py` 的 `LEGACY_KEY_MERGES`（键级搬迁表）。
+    # 注意：**动作开关**（`send_voice` / `list_voices`）仍在 `robot_actions.chat`，
+    # 所以这里不再从动作目录算分组名。
 
     def voice_config_group(self) -> str:
-        """「语音与声聊」的配置分组名（**跟动作目录走，不写死字符串**）。
+        """语音两项的配置分组（点分路径 `model_center.audio`）。
 
-        v1.7.2/v1.7.4 两次收敛后，分组名是**点分路径** `robot_actions.chat`；旧分组留作
-        隐藏兼容位。分组名是那个迁移的地盘，写死 `actions_voice` / `actions_chat` 会在
-        收敛之后静默读不到（配置变摆设，正是 AGENTS 坑 66 那类事故）。`bridge.section()`
-        自带 N:1 归并（新路径优先、旧分组补缺）并支持点分路径，所以这里只要报对**新**路径。
+        单一实现源是 `core/service/config.py` 的 `VOICE_SECTION`（键级搬迁表的目标），
+        这里只转发一次，别写死字符串——写死会在下一次搬迁时静默读空（坑 66 那类事故）。
         """
-        return platform_action_catalog.ACTION_CONFIG_GROUPS.get('voice', 'robot_actions.chat')
+        return VOICE_SECTION
 
     def _voice_option(self, key: str) -> str:
         return _clean(self.bridge.section(self.voice_config_group()).get(key))
@@ -2500,13 +2511,13 @@ class AstrbotTransport:
             if tokens and not (tokens & _TTS_MODALITIES):
                 return (
                     'TTS 服务商 %s 没有声明文字转语音能力（已声明=%s）：请在 AstrBot 里换一个 '
-                    'TTS 服务商，或把「语音与声聊」的这一项改选'
+                    'TTS 服务商，或把「语音 / 音频理解」的这一项改选'
                     % (label, '/'.join(sorted(tokens)))
                 )
         if not callable(getattr(provider, 'get_audio', None)):
             return (
                 'TTS 服务商 %s 没有 t2s 能力（缺 get_audio）：它不是文字转语音模型，'
-                '请在 AstrBot 里换一个 TTS 服务商，或把「语音与声聊」的这一项改选' % label
+                '请在 AstrBot 里换一个 TTS 服务商，或把「语音 / 音频理解」的这一项改选' % label
             )
         return ''
 
@@ -2515,13 +2526,13 @@ class AstrbotTransport:
         other = self._inst_by_id(provider_id)
         if other is not None:
             return (
-                '「语音与声聊」指名的 %s 不是 AstrBot 的 TTS 服务商（它是 %s）：'
+                '「语音 / 音频理解」指名的 %s 不是 AstrBot 的 TTS 服务商（它是 %s）：'
                 '请改选一个文字转语音模型，或把这一项留空用当前默认 TTS'
                 % (provider_id, type(other).__name__)
             )
         available = [self._provider_id(item) for item in self._tts_providers()]
         return (
-            '「语音与声聊」指名的 TTS 服务商 %s 不存在（AstrBot 里可用的：%s）：'
+            '「语音 / 音频理解」指名的 TTS 服务商 %s 不存在（AstrBot 里可用的：%s）：'
             '请确认这个服务商，或把这一项留空用当前默认 TTS'
             % (provider_id, '、'.join(item for item in available if item) or '无')
         )
@@ -2565,7 +2576,7 @@ class AstrbotTransport:
 
         解析优先级：
 
-        1. **指名的 `tts_provider_id`**（「语音与声聊」组）→ 按 id 取那一个（留空跳过）；
+        1. **指名的 `tts_provider_id`**（「语音 / 音频理解设置」）→ 按 id 取那一个（留空跳过）；
         2. 宿主当前默认 TTS：`get_using_tts_provider_async` → `get_using_tts_provider`
            → `provider_manager.curr_tts_provider_inst`（逐层判空，与历史行为一致）。
 
@@ -3167,6 +3178,11 @@ class AstrbotHttpClient:
         provider_id = self.bridge.task_model_id('audio')
         if not provider_id or not audio_urls:
             return None
+        # v1.7.5：`model_center.audio.stt_enabled` 关掉时**不转写**——语音随后按音频
+        # 证据交给主模型（`_filter_unsupported_modalities` 会按主模型声明的模态决定
+        # 是丢掉还是带上），界面 hint 说的就是这件事。
+        if not self.bridge.audio_transcription_enabled():
+            return None
         provider = self.bridge.provider_by_id(provider_id)
         get_text = getattr(provider, 'get_text', None)
         if not callable(get_text):
@@ -3416,6 +3432,7 @@ try:  # pragma: no cover - 取决于并行任务落地顺序
         merge_legacy_section_values as _core_merge_legacy_section_values,
         normalize_config as _core_normalize_config,
         read_section_path as _core_read_section_path,
+        VOICE_SECTION as _CORE_VOICE_SECTION,
     )
 except ImportError:  # pragma: no cover
     _CORE_SECTION_ALIASES = None
@@ -3424,6 +3441,12 @@ except ImportError:  # pragma: no cover
     _core_merge_legacy_section_values = None
     _core_normalize_config = None
     _core_read_section_path = None
+    _CORE_VOICE_SECTION = None
+
+#: 语音两项（`tts_provider_id` / `default_voice`）的配置分组。单一实现源在
+#: `plugin/core/service/config.py` 的 `VOICE_SECTION`（键级搬迁 `LEGACY_KEY_MERGES`
+#: 的目标），这里只镜像一次；core 尚未落地时才用等值兜底。
+VOICE_SECTION: str = _CORE_VOICE_SECTION or 'model_center.audio'
 
 #: AstrBot `_conf_schema.json` 顶层分组名 → 上游 Console 分组名。
 #: **单一实现源在 `plugin/core/service/config.py`**（`CONFIG_SECTION_ALIASES`），
@@ -3754,7 +3777,7 @@ class AstrbotBridge:
         if target == raw:
             return 0
         await self.save_raw_config(target)
-        log_fallback('info', '配置分组迁移完成：旧分组的值已折进 robot_actions.* / runtime.input_status（v1.7.4）')
+        log_fallback('info', '配置迁移完成：旧分组的值已折进 robot_actions.* / runtime.input_status（v1.7.4），语音两项已折进 model_center.audio（v1.7.5）')
         return 1
 
     async def shutdown(self) -> None:
@@ -4022,16 +4045,32 @@ class AstrbotBridge:
             if note:
                 log_fallback('warn', '%s', note)
 
+    def audio_transcription_enabled(self) -> bool:
+        """`model_center.audio.stt_enabled`（v1.7.5）：「语音转文字」开关。
+
+        **缺键按 `True`**：这个键是 v1.7.5 才有的，旧配置文件里没有它时不能把用户的
+        转写悄悄关掉（配了转写模型就转，是历史行为）。关掉之后 `_transcribe` 不调转写
+        模型，语音按音频证据原样交给主模型——所以 `audio_capability_note` 也必须认它，
+        否则启动自检会说"已指定转写模型"而实际没转。
+        """
+        value = self.section('audio').get('stt_enabled')
+        return True if value is None else bool(value)
+
     def audio_capability_note(self) -> str:
         """主叙事当前能不能吃音频；不能时返回一句给人看的话，否则空串。"""
-        if self.task_model_id('audio'):
-            return ''  # 已指定语音转写模型，音频不进主模型
+        transcript_provider = self.task_model_id('audio')
+        if transcript_provider and self.audio_transcription_enabled():
+            return ''  # 已指定语音转写模型且开关是开的，音频不进主模型
         provider_id = self.task_model_id('main') or self._resolved_chat_provider_id
         if not provider_id:
             return ''
         declared = self.provider_modalities(self.provider_by_id(provider_id))
         if not declared or 'audio' in declared:
             return ''
+        if transcript_provider:
+            # 指定了转写模型却把「语音转文字」关了：说清是开关造成的，别让用户去换模型。
+            return ('「语音 / 音频理解」里的「语音转文字」是关的，而当前主模型又未声明音频能力，'
+                    '语音会被忽略：打开那个开关，或把主模型换成支持音频输入的')
         return '当前主模型未声明音频能力，语音会被忽略，建议在「语音 / 音频理解」里指定语音转写模型'
 
     async def resolve_chat_provider_id(self) -> str:

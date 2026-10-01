@@ -197,24 +197,15 @@ export function filterNapcatOnly(actions: PlatformActionRow[], on: boolean): Pla
 }
 
 /**
- * 行内那句「这条动作走什么通道」。空间动作与改状态各自说清，别只挂一枚徽章了事。
+ * 行内那句「这条动作走什么通道」。
  *
- * 空间那 7 条是 NapCat 后端专属：先经 NapCat WebSocket 调 `get_cookies`
- * （`domain=user.qzone.qq.com`）与 `get_login_info`，再用 cookie 里的 `p_skey` 算
- * `g_tk` 去打腾讯 QZone 的 CGI 接口。界面上只承诺这一条通道（适配层若还有别的回退
- * 实现，那是运行期的兜底，不在这里宣传）。
+ * v1.7.5：统一成**一句人话** —— 「非 NapCat 后端无法使用」（用户指定的口径）。
+ * 早先这里按类别分三套写法（空间那套还会展开 `get_cookies` / `p_skey` / `g_tk` 的
+ * 握手细节），用户明确要求删掉那些实现细节、只留结论：界面上只承诺"哪个后端能做"。
  */
 export function backendNote(row: PlatformActionRow): string {
   if (!isNapcatOnly(row)) return ''
-  if (row.category === 'qzone') {
-    return '空间动作需要 NapCat 后端：先用 get_cookies（domain=user.qzone.qq.com）'
-      + '+ get_login_info 拿登录态，再由 p_skey 算出 g_tk 直接打 QZone 接口。'
-      + '只读动作不占空间配额。'
-  }
-  if (row.id === 'update_qq_status') {
-    return '只有 NapCat 有这条动作（set_online_status / set_diy_online_status），标准 OneBot 没有。'
-  }
-  return '这条动作只有 NapCat 后端提供。'
+  return '非 NapCat 后端无法使用。'
 }
 
 /** 「只看 NapCat 专属」按钮上的条数：优先用后端统计，缺了按行数。 */

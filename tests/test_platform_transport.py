@@ -392,7 +392,15 @@ class PlatformTransportTestCase(unittest.TestCase):
         write_section_path(self.bridge.config, group, dict(options))
 
     def set_voice_config(self, **options) -> None:
-        self.set_action_config('voice', **options)
+        """语音两项（`tts_provider_id` / `default_voice`）现在住在「模型中心 → 语音 /
+        音频理解设置」里（v1.7.5 从 `robot_actions.chat` 搬过去）。
+
+        搬家的规则是"**读取优先新位置、旧位置兜底**"，所以这里默认写新位置；想验旧位置
+        兜底就自己往 `robot_actions.chat` / `actions_voice` 写（见
+        `test_legacy_group_config_still_selects_the_provider`）。
+        """
+        from plugin.core.service.config import VOICE_SECTION  # noqa: PLC0415
+        write_section_path(self.bridge.config, VOICE_SECTION, dict(options))
 
     def run_action(self, action, params=None):
         return asyncio.run(self.transport.platform_action(action, params if params is not None else {}))
@@ -1077,7 +1085,9 @@ class VoiceAndInputStatusTests(PlatformTransportTestCase):
 # =========================================================================== #
 
 class VoiceProviderSelectionTests(PlatformTransportTestCase):
-    """「语音与声聊」里选的是**服务商**（`tts_provider_id`），音色是服务商内部的事。
+    """语音那一组里选的是**服务商**（`tts_provider_id`），音色是服务商内部的事。
+
+    v1.7.5 起这两项住在「模型中心 → 语音 / 音频理解设置」（`model_center.audio`）。
 
     钉住四条纪律：指名命中、指名但不存在**绝不回落**、宿主没有列表时 warn + 回落、
     指名了一个存在但不是 TTS 的东西时把原因说清（含糊的"失败了"等于没报错）。
@@ -1218,21 +1228,55 @@ class VoiceProviderSelectionTests(PlatformTransportTestCase):
         self.assertEqual(self.run_action('list_voices', {})['data']['voices'][0]['id'], 'fish-audio')
 
     def test_legacy_group_config_still_selects_the_provider(self):
-        """旧配置只写了 `actions_voice`（v1.7.2 收敛前的分组名）也照样选得中。
+        """旧位置写的服务商照样选得中——**两级兜底**都要成立。
 
-        收敛只改名不改键，旧分组留作隐藏兼容位；适配层读的是**目录里的新分组名**，
-        值由 `bridge.section()` 的 N:1 归并兜底——两边任一环节漏了，用户升级后
-        "我明明配了"就会变成静默回落。
+        v1.7.2 之前写在 `actions_voice` 里（整组归并），v1.7.4 起写在 `robot_actions.chat`
+        里（v1.7.5 的**键级搬迁** `LEGACY_KEY_MERGES` 的源）。适配层现在读
+        `model_center.audio`，值由 `bridge.section()` 里的归并兜底——任一环节漏了，
+        用户升级后"我明明配了"就会静默回落成默认 TTS。
         """
+        for where, config in (
+            ('actions_voice（v1.7.2 之前的组）', {'actions_voice': {'tts_provider_id': 'fish-audio'}}),
+            ('robot_actions.chat（v1.7.4 的可见组）',
+             {'robot_actions': {'chat': {'tts_provider_id': 'fish-audio'}}}),
+        ):
+            with self.subTest(where=where):
+                default = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+                other = self._provider('fish-audio', voice='sweet')
+                self.context.tts_providers = [default, other]
+                self.enter_session()
+                for key, value in config.items():
+                    self.bridge.config[key] = value
+                self.bridge.config['model_center'] = {'audio': {}}
+                result = self.run_action('send_voice', {'content': '晚安'})
+                self.assertTrue(result['ok'], result)
+                self.assertEqual(other.texts, ['晚安'], where)
+                self.assertEqual(default.texts, [], where)
+                self.context.tts_providers = []
+
+    def test_the_new_location_wins_over_the_old_one(self):
+        """新位置写过就以它为准（旧位置只是兜底，不能压着新值）。"""
         self.enter_session()
         default = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
         other = self._provider('fish-audio', voice='sweet')
         self.context.tts_providers = [default, other]
-        self.bridge.config['actions_voice'] = {'tts_provider_id': 'fish-audio'}
+        self.bridge.config['robot_actions'] = {'chat': {'tts_provider_id': 'fish-audio'}}
+        self.set_voice_config(tts_provider_id='edge-tts')
         result = self.run_action('send_voice', {'content': '晚安'})
         self.assertTrue(result['ok'], result)
-        self.assertEqual(other.texts, ['晚安'])
-        self.assertEqual(default.texts, [])
+        self.assertEqual(default.texts, ['晚安'], '新位置（model_center.audio）说了算')
+        self.assertEqual(other.texts, [])
+
+    def test_default_voice_reads_from_the_new_section(self):
+        """音色（`default_voice`）也从新位置读：留在旧组的音色不该再被认。"""
+        self.enter_session()
+        default = self._provider('edge-tts', **{'edge-tts-voice': 'zh-CN-XiaoxiaoNeural'})
+        other = self._provider('fish-audio', voice='sweet')
+        self.context.tts_providers = [default, other]
+        self.set_voice_config(default_voice='sweet')
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(other.texts, ['晚安'], '音色命中 fish-audio 的 sweet')
 
 
 # =========================================================================== #

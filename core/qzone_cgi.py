@@ -41,6 +41,19 @@ ok = success_or_error(parse_jsonp(raw) if isinstance(raw, str) else raw)
 **逐字照抄**（`topicId` / `feedsKey` / `ugc_right` / `curkey` / `unikey` … 大小写与
 下划线都不许动）；本模块的 Python 标识符用 snake_case。
 
+**第八条接口 `update`（改已发说说的可见范围，v1.7.5 新增）**不在上面那份 client 里
+（它只有发布 / 删除 / 评论 / 点赞 / 转发 / 两条读），来源是同一个仓库内**附带的参考实现**
+`._ref/qzone_api-1.1.0/`（= PyPI `qzone-api` 1.1.0，其上游客源站已下线）：
+`qzone_api/api/api_zone.py` 的 `update_url` +
+`qzone_api/api/api_feed.py::edit_message` + `qzone_api/api/api_parms.py::build_edit_message_params`
+（该文件的 docstring 自称"真实抓包确认"，字段清单逐字照抄）。两处**有分歧**的地方按
+更权威的一方处理，并在 `docs/PORTING_NOTES.md` 记着：
+
+* `allow_uins` 的分隔符：参考实现说逗号，NapCat 的
+  `packages/napcat-core/data/qzone.ts` 说 `|`，且 NapCat 自己的单测
+  （`packages/napcat-test/qzone.test.ts`）钉着 `'10001|10002'` ——用 **`|`**；
+* 编辑请求要不要 `who`：参考实现的编辑构造器**没有** `who`（发布有），照它，不加。
+
 刻意不做的事：图片上传（`cgi_upload_image` 不在这批交付里）、重试 / 限流 / 审计
 （属于调用方的策略层）、任何网络动作。
 """
@@ -65,6 +78,7 @@ __all__ = [
     "extract_cookie",
     "qzone_auth_from_cookies",
     "build_publish_request",
+    "build_update_visibility_request",
     "build_delete_request",
     "build_comment_request",
     "build_forward_request",
@@ -90,7 +104,7 @@ QZONE_UA = (
 
 _QZONE_BASE = "https://user.qzone.qq.com/proxy/domain"
 
-#: QZone CGI 接口地址（七条，逐字照抄 `constants.py` 的 `URLS`）。
+#: QZone CGI 接口地址（前七条逐字照抄 `constants.py` 的 `URLS`；`update` 见模块 docstring）。
 QZONE_URLS: Dict[str, str] = {
     "publish": f"{_QZONE_BASE}/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6",
     "delete": f"{_QZONE_BASE}/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6",
@@ -99,7 +113,16 @@ QZONE_URLS: Dict[str, str] = {
     "like": f"{_QZONE_BASE}/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app",
     "feed": f"{_QZONE_BASE}/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more",
     "mood_list": f"{_QZONE_BASE}/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6",
+    # 改已发说说的可见范围（参考实现 `qzone_api/api/api_zone.py::update_url`；注意**没有** `_v6`）。
+    "update": f"{_QZONE_BASE}/taotao.qzone.qq.com/cgi-bin/emotion_cgi_update",
 }
+
+#: `allow_uins`（部分人可见 / 部分人不可见）生效的那两档 `ugc_right`。
+QZONE_VISIBLE_TARGETED: tuple[int, ...] = (16, 128)
+
+#: `allow_uins` 里多个 QQ 的分隔符（NapCat `data/qzone.ts` 的
+#: "多个QQ号使用 | 拼接"，其单测钉着 `'10001|10002'`）。
+QZONE_ALLOW_UINS_SEPARATOR = "|"
 
 #: appid（字符串！接口给的是字符串）→ 动态类型名。
 QZONE_APP_TYPES: Dict[str, str] = {
@@ -111,11 +134,27 @@ QZONE_APP_TYPES: Dict[str, str] = {
     "6600": "广告",
 }
 
-#: 说说可见范围（`ugc_right` 的取值）。
+#: 说说可见范围（`ugc_right` 的取值，**五档**）。
+#:
+#: ⚠️ v1.7.5 **修正**：本表原先照抄 qzone-sdk `constants.py` 的
+#: `{"public": 1, "friends": 3, "private": 4}`，其中 **3 不是合法取值**，且
+#: `friends=3 / private=4` 与本插件其它地方（`core/qzone.py::qzone_visibility_label`、
+#: 发说说默认 `ugc_right=4` 表示"好友可见"）自相矛盾。权威依据：
+#:
+#: * **NapCat** `packages/napcat-core/data/qzone.ts` 与
+#:   `packages/napcat-onebot/action/extends/SendQzoneMsg.ts`：
+#:   `ValidUgcRights = [1, 4, 16, 64, 128]`，注释逐字是
+#:   "1所有人可见 4好友可见 16部分好友可见 64仅自己可见 128部分好友不可见"；
+#: * **上游 Koishi** `QZONE_UGC_RIGHT_VALUES = {1,4,16,64,128}` 与 `qzoneVisibilityLabel`
+#:   （本仓库 `core/qzone.py` 的 `qzone_visibility_label` 就是它的移植）；
+#: * qzone-sdk 仓库内附带的参考实现 `._ref/qzone_api-1.1.0/qzone_api/api/api_parms.py`
+#:   的 `UGC_RIGHT_ALL / FRIENDS / PART / EXCLUDE / PRIVATE` 常量同表。
 QZONE_VISIBLE: Dict[str, int] = {
-    "public": 1,    # 公开
-    "friends": 3,   # QQ 好友可见
-    "private": 4,   # 仅自己可见
+    "public": 1,     # 所有人可见
+    "friends": 4,    # 仅 QQ 好友可见
+    "partial": 16,   # 部分人可见（`allow_uins` = 白名单）
+    "exclude": 128,  # 部分人不可见（`allow_uins` = 黑名单）
+    "private": 64,   # 仅自己可见
 }
 
 #: `build_*_request` 的返回：`(method, url, headers, body)`。
@@ -233,6 +272,14 @@ def _authed_url(key: str, auth: Any) -> str:
     return f"{QZONE_URLS[key]}?g_tk={_auth_field(auth, 'g_tk')}"
 
 
+def _allow_uins(target_uins: Any) -> str:
+    """把 QQ 名单拼成 `allow_uins`（`|` 分隔；空 / 非列表一律空串）。"""
+    if isinstance(target_uins, (str, bytes)) or not isinstance(target_uins, (list, tuple, set)):
+        return ""
+    parts = [str(item).strip() for item in target_uins if str(item).strip()]
+    return QZONE_ALLOW_UINS_SEPARATOR.join(parts)
+
+
 def build_publish_request(
     auth: Any,
     content: str,
@@ -240,7 +287,7 @@ def build_publish_request(
     richval: str = "",
     pic_bo: str = "",
 ) -> QZoneRequest:
-    """发说说。`visible`：1 公开 / 3 好友 / 4 仅自己（见 `QZONE_VISIBLE`）。
+    """发说说。`visible`：1 所有人 / 4 好友 / 16 部分可见 / 64 仅自己 / 128 部分不可见（见 `QZONE_VISIBLE`）。
 
     `richval` / `pic_bo` 是**已上传图片**的产物（图片上传不在这批交付里，由调用方
     自己走 `cgi_upload_image` 后回填）。给了 `richval` 就照参考实现的图片分支把
@@ -276,6 +323,60 @@ def build_publish_request(
     if pic_bo:
         data["pic_bo"] = pic_bo
     return "POST", _authed_url("publish", auth), _headers(auth, post=True), data
+
+
+def build_update_visibility_request(
+    auth: Any,
+    tid: str,
+    content: str,
+    visible: int,
+    target_uins: Any = (),
+    ugcright_id: str = "",
+) -> QZoneRequest:
+    """改一条**已发出**的说说的可见范围（`emotion_cgi_update`，v1.7.5）。
+
+    参数与字段顺序**逐字**来自参考实现 `qzone_api/api/api_parms.py::build_edit_message_params`
+    （来源见模块 docstring）。三件事必须说清：
+
+    * `content` 是**必填**的：这条接口是"编辑说说"，服务端按整条重建——想只改可见性也得
+      把当前正文原样带回去（调用方从说说列表里读到它）。传空串会把正文清掉，所以这里
+      空串直接**抛 `QZoneAuthError`**（它继承 `ValueError`，属于"取参错误"那一类），
+      宁可让上层报错，也不要把用户的正文擦掉。
+    * 带图说说的 `richval` **无法重建**（说说列表里拿不到 `albumid` / `lloc`），这里与参考
+      实现一致地发空串。所以**调用方必须先确认这条说说没有配图**再调本函数
+      （`core/qzone.py` 的动作侧就是这么把关的）——否则可能把图弄丢。
+    * `target_uins` 只在 `visible` 为 16（部分人可见）/ 128（部分人不可见）时有意义，
+      拼成 `allow_uins`（**`|` 分隔**，见 `QZONE_ALLOW_UINS_SEPARATOR` 的说明）；其余
+      三档即使给了名单也**不带**这个字段（服务端不看，带了只会让请求更容易被判非法）。
+    """
+    if not str(content or "").strip():
+        raise QZoneAuthError("改可见范围必须带上说说正文（服务端会按整条重建，空正文等于清空）")
+    uin = _auth_field(auth, "uin")
+    referer = f"https://user.qzone.qq.com/{uin}"
+    data: Dict[str, str] = {
+        "syn_tweet_verson": "1",
+        "tid": str(tid),
+        "paramstr": "1",
+        "pic_template": "",
+        "richtype": "",
+        "richval": "",
+        "special_url": "",
+        "subrichtype": "",
+        "con": content,
+        "feedversion": "1",
+        "ver": "1",
+        "ugc_right": str(visible),
+        "to_sign": "0",
+        "ugcright_id": str(ugcright_id or ""),
+        "hostuin": uin,
+        "code_version": "1",
+        "format": "fs",
+        "qzreferrer": referer,
+    }
+    uins = _allow_uins(target_uins) if visible in QZONE_VISIBLE_TARGETED else ""
+    if uins:
+        data["allow_uins"] = uins
+    return "POST", _authed_url("update", auth), _headers(auth, post=True), data
 
 
 def build_delete_request(
