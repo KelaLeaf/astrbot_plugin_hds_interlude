@@ -83,10 +83,16 @@ KNOWN_SECTIONS = frozenset({
     'schedule_preplan', 'timeline_director', 'agency', 'chat_actions', 'stickers',
     'memory', 'alter_system', 'browser', 'blind_mode', 'logging', 'prompts',
     'chat_rhythm', 'black_box', 'shared_story_compat', 'runtime_compat', 'model_compat',
-    # 本移植版新增：QQ 空间（v1.6.0 由隐藏兼容位转正）、输入状态、以及动作开关分组。
-    # 动作分组名从目录派生，**不要手抄**——加动作时这里自动跟上。
+    # 本移植版新增：QQ 空间（v1.6.0 由隐藏兼容位转正）、输入状态（v1.7.4 起是
+    # `runtime` 的子配置，顶层那一份降级为隐藏兼容位）、以及动作开关分组。
+    # 动作分组的**根**从目录派生（v1.7.4 起落点是嵌套路径 `robot_actions.chat`，
+    # 顶层只有一个 `robot_actions`），别手抄——加动作时这里自动跟上。
     'qzone', 'input_status', 'world_seeder', 'works', 'forward_message', 'forward_message_compat',
-    *sorted(set(ACTION_CONFIG_GROUPS.values())),
+    *sorted({group.split('.', 1)[0] for group in ACTION_CONFIG_GROUPS.values()}),
+    # 退休的「风险操作」组：v1.7.4 起它**不在归并表里**了（读取侧不认它），所以下面那句
+    # "从归并表派生" 覆盖不到它——但它照旧留在 schema 里当兼容位，老导出文件会带着它，
+    # 必须认得出来（否则导入时白报一句"未知顶层键"）。
+    'actions_risks',
     # 收敛 / 取消「风险操作」组后留下的旧分组（藏在 schema 里当只读兼容位）：老导出文件
     # 里只有这些组名，认得出来才不会报"未知顶层键"。组名从归并表派生，别手抄。
     *sorted({name for sources in LEGACY_SECTION_MERGES.values() for name in sources}),

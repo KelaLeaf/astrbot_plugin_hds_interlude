@@ -2416,12 +2416,12 @@ class AstrbotTransport:
     def voice_config_group(self) -> str:
         """「语音与声聊」的配置分组名（**跟动作目录走，不写死字符串**）。
 
-        v1.7.2 把十个 `actions_*` 组收敛成四个，旧分组留作隐藏兼容位；
-        分组名是那个迁移的地盘，写死 `actions_voice` 会在收敛之后静默读不到
-        （配置变摆设，正是 AGENTS 坑 66 那类事故）。`bridge.section()` 自带
-        N:1 归并（新分组优先、旧分组补缺），所以这里只要报对**新**分组名。
+        v1.7.2/v1.7.4 两次收敛后，分组名是**点分路径** `robot_actions.chat`；旧分组留作
+        隐藏兼容位。分组名是那个迁移的地盘，写死 `actions_voice` / `actions_chat` 会在
+        收敛之后静默读不到（配置变摆设，正是 AGENTS 坑 66 那类事故）。`bridge.section()`
+        自带 N:1 归并（新路径优先、旧分组补缺）并支持点分路径，所以这里只要报对**新**路径。
         """
-        return platform_action_catalog.ACTION_CONFIG_GROUPS.get('voice', 'actions_voice')
+        return platform_action_catalog.ACTION_CONFIG_GROUPS.get('voice', 'robot_actions.chat')
 
     def _voice_option(self, key: str) -> str:
         return _clean(self.bridge.section(self.voice_config_group()).get(key))
@@ -3415,6 +3415,7 @@ try:  # pragma: no cover - 取决于并行任务落地顺序
         apply_section_aliases as _core_apply_section_aliases,
         merge_legacy_section_values as _core_merge_legacy_section_values,
         normalize_config as _core_normalize_config,
+        read_section_path as _core_read_section_path,
     )
 except ImportError:  # pragma: no cover
     _CORE_SECTION_ALIASES = None
@@ -3422,6 +3423,7 @@ except ImportError:  # pragma: no cover
     _core_apply_section_aliases = None
     _core_merge_legacy_section_values = None
     _core_normalize_config = None
+    _core_read_section_path = None
 
 #: AstrBot `_conf_schema.json` 顶层分组名 → 上游 Console 分组名。
 #: **单一实现源在 `plugin/core/service/config.py`**（`CONFIG_SECTION_ALIASES`），
@@ -3450,6 +3452,28 @@ def _local_apply_section_aliases(raw: Any) -> dict[str, Any]:
 LEGACY_SECTION_MERGES: dict[str, tuple[str, ...]] = (
     dict(_CORE_SECTION_MERGES) if _CORE_SECTION_MERGES is not None else {}
 )
+
+
+def read_section_path(config: Any, path: str) -> Any:
+    """按**点分路径**读嵌套配置（读不到回 `None`）。
+
+    单一实现源在 `core/service/config.py`（`read_section_path`），适配层只转发一次；
+    core 尚未落地时才用下面这份等值兜底。`section()` 读嵌套落点（`robot_actions.chat` /
+    `runtime.input_status`）走它。
+    """
+    if _core_read_section_path is not None:
+        try:
+            return _core_read_section_path(config, path)
+        except Exception:  # noqa: BLE001 - 读配置绝不因为路径异常而炸
+            pass
+    node: Any = config
+    for step in str(path).split('.'):
+        if not step or not isinstance(node, dict):
+            return None
+        node = node.get(step)
+        if node is None:
+            return None
+    return node
 
 
 def _merge_legacy_section_values(raw: Any, name: str, values: Any = None) -> dict[str, Any]:
@@ -3702,13 +3726,13 @@ class AstrbotBridge:
         return persona_id
 
     async def migrate_legacy_action_sections(self) -> int:
-        """把旧动作开关分组里用户写过的值折进新分组，写一次盘（v1.7.2 收敛用，幂等）。
+        """把旧动作开关分组里用户写过的值折进新路径，写一次盘（v1.7.2 起，幂等）。
 
         为什么必须在**启动**时折一次（而不是只靠读取侧归并）：
 
         1. 宿主每次加载都按 `_conf_schema.json` 补默认值再落盘
            （`AstrbotConfig.check_config_integrity`：缺的键连默认值一起插进配置文件）。
-           升级后的第一次加载，`actions_chat` 就是这样被整组补上默认值（开关全 true）的，
+           升级后的第一次加载，`robot_actions` 就是这样被整组补上默认值（开关全 true）的，
            而用户真正的选择还在旧分组里。读取侧的归并靠"等于默认值算没写过"能读对，
            但**用户在新分组里把开关改回默认值**（比如重新打开升级前关掉的语音）时，
            旧分组里的旧值会永远压着它——界面上就是"改了没反应"。
@@ -3716,7 +3740,8 @@ class AstrbotBridge:
            （坑 34 的老病）。折完两处才是同一份。
 
         折叠规则与读取侧同一套（`core/service/config.py` 的 `fold_legacy_section_merges`
-        → `merge_legacy_section_values`；"用户写过 = 不等于 schema 默认值"）。没有可折的
+        → `merge_legacy_section_values`；"用户写过 = 不等于 schema 默认值"），目标路径
+        可以是嵌套的（`robot_actions.chat` / `runtime.input_status`）。没有可折的
         东西时**不写盘**，返回 0。放在适配层的真实启动路径（同坑 68 的理由：别塞进 core
         的定时器）。失败只 warn：读侧的归并仍然兜得住，不会丢配置。
         """
@@ -3729,7 +3754,7 @@ class AstrbotBridge:
         if target == raw:
             return 0
         await self.save_raw_config(target)
-        log_fallback('info', '动作开关分组迁移完成：旧分组的值已折进 actions_chat（v1.7.2 收敛）')
+        log_fallback('info', '配置分组迁移完成：旧分组的值已折进 robot_actions.* / runtime.input_status（v1.7.4）')
         return 1
 
     async def shutdown(self) -> None:
@@ -4917,6 +4942,10 @@ class AstrbotBridge:
     def section(self, name: str) -> dict[str, Any]:
         """读一个 snake_case 配置段（兼容对象式配置）。
 
+        `name` 既可以是顶层组名，也可以是**点分路径**（`robot_actions.chat` /
+        `runtime.input_status`）：v1.7.4 起动作开关并进了一个父组、输入状态挪进了
+        「运行时」当子配置，落点由 `platform_actions.ACTION_CONFIG_GROUPS` 定，是点分路径。
+
         `normalize_config` 已经补过分组别名，正常情况下 `name` 直接命中；这里仍
         按 `CONFIG_SECTION_ALIASES` 反向兜底一次（例如有人直接构造了未过归一化的
         `AstrbotBridge`，或将来别名表变化）。
@@ -4928,22 +4957,28 @@ class AstrbotBridge:
         显示成关着、关着显示成开着，重启宿主剥掉历史遗留的假顶层键后必现）。
         顶层同名键只在嵌套缺失时兜底——那是旧版本控制台写出来的垃圾，宿主下次加载就会删。
 
-        **N:1 归并**（v1.7.2）：动作开关组由十个收敛成四个，旧分组留在 schema 里当
-        隐藏兼容位。读 `actions_chat` 这类新分组名时，缺的键从旧分组补（新值优先），
-        所以用户升级前设过的开关照旧读得到；旧分组本身也能直接读（`actions_interaction`
-        仍然回它自己的那份）。写方向只写新分组名，见 `core/service/config.py` 的
-        `LEGACY_SECTION_MERGES`。
+        **N:1 归并**（v1.7.2 起，v1.7.4 改成点分目标）：动作开关组由十个收敛成一个父组
+        下的三个子组，旧分组留在 schema 里当隐藏兼容位。读 `robot_actions.chat` 这类
+        新路径时，缺的键从旧分组补（新值优先），所以用户升级前设过的开关照旧读得到；
+        旧分组本身也能直接读（`actions_interaction` 仍然回它自己的那份）。写方向只写
+        新路径，见 `core/service/config.py` 的 `LEGACY_SECTION_MERGES`。
         """
         if name in NESTED_MODEL_SECTIONS:
             nested = self.section('model').get(name)
             if isinstance(nested, dict):
                 return nested
-        section = self.config.get(name) if isinstance(self.config, dict) else None
-        if section is None:
-            for alias, target in CONFIG_SECTION_ALIASES.items():
-                if target == name and isinstance(self.config, dict):
-                    section = self.config.get(alias)
-                    break
+        section: Any = None
+        if '.' in name:
+            # 嵌套目标：只按**整条路径**取。不回落父级对象（那棵子树的键名对不上）。
+            if isinstance(self.config, dict):
+                section = read_section_path(self.config, name)
+        else:
+            section = self.config.get(name) if isinstance(self.config, dict) else None
+            if section is None:
+                for alias, target in CONFIG_SECTION_ALIASES.items():
+                    if target == name and isinstance(self.config, dict):
+                        section = self.config.get(alias)
+                        break
         if isinstance(section, dict):
             values = section
         elif section is None:

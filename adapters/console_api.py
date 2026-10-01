@@ -26,7 +26,11 @@ from ..core import platform_actions
 from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
 #: N:1 旧分组归并（配置页显示的当前值必须与运行期读到的一致，见 `config_schema`）。
-from ..core.service.config import LEGACY_SECTION_MERGES, merge_legacy_section_values, shared_legacy_sources
+from ..core.service.config import (
+    LEGACY_SECTION_MERGES,
+    merge_legacy_section_values,
+    read_section_path,
+)
 from ..core.token_stats import normalize_range, range_bounds, summarize_usage
 from ..core.story_state import decode_story_state
 # 作品正文 / 创作意图 / 修改理由的上限与分段长度：**单一事实源在 `core/works.py`**，
@@ -321,40 +325,6 @@ def _drop_schema_path(target: dict[str, Any], path: Any) -> None:
         node = child
     if parts and isinstance(node, dict):
         node.pop(parts[-1], None)
-
-
-def _sync_shared_legacy_switches(target: dict[str, Any], path: Any, value: Any) -> None:
-    """把刚写到新分组里的开关**同步进共用的旧分组**（取消独立风险组的收口）。
-
-    为什么需要：危险动作的开关从那个独立风险组搬进了各自类别组，而旧组必须原样留着
-    （回退到上一个版本时它才是真源，见 `core/service/config.py` 的
-    `shared_legacy_sources`）。折叠**不清空**共用源，于是"新组里的值 == schema 默认值"
-    这句话又有歧义了——读取侧会判"没写过"并回落到旧组的旧值，用户在新组里把危险开关
-    关掉就不会生效（§35.4 那个"改了没反应"的老病）。写的时候顺手同步一份，歧义就消失。
-
-    只碰**共用源**（独占源由折叠清空，写回去反而会跟折叠打架），也只碰旧组里**已经存在**
-    的那个键——不主动创建一堆作废的隐藏键（坑 72 的写方向纪律）。
-    """
-    parts = [part for part in _text(path).split('.') if part]
-    if len(parts) != 2 or not isinstance(target, dict):
-        return
-    group, key = parts
-    sources = LEGACY_SECTION_MERGES.get(group)
-    if not sources:
-        return
-    shared = shared_legacy_sources()
-    for source in sources:
-        if source not in shared:
-            continue
-        section = target.get(source)
-        if not isinstance(section, dict) or key not in section:
-            continue
-        section = dict(section)
-        if value is None:
-            section.pop(key, None)
-        else:
-            section[key] = value
-        target[source] = section
 
 
 def _mask_secrets(value: Any) -> Any:
@@ -948,9 +918,10 @@ class ConsoleApi:
         顶层再给一份 `napcat_only` id 清单——面板的「只看 NapCat 专属（N）」筛选与徽章
         都读它，**不在前端重算**（`backends` 的顺序就是运行期的通道优先级）。
 
-        配置开关的分组由 `platform_actions.action_config_group()` 给出（**按类别**：群管理类
-        进 `actions_group`、空间类进 `actions_qzone`、其余进 `actions_chat`，危险动作没有单独的
-        组），子键 = 动作 id。**分组不存在 = 未配置 = 不限制**，
+        配置开关的分组由 `platform_actions.action_config_group()` 给出（**按类别，点分路径**：
+        群管理类进 `robot_actions.group`、空间类进 `robot_actions.qzone`、其余进
+        `robot_actions.chat`，危险动作没有单独的组），子键 = 动作 id。
+        **分组不存在 = 未配置 = 不限制**，
         所以旧版本升级上来的用户不会因为 schema 还没落地就整页显示"全关"。
         """
         table = self._action_permissions()
@@ -1126,9 +1097,10 @@ class ConsoleApi:
     def _action_groups(self) -> dict[str, str]:
         """配置分组 id → 组标题（面板用它说明"开关在哪一组"）。
 
-        标题来自 `platform_actions.ACTION_CONFIG_GROUP_LABELS`——收敛成三个组之后
-        "先到的类别定标签"会把 `actions_chat` 标成「互动」，而那一组里还有消息 /
-        历史 / 状态 / 资料 / 语音 / 联系人。表里没有的分组才回落到类别标签。
+        标题来自 `platform_actions.ACTION_CONFIG_GROUP_LABELS`——父组下面三个子组
+        （会话动作 / 群管理动作 / QQ 空间动作），是点分路径的键。表里没有的分组
+        才回落到类别标签（"先到的类别定标签"会把一整组标成「互动」，而那一组里
+        还有消息 / 历史 / 状态 / 资料 / 语音 / 联系人）。
         """
         groups: dict[str, str] = {
             group: label
@@ -1171,6 +1143,18 @@ class ConsoleApi:
                 if not isinstance(spec, dict):
                     continue
                 path = '%s.%s' % (group_key, field_key)
+                # 这个字段**本身就是归并目标**时（v1.7.4 起：`robot_actions.chat` /
+                # `runtime.input_status` 这类嵌套子组），当前值也必须取"读取侧看到的那一份"
+                # ——否则内嵌表单会拿磁盘上的默认值渲染，用户在控制台里改一项就把旧分组里
+                # 没读出来的用户选择整块覆盖掉（坑 34 的同款：界面显示与运行期不一致）。
+                if path in LEGACY_SECTION_MERGES:
+                    field_value = merge_legacy_section_values(
+                        raw, path, read_section_path(raw, path),
+                    )
+                    field_present = bool(field_value)
+                else:
+                    field_value = current.get(field_key, None)
+                    field_present = field_key in current
                 row = schema_row_fields(spec)
                 fields.append({
                     'key': field_key,
@@ -1197,8 +1181,8 @@ class ConsoleApi:
                     'special': _text(spec.get('_special')),
                     'invisible': bool(spec.get('invisible')),
                     'advanced': bool(spec.get('advanced')),
-                    'value': _mask_secrets(current.get(field_key, None)),
-                    'present': field_key in current,
+                    'value': _mask_secrets(field_value),
+                    'present': field_present,
                     'note': host_editor_note(path, spec),
                     'delegated': path in DELEGATED_FIELDS,
                 })
@@ -1225,9 +1209,13 @@ class ConsoleApi:
         控制台现在能改所有可配置项，但仍然改不动 schema 之外的东西。
         写盘走 `Bridge.save_raw_config()`（与配置导入同一条路径），并在内存里立即生效。
 
-        动作开关还多一步 `_sync_shared_legacy_switches`：被多个新组共用的旧分组
-        （危险动作以前那一组）不会在折叠时被清空，所以这里必须把用户刚写的值同步过去，
-        否则"在新组里把危险开关改回默认值"会被旧分组里的旧值压住（改了没反应）。
+        路径可以是**嵌套的**（`robot_actions.chat.send_poke` / `runtime.input_status`）：
+        `_resolve_schema_field` 只沿 `type: object` 的 `items` 往下走，`_set_schema_path`
+        沿途浅拷贝父字典，所以父组的其它子组不会被连带覆盖。
+
+        v1.7.4 起不再需要 v1.7.3 那个 `_sync_shared_legacy_switches`：`actions_risks`
+        已退出归并（每个旧组只供给一个目标），折叠会把旧组清空，新路径说了算（见
+        `core/service/config.py` 的 `LEGACY_SECTION_MERGES`）。
         """
         schema = load_config_schema()
         spec = _resolve_schema_field(schema, path)
@@ -1250,7 +1238,6 @@ class ConsoleApi:
             _drop_schema_path(target, text_path)
         else:
             _set_schema_path(target, text_path, coerced)
-        _sync_shared_legacy_switches(target, text_path, coerced)
         saved_via = await self.bridge.save_raw_config(target)
         self._reload()
         return {

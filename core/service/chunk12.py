@@ -40,7 +40,7 @@ from ..scheduled_command import (
 )
 from ..time import iso
 from .base import ServiceBase, pick
-from .config import merge_legacy_section_values
+from .config import merge_legacy_section_values, read_section_path
 
 __all__ = ['ServiceChunk12']
 
@@ -113,15 +113,21 @@ class ServiceChunk12(ServiceBase):
     def action_group_values(self, group: str) -> dict[str, Any]:
         """读一个动作配置分组（不存在就回空 dict = "未配置"，等价于不限制）。
 
-        两件事都在这里收口：
+        `group` 是**点分路径**（`robot_actions.chat` 这种嵌套段，见
+        `platform_actions.ACTION_CONFIG_GROUPS`；`runtime.input_status` 同理）。
+
+        三件事都在这里收口：
 
         * **两个读法都试**：`ServiceBase` 本身没有 `section()`（那是适配层
           `AstrbotBridge` 的成员，见 chunk14 的同款说明），所以宿主注入了 `section`
-          就用它、否则读 `self.config`。早期版本只走 `self.section`，异常被吞掉后
-          恒回 `{}` —— 配置页里的开关看着能点，运行期其实一条都不生效。
+          就用它、否则按点分路径读 `self.config`（`read_section_path`）。
+          早期版本只走 `self.section`，异常被吞掉后恒回 `{}` —— 配置页里的开关看着能点，
+          运行期其实一条都不生效。
         * **N:1 旧分组归并**（`LEGACY_SECTION_MERGES`）：动作开关组 v1.7.2 由十个收敛成
-          三个（v1.7.3 又取消了「风险操作」组），用户升级前设过的键还在旧分组里；新分组的
-          键优先、缺的键从旧分组补，所以新旧配置读出来是同一份。
+          三个、v1.7.3 取消「风险操作」组、v1.7.4 又把三个并进一个父组，用户升级前设过的
+          键还在旧分组里；新路径的键优先、缺的键从旧分组补，所以新旧配置读出来是同一份。
+        * **嵌套路径的父级对象不算数**：`robot_actions.chat` 读不到时不能回落到
+          `robot_actions`（那是一整棵子树，键名对不上），所以只按整条路径取。
         """
         values: dict[str, Any] = {}
         reader = getattr(self, 'section', None)
@@ -134,7 +140,7 @@ class ServiceChunk12(ServiceBase):
                 values = dict(section)
         raw = self.config if isinstance(self.config, dict) else {}
         if not values:
-            own = raw.get(group)
+            own = read_section_path(raw, group)
             if isinstance(own, dict):
                 values = dict(own)
         return merge_legacy_section_values(raw, group, values)
@@ -398,12 +404,16 @@ class ServiceChunk12(ServiceBase):
     # ------------------------------------------------------------------ #
 
     def input_status_config(self) -> dict[str, Any]:
-        """输入状态配置（缺失 = 用默认：开、至少可见 600ms、打字节拍 25%）。"""
+        """输入状态配置（缺失 = 用默认：开、至少可见 600ms、打字节拍 25%）。
+
+        v1.7.4 起这一段住在「运行时」组里（`runtime.input_status`），顶层 `input_status`
+        只剩隐藏兼容位；两条路径由 `LEGACY_SECTION_MERGES` 归并，老配置照旧读得到。
+        """
         return {
             'enabled': True,
             'min_visible_ms': 600,
             'beat_chance': 0.25,
-            **self.action_group_values('input_status'),
+            **self.action_group_values('runtime.input_status'),
         }
 
     def typing_indicator_target(self, session: Any) -> dict[str, Any]:

@@ -218,7 +218,7 @@ export function Actions({ refreshKey }: PanelProps) {
           </p>
           <p>
             <Badge>与配置开关是「与」关系</Badge> 每个动作还有一枚配置开关，在「配置」面板的
-            <span class="font-mono"> {Object.values(data?.groups ?? {}).join(' / ') || '动作'}</span> 里。
+            <span class="font-mono"> 机器人动作 → {Object.values(data?.groups ?? {}).join(' / ') || '会话动作'}</span> 里。
           </p>
           <p>
             <Badge tone="danger">危险动作</Badge> 默认档位是「关闭」，开关分别在各自的类别组里；

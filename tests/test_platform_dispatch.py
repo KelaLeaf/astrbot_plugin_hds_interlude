@@ -141,16 +141,20 @@ class SwitchAndPermissionTests(unittest.TestCase):
         早期版本只走 `self.section`、异常又被吞掉，于是恒回 `{}`——配置页里的开关
         看着能点，运行期一条都不生效。现在回落读 `self.config`，并且新旧分组名都认。
         """
-        host = _Host(config={'actions_chat': {'enabled': True, 'send_poke': False}})
+        host = _Host(config={'robot_actions': {'chat': {'enabled': True, 'send_poke': False}}})
         with mock.patch.object(_Host, 'section', None):
             self.assertIs(host.action_switch('send_poke'), False)
             self.assertNotIn('send_poke', host.available_platform_actions())
             self.assertIn('send_like', host.available_platform_actions())
-        # 旧分组名同理（v1.7.2 收敛前的配置直接读也要生效）
-        legacy = _Host(config={'actions_interaction': {'send_poke': False}})
+        # v1.7.2/v1.7.3 的顶层组名同理（那条路径直接读配置也要生效）
+        legacy = _Host(config={'actions_chat': {'enabled': True, 'send_poke': False}})
         with mock.patch.object(_Host, 'section', None):
             self.assertIs(legacy.action_switch('send_poke'), False)
-            self.assertIsNone(legacy.action_switch('send_like'), '没写过的键照旧 = 未配置')
+        # 更老的分组名（v1.6.0 的七个组）也要生效
+        oldest = _Host(config={'actions_interaction': {'send_poke': False}})
+        with mock.patch.object(_Host, 'section', None):
+            self.assertIs(oldest.action_switch('send_poke'), False)
+            self.assertIsNone(oldest.action_switch('send_like'), '没写过的键照旧 = 未配置')
 
     def test_dangerous_actions_need_their_group_switch_and_the_permission_table(self):
         """危险动作：开关（在自己类别组里）+ 权限档位，两样都要（v1.7.3 取消风险组）。"""
@@ -165,13 +169,20 @@ class SwitchAndPermissionTests(unittest.TestCase):
         self.assertIn('set_group_kick', host.available_platform_actions())
         self.assertEqual(host.risky_actions_in_use(), ['set_group_kick'])
         self.assertTrue(any('平台动作' in message or '风险' in message for _l, message in host.reports) or True)
-        # 旧形状（开关落在 `actions_risks`）读出来是同一份——升级不丢。
+        # v1.7.2/v1.7.3 的顶层组名读出来是同一份——升级不丢。
         legacy = _Host(
-            config={'actions_risks': {'enabled': True, 'set_group_kick': True}},
+            config={'actions_group': {'enabled': True, 'set_group_kick': True}},
             base_dir=str(self._write_permissions({'set_group_kick': 'global'})),
         )
         self.assertIs(legacy.action_switch('set_group_kick'), True)
         self.assertIn('set_group_kick', legacy.available_platform_actions())
+        # 退休的 `actions_risks` **不再是归并源**（v1.7.4 的简化）：照旧留在 schema 里当
+        # 兼容位，但读取侧不认它——用户判断那些配置目前没人用。
+        retired = _Host(
+            config={'actions_risks': {'enabled': True, 'set_group_kick': True}},
+            base_dir=str(self._write_permissions({'set_group_kick': 'global'})),
+        )
+        self.assertIsNone(retired.action_switch('set_group_kick'))
 
     def test_private_scope_excludes_group_only_actions(self):
         host = _Host(config={})
@@ -400,6 +411,39 @@ class TypingIndicatorTests(unittest.IsolatedAsyncioTestCase):
         waited = await host.typing_indicator({'userId': '1', 'groupId': ''}, '你好')
         self.assertGreaterEqual(waited, 0)
         self.assertEqual([typing for _t, typing in transport.status], [True, False], '一亮一灭')
+
+    async def test_nested_runtime_input_status_drives_the_indicator(self):
+        """**新用例（用户点名）**：`input_status` 挪进「运行时」之后按嵌套路径读。
+
+        v1.7.4 起落点是 `runtime.input_status`（顶层那一份只剩隐藏兼容位）；两条路径
+        由 `LEGACY_SECTION_MERGES` 归并，所以新旧配置读出来是同一份。
+        """
+        transport = _Transport()
+        host = self._host(transport, {'runtime': {'input_status': {
+            'enabled': True, 'min_visible_ms': 100, 'beat_chance': 0,
+        }}})
+        host.typing_delay_milliseconds = lambda content: 300  # type: ignore[assignment]
+        await host.typing_indicator({'userId': '1'}, '你好')
+        self.assertEqual([typing for _t, typing in transport.status], [True, False])
+
+        # 旧顶层组（v1.7.3 的形状）照样生效
+        transport = _Transport()
+        host = self._host(transport, {'input_status': {
+            'enabled': True, 'min_visible_ms': 100, 'beat_chance': 0,
+        }})
+        host.typing_delay_milliseconds = lambda content: 300  # type: ignore[assignment]
+        await host.typing_indicator({'userId': '1'}, '你好')
+        self.assertEqual([typing for _t, typing in transport.status], [True, False])
+
+        # 嵌套里关掉就是关掉（宿主补的默认值不许把它顶开）
+        transport = _Transport()
+        host = self._host(transport, {
+            'runtime': {'input_status': {'enabled': True}},
+            'input_status': {'enabled': False},
+        })
+        host.typing_delay_milliseconds = lambda content: 300  # type: ignore[assignment]
+        self.assertEqual(await host.typing_indicator({'userId': '1'}, '你好'), 0)
+        self.assertEqual(transport.status, [])
 
     async def test_short_waits_do_not_flicker(self):
         transport = _Transport()

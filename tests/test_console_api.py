@@ -144,15 +144,19 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertTrue(all(tier['label'] and tier['description'] for tier in payload['tiers']))
         for row in rows:
             self.assertIn(row['group'], payload['groups'])
-        # v1.7.2 收敛成三个开关组（v1.7.3 又取消了独立的风险组）：文案必须是**合并后**的
-        # 组名，而不是"先到的类别"（`actions_chat` 里坐着互动/消息/历史/状态/资料/语音/
-        # 联系人七类，叫「互动」是错的），危险动作也不再有自己的组。
+        # v1.7.4：动作开关并进一个父组 `robot_actions`，落点是三个**子组**（点分路径）。
+        # 文案必须是子组中文名，而不是"先到的类别"（`robot_actions.chat` 里坐着互动/消息/
+        # 历史/状态/资料/语音/联系人七类，叫「互动」是错的）。
         self.assertEqual(payload['groups'],
                          dict(platform_actions.ACTION_CONFIG_GROUP_LABELS))
         self.assertEqual(sorted(payload['groups']),
-                         ['actions_chat', 'actions_group', 'actions_qzone'])
-        self.assertEqual(payload['groups']['actions_chat'], '动作：会话')
-        self.assertNotIn('actions_risks', {row['group'] for row in rows})
+                         ['robot_actions.chat', 'robot_actions.group', 'robot_actions.qzone'])
+        self.assertEqual(payload['groups']['robot_actions.chat'], '会话动作')
+        self.assertEqual(set(payload['groups'].values()),
+                         {'会话动作', '群管理动作', 'QQ 空间动作'})
+        legacy_names = {'actions_chat', 'actions_group', 'actions_qzone', 'actions_risks'}
+        self.assertEqual(legacy_names & {row['group'] for row in rows}, set(),
+                         '旧组名不许再作为落点出现在动作页 payload 里')
         # 各 risk 计数与档位分布都要对得上
         counts = {}
         for row in rows:
@@ -205,23 +209,24 @@ class ConsoleApiTests(unittest.TestCase):
                          len(payload['actions']) - payload['stats']['risky'] - 1)
 
     def test_enabling_a_dangerous_action_drives_the_warning_counter(self):
-        """危险动作的开关现在落在它自己类别所属的组里（群管理类 → `actions_group`）。"""
-        self.bridge.config['actions_group'] = {'set_group_kick': True}
+        """危险动作的开关现在落在它自己类别所属的子组里（群管理类 → `robot_actions.group`）。"""
+        self.bridge.config['robot_actions'] = {'group': {'set_group_kick': True}}
         _run(self.api.set_action_permission('set_group_kick', 'admin'))
         payload = _run(self.api.actions_catalog())
         row = next(item for item in payload['actions'] if item['id'] == 'set_group_kick')
         self.assertEqual(row['permission'], 'admin')
-        self.assertEqual(row['group'], 'actions_group')
+        self.assertEqual(row['group'], 'robot_actions.group')
         self.assertTrue(row['enabled'])
         self.assertEqual(payload['stats']['risky_enabled'], 1)
 
     # ---- v1.7.2 分组收敛 / v1.7.3 取消风险组：旧格式配置仍要读得到 ----
 
     def test_action_switches_read_old_format_groups(self):
-        """旧格式：开关写在 `actions_interaction` 等旧组里，没有 `actions_chat`。
+        """旧格式：开关写在 `actions_interaction` 等旧组里，没有 `robot_actions`。
 
-        这是本任务的核心验收——分组名收敛了，用户升级前设过的开关必须照旧读得到，
-        并且面板上报告的落点是**新组名**（写方向也只写新组）。
+        这是本任务的**核心验收（用户点名）**——分组名收敛了，用户升级前设过的开关必须
+        照旧读得到（通过 `robot_actions.chat / group / qzone` 的嵌套路径），并且面板上
+        报告的落点是**新子组**（写方向也只写新路径）。
         """
         # ① 归一化路径：`normalize_config` 的 N:1 归并（服务层/桥接装配置时走它）
         bridge = _make_bridge({
@@ -237,22 +242,23 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertIsNone(switches['set_group_kick'], '没配过的组照旧 = 未配置 = 不限制')
         for row in payload['actions']:
             with self.subTest(action=row['id']):
-                self.assertNotIn(row['group'], ('actions_interaction', 'actions_voice'),
-                                 '落点必须是收敛后的三个组之一')
+                self.assertTrue(row['group'].startswith('robot_actions.'),
+                                '落点必须是父组下的三个子组之一')
 
         # ② 直接改内存里的旧组（`bridge.section()` 自己会归并，不依赖归一化）
-        self.bridge.config.pop('actions_chat', None)
+        self.bridge.config.pop('robot_actions', None)
         self.bridge.config['actions_interaction'] = {'send_poke': False}
         row = next(item for item in _run(self.api.actions_catalog())['actions']
                    if item['id'] == 'send_poke')
         self.assertIs(row['config_enabled'], False)
-        self.assertEqual(row['group'], 'actions_chat')
+        self.assertEqual(row['group'], 'robot_actions.chat')
 
-    def test_risk_group_switches_read_through_their_new_groups(self):
-        """**回归用例（用户点名）**：开关落在 `actions_risks` 的配置，读取侧仍读得到。
+    def test_retired_risk_group_is_a_dead_compat_slot(self):
+        """`actions_risks` 从 v1.7.4 起**不再参与归并**：它里面的开关不影响任何动作。
 
-        面板报告的落点是新组名（群管理 / 空间 / 会话），`config_enabled` 是旧组里的值，
-        而旧组自己一个键都没动——回退到上一个版本时它才是真源。
+        用户判断那些配置目前没人用（危险开关在 v1.7.3 就搬进各自类别组了）。兼容位照旧留在
+        schema 里（回退到旧版本仍读得到它），但读取侧不认——面板照旧回"未配置 = 不限制"，
+        而不是把一个谁都没在用的旧值当成用户的选择。
         """
         bridge = _make_bridge({'actions_risks': {
             'enabled': True, 'set_group_kick': True, 'delete_qzone_post': True,
@@ -261,26 +267,25 @@ class ConsoleApiTests(unittest.TestCase):
         bridge.db = self.bridge.db
         payload = _run(ConsoleApi(bridge).actions_catalog())
         rows = {row['id']: row for row in payload['actions']}
-        for action_id, group in (('set_group_kick', 'actions_group'),
-                                 ('delete_qzone_post', 'actions_qzone'),
-                                 ('delete_friend', 'actions_chat')):
+        for action_id, group in (('set_group_kick', 'robot_actions.group'),
+                                 ('delete_qzone_post', 'robot_actions.qzone'),
+                                 ('delete_friend', 'robot_actions.chat')):
             with self.subTest(action=action_id):
-                self.assertIs(rows[action_id]['config_enabled'], True)
+                self.assertIsNone(rows[action_id]['config_enabled'],
+                                  '退休的风险组不再是归并源')
                 self.assertEqual(rows[action_id]['group'], group)
-        self.assertIsNone(rows['send_poke']['config_enabled'],
-                          '旧风险组里的键不许流进别的动作')
+        self.assertIsNone(rows['send_poke']['config_enabled'])
 
-    def test_writing_a_new_group_switch_syncs_the_shared_legacy_group(self):
-        """控制台把危险开关**改回默认值**（关掉）时，旧组那一份要跟着改。
+    def test_writing_a_nested_switch_path_lands_in_the_nested_group(self):
+        """控制台写 `robot_actions.group.set_group_kick` 必须落到**嵌套子组**里。
 
-        折叠不清空共用源，所以"新组里 == 默认值"仍有歧义；写的时候同步一份，用户在新组里
-        关掉危险动作才会真的生效（§35.4 的"改了没反应"）。
+        v1.7.4 的关键写方向：路径是点分的（`_resolve_schema_field` 只沿 `type: object`
+        的 items 往下走），落盘不能变成 `"robot_actions.group"` 这种平铺假键——宿主下次
+        加载会把它当未知键删掉（坑 22），用户的改动等于没写。
         """
-        from plugin.core.service.config import apply_section_aliases  # noqa: PLC0415
-
         self.bridge.raw_config = lambda: {
-            'actions_risks': {'enabled': True, 'set_group_kick': True},
             'actions_group': {'enabled': True, 'set_group_kick': True},
+            'robot_actions': {'chat': {'send_poke': False}},
         }
         written: dict[str, Any] = {}
 
@@ -290,34 +295,35 @@ class ConsoleApiTests(unittest.TestCase):
             return 'test'
 
         self.bridge.save_raw_config = fake_save
-        _run(self.api.set_config_value('actions_group.set_group_kick', False))
-        self.assertIs(written['actions_group']['set_group_kick'], False)
-        self.assertIs(written['actions_risks']['set_group_kick'], False,
-                      '旧组那一份必须一起改（否则读取侧会回落到旧的 true）')
-        # 写完之后读取侧的合成值必须是用户刚写的那个（改回默认值真的生效）。
-        self.assertIs(apply_section_aliases(written)['actions_group']['set_group_kick'], False)
+        _run(self.api.set_config_value('robot_actions.group.set_group_kick', False))
+        self.assertIs(written['robot_actions']['group']['set_group_kick'], False)
+        self.assertNotIn('robot_actions.group', written, '不许写成点号平铺的假键')
+        self.assertIs(written['robot_actions']['chat']['send_poke'], False,
+                      '兄弟子组不许被覆盖掉')
 
-    def test_sync_never_creates_a_retired_group_or_touches_exclusive_ones(self):
-        """同步只碰**已经存在**的共用源键；独占旧组照旧交给折叠清空。"""
-        target = {'actions_group': {'enabled': True, 'set_group_kick': False},
-                  'actions_interaction': {'send_poke': False}}
-        console_module._sync_shared_legacy_switches(target, 'actions_group.set_group_kick', False)
-        self.assertNotIn('actions_risks', target, '旧的共用组不存在时不许凭空造出来')
-        console_module._sync_shared_legacy_switches(target, 'actions_chat.send_poke', True)
-        self.assertIs(target['actions_interaction']['send_poke'], False,
-                      '独占旧组不参与同步（它由折叠清空）')
+    def test_config_page_shows_the_merged_value_of_the_nested_groups(self):
+        """配置页显示的必须是运行期**真正生效**的值（含旧分组归并），见坑 34。
 
-    def test_config_page_shows_the_merged_value_of_the_new_action_group(self):
-        """配置页显示的必须是运行期**真正生效**的值（含旧分组归并），见坑 34。"""
-        # 磁盘上（这里用 `_live_config` 代表）只有旧分组，没有 `actions_chat`
+        嵌套目标（`robot_actions.chat` / `runtime.input_status`）尤其要：内嵌表单拿到的是
+        整个子组对象，显示成默认值的话，用户在控制台里改一项就把旧分组里没读出来的选择
+        整块覆盖掉。
+        """
+        # 磁盘上（这里用 `_live_config` 代表）只有旧分组，没有 `robot_actions`
         self.bridge._live_config['actions_interaction'] = {'send_poke': False}
+        self.bridge._live_config['input_status'] = {'enabled': False}
         payload = _run(self.api.config_schema())
         groups = {group['key']: group for group in payload['groups']}
-        field = next(item for item in groups['actions_chat']['fields'] if item['key'] == 'send_poke')
-        self.assertIs(field['value'], False)
-        self.assertTrue(field['present'], '旧分组里的值也算"设过"')
+        chat = next(item for item in groups['robot_actions']['fields'] if item['key'] == 'chat')
+        self.assertEqual(chat['type'], 'object')
+        self.assertIs(chat['value']['send_poke'], False)
+        self.assertTrue(chat['present'], '旧分组里的值也算"设过"')
+        status = next(item for item in groups['runtime']['fields']
+                      if item['key'] == 'input_status')
+        self.assertEqual(status['type'], 'object')
+        self.assertIs(status['value']['enabled'], False)
         self.assertTrue(groups['actions_interaction']['invisible'],
                         '旧组下发的数据仍带 invisible 标记（宿主配置页据此隐藏）')
+        self.assertTrue(groups['input_status']['invisible'])
 
     def test_permission_write_round_trips_to_the_temp_data_dir(self):
         path = self._temp_permissions()
@@ -1410,10 +1416,10 @@ class ConfigEditorTests(unittest.TestCase):
 
     # ---- v1.7.2 升级现场：启动时把旧动作分组折进新分组 ----
 
-    def test_startup_migration_folds_legacy_action_switches_into_the_new_group(self):
+    def test_startup_migration_folds_legacy_action_switches_into_the_nested_group(self):
         """宿主已把 `actions_chat` 按 schema 补成默认值，用户的开关还在旧分组里。
 
-        启动迁移必须把用户的选择折进新组、清空旧组并写盘；折完之后用户在新组里
+        启动迁移必须把用户的选择折进**嵌套**新路径、清空旧组并写盘；折完之后用户在新路径里
         **把开关改回默认值**（关掉→打开）也必须真的生效——这正是"只靠读取侧归并"
         做不到的那一步（旧组里的旧值会永远压着新组）。
         """
@@ -1429,52 +1435,56 @@ class ConfigEditorTests(unittest.TestCase):
             }, ensure_ascii=False))
         self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 1)
         data = self._read()
-        self.assertIs(data['actions_chat']['send_poke'], False)
-        self.assertIs(data['actions_chat']['send_voice'], False)
-        self.assertEqual(data['actions_chat']['default_voice'], 'zh-CN-YunxiNeural')
+        chat = data['robot_actions']['chat']
+        self.assertIs(chat['send_poke'], False)
+        self.assertIs(chat['send_voice'], False)
+        self.assertEqual(chat['default_voice'], 'zh-CN-YunxiNeural')
+        self.assertEqual(data['actions_chat'], {}, '退休的顶层组折完清空')
         self.assertEqual(data['actions_interaction'], {})
         self.assertEqual(data['actions_voice'], {})
         # 运行期立刻读到折完的那份（`save_raw_config` 会用刚写下去的那份生效）
-        self.assertIs(self.bridge.section('actions_chat')['send_poke'], False)
+        self.assertIs(self.bridge.section('robot_actions.chat')['send_poke'], False)
         # 幂等：再跑一次没有可折的东西，不写盘、内容不变
         self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 0)
         self.assertEqual(self._read(), data)
         # 折完之后"改回默认值"必须生效（否则界面上就是"改了没反应"）
-        _run(self.api.set_config_value('actions_chat.send_poke', True))
-        self.assertIs(self.bridge.section('actions_chat')['send_poke'], True)
-        self.assertIs(self._read()['actions_chat']['send_poke'], True)
+        _run(self.api.set_config_value('robot_actions.chat.send_poke', True))
+        self.assertIs(self.bridge.section('robot_actions.chat')['send_poke'], True)
+        self.assertIs(self._read()['robot_actions']['chat']['send_poke'], True)
 
-    def test_startup_migration_keeps_the_retired_risk_group_readable(self):
-        """v1.7.3 升级现场：开关落在退休的 `actions_risks` 里，启动迁移后**两份都能读**。
+    def test_startup_migration_leaves_the_retired_risk_group_untouched(self):
+        """v1.7.4 升级现场：退休的 `actions_risks` 只留兼容位，迁移既不读它也不清它。
 
-        退休的那一组是**共用源**（键分属三个新组），所以折叠不清空它：清掉等于把另外两个
-        新组的数据一起删了，而且回退到 v1.7.2 时那个版本只认这一组（用户要求来回升级不丢）。
-        新组这一份由折叠写实，于是宿主配置页与运行期读到的是同一个值。
+        它不再是归并源（用户判断那些配置没人用），所以折叠不碰它——回退到 v1.7.2 时那个
+        版本读的就是它，留着才不丢；而可见子组的内容只由 `actions_group` 这类真正的源决定。
         """
         with open(self.path, 'w', encoding='utf-8') as handle:
             handle.write('\ufeff' + json.dumps({
-                'actions_group': {'enabled': True, 'set_group_kick': False},
+                # `get_group_members_info` 默认 true，"用户关掉"才算写过。
+                'actions_group': {'enabled': True, 'get_group_members_info': False},
                 'actions_risks': {'enabled': True, 'set_group_kick': True,
                                   'delete_qzone_post': True, 'delete_friend': True},
             }, ensure_ascii=False))
         self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 1)
         data = self._read()
-        self.assertIs(data['actions_group']['set_group_kick'], True, '用户的选择折进新组')
-        self.assertIs(data['actions_qzone']['delete_qzone_post'], True)
-        self.assertIs(data['actions_chat']['delete_friend'], True)
-        self.assertIs(data['actions_risks']['set_group_kick'], True,
-                      '共用源不许被清空（回退到 v1.7.2 时它才是真源）')
-        # 运行期读到的是同一份
-        self.assertIs(self.bridge.section('actions_group')['set_group_kick'], True)
+        self.assertIs(data['robot_actions']['group']['get_group_members_info'], False,
+                      '用户关掉的开关折进嵌套子组')
+        self.assertEqual(data['actions_group'], {}, '独占旧组折完清空')
+        self.assertEqual(data['actions_risks']['set_group_kick'], True,
+                         '不参与归并的兼容位原样保留')
+        # 运行期读到的是同一份；退休组里的键**不会**因此漏进可见子组。
+        group = self.bridge.section('robot_actions.group')
+        self.assertIs(group['get_group_members_info'], False)
+        self.assertNotIn('set_group_kick', group)
         # 幂等：没有可折的东西了，不写盘
         self.assertEqual(_run(self.bridge.migrate_legacy_action_sections()), 0)
         self.assertEqual(self._read(), data)
-        # 用户在新组里把它关掉：新组与共用源一起改，"改了没反应"不会发生
-        _run(self.api.set_config_value('actions_group.set_group_kick', False))
+        # 用户在新子组里改回默认值：只写嵌套路径，兼容位不动
+        _run(self.api.set_config_value('robot_actions.group.get_group_members_info', True))
         stored = self._read()
-        self.assertIs(stored['actions_group']['set_group_kick'], False)
-        self.assertIs(stored['actions_risks']['set_group_kick'], False)
-        self.assertIs(self.bridge.section('actions_group')['set_group_kick'], False)
+        self.assertIs(stored['robot_actions']['group']['get_group_members_info'], True)
+        self.assertIs(stored['actions_risks']['set_group_kick'], True)
+        self.assertIs(self.bridge.section('robot_actions.group')['get_group_members_info'], True)
 
 
 # =========================================================================== #

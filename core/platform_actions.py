@@ -23,14 +23,19 @@
   改群名/群公告之外的破坏性操作、群文件删除）。
 
 `dangerous` 的默认档位一律是 `disabled`，而且**开关默认关着**；开关落在它自己类别所属
-的那个组里（群管理类进 `actions_group`、空间类进 `actions_qzone`、其余进 `actions_chat`），
-每个危险开关的 `hint` 就是那句警告 `RISK_WARNING`。
+的那个子组里（群管理类进 `robot_actions.group`、空间类进 `robot_actions.qzone`、
+其余进 `robot_actions.chat`），每个危险开关的 `hint` 就是那句警告 `RISK_WARNING`。
 
 v1.7.2 曾把危险动作单独收进一个"风险操作"组，随后按用户要求取消了这个分组：
 「都在机器人动作配置组，然后分类会话动作 / 群管理动作 / QQ 空间动作，这里不用单独把
 风险操作分离一个类，因为控制台动作页已经有标注了」。**危险是动作的属性**（控制台
-「动作」页给它们打红色徽章），不是配置页里独立的一类分组。旧组名仍留在 schema 里当
-隐藏兼容位（读配置时照旧认它里面的键），细节见 `docs/PORTING_NOTES.md` §36。
+「动作」页给它们打红色徽章），不是配置页里独立的一类分组。
+
+v1.7.4 起这一层只有**一个**配置页父组 `robot_actions`（标题「机器人动作」），底下三个
+子组 = `chat` / `group` / `qzone`（标题「会话动作 / 群管理动作 / QQ 空间动作」）。
+落点写在 `ACTION_CONFIG_GROUPS` 里，是**点分路径**（`robot_actions.chat` 这种）。
+旧组名（`actions_chat` / `actions_group` / `actions_qzone` / 七个 v1.6.0 老组）仍留在
+schema 里当隐藏兼容位（读配置时照旧认它里面的键），细节见 `docs/PORTING_NOTES.md` §37。
 """
 
 from __future__ import annotations
@@ -43,6 +48,8 @@ __all__ = [
     'ACTION_CATEGORIES',
     'ACTION_CONFIG_GROUPS',
     'ACTION_CONFIG_GROUP_LABELS',
+    'ACTION_CONFIG_GROUP_ROOTS',
+    'ACTION_CONFIG_SECTION',
     'action_config_group',
     'PERMISSION_TIERS',
     'PLATFORM_ACTION_FIELD',
@@ -164,44 +171,59 @@ ACTION_CATEGORIES: dict[str, str] = {
 }
 
 
+#: 动作开关的**父分组**（`_conf_schema.json` 的顶层组，v1.7.4 起只有一个）。
+#:
+#: 用户在配置页看到的是「机器人动作」一张卡片，里面三个子组；schema 里的真实形状是
+#: `robot_actions.items.{chat,group,qzone}`。契约与 `model_center` 的嵌套段一致
+#: （宿主配置页的 `AstrBotConfig` 对 `type: "object"` 的子项递归渲染，见坑 24/34）。
+ACTION_CONFIG_SECTION = 'robot_actions'
+
 #: 动作类别 → 配置分组（**schema 与运行期共用这一条映射**，避免"开关在哪"两处各写一遍）。
 #:
-#: **v1.7.2 收敛成三组**（`actions_chat` / `actions_group` / `actions_qzone`）：原先十个
-#: `actions_*` 组在配置页是十张"开关卡片"，用户要滚很久才找得到想要的那条。收敛只动
-#: **分组名**，不动键名（键逐字 = 动作 id），旧分组由读取侧的 N:1 合并兜底
-#: （`core/service/config.py` 的 `LEGACY_SECTION_MERGES`）。
+#: **值是点分路径**（`robot_actions.chat`）：父组是「机器人动作」，三个子组是
+#: 「会话动作 / 群管理动作 / QQ 空间动作」。v1.7.2 先把十个 `actions_*` 组收敛成三个顶层组、
+#: v1.7.3 取消「风险操作」独立组、v1.7.4 再把这三个并进一个父组——三次都**只动分组名，
+#: 不动键名**（键逐字 = 动作 id），旧分组由读取侧的 N:1 归并兜底
+#: （`core/service/config.py` 的 `LEGACY_SECTION_MERGES`，键也是点分路径）。
 #:
-#: **危险动作没有单独的组**：它们按 `category` 落进上面这三组之一（用户明确要求不把
+#: **危险动作没有单独的组**：它们按 `category` 落进三个子组之一（用户明确要求不把
 #: 危险动作单独分成一类，见模块 docstring）。
 ACTION_CONFIG_GROUPS: dict[str, str] = {
-    'interaction': 'actions_chat',
-    'message': 'actions_chat',
-    'history': 'actions_chat',
-    'status': 'actions_chat',
-    'profile': 'actions_chat',
-    'voice': 'actions_chat',
-    'contact': 'actions_chat',
-    'group_read': 'actions_group',
-    'group_write': 'actions_group',
-    'qzone': 'actions_qzone',
+    'interaction': 'robot_actions.chat',
+    'message': 'robot_actions.chat',
+    'history': 'robot_actions.chat',
+    'status': 'robot_actions.chat',
+    'profile': 'robot_actions.chat',
+    'voice': 'robot_actions.chat',
+    'contact': 'robot_actions.chat',
+    'group_read': 'robot_actions.group',
+    'group_write': 'robot_actions.group',
+    'qzone': 'robot_actions.qzone',
 }
 
-#: 配置分组 → 组标题（控制台「动作」页用来说明"这个开关在哪一组"，与 schema 的 `title` 同源）。
+#: 配置子分组（点分路径）→ 组标题（控制台「动作」页用来说明"这个开关在哪一组"，
+#: 与 schema 的 `title` 同源）。
 #:
 #: 为什么单列一张表而不是按类别推：多个类别并进同一组之后，"先到的类别定标签"会
-#: 把 `actions_chat` 标成「互动」，而那一组里还有消息/历史/状态/资料/语音/联系人。
-#: 组名仍然只有一个来源（`ACTION_CONFIG_GROUPS`），`test_configuration.py` 断言两张表的
-#: 键集合完全相等，改一处漏一处当场红。三个标题写成「动作：X」——一眼看出是一家的。
+#: 把 `robot_actions.chat` 标成「互动」，而那一组里还有消息/历史/状态/资料/语音/联系人。
+#: 落点仍然只有一个来源（`ACTION_CONFIG_GROUPS`），`test_configuration.py` 断言两张表的
+#: 键集合完全相等，改一处漏一处当场红。标题就是那三个**子组中文名**（配置页里显示的
+#: 也是它们），不再带「动作：」前缀——父组已经叫「机器人动作」了。
 ACTION_CONFIG_GROUP_LABELS: dict[str, str] = {
-    'actions_chat': '动作：会话',
-    'actions_group': '动作：群管理',
-    'actions_qzone': '动作：QQ 空间',
+    'robot_actions.chat': '会话动作',
+    'robot_actions.group': '群管理动作',
+    'robot_actions.qzone': 'QQ 空间动作',
 }
+
+#: 落点路径的**根**去重集合（`{'robot_actions'}`）：控制台/配置页要按顶层组处理它们时用。
+ACTION_CONFIG_GROUP_ROOTS: frozenset[str] = frozenset(
+    group.split('.', 1)[0] for group in ACTION_CONFIG_GROUPS.values()
+)
 
 
 def action_config_group(action: 'PlatformAction') -> str:
-    """某动作的开关落在哪个配置分组（**按类别**，危险动作也回自己的类别组）。"""
-    return ACTION_CONFIG_GROUPS.get(action.category, 'actions_chat')
+    """某动作的开关落在哪个配置分组（**点分路径**；危险动作也回自己的类别组）。"""
+    return ACTION_CONFIG_GROUPS.get(action.category, 'robot_actions.chat')
 
 
 def _p(*args: Any, **kwargs: Any) -> ActionParam:
@@ -798,7 +820,7 @@ def actions_by_category() -> dict[str, list[PlatformAction]]:
 def risky_actions() -> list[PlatformAction]:
     """全部危险动作（给控制台警示区与文档的"危险动作"清单用）。
 
-    它们的开关不再有专门的组，落在各自类别所属的那个 `actions_*` 里
+    它们的开关不再有专门的组，落在各自类别所属的那个子组里
     （`action_config_group()`），且默认 `false` + 默认档位 `disabled`。
     """
     return [item for item in _ACTION_LIST if item.risk == 'dangerous']

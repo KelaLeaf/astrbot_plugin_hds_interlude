@@ -23,6 +23,7 @@ import json
 import os
 import re
 import unittest
+from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_ROOT = os.path.dirname(HERE)
@@ -187,8 +188,8 @@ UPSTREAM_COMPAT_FIELDS = {
     "runtime_compat": ["pauseAfterConversationMinutes", "staleNarrativeRequestWindowSeconds"],
 }
 
-#: v1.7.2 动作开关分组收敛（10 → 4）、v1.7.3 取消「风险操作」组后**留在 schema 里当隐藏
-#: 兼容位**的旧分组 → 原键集合。
+#: v1.7.2 动作开关分组收敛（10 → 4）、v1.7.3 取消「风险操作」组、v1.7.4 并进一个父组
+#: 之后**留在 schema 里当隐藏兼容位**的旧分组 → 原键集合。
 #:
 #: 为什么必须留着、而且键一个都不能少：宿主每次加载都按 `_conf_schema.json` 重建配置，
 #: schema 里没有的分组会被**直接删掉**（AGENTS 坑 22）。所以"把 `actions_interaction`
@@ -210,8 +211,36 @@ LEGACY_ACTION_COMPAT_GROUPS = {
         "enabled", "list_contacts", "search_contacts", "get_user_profile", "get_group_info",
         "handle_friend_request", "handle_group_request", "auto_learn",
     ),
-    # v1.7.3：危险动作的开关搬回各自类别组，这一组随之退休——但它**同时供给三个新组**
-    # （群管理 / 空间 / 联系人各有一批），读取侧按键分流，所以它的键分散在三个新组里。
+    # v1.7.2/v1.7.3 的可见分组（v1.7.4 并进 `robot_actions` 之后降级成兼容位）。
+    "actions_chat": (
+        "enabled", "send_poke", "send_like", "recall_message",
+        "schedule_message", "list_scheduled_messages", "cancel_scheduled_message",
+        "schedule_command", "list_scheduled_commands", "cancel_scheduled_command",
+        "get_group_msg_history", "get_friend_msg_history",
+        "update_qq_status", "get_qq_status", "get_fun_status_list",
+        "set_qq_profile", "set_qq_avatar", "get_qq_profile",
+        "send_voice", "list_voices", "tts_provider_id", "default_voice",
+        "list_contacts", "search_contacts", "get_user_profile", "get_group_info",
+        "handle_friend_request", "handle_group_request", "auto_learn", "delete_friend",
+    ),
+    "actions_group": (
+        "enabled", "get_group_members_info", "get_user_group_role", "get_group_honor_info",
+        "get_group_shut_list", "get_group_notice_list", "get_group_at_all_remain",
+        "list_group_files", "send_group_notice", "delete_group_notice", "set_essence_msg",
+        "delete_essence_msg", "send_group_sign", "set_group_card",
+        "set_group_special_title", "set_group_add_option", "set_group_portrait",
+        "set_group_name", "set_group_ban", "set_group_whole_ban", "set_group_kick",
+        "set_group_admin", "delete_group_file", "upload_group_file", "rename_group_file",
+        "move_group_file", "create_group_file_folder", "delete_group_folder",
+        "trans_group_file",
+    ),
+    "actions_qzone": (
+        "enabled", "publish_qzone_post", "comment_qzone_post", "like_qzone_post",
+        "list_qzone_posts", "list_qzone_feeds", "forward_qzone_post", "delete_qzone_post",
+    ),
+    # v1.7.3：危险动作的开关搬回各自类别组，这一组随之退休，v1.7.4 起**不再参与归并**
+    # （用户判断那些配置目前没人用，见 `docs/PORTING_NOTES.md` §37）——但它照旧留在
+    # schema 里当隐藏兼容位，键集合一个不少。
     "actions_risks": (
         "enabled", "set_group_special_title", "set_group_add_option", "set_group_portrait",
         "set_group_name", "set_group_ban", "set_group_whole_ban", "set_group_kick",
@@ -221,17 +250,31 @@ LEGACY_ACTION_COMPAT_GROUPS = {
     ),
 }
 
-#: 每个隐藏兼容位供给哪些新分组（与 `LEGACY_SECTION_MERGES` 同源，别手抄）。
+#: 留在 schema 里、但**不是**归并源的隐藏动作组（`actions_risks`）。
+LEGACY_UNMERGED_ACTION_GROUPS = ("actions_risks",)
+
+#: 每个隐藏兼容位的**键在哪些可见路径里还找得到一份**。
+#:
+#: 归并源（`LEGACY_SECTION_MERGES` 的 values）必须真在这些路径上被读取侧补进去；
+#: `actions_risks` 只是"键在三个子组里也各有一份"（v1.7.3 起危险开关就在那里），
+#: 它**不是归并源**（v1.7.4 的简化），所以下面那句 join 检查不含它。
 LEGACY_ACTION_COMPAT_TARGETS = {
-    "actions_interaction": ("actions_chat",),
-    "actions_message": ("actions_chat",),
-    "actions_history": ("actions_chat",),
-    "actions_status": ("actions_chat",),
-    "actions_profile": ("actions_chat",),
-    "actions_voice": ("actions_chat",),
-    "actions_contact": ("actions_chat",),
-    "actions_risks": ("actions_chat", "actions_group", "actions_qzone"),
+    "actions_interaction": ("robot_actions.chat",),
+    "actions_message": ("robot_actions.chat",),
+    "actions_history": ("robot_actions.chat",),
+    "actions_status": ("robot_actions.chat",),
+    "actions_profile": ("robot_actions.chat",),
+    "actions_voice": ("robot_actions.chat",),
+    "actions_contact": ("robot_actions.chat",),
+    "actions_chat": ("robot_actions.chat",),
+    "actions_group": ("robot_actions.group",),
+    "actions_qzone": ("robot_actions.qzone",),
+    "actions_risks": ("robot_actions.chat", "robot_actions.group", "robot_actions.qzone"),
 }
+
+#: v1.7.4 起 `input_status` 从顶层组挪进「运行时」当子配置：顶层那一份降级成隐藏兼容位。
+INPUT_STATUS_COMPAT_TARGET = "runtime.input_status"
+INPUT_STATUS_COMPAT_KEYS = ("enabled", "min_visible_ms", "beat_chance")
 
 #: 上游深度字段（嵌套 / 列表项）的默认值断言：(节点路径..., 键, 期望默认值)
 DEEP_DEFAULTS = [
@@ -483,6 +526,29 @@ def read(path: str) -> str:
         return fp.read()
 
 
+def schema_at(schema: dict, path: str) -> dict:
+    """按**点分路径**取 schema 节点（`robot_actions.chat` / `runtime.input_status`）。
+
+    v1.7.4 起动作开关并进一个父组、输入状态挪进「运行时」当子配置，落点是嵌套路径；
+    测试里凡是"按分组名取 items"的地方都走它，别写死 `schema[key]["items"]`
+    （`robot_actions` 的 items 是三个子组、不是开关）。
+    """
+    node: Any = schema
+    for step in path.split("."):
+        node = node[step] if step in node else node["items"][step]
+    return node
+
+
+def config_at(config: Any, path: str, default: Any = None) -> Any:
+    """按点分路径读**配置**（不是 schema）：读不到回 `default`（默认 `None`）。"""
+    node: Any = config
+    for step in path.split("."):
+        if not isinstance(node, dict) or step not in node:
+            return default
+        node = node[step]
+    return node
+
+
 def iter_fields(node: dict, path: str = ""):
     """深度遍历 schema，产出 (路径, 字段名, 字段定义)。"""
     for key, spec in node.items():
@@ -514,7 +580,8 @@ class ConfigurationSchemaTest(unittest.TestCase):
         cls.schema = load_schema()
 
     def section(self, top_key: str) -> dict:
-        return self.schema[top_key]["items"]
+        """某个分组（含点分嵌套路径）的 `items`。"""
+        return schema_at(self.schema, top_key)["items"]
 
     # -- 上游第 1 条：Console sections follow the documented setup order ---------
 
@@ -976,44 +1043,13 @@ class ConfigurationSchemaTest(unittest.TestCase):
         #
         # v1.7.2：十个动作组收敛成**三个**（`actions_chat` 收互动 / 消息 / 历史 / 状态 /
         # 资料 / 语音 / 联系人）；v1.7.3 又取消了独立的「风险操作」组，危险动作的开关回到
-        # 各自类别组。可见组只记在下面；八个旧组转成隐藏兼容位，它们的
-        # 键集合单独钉在 `LEGACY_ACTION_COMPAT_GROUPS`。
-        "actions_chat": {
-            "enabled", "send_poke", "send_like", "recall_message",
-            "schedule_message", "list_scheduled_messages", "cancel_scheduled_message",
-            "schedule_command", "list_scheduled_commands", "cancel_scheduled_command",
-            "get_group_msg_history", "get_friend_msg_history",
-            "update_qq_status", "get_qq_status", "get_fun_status_list",
-            "set_qq_profile", "set_qq_avatar", "get_qq_profile",
-            # `send_voice` / `list_voices` 是动作；`tts_provider_id` 与 `default_voice`
-            # 是这一组的两个非动作旋钮（TTS 服务商 / 音色）。
-            "send_voice", "list_voices", "tts_provider_id", "default_voice",
-            "list_contacts", "search_contacts", "get_user_profile", "get_group_info",
-            "handle_friend_request", "handle_group_request", "auto_learn",
-            # v1.7.3：联系人里的危险动作（默认关闭）也回这一组。
-            "delete_friend",
-        },
-        "actions_group": {
-            "enabled", "get_group_members_info", "get_user_group_role", "get_group_honor_info",
-            "get_group_shut_list", "get_group_notice_list", "get_group_at_all_remain",
-            "list_group_files", "send_group_notice", "delete_group_notice", "set_essence_msg",
-            "delete_essence_msg", "send_group_sign", "set_group_card",
-            # v1.7.3：十五个群管理类的危险动作（默认关闭）回这一组。
-            "set_group_special_title", "set_group_add_option", "set_group_portrait",
-            "set_group_name", "set_group_ban", "set_group_whole_ban", "set_group_kick",
-            "set_group_admin", "delete_group_file", "upload_group_file", "rename_group_file",
-            "move_group_file", "create_group_file_folder", "delete_group_folder",
-            "trans_group_file",
-        },
-        "actions_qzone": {
-            "enabled", "publish_qzone_post", "comment_qzone_post", "like_qzone_post",
-            "list_qzone_posts",
-            # v1.7.1：走 NapCat WebSocket 方案（get_cookies + QZone CGI）新增的两条。
-            "list_qzone_feeds", "forward_qzone_post",
-            # v1.7.3：「删说说」这条危险动作（默认关闭）回这一组。
-            "delete_qzone_post",
-        },
-        "input_status": {"enabled", "min_visible_ms", "beat_chance"},
+        # 各自类别组；v1.7.4 再把这三个并进**一个父组** `robot_actions`（三个子组
+        # chat / group / qzone）。父组在 `items` 里只有这三个子组对象，所以本表只登记它们；
+        # 子组内部的键集合由 `LEGACY_ACTION_COMPAT_GROUPS` 与目录对账表守着。
+        "robot_actions": {"chat", "group", "qzone"},
+        # v1.7.4：输入状态从顶层组挪进「运行时」当子配置——父组 `runtime` 的 items 因此
+        # 多出一个对象键（`test_upstream_field_count_matches` 按 items 数一遍，所以要登记）。
+        "runtime": {"input_status"},
     }
 
     def test_upstream_field_count_matches(self):
@@ -1105,10 +1141,12 @@ class ConfigurationSchemaTest(unittest.TestCase):
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
 
         hidden_roots = {key for key, spec in self.schema.items() if spec.get("invisible")}
+        # 可见落点是**点分路径**（`robot_actions.chat` …）：比"上一层目录"而不是比顶层组名。
+        visible_paths = set(catalog.ACTION_CONFIG_GROUPS.values())
         checked = 0
         for path, key, spec in iter_fields(self.schema):
             root = path.split(".", 1)[0]
-            if root in hidden_roots or root not in set(catalog.ACTION_CONFIG_GROUPS.values()):
+            if root in hidden_roots or path.rsplit(".", 1)[0] not in visible_paths:
                 continue
             action = catalog.ACTIONS.get(key)
             if action is None:
@@ -1130,9 +1168,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
         在 `_conf_schema.json` 里补开关，这里当场红——否则那个动作要么永远调不动
         （开关读不出来），要么被塞进别的分组、被另一个总开关连坐。
 
-        v1.7.2/v1.7.3 起还要认第二种合法出现：**隐藏的旧分组里的兼容副本**（用户升级前
-        设过的开关就写在那里）。副本只允许落在"归并进这个组"的旧组里，别的旧组出现同名键
-        一律红——那说明有动作被搬进了不相干的分组。
+        v1.7.2/v1.7.3/v1.7.4 起还要认第二种合法出现：**隐藏的旧分组里的兼容副本**（用户
+        升级前设过的开关就写在那里）。副本只允许落在"归并进这个路径"的旧组里，别的旧组
+        出现同名键一律红——那说明有动作被搬进了不相干的分组。
         """
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
         from plugin.core.service.config import LEGACY_SECTION_MERGES  # noqa: PLC0415
@@ -1159,16 +1197,20 @@ class ConfigurationSchemaTest(unittest.TestCase):
                     root = extra.split(".", 1)[0]
                     self.assertIn(root, LEGACY_ACTION_COMPAT_GROUPS,
                                   f"{action_id} 多出一份开关：{extra}")
+                    if root in LEGACY_UNMERGED_ACTION_GROUPS:
+                        # `actions_risks` 只留兼容位、不参与归并（v1.7.4）：它里面的
+                        # 同名键是 v1.7.2/1.7.3 的历史快照，允许存在但读取侧不认。
+                        continue
                     self.assertIn(root, LEGACY_SECTION_MERGES.get(group, ()),
                                   f"{action_id} 的兼容副本落在不相干的旧组：{extra}")
 
-        # 2) 每个**可见**的 `actions_*` 分组都要有总开关；组里除白名单外的键都必须是
+        # 2) 每个**可见**的动作子分组都要有总开关；组里除白名单外的键都必须是
         #    动作 id，而且必须是"该落在这个组"的动作。隐藏的旧组是历史快照（键可以比
         #    目录旧、也可以有非动作键），由 `LEGACY_ACTION_COMPAT_GROUPS` 单独对账。
         extras = {"enabled", "default_voice", "auto_learn", "tts_provider_id"}
-        action_groups = [key for key in self.schema if key.startswith("actions_")
-                         and key not in hidden_roots]
-        self.assertTrue(action_groups, "schema 里没有可见的 actions_* 分组")
+        action_groups = [path for path, spec in catalog.ACTION_CONFIG_GROUP_LABELS.items()
+                         if path.rsplit(".", 1)[0] not in hidden_roots]
+        self.assertTrue(action_groups, "schema 里没有可见的动作子分组")
         for group_key in action_groups:
             with self.subTest(group=group_key):
                 items = self.section(group_key)
@@ -1186,27 +1228,35 @@ class ConfigurationSchemaTest(unittest.TestCase):
                 group = catalog.action_config_group(action)
                 self.assertIs(self.section(group)[action.id]["default"], False)
 
-    # -- v1.7.2 分组收敛 / v1.7.3 取消风险组 -----------------------------------
+    # -- v1.7.2 分组收敛 / v1.7.3 取消风险组 / v1.7.4 并进父组 --------------------
 
     def test_legacy_action_groups_stay_hidden_and_keep_every_key(self):
         """旧动作分组必须留在 schema 里、隐藏、且**键一个不少**（升级不丢配置）。
 
         宿主每次加载都按 schema 重建配置：schema 里没有的分组会被直接删掉（坑 22）。
         所以旧组只能"留着 + 隐藏 + 读取侧归并"，不能改名或删掉。同时旧键必须都还在
-        **可见的**新组里——只留在旧组的话，用户在配置页里根本改不到它。
+        **可见的**新子组里——只留在旧组的话，用户在配置页里根本改不到它。
 
-        `actions_risks` 是**共用源**：它的键分散在三个新组里（群管理 / 空间 / 联系人），
-        所以逐个键检查"至少有一个目标组认得它"。
+        `actions_risks` 是**只留兼容位、不参与归并**的那一个（v1.7.4 的简化），所以它的
+        每个键照样必须在可见子组里有一份（v1.7.3 起危险开关就在各自类别组里）。
         """
         from plugin.core.service.config import LEGACY_SECTION_MERGES  # noqa: PLC0415
 
         merged_sources = {name for sources in LEGACY_SECTION_MERGES.values()
                           for name in sources}
-        self.assertEqual(merged_sources, set(LEGACY_ACTION_COMPAT_GROUPS),
-                         "归并表与隐藏兼容位表必须完全一致")
+        self.assertEqual(
+            merged_sources - {"input_status"} | set(LEGACY_UNMERGED_ACTION_GROUPS),
+            set(LEGACY_ACTION_COMPAT_GROUPS),
+            "归并表（除去 input_status，它不是动作组）+ 不归并的动作兼容位"
+            "必须覆盖全部隐藏旧动作组",
+        )
+        self.assertIn("input_status", merged_sources,
+                      "输入状态的顶层兼容位必须在归并表里（`runtime.input_status`）")
         self.assertEqual(set(LEGACY_ACTION_COMPAT_TARGETS), set(LEGACY_ACTION_COMPAT_GROUPS),
                          "兼容位目标表必须覆盖每一个旧组")
         for target, sources in LEGACY_SECTION_MERGES.items():
+            if not target.startswith("robot_actions"):
+                continue
             for source in sources:
                 self.assertIn(target, LEGACY_ACTION_COMPAT_TARGETS[source],
                               f"{source} → {target} 的归并没有登记在目标表里")
@@ -1224,41 +1274,86 @@ class ConfigurationSchemaTest(unittest.TestCase):
                     with self.subTest(group=group, key=key):
                         self.assertTrue(
                             any(key in self.section(target) for target in targets),
-                            f"{group}.{key} 没进任何可见的新组：{targets}",
+                            f"{group}.{key} 没进任何可见的新路径：{targets}",
                         )
 
-    def test_visible_action_groups_are_exactly_the_catalog_groups(self):
-        """可见的 `actions_*` 组 = 目录声明的三组；分组标题表的键与之逐字相等。
+    def test_legacy_source_keys_are_subsets_of_their_targets(self):
+        """每个旧组的键集合必须是它目标子组的**子集**。
 
-        组名只有一个来源（`ACTION_CONFIG_GROUPS`），标题表跟着它走——两处漂移会让
-        「动作」页把开关指到不存在的分组。
+        v1.7.4 删掉了"按键分流"那条规则（旧组只供给一个目标之后就不需要了）。这条断言
+        是它的替代：源键不许有目标 schema 声明之外的键——否则归并会把陌生的键折进新子组，
+        宿主下次加载再按 schema 把它删掉（日志刷 `Config key removed`）。
+        """
+        from plugin.core.service.config import LEGACY_SECTION_MERGES  # noqa: PLC0415
+
+        for target, sources in LEGACY_SECTION_MERGES.items():
+            target_keys = set(self.section(target))
+            for source in sources:
+                with self.subTest(source=source, target=target):
+                    self.assertLessEqual(
+                        set(self.section(source)), target_keys,
+                        f"{source} 里有 {target} 声明之外的键",
+                    )
+
+    def test_input_status_section_moved_into_runtime(self):
+        """`input_status` 现在是 `runtime` 的子配置；顶层那一份只剩隐藏兼容位。"""
+        from plugin.core.service.config import LEGACY_SECTION_MERGES  # noqa: PLC0415
+
+        nested = self.section(INPUT_STATUS_COMPAT_TARGET)
+        legacy = self.section("input_status")
+        self.assertEqual(set(nested), set(INPUT_STATUS_COMPAT_KEYS))
+        self.assertEqual(set(legacy), set(INPUT_STATUS_COMPAT_KEYS),
+                         "顶层兼容位的键集合也一个不能少")
+        self.assertEqual(nested, legacy,
+                         "两处的类型/默认值/hint 必须逐字相同（读取侧按同一套判「用户写过」）")
+        self.assertIs(self.schema["input_status"].get("invisible"), True)
+        self.assertTrue(self.schema["input_status"]["description"].startswith("【已弃用】"))
+        self.assertEqual(LEGACY_SECTION_MERGES[INPUT_STATUS_COMPAT_TARGET], ("input_status",))
+        # `runtime` 现在是**标量键 + 嵌套子对象**混排（同 `model_center` 的形状）。
+        self.assertEqual(self.schema["runtime"]["items"]["input_status"]["type"], "object")
+
+    def test_visible_action_groups_are_exactly_the_catalog_groups(self):
+        """可见的动作落点 = 目录声明的三个子组，它们同属一个父组；标题表与之逐字相等。
+
+        落点只有一个来源（`ACTION_CONFIG_GROUPS`，值是点分路径），标题表跟着它走——
+        两处漂移会让「动作」页把开关指到不存在的分组。
         """
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
 
         expected = set(catalog.ACTION_CONFIG_GROUPS.values())
         self.assertEqual(set(catalog.ACTION_CONFIG_GROUP_LABELS), expected)
+        # 父组：唯一、可见、标题 = 「机器人动作」。
+        self.assertEqual(catalog.ACTION_CONFIG_SECTION, "robot_actions")
+        self.assertIsNot(self.schema["robot_actions"].get("invisible"), True)
+        self.assertEqual(self.schema["robot_actions"]["title"], "机器人动作")
+        self.assertEqual(set(self.section("robot_actions")), {"chat", "group", "qzone"})
+        self.assertEqual(catalog.ACTION_CONFIG_GROUP_ROOTS,
+                         {path.split(".", 1)[0] for path in expected})
+        # 再没有**可见的**顶层 `actions_*` 分组（都降级成隐藏兼容位了）。
         visible = {key for key, spec in self.schema.items()
                    if key.startswith("actions_") and not spec.get("invisible")}
-        self.assertEqual(visible, expected)
-        self.assertEqual(len(visible), 3,
-                         "动作开关组收敛成三个（v1.7.2 四组，v1.7.3 取消风险组）")
-        # 三个标题写成一家人的样子（用户点名：「动作：会话」这种写法）。
+        self.assertEqual(visible, set())
+        # 三个子组的标题就是它们的中文名，且是 `robot_actions` 的直接子项。
         self.assertEqual(set(catalog.ACTION_CONFIG_GROUP_LABELS.values()),
-                         {"动作：会话", "动作：群管理", "动作：QQ 空间"})
-        for group in expected:
-            self.assertEqual(self.schema[group]["title"],
-                             catalog.ACTION_CONFIG_GROUP_LABELS[group],
-                             f"{group} 的 schema 标题与目录不一致")
+                         {"会话动作", "群管理动作", "QQ 空间动作"})
+        for path in expected:
+            with self.subTest(group=path):
+                node = schema_at(self.schema, path)
+                self.assertEqual(node["title"], catalog.ACTION_CONFIG_GROUP_LABELS[path],
+                                 f"{path} 的 schema 标题与目录不一致")
+                self.assertEqual(path.split(".", 1)[0], catalog.ACTION_CONFIG_SECTION)
         # 退休的风险组不许再以可见分组的形式出现。
         self.assertNotIn("actions_risks", visible)
 
     def test_legacy_action_groups_are_never_referenced_as_new_targets(self):
-        """新落点只能是四组之一：目录里不许再出现旧组名（否则又写回作废的键）。"""
+        """新落点只能是三个子组：目录里不许再出现旧组名（否则又写回作废的键）。"""
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
 
         for category, group in catalog.ACTION_CONFIG_GROUPS.items():
             with self.subTest(category=category):
                 self.assertNotIn(group, LEGACY_ACTION_COMPAT_GROUPS)
+                for part in group.split("."):
+                    self.assertNotIn(part, LEGACY_ACTION_COMPAT_GROUPS)
         for action in catalog.ACTIONS.values():
             with self.subTest(action=action.id):
                 self.assertNotIn(catalog.action_config_group(action),
@@ -1275,13 +1370,15 @@ class ConfigurationSchemaTest(unittest.TestCase):
         留空回落默认 / 指名坏了要说得清）在 `test_platform_transport.py` 的
         `VoiceProviderSelectionTests` 里跑：这里只钉 schema 这一半，免得两边各说各话。
 
-        分组名跟动作目录走（v1.7.2 收敛成四个 `actions_*` 之后，「语音」落在
-        `actions_chat`）——写死旧组名会在下一次收敛时静默读空。
+        分组名跟动作目录走（v1.7.2 收敛成三个 `actions_*` 之后，「语音」落在
+        `actions_chat`；v1.7.4 起是嵌套路径 `robot_actions.chat`）——写死旧组名会在
+        下一次收敛时静默读空。
         """
         from plugin.core import platform_actions as catalog  # noqa: PLC0415
 
         group = catalog.ACTION_CONFIG_GROUPS["voice"]
-        self.assertIsNot(self.schema[group].get("invisible"), True,
+        self.assertEqual(group, "robot_actions.chat")
+        self.assertIsNot(self.schema["robot_actions"].get("invisible"), True,
                          f"{group} 必须可见，否则用户改不到 TTS 服务商")
         voice = self.section(group)
         self.assertEqual(voice["tts_provider_id"]["_special"], "select_provider_tts")
@@ -1387,17 +1484,21 @@ class ConfigurationSchemaTest(unittest.TestCase):
 class LegacyActionSectionMergeTest(unittest.TestCase):
     """**升级不丢配置**：旧格式（动作开关落在旧分组里）在读取侧仍然读得到。
 
-    这是 v1.7.2「十个动作组收敛成四个」的核心验收：分组名变了，但用户配过的值还在
-    磁盘上的旧键里；读取侧靠 `LEGACY_SECTION_MERGES` 的 N:1 归并把它读出来，
-    写方向只写新分组名（`fold_legacy_section_merges` 顺手把旧值折进新组）。
+    这是 v1.7.2 起三次分组收敛的核心验收（v1.7.2 十组→三组、v1.7.3 取消风险组、
+    v1.7.4 三组→一个父组 `robot_actions`）：分组名变了，但用户配过的值还在磁盘上的
+    旧键里；读取侧靠 `LEGACY_SECTION_MERGES` 的 N:1 归并把它读出来，写方向只写新路径
+    （`fold_legacy_section_merges` 顺手把旧值折进新路径）。
 
     归并的判据是「**用户写过的**新分组值优先」——"写过" = 不等于 schema 默认值。
     为什么不能简单地"新组一律优先"：宿主每次加载都按 schema 把缺的键**连默认值一起**
-    补进配置文件（`AstrbotConfig.check_config_integrity`），升级后 `actions_chat` 就是
+    补进配置文件（`AstrbotConfig.check_config_integrity`），升级后 `robot_actions` 就是
     这样被整组补成默认值的；按字面优先会让宿主补的默认值顶掉用户真正的选择。
+
+    v1.7.4 起目标路径是**嵌套的**（`robot_actions.chat` / `runtime.input_status`），
+    所以默认值也必须按点分路径去 schema 里取（`schema_group_defaults`）。
     """
 
-    #: 一份**旧格式**配置：只有旧分组，没有任何 `actions_chat`。
+    #: 一份**旧格式**配置：开关散在 7 个 v1.6.0 老组里，没有任何 `robot_actions`。
     LEGACY_CONFIG = {
         "actions_interaction": {"enabled": True, "send_poke": False, "send_like": True},
         "actions_message": {"schedule_message": False},
@@ -1408,65 +1509,58 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
         "actions_contact": {"auto_learn": True},
     }
 
-    #: 一份"开关落在 `actions_risks`"的配置——v1.7.2 升级上来的用户就是这样。
-    RISK_CONFIG = {
-        "actions_risks": {
-            "enabled": True,
-            "set_group_kick": True,
-            "set_group_ban": False,
-            "delete_qzone_post": True,
-            "delete_friend": True,
-        },
+    #: 一份 v1.7.2/v1.7.3 形状的配置：开关落在**顶层**那三个组里。
+    PREVIOUS_CONFIG = {
+        "actions_chat": {"enabled": True, "send_poke": False, "default_voice": "zh-CN-YunxiNeural"},
+        "actions_group": {"enabled": False, "set_group_kick": True},
+        "actions_qzone": {"delete_qzone_post": True},
     }
 
-    def test_risk_group_switches_still_read_through_their_new_groups(self):
-        """v1.7.3 取消独立风险组后，旧配置里的危险开关照旧读得到（**按键分流**）。
+    #: v1.7.2 升级上来的用户可能把危险开关写在退休的 `actions_risks` 里——
+    #: v1.7.4 起它**不再参与归并**（用户判断那些配置没人用），照旧留着当兼容位。
+    RISK_CONFIG = {
+        "actions_risks": {"enabled": True, "set_group_kick": True, "delete_friend": True},
+    }
 
-        回归用例（用户点名要的）：一份开关落在 `actions_risks` 的配置，读取侧必须仍然
-        读得到——群管理类的进 `actions_group`、空间类进 `actions_qzone`、联系人进
-        `actions_chat`，而且**不许串味**（群管理的键流进会话组会让总开关跟着乱）。
+    def test_previous_groups_read_through_the_nested_paths(self):
+        """v1.7.2/v1.7.3 的三个顶层组 → `robot_actions.chat/group/qzone` 读得到。"""
+        from plugin.core.service.config import apply_section_aliases  # noqa: PLC0415
+
+        merged = apply_section_aliases(self.PREVIOUS_CONFIG)
+        chat = config_at(merged, "robot_actions.chat")
+        group = config_at(merged, "robot_actions.group")
+        qzone = config_at(merged, "robot_actions.qzone")
+        self.assertIs(chat["send_poke"], False, "用户关掉的开关不能被默认值顶回来")
+        self.assertEqual(chat["default_voice"], "zh-CN-YunxiNeural")
+        self.assertIs(group["enabled"], False, "用户关掉的总开关照旧是关的")
+        self.assertIs(group["set_group_kick"], True)
+        self.assertIs(qzone["delete_qzone_post"], True)
+        # 旧组本身原样保留（回退到上一个版本时它才是真源）。
+        self.assertEqual(merged["actions_chat"], self.PREVIOUS_CONFIG["actions_chat"])
+
+    def test_retired_risk_group_is_no_longer_a_merge_source(self):
+        """`actions_risks` 退出归并（v1.7.4 的简化）：它不再影响任何可见子组。
+
+        用户判断这些配置目前没人用；危险开关在 v1.7.3 就已经搬进各自类别组了。
+        兼容位继续留着（回退到旧版本仍读得到它），但读取侧**不认**它。
         """
         from plugin.core.service.config import apply_section_aliases  # noqa: PLC0415
 
         merged = apply_section_aliases(self.RISK_CONFIG)
-        self.assertIs(merged["actions_group"]["set_group_kick"], True)
-        self.assertIs(merged["actions_group"]["set_group_ban"], False)
-        self.assertIs(merged["actions_qzone"]["delete_qzone_post"], True)
-        self.assertIs(merged["actions_chat"]["delete_friend"], True)
-        # 按键分流：不属于这个新组的键不许补进去。
-        for group, foreign in (
-            ("actions_chat", "set_group_kick"), ("actions_qzone", "set_group_kick"),
-            ("actions_group", "delete_friend"), ("actions_chat", "delete_qzone_post"),
-        ):
-            with self.subTest(group=group, key=foreign):
-                self.assertNotIn(foreign, merged[group])
-        # 旧分组本身原样保留（回退到上一个版本时它才是真源）。
-        self.assertEqual(merged["actions_risks"], self.RISK_CONFIG["actions_risks"])
-
-    def test_the_retired_risk_master_switch_never_gates_the_new_groups(self):
-        """`actions_risks.enabled` 默认 `false`：别把那个"没写过"的 false 当成"关掉整组"。
-
-        这是真机形状：宿主按 schema 把四个组都补成默认值，用户从没碰过风险组。
-        归并若拿**目标组**的默认值（`true`）去比，那个 `false` 会被读成"用户关掉了这一组"，
-        于是会话 / 群管理 / 空间三组的总开关全被关掉——所有动作静默失效。
-        """
-        from plugin.core.service.config import (  # noqa: PLC0415
-            apply_section_aliases, schema_group_defaults,
-        )
-
-        host = {group: dict(schema_group_defaults(group))
-                for group in ("actions_chat", "actions_group", "actions_qzone", "actions_risks")}
-        merged = apply_section_aliases(host)
-        for group in ("actions_chat", "actions_group", "actions_qzone"):
-            with self.subTest(group=group):
-                self.assertIs(merged[group]["enabled"], True,
-                              "总开关被旧风险组补出来的默认值关掉了")
+        for path in ("robot_actions.chat", "robot_actions.group", "robot_actions.qzone"):
+            with self.subTest(path=path):
+                self.assertNotIn("set_group_kick", config_at(merged, path, {}))
+        self.assertEqual(merged["actions_risks"], self.RISK_CONFIG["actions_risks"],
+                         "兼容位原样保留")
+        from plugin.core.service.config import LEGACY_SECTION_MERGES  # noqa: PLC0415
+        for sources in LEGACY_SECTION_MERGES.values():
+            self.assertNotIn("actions_risks", sources)
 
     def test_apply_section_aliases_merges_old_groups_into_the_new_one(self):
         from plugin.core.service.config import apply_section_aliases  # noqa: PLC0415
 
         merged = apply_section_aliases(self.LEGACY_CONFIG)
-        chat = merged["actions_chat"]
+        chat = config_at(merged, "robot_actions.chat")
         # 逐个开关：关掉的仍是关掉的（`False` 不能被默认值顶回 `True`）
         for path, expected in (
             ("send_poke", False), ("send_like", True), ("schedule_message", False),
@@ -1476,44 +1570,50 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
             ("default_voice", "zh-CN-YunxiNeural"),
         ):
             with self.subTest(key=path):
-                self.assertIn(path, chat, f"actions_chat 缺 {path}")
+                self.assertIn(path, chat, f"robot_actions.chat 缺 {path}")
                 self.assertEqual(chat[path], expected)
         # 旧分组本身原样保留（"未知键不丢"照旧，写回时也不动它们）
         self.assertEqual(merged["actions_interaction"], self.LEGACY_CONFIG["actions_interaction"])
+        # **别的子组**不许被这些旧组串味（7 个老组只供给 chat）。
+        for name in ("group", "qzone"):
+            with self.subTest(sibling=name):
+                self.assertNotIn("send_poke", config_at(merged, "robot_actions." + name, {}))
 
     def test_written_value_in_the_new_group_wins_over_the_old_one(self):
         from plugin.core.service.config import apply_section_aliases  # noqa: PLC0415
 
         merged = apply_section_aliases({
-            # 新组里是**用户写过**的值（不等于默认值 true）
-            "actions_chat": {"send_poke": False, "send_like": False},
+            # 新路径里是**用户写过**的值（不等于默认值 true）
+            "robot_actions": {"chat": {"send_poke": False, "send_like": False}},
             "actions_interaction": {"send_poke": True, "send_like": True},
         })
-        self.assertIs(merged["actions_chat"]["send_poke"], False, "用户写过的新组值优先")
-        self.assertIs(merged["actions_chat"]["send_like"], False)
+        chat = config_at(merged, "robot_actions.chat")
+        self.assertIs(chat["send_poke"], False, "用户写过的新路径值优先")
+        self.assertIs(chat["send_like"], False)
 
     def test_host_inserted_defaults_do_not_override_the_old_group(self):
         """宿主补的默认值（= schema 默认值）不许顶掉用户升级前的选择。
 
-        这是升级后**第一次加载**的真实形状：`actions_chat` 是宿主按 schema 补出来的
+        这是升级后**第一次加载**的真实形状：`robot_actions.chat` 是宿主按 schema 补出来的
         （开关全 true），用户的 `send_poke=False` 还在旧分组里。
         """
         from plugin.core.service.config import (  # noqa: PLC0415
             apply_section_aliases, schema_group_defaults,
         )
 
-        defaults = schema_group_defaults("actions_chat")
+        defaults = schema_group_defaults("robot_actions.chat")
         host_inserted = {key: defaults[key] for key in ("enabled", "send_poke", "send_like")}
         merged = apply_section_aliases({
-            "actions_chat": dict(host_inserted),
+            "robot_actions": {"chat": dict(host_inserted)},
             "actions_interaction": {"send_poke": False},
         })
-        self.assertIs(merged["actions_chat"]["send_poke"], False,
+        chat = config_at(merged, "robot_actions.chat")
+        self.assertIs(chat["send_poke"], False,
                       "旧分组里的用户选择必须赢过宿主补的默认值")
-        self.assertIs(merged["actions_chat"]["send_like"], True, "两边都是默认值 → 默认值")
+        self.assertIs(chat["send_like"], True, "两边都是默认值 → 默认值")
 
     def test_action_group_master_switch_keeps_any_old_group_turned_off(self):
-        """七个旧组各有一个总开关：只要有一个是"用户关掉的"，新组总开关就是关的。
+        """七个旧组各有一个总开关：只要有一个是"用户关掉的"，新子组总开关就是关的。
 
         归并是保守的——宁可少用几个动作，也不能因为"另一个旧组的总开关是默认值 true"
         就把用户关掉的那一组悄悄打开。
@@ -1525,45 +1625,72 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
             "actions_interaction": {"enabled": True},
             "actions_voice": {"enabled": False},
         })
-        self.assertIs(merged["actions_chat"]["enabled"], False)
+        self.assertIs(config_at(merged, "robot_actions.chat")["enabled"], False)
 
     def test_normalize_config_carries_the_merge_to_the_service_layer(self):
         """服务层拿到的是 `normalize_config` 的产物：归并必须在那之前完成。"""
         from plugin.core.service.config import normalize_config  # noqa: PLC0415
 
         normalized = normalize_config(self.LEGACY_CONFIG)
-        self.assertIs(normalized["actions_chat"]["send_poke"], False)
-        self.assertEqual(normalized["actions_chat"]["default_voice"], "zh-CN-YunxiNeural")
+        chat = config_at(normalized, "robot_actions.chat")
+        self.assertIs(chat["send_poke"], False)
+        self.assertEqual(chat["default_voice"], "zh-CN-YunxiNeural")
 
     def test_schema_defaults_are_read_from_the_schema_file(self):
         """默认值只能来自 `_conf_schema.json`（宿主补默认值读的就是它）。"""
         from plugin.core.service.config import schema_group_defaults  # noqa: PLC0415
 
         schema = load_schema()
-        defaults = schema_group_defaults("actions_chat")
+        defaults = schema_group_defaults("robot_actions.chat")
         self.assertEqual(defaults["send_poke"], True)
         self.assertEqual(defaults["auto_learn"], False)
         self.assertEqual(defaults["default_voice"], "")
         self.assertEqual(defaults, {key: spec.get("default")
-                                    for key, spec in schema["actions_chat"]["items"].items()})
+                                    for key, spec in schema_at(schema, "robot_actions.chat")["items"].items()})
         # 不是归并目标 / 不存在的分组 → 空表（调用方按"没有默认值"处理）
         self.assertEqual(schema_group_defaults("__不存在__"), {})
+        self.assertEqual(schema_group_defaults("robot_actions.nope"), {})
+
+    def test_nested_path_defaults_are_read_for_every_merge_target(self):
+        """**新用例（用户点名）**：每个归并目标都要能按点分路径取到自己的默认值。
+
+        这是 v1.7.4 的关键实现点：`schema_group_defaults()` 原来只认顶层组名，改成
+        认点分路径之后，"宿主补的默认值不算用户写过"这条规则才在嵌套目标上成立。
+        取不到默认值 = 归并退化成"新组一律优先" = 升级后开关被静默打开。
+        """
+        from plugin.core.service.config import (  # noqa: PLC0415
+            LEGACY_SECTION_MERGES, schema_group_defaults,
+        )
+
+        schema = load_schema()
+        self.assertTrue(LEGACY_SECTION_MERGES, "归并表不能为空")
+        for target in LEGACY_SECTION_MERGES:
+            with self.subTest(target=target):
+                self.assertIn(".", target, "v1.7.4 起所有目标都是嵌套路径")
+                expected = {key: spec.get("default")
+                            for key, spec in schema_at(schema, target)["items"].items()}
+                self.assertTrue(expected, f"{target} 的默认值不该是空表")
+                self.assertEqual(schema_group_defaults(target), expected)
+        # 顶层组名照旧能取（旧调用方 / 源分组判定还用得到）。
+        self.assertEqual(set(schema_group_defaults("actions_interaction")),
+                         {"enabled", "send_poke", "send_like", "recall_message"})
 
     # -- 写方向的折叠（迁移本体）-----------------------------------------------
 
-    def test_fold_moves_the_values_into_the_new_group_and_empties_the_old_ones(self):
+    def test_fold_moves_the_values_into_the_nested_group_and_empties_the_old_ones(self):
         from plugin.core.service.config import fold_legacy_section_merges  # noqa: PLC0415
 
         raw = {
-            "actions_chat": {"enabled": True, "send_poke": True, "send_like": True},
+            "robot_actions": {"chat": {"enabled": True, "send_poke": True, "send_like": True}},
             "actions_interaction": {"enabled": True, "send_poke": False, "send_like": True},
             "actions_voice": {"send_voice": False, "default_voice": "zh-CN-YunxiNeural"},
             "runtime": {"auto_create": True},
         }
         folded = fold_legacy_section_merges(dict(raw))
-        self.assertIs(folded["actions_chat"]["send_poke"], False, "旧组的用户选择折进新组")
-        self.assertIs(folded["actions_chat"]["send_voice"], False)
-        self.assertEqual(folded["actions_chat"]["default_voice"], "zh-CN-YunxiNeural")
+        chat = config_at(folded, "robot_actions.chat")
+        self.assertIs(chat["send_poke"], False, "旧组的用户选择折进新路径")
+        self.assertIs(chat["send_voice"], False)
+        self.assertEqual(chat["default_voice"], "zh-CN-YunxiNeural")
         self.assertEqual(folded["actions_interaction"], {}, "折完的旧组必须清空")
         self.assertEqual(folded["actions_voice"], {})
         self.assertEqual(folded["runtime"], {"auto_create": True}, "别的分组不动")
@@ -1576,58 +1703,96 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
         })
         twice = fold_legacy_section_merges(dict(once))
         self.assertEqual(once, twice, "折两次必须与折一次完全一样")
-        # 折完之后：用户在新组里把开关**改回默认值**（关掉→打开）必须真的生效
-        once["actions_chat"]["send_poke"] = True
-        self.assertIs(fold_legacy_section_merges(dict(once))["actions_chat"]["send_poke"], True)
+        # 折完之后：用户在新路径里把开关**改回默认值**（关掉→打开）必须真的生效
+        config_at(once, "robot_actions.chat")["send_poke"] = True
+        self.assertIs(
+            config_at(fold_legacy_section_merges(dict(once)), "robot_actions.chat")["send_poke"],
+            True,
+        )
+
+    def test_fold_is_idempotent_for_a_nested_target(self):
+        """**新用例（用户点名）**：折一次写盘、再折不产生新写入（嵌套目标同款）。
+
+        幂等是启动迁移的硬要求——不幂等的话每次启动都会写一次盘（`migrate_legacy_action_sections`
+        靠"折出来的结果与磁盘一致就返回 0"来决定要不要写）。
+        """
+        from plugin.core.service.config import fold_legacy_section_merges  # noqa: PLC0415
+
+        once = fold_legacy_section_merges({
+            "input_status": {"enabled": False, "min_visible_ms": 1234},
+            "actions_voice": {"send_voice": False},
+        })
+        nested = config_at(once, "runtime.input_status")
+        self.assertIs(nested["enabled"], False)
+        self.assertEqual(nested["min_visible_ms"], 1234)
+        self.assertEqual(once["input_status"], {}, "旧顶层组折完清空")
+        # 再折一次：**一模一样**（调用方据此判断"不用写盘"）。
+        self.assertEqual(fold_legacy_section_merges(dict(once)), once)
+        # 宿主把清空的旧组补成默认值之后，也不该再折出新东西。
+        refilled = dict(once)
+        refilled["input_status"] = dict(schema_group_defaults_for_test("input_status"))
+        self.assertEqual(fold_legacy_section_merges(dict(refilled)), refilled)
 
     def test_fold_leaves_host_filled_default_legacy_groups_alone(self):
         """宿主每次加载都会把旧组补成默认值：那不算"用户写过"，别每次启动都写盘。"""
         from plugin.core.service.config import fold_legacy_section_merges  # noqa: PLC0415
 
         raw = {
-            "actions_chat": {"enabled": True, "send_poke": True, "send_like": True},
+            "robot_actions": {"chat": {"enabled": True, "send_poke": True, "send_like": True}},
             "actions_interaction": {"enabled": True, "send_poke": True, "send_like": True},
             "actions_voice": {"enabled": True, "send_voice": True, "default_voice": ""},
         }
         self.assertEqual(fold_legacy_section_merges(dict(raw)), raw, "没有可折的东西就不动配置")
 
     def test_fold_clears_a_legacy_group_whose_value_the_new_group_already_won(self):
-        """新组已经压着旧组时也要清旧组——否则用户把新组值改回默认值就会被打回旧值。"""
+        """新路径已经压着旧组时也要清旧组——否则用户把新值改回默认值就会被打回旧值。"""
         from plugin.core.service.config import fold_legacy_section_merges  # noqa: PLC0415
 
         folded = fold_legacy_section_merges({
-            "actions_chat": {"send_poke": False},
+            "robot_actions": {"chat": {"send_poke": False}},
             "actions_interaction": {"send_poke": False},
         })
-        self.assertIs(folded["actions_chat"]["send_poke"], False)
+        self.assertIs(config_at(folded, "robot_actions.chat")["send_poke"], False)
         self.assertEqual(folded["actions_interaction"], {})
-        folded["actions_chat"]["send_poke"] = True
-        self.assertIs(fold_legacy_section_merges(dict(folded))["actions_chat"]["send_poke"], True)
 
     def test_fold_does_not_mutate_the_callers_nested_dicts(self):
+        """折叠沿途**浅拷贝父字典**：调用方（`raw_config()` 的返回值）手里的嵌套 dict 不许被改。
+
+        这是 v1.7.4 新增的坑面：写 `runtime.input_status` 这种两层路径时若不拷贝
+        `runtime`，折叠会原地改掉调用方那份配置（迁移与写盘就会互相打架）。
+        """
         from plugin.core.service.config import fold_legacy_section_merges  # noqa: PLC0415
 
-        raw = {"actions_interaction": {"send_poke": False}}
+        raw = {
+            "actions_interaction": {"send_poke": False},
+            "runtime": {"auto_create": True},
+            "input_status": {"min_visible_ms": 100},
+        }
+        snapshot = json.loads(json.dumps(raw))
         fold_legacy_section_merges(dict(raw))
-        self.assertEqual(raw, {"actions_interaction": {"send_poke": False}})
+        self.assertEqual(raw, snapshot, "调用方的嵌套 dict 被原地改掉了")
 
     def test_to_schema_shape_folds_the_legacy_action_groups(self):
-        """写盘路径自带迁移：控制台改任何一项、配置导入，都会把旧组折进新组。"""
+        """写盘路径自带迁移：控制台改任何一项、配置导入，都会把旧组折进新路径。"""
         from plugin.core.service.config import to_schema_shape  # noqa: PLC0415
 
         written = to_schema_shape({
             "actions_interaction": {"send_poke": False},
+            "input_status": {"min_visible_ms": 100},
             "runtime": {"auto_create": True},
         })
-        self.assertIs(written["actions_chat"]["send_poke"], False)
+        self.assertIs(config_at(written, "robot_actions.chat")["send_poke"], False)
         self.assertEqual(written["actions_interaction"], {})
+        self.assertEqual(config_at(written, "runtime.input_status")["min_visible_ms"], 100)
+        self.assertEqual(written["input_status"], {})
+        self.assertIs(written["runtime"]["auto_create"], True)
 
     def test_merge_does_not_touch_the_source_dicts(self):
         """归并返回新 dict：调用方可能还拿着原始配置（`routing_config` 就这么用）。"""
         from plugin.core.service.config import merge_legacy_section_values  # noqa: PLC0415
 
         raw = {"actions_interaction": {"send_poke": False}}
-        merged = merge_legacy_section_values(raw, "actions_chat", None)
+        merged = merge_legacy_section_values(raw, "robot_actions.chat", None)
         merged["send_poke"] = True
         merged["extra"] = 1
         self.assertEqual(raw["actions_interaction"], {"send_poke": False})
@@ -1637,52 +1802,81 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
         from plugin.core.service.config import merge_legacy_section_values  # noqa: PLC0415
 
         raw = {"actions_interaction": {"send_poke": False}}
-        self.assertEqual(merge_legacy_section_values(raw, "actions_interaction", raw.get("actions_interaction")),
-                         {"send_poke": False})
+        self.assertEqual(
+            merge_legacy_section_values(raw, "actions_interaction",
+                                        raw.get("actions_interaction")),
+            {"send_poke": False},
+        )
 
     def test_unknown_group_and_non_dict_input_are_safe(self):
         from plugin.core.service.config import merge_legacy_section_values  # noqa: PLC0415
 
-        self.assertEqual(merge_legacy_section_values(None, "actions_chat", None), {})
+        self.assertEqual(merge_legacy_section_values(None, "robot_actions.chat", None), {})
         self.assertEqual(merge_legacy_section_values({"runtime": {}}, "runtime", None), {})
-        # 按键分流：目标分组 schema 里没有的旧键不补（共享源里的别的类别的键）。
+        self.assertEqual(merge_legacy_section_values({"runtime": {}}, "runtime.input_status", None), {})
+        # 不是归并目标的路径原样返回（浅拷贝一份）。
         self.assertEqual(merge_legacy_section_values(
-            {"actions_history": {"x": 1}}, "actions_chat", {"y": 2}),
+            {"actions_history": {"x": 1}}, "actions_history", {"y": 2}),
             {"y": 2})
 
-    # -- 共用源（`actions_risks`）的折叠：不清空 --------------------------------
+    # -- 嵌套读取（`read_section_path` / `write_section_path`）-------------------
 
-    def test_fold_keeps_the_shared_legacy_group_for_a_downgrade(self):
-        """折叠**不清空**共用源：回退到上一个版本时那 17 个危险开关还读得到。
+    def test_read_and_write_section_path(self):
+        """点分路径读写：读不到回 `None`，写沿途浅拷贝父字典。"""
+        from plugin.core.service.config import read_section_path, write_section_path  # noqa: PLC0415
 
-        `actions_risks` 的键分属三个新组，清掉等于把另外两个组的数据一起删了；而且
-        用户回退到 v1.7.2 时那个版本只认这个组（用户明确要求来回升级不丢开关）。
-        """
-        from plugin.core.service.config import fold_legacy_section_merges  # noqa: PLC0415
+        raw = {"robot_actions": {"chat": {"send_poke": False}}, "runtime": {"auto_create": True}}
+        self.assertEqual(read_section_path(raw, "robot_actions.chat")["send_poke"], False)
+        self.assertEqual(read_section_path(raw, "runtime"), {"auto_create": True})
+        self.assertIsNone(read_section_path(raw, "robot_actions.group"))
+        self.assertIsNone(read_section_path(raw, "nope.nope"))
+        self.assertIsNone(read_section_path(None, "runtime"))
 
-        folded = fold_legacy_section_merges(dict(self.RISK_CONFIG))
-        self.assertIs(folded["actions_group"]["set_group_kick"], True, "值折进了群管理组")
-        self.assertIs(folded["actions_qzone"]["delete_qzone_post"], True)
-        self.assertIs(folded["actions_chat"]["delete_friend"], True)
-        self.assertEqual(folded["actions_risks"], self.RISK_CONFIG["actions_risks"],
-                         "共用源不许被清空（否则回退到旧版本会丢开关）")
-        # 幂等：折完再折一次内容不变（否则每次启动都写盘）。
-        self.assertEqual(fold_legacy_section_merges(dict(folded)), folded)
-        # 独占源照旧清空（那一条"改了没反应"的老病还得靠它兜住）。
-        self.assertEqual(
-            fold_legacy_section_merges({"actions_interaction": {"send_poke": False}})["actions_interaction"],
-            {},
-        )
+        target = dict(raw)
+        write_section_path(target, "runtime.input_status", {"enabled": False})
+        self.assertEqual(target["runtime"],
+                         {"auto_create": True, "input_status": {"enabled": False}})
+        self.assertEqual(raw["runtime"], {"auto_create": True}, "父字典不许被原地改")
 
-    def test_fold_leaves_the_risky_switches_alone_when_nothing_was_written(self):
-        """宿主补出来的默认值不算"用户写过"：没东西可折时一个字节都不动。"""
+    def test_input_status_legacy_top_level_is_still_readable(self):
+        """**新用例（用户点名）**：`input_status` 留在**顶层**的旧配置仍读得到，
+        写盘落到 `runtime.input_status`。"""
         from plugin.core.service.config import (  # noqa: PLC0415
-            fold_legacy_section_merges, schema_group_defaults,
+            apply_section_aliases, fold_legacy_section_merges, read_section_path,
         )
 
-        raw = {group: dict(schema_group_defaults(group))
-               for group in ("actions_chat", "actions_group", "actions_qzone", "actions_risks")}
-        self.assertEqual(fold_legacy_section_merges(dict(raw)), raw)
+        legacy = {"input_status": {"enabled": False, "min_visible_ms": 1234, "beat_chance": 0.5}}
+        merged = apply_section_aliases(legacy)
+        nested = read_section_path(merged, "runtime.input_status")
+        self.assertIs(nested["enabled"], False, "关掉的输入状态不许被默认值打开")
+        self.assertEqual(nested["min_visible_ms"], 1234)
+        self.assertEqual(nested["beat_chance"], 0.5)
+        # 顶层旧组原样保留（回退到旧版本仍读得到）。
+        self.assertEqual(merged["input_status"], legacy["input_status"])
+
+        written = fold_legacy_section_merges(dict(legacy))
+        self.assertEqual(read_section_path(written, "runtime.input_status")["min_visible_ms"], 1234)
+        self.assertEqual(written["input_status"], {}, "折完清空顶层兼容位")
+
+    def test_input_status_host_defaults_do_not_override_the_legacy_choice(self):
+        """同上：宿主给 `runtime.input_status` 补的默认值不许顶掉旧顶层组里的选择。"""
+        from plugin.core.service.config import (  # noqa: PLC0415
+            apply_section_aliases, read_section_path, schema_group_defaults,
+        )
+
+        host = {
+            "runtime": {"input_status": dict(schema_group_defaults("runtime.input_status"))},
+            "input_status": {"enabled": False},
+        }
+        merged = apply_section_aliases(host)
+        self.assertIs(read_section_path(merged, "runtime.input_status")["enabled"], False)
+
+
+def schema_group_defaults_for_test(group: str) -> dict:
+    """测试内的小转发：避免在每个用例里重复 import。"""
+    from plugin.core.service.config import schema_group_defaults  # noqa: PLC0415
+
+    return schema_group_defaults(group)
 
 
 class ReleaseConsistencyTest(unittest.TestCase):

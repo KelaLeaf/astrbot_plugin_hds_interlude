@@ -165,6 +165,7 @@ _install_astrbot_stub()
 
 from plugin.core import logging as interlude_logging  # noqa: E402
 from plugin.core import platform_actions as pa  # noqa: E402
+from plugin.core.service.config import write_section_path  # noqa: E402
 from plugin.core.service.transport import NullTransport  # noqa: E402
 from plugin.adapters import astrbot_bridge as bridge_module  # noqa: E402
 from plugin.adapters.astrbot_bridge import (  # noqa: E402
@@ -383,11 +384,12 @@ class PlatformTransportTestCase(unittest.TestCase):
     def set_action_config(self, category: str, **options) -> None:
         """给某个动作类别所在的配置组配上一份设置。
 
-        分组名跟动作目录走（v1.7.2 把十个 `actions_*` 收敛成四个），桥构造时读的是
-        归一化后的那份配置，这里直接改它读的那一份。
+        落点跟动作目录走（v1.7.4 起是**点分路径** `robot_actions.chat` 这种），桥构造时读的是
+        归一化后的那份配置，这里按路径写进它读的那一份——不能写成 `"robot_actions.chat"`
+        这种平铺假键（宿主下次加载会当未知键删掉，AGENTS 坑 22）。
         """
-        group = pa.ACTION_CONFIG_GROUPS.get(category, 'actions_%s' % category)
-        self.bridge.config[group] = dict(options)
+        group = pa.ACTION_CONFIG_GROUPS.get(category, 'robot_actions.%s' % category)
+        write_section_path(self.bridge.config, group, dict(options))
 
     def set_voice_config(self, **options) -> None:
         self.set_action_config('voice', **options)

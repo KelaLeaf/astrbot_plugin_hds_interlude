@@ -526,6 +526,7 @@ export interface PlatformActionRow {
   enabled: boolean
   /** 配置开关的原始值；`null` = 该分组/键不存在（未配置 = 不限制）。 */
   config_enabled: boolean | null
+  /** 开关落在哪个配置子组（**点分路径**，如 `robot_actions.chat`）。 */
   group: string
   /** 后端标签（人话，**顺序 = 通道优先级**）；缺省 = 后端是标准 OneBot。 */
   backends?: string[]
@@ -548,7 +549,7 @@ export interface PermissionTierBrief {
 export interface ActionsCatalogPayload {
   actions: PlatformActionRow[]
   tiers: PermissionTierBrief[]
-  /** 配置分组 id → 组标题（说明每个开关在哪一组）。 */
+  /** 配置子组路径（`robot_actions.chat` 这种）→ 子组中文名（会话动作 / 群管理动作 / QQ 空间动作）。 */
   groups: Record<string, string>
   /** 危险动作的警示语（core 里的原文，逐字）。 */
   risk_warning: string
