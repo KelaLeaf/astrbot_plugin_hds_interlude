@@ -625,6 +625,55 @@ async def _fetch_remote_bytes(service: Any, url: str, kind: str) -> Optional[byt
     return None
 
 
+async def _load_group_batch_audio(
+    service: Any, story: Any, batch: list[Any], session: Any = None,
+) -> list[Any]:
+    """群聊的**音频批次预算**（上游 `src/service.ts:2197-2215`，v1.7.6 补上的消费点）。
+
+    上游在这里才真正用满 `audioConfig`：条数上限 = `maxPerMessage × 4`、字节上限 =
+    `maxFileSizeMB × 1_000_000 × 4`（一个群里连发好几条语音时，不能让一次回合把整个
+    上下文塞满）；超出的部分**延后 / 跳过当前回合**，并各留一条 warn。
+
+    与上游的差异只有两处、都是本移植版既有的形状：逐条消息的 `audioSession` 我们只留
+    一份最新的会话（`latest_session`），附件 id 用 `group-audio-N`（上游还带说话人昵称）。
+    """
+    config = _audio_config(service)
+    max_count = max(1, _int_value(
+        _value(config, 'maxPerMessage', DEFAULT_AUDIO_MAX_PER_MESSAGE),
+        DEFAULT_AUDIO_MAX_PER_MESSAGE,
+    ) * 4)
+    max_bytes = max(1, int(_number_value(
+        _value(config, 'maxFileSizeMB', DEFAULT_AUDIO_MAX_FILE_SIZE_MB),
+        float(DEFAULT_AUDIO_MAX_FILE_SIZE_MB),
+    ) * 1_000_000 * 4))
+    audio: list[Any] = []
+    total_bytes = 0
+    for message in batch:
+        sources = _turn_get(message, 'audioSources', 'audio_sources') or []
+        if not sources:
+            continue
+        remaining = max_count - len(audio)
+        if remaining <= 0 or total_bytes >= max_bytes:
+            service.report(
+                'warn', story, 'user-message',
+                '群音频批次达到资源上限，剩余音频延后处理 附件上限=%d 字节上限=%d',
+                max_count, max_bytes,
+            )
+            continue
+        loaded = await service.load_native_audio(story, list(sources), session, remaining)
+        for item in loaded:
+            payload_size = len(_text(_value(item, 'base64', '')))
+            if total_bytes + payload_size > max_bytes:
+                service.report(
+                    'warn', story, 'user-message',
+                    '群音频批次达到字节上限，剩余音频跳过当前回合 字节上限=%d', max_bytes,
+                )
+                break
+            audio.append({**item, 'id': 'group-audio-%d' % (len(audio) + 1)})
+            total_bytes += payload_size
+    return audio
+
+
 def _pil_downscale(data: bytes, max_dimension: int) -> Optional[bytes]:
     """上游 `downscaleImageForVision` 的 PIL 等价物：EXIF 定向 + 等比缩放 + JPEG q85。
 
@@ -872,11 +921,17 @@ class ServiceChunk3(ServiceBase):
     # 原生音视频（上游 2651–2717）
     # ------------------------------------------------------------------ #
 
-    async def load_native_audio(self, story: Any, sources: list[str], session: Any = None) -> list[Any]:
-        """上游 `loadNativeAudio(story, sources, session?)`（`src/service.ts:2651`）逐条移植。
+    async def load_native_audio(
+        self, story: Any, sources: list[str], session: Any = None, max_count: Optional[int] = None,
+    ) -> list[Any]:
+        """上游 `loadNativeAudio(story, sources, session?, maxCount = maxPerMessage)`
+        （`src/service.ts:3058`）逐条移植。
 
         QQ 语音是 SILK，多模态模型读不了，所以 `onebot-file:` 一律要求服务端
         转码（`out_format`）后回传 base64；本方法只返回瞬时附件，**不落库**。
+
+        `max_count`（v1.7.6 补上，上游第 4 个参数）：群聊批次按预算算出的"还能收几条"，
+        上游取 `min(maxPerMessage, maxCount)`；缺省（私聊路径）就是 `maxPerMessage`。
         """
         config = _audio_config(self)
         if not _value(config, 'enabled', False) or not sources:
@@ -884,6 +939,8 @@ class ServiceChunk3(ServiceBase):
         audio: list[Any] = []
         max_per_message = _int_value(_value(config, 'maxPerMessage', DEFAULT_AUDIO_MAX_PER_MESSAGE),
                                     DEFAULT_AUDIO_MAX_PER_MESSAGE)
+        if max_count is not None:
+            max_per_message = min(max_per_message, max(0, _int_value(max_count, 0)))
         for index, source in enumerate(sources[:max(0, max_per_message)]):
             try:
                 item = await self.fetch_native_audio(source, session)
@@ -1430,6 +1487,8 @@ class ServiceChunk3(ServiceBase):
             )
             images = loaded_images if vision_mode == 'native' else []
             # 语音走原生音频通道：SnowLuma 服务端逐条转码，主模型以 input_audio 收到。
+            # **私聊**这一路与上游 3413-3414 一致：批次内去重后按 `maxPerMessage` 取，
+            # 不设群聊那套批次预算（那条在 `chunk1.flush_group_turn` 里）。
             audio_sources = _unique([
                 source for message in batch
                 for source in (_turn_get(message, 'audioSources', 'audio_sources') or [])

@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | 空间动作优先走 NapCat WS（`get_cookies` + QZone CGI），拿不到 cookie 才回退 SnowLuma | 静默走回退：装了 SnowLuma 的用户以为在走 NapCat，没装的人发现动作"没反应" | `NapcatChannelTests` |
 | CGI **真打出去了**但失败 → **不许**再走回退（否则一次动作写两次） | 重复评论 / 重复点赞 | `test_a_failed_cgi_call_never_falls_back_to_snowluma` |
+| CGI **拿不到响应**（回 `None` / 抛异常）→ `unknown`（"可能已发生"，不自动重试）；`code != 0` → `failed` | 发帖的网络错误记成 `failed` → 调用方重试 → **重复发帖** | `CgiOutcomeClassificationTests` / `WritePathAmbiguityTests` |
 | 只读的 `qzone_read` 不落审计行、不占配额 | 她"看一眼好友动态"就把当天的评论额度花光 | `QzoneReadTests` |
 | `napcat_actions()` = 那 9 条；`backend_labels` 顺序 = `backends` 顺序 | 面板把 NapCat 专属标丢 / 标签顺序与运行期优先级不一致 | `BackendCatalogTests` |
 | `forward` 走**评论**配额（不是点赞） | 转发把点赞额度吃掉 | `ForwardGateTests` |
@@ -555,20 +556,203 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(host.transport.calls, [], '不该往平台打任何动作（根本没有这条动作）')
         self.assertEqual(host.rows[-1]['status'], 'failed')
 
-    async def test_a_transport_error_is_recorded_as_failed(self):
-        """传输层异常 → `failed`（与其它 CGI 动作一致），这条动作**重试是安全的**。
+    async def test_a_transport_error_is_recorded_as_unknown_not_failed(self):
+        """传输层异常 → `unknown`（v1.7.6 改口径）。
 
-        为什么不判 `unknown`：`unknown` 的语义是"可能已生效，禁止自动重试"，那是给
-        **非幂等**动作（发帖 / 评论）准备的。改可见范围是幂等的——再改一次结果一样，
-        所以让它留在 `failed` 更诚实：模型可以重试，代价只是再来一次请求。
-        （`call_qzone_cgi` 不给传输层异常打 `ambiguous`，与 `call_qzone_action` 不同；
-        这是既有行为，本用例把它钉住，改口径要连带改发帖/评论那几条。）
+        原先判 `failed`（理由：改可见范围是幂等的，重试安全）。现在与**其它四条写
+        路径**统一：`call_qzone_cgi` 拿不到响应就标 `ambiguous`，审计行写 `unknown`
+        ——"可能已经生效"的东西一律不自动重试。幂等动作少一次重试是可接受的代价，
+        而"某一条路径单独用另一套口径"正是重复发帖那类事故的温床。
         """
         host, _calls = self._host(result=RuntimeError('socket closed'))
         result = await host.qzone_execute(STORY, 'visibility', self._payload())
         self.assertFalse(result['ok'], result)
-        self.assertEqual(host.rows[-1]['status'], 'failed')
+        self.assertEqual(host.rows[-1]['status'], 'unknown')
         self.assertIn('socket closed', result['error'])
+        self.assertIn('结果未知', result['error'])
+        self.assertIn('不会自动重试', result['error'])
+
+
+# --------------------------------------------------------------------------- #
+# 2c. CGI 通道的失败分类（v1.7.6）：拿不到响应 = unknown，接口拒绝 = failed
+# --------------------------------------------------------------------------- #
+
+
+async def _auth_only(action: str, params: dict) -> dict:
+    """只够 `qzone_cgi_auth` 用的 OneBot 直通（`get_cookies` + `get_login_info`）。"""
+    if action == 'get_cookies':
+        return {'ok': True, 'error': '', 'data': {'cookies': COOKIES}}
+    return {'ok': True, 'error': '', 'data': {'user_id': 10001}}
+
+
+class CgiOutcomeClassificationTests(unittest.IsolatedAsyncioTestCase):
+    """`call_qzone_cgi` 的三分类（与 `call_qzone_action` **同一套口径**）。
+
+    这几条是**重复发帖**的最后一道闸门：传输层拿不到响应时若记成 `failed`，调用方
+    会认为"没发出去、可以重试"，于是同一个 tid 出现两条说说。
+    """
+
+    async def _call(self, request: object) -> dict:
+        return await q.call_qzone_cgi(
+            request, _auth_only, 'comment', {'tid': TID, 'content': '好看'},
+        )
+
+    async def test_a_raising_transport_is_ambiguous(self):
+        """① 传输层抛异常（超时 / 断连）→ `ambiguous`，且**不是** `QzoneCgiUnavailable`。
+
+        这一点必须钉住：`_qzone_run_action` 只对 `QzoneCgiUnavailable` 回落 SnowLuma，
+        写动作的传输异常要是落进那个类，就会被当成"通道不可用"再发一次。
+        """
+        async def request(method: str, url: str, headers: object = None, data: object = None) -> object:
+            raise RuntimeError('socket closed')
+
+        with self.assertRaises(q.QzoneActionError) as caught:
+            await self._call(request)
+        self.assertIs(caught.exception.ambiguous, True)
+        self.assertNotIsInstance(caught.exception, q.QzoneCgiUnavailable)
+        self.assertIn('结果未知，请勿自动重试', str(caught.exception))
+        self.assertIn('socket closed', str(caught.exception))
+
+    async def test_a_none_response_is_ambiguous_too(self):
+        """① 传输层按约定回 `None`（失败只记 debug）→ 同样 `ambiguous`。"""
+
+        async def request(method: str, url: str, headers: object = None, data: object = None) -> object:
+            return None
+
+        with self.assertRaises(q.QzoneActionError) as caught:
+            await self._call(request)
+        self.assertIs(caught.exception.ambiguous, True)
+        self.assertIn('结果未知，请勿自动重试', str(caught.exception))
+
+    async def test_an_explicit_cgi_rejection_is_failed(self):
+        """② 拿到响应且 `code != 0`（没登录 / 风控 / 参数不对）→ `failed`，重试安全。"""
+        async def request(method: str, url: str, headers: object = None, data: object = None) -> object:
+            return '{"code":-3000,"message":"操作太频繁"}'
+
+        with self.assertRaises(q.QzoneActionError) as caught:
+            await self._call(request)
+        self.assertIs(caught.exception.ambiguous, False)
+        self.assertEqual(caught.exception.retcode, -3000)
+        self.assertIn('操作太频繁', str(caught.exception))
+        self.assertNotIn('结果未知', str(caught.exception))
+
+    async def test_a_successful_call_returns_the_parsed_result(self):
+        """③ 成功：回 `success_or_error` 解析出来的那份结果。"""
+        async def request(method: str, url: str, headers: object = None, data: object = None) -> object:
+            return '{"code":0,"tid":"%s"}' % TID
+
+        result = await self._call(request)
+        self.assertIs(result['success'], True)
+        self.assertEqual(result['tid'], TID)
+
+
+class WritePathAmbiguityTests(unittest.IsolatedAsyncioTestCase):
+    """④ **五条写路径**在传输失败时都必须记 `unknown`（不能有一条漏标）。
+
+    发帖 / 评论 / 点赞 / 转发四条走各自的通道（发帖是平台原生 `send_qzone_msg`，
+    其余优先 NapCat WS 的 QZone CGI），改可见范围是本移植版补的第五条。
+    参数化跑一遍，避免"某一条路径单独另一套口径"。
+    """
+
+    #: 每条路径一条最低限度能过门的 payload。
+    CASES = {
+        'post': {'content': '今天天气不错'},
+        'comment': {'tid': TID, 'content': '好看', 'targetUin': FRIEND_UIN},
+        'like': {'tid': TID, 'targetUin': FRIEND_UIN},
+        'forward': {'tid': TID},
+        'visibility': {'tid': TID, 'visible': '所有人可见'},
+    }
+
+    def _host_for(self, kind: str) -> _Host:
+        """造一个"写请求一定拿不到响应"的宿主；读请求（找回正文）照常成功。"""
+        host = _Host(config=dict(
+            BASE_CONFIG, daily_post_cap=5, daily_comment_cap=5, daily_like_cap=5,
+            min_interval_minutes=0,
+        ))
+        if kind == 'post':
+            # 发帖走平台原生动作（NapCat 原生只有发/删说说）：让 OneBot 直通抛异常。
+            def handler(action: str, params: dict) -> dict:
+                raise RuntimeError('socket closed')
+
+            host.transport = _NapcatTransport(handler, has_http=False)
+            return host
+
+        def http(method: str, url: str, headers: object, data: object) -> object:
+            if 'emotion_cgi_msglist_v6' in url:  # 改可见范围要先读回正文
+                return MOODS_TEXT
+            raise RuntimeError('socket closed')
+
+        host.transport = _NapcatTransport(_napcat_handler([]), http=http)
+        return host
+
+    async def test_every_write_path_records_a_missing_response_as_unknown(self):
+        for kind, payload in self.CASES.items():
+            with self.subTest(kind=kind):
+                host = self._host_for(kind)
+                result = await host.qzone_execute(STORY, kind, payload)
+
+                self.assertFalse(result['ok'], result)
+                self.assertIn('结果未知', result['error'], '调用方要能看出"可能已发生"')
+                self.assertIn('不会自动重试', result['error'])
+                row = host.rows[-1]
+                self.assertEqual(row['status'], 'unknown', '记 failed 就会招来重试 = 重复动作')
+                self.assertIn('可能已生效', row['error'], '审计行自己也要写明')
+                self.assertTrue(
+                    any('无法确认是否生效' in text for text in host.notes('warn')),
+                    host.standalone,
+                )
+
+    async def test_an_unknown_outcome_blocks_the_immediate_retry(self):
+        """`unknown` 的实际后果：马上重试会被限流门挡下（保守按"已发生"计入）。
+
+        "不重试"不是一句口号——它落在 `evaluate_qzone_gate` 上：`unknown` 计间隔、
+        计配额，所以调用方即使想重发也会先撞门。被拦下的那次**不落审计行**。
+        """
+        host = _Host(config=dict(
+            BASE_CONFIG, daily_comment_cap=5, min_interval_minutes=90,
+        ))
+        host.transport = _NapcatTransport(
+            _napcat_handler([]), http=lambda *a: RuntimeError('socket closed'),
+        )
+        first = await host.qzone_execute(STORY, 'comment', {
+            'tid': TID, 'content': '好看', 'targetUin': FRIEND_UIN,
+        })
+        self.assertFalse(first['ok'], first)
+        self.assertEqual(host.rows[-1]['status'], 'unknown')
+
+        second = await host.qzone_execute(STORY, 'comment', {
+            'tid': TID, 'content': '好看', 'targetUin': FRIEND_UIN,
+        })
+        self.assertFalse(second['ok'], second)
+        self.assertIn('最小间隔', second['error'])
+        self.assertEqual(len([row for row in host.rows if row.get('kind') == 'comment']), 1,
+                         '被门拦下的重试不该再落一条审计行')
+
+    async def test_every_write_path_records_an_explicit_rejection_as_failed(self):
+        """反面：接口**明确拒绝**（`code != 0`）时五条路径都记 `failed`（重试安全）。"""
+        for kind, payload in self.CASES.items():
+            with self.subTest(kind=kind):
+                host = _Host(config=dict(
+                    BASE_CONFIG, daily_post_cap=5, daily_comment_cap=5, daily_like_cap=5,
+                    min_interval_minutes=0,
+                ))
+                if kind == 'post':
+                    def handler(action: str, params: dict) -> dict:
+                        return {'ok': False, 'error': '操作过于频繁', 'retcode': 1200}
+
+                    host.transport = _NapcatTransport(handler, has_http=False)
+                else:
+                    def http(method: str, url: str, headers: object, data: object) -> object:
+                        if 'emotion_cgi_msglist_v6' in url:
+                            return MOODS_TEXT
+                        return '{"code":-3000,"message":"操作太频繁"}'
+
+                    host.transport = _NapcatTransport(_napcat_handler([]), http=http)
+                result = await host.qzone_execute(STORY, kind, payload)
+
+                self.assertFalse(result['ok'], result)
+                self.assertNotIn('可能已生效', result['error'])
+                self.assertEqual(host.rows[-1]['status'], 'failed')
 
 
 # --------------------------------------------------------------------------- #
@@ -745,12 +929,14 @@ class BackendCatalogTests(unittest.TestCase):
         # 值就是它唯一可达的那条 CGI（`_qzone_run_action` 不传 cgi_action 时的默认查表）。
         self.assertEqual(q.QZONE_CGI_BY_ID['set_qzone_visibility'], 'update_visibility')
         self.assertEqual(q.QZONE_CGI_ACTIONS['set_qzone_visibility'], 'update_visibility')
-        self.assertEqual(
-            q.QZONE_NAPCAT_ONLY_ACTIONS,
-            frozenset({'forward_qzone_post', 'list_qzone_feeds'}),
+        # v1.7.6：`qzone.QZONE_NAPCAT_ONLY_ACTIONS` 已删（只有测试引用过它）。NapCat
+        # 专属动作的**唯一真源**是目录：`napcat_actions()` 由每条 `PlatformAction.backends`
+        # 派生，面板徽章 / 筛选与运行期优先级都读它。
+        self.assertFalse(
+            hasattr(q, 'QZONE_NAPCAT_ONLY_ACTIONS'),
+            'NapCat 专属清单只能有目录这一个真源',
         )
-        for action_id in q.QZONE_NAPCAT_ONLY_ACTIONS:
-            self.assertIn(action_id, pa.ACTIONS)
+        self.assertEqual({action.id for action in pa.napcat_actions()}, set(NAPCAT_ONLY_IDS))
 
     def test_the_console_payload_carries_the_labels_the_panel_needs(self):
         """面板读的是 payload：徽章文案 / NapCat 布尔 / 专属清单都必须在里面。"""

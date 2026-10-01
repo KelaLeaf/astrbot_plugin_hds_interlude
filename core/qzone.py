@@ -619,11 +619,10 @@ QZONE_CGI_BY_ID = {
     'set_qzone_visibility': 'update_visibility',
 }
 
-#: 这几个动作**只有** NapCat 的 `get_cookies` 通道能做——SnowLuma 那套扩展动作
-#: 在我们这里只当回退，纯 NapCat 环境下也能工作。
-QZONE_NAPCAT_ONLY_ACTIONS = frozenset({
-    'forward_qzone_post', 'list_qzone_feeds',
-})
+#: v1.7.6 删掉了 `QZONE_NAPCAT_ONLY_ACTIONS`：它只被测试引用，运行期没有任何消费点，
+#: 而"哪些动作是 NapCat 专属"的**唯一真源**是目录里的
+#: `platform_actions.napcat_actions()`（由每条 `PlatformAction.backends` 派生）。
+#: 留着它就是第二个真源——两处迟早对不上，界面上标的和跑起来的就会不一致。
 
 
 class QzoneCgiUnavailable(QzoneActionError):
@@ -728,6 +727,14 @@ async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = Non
     `request` 是 `Transport.request_text` 的绑定方法（原始 HTTP）。返回形状与
     `call_qzone_action` 对齐（成功回动作结果，失败抛 `QzoneActionError`），
     这样上层的限流/审计/剧本留痕那一套**不用改**。
+
+    **失败分类与 `call_qzone_action` 同一套口径**（别在这里另造词汇）：
+
+    * 传输层拿不到响应（`request_text` 回 `None`，或它抛了异常 / 超时）→
+      `ambiguous=True`：请求**可能已经打到腾讯**了，结果未知，禁止自动重试；
+    * 拿到响应而 `success_or_error` 判 `code != 0` → `ambiguous=False`：
+      接口明确拒绝（没登录 / 风控 / 参数不对），重试是安全的；
+    * 成功 → 回动作结果。
     """
     from . import qzone_cgi as cgi
 
@@ -735,9 +742,23 @@ async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = Non
         raise QzoneCgiUnavailable('QQ 空间（NapCat 通道）不可用：传输层没有原始 HTTP 能力', action, None, False)
     auth = await qzone_cgi_auth(call, login_call)
     method, url, headers, data = qzone_cgi_request(action, auth, params or {})
-    text = await request(method, url, headers=headers, data=data)
+    try:
+        # `Transport.request_text` 的约定是"失败返回 None、绝不抛"，但传输层实现
+        # 未必守得住（超时 / 断连在 HTTP 客户端里本来就是异常），而**写动作**一旦
+        # 漏判就会变成"记 failed → 调用方重试 → 重复发帖"。
+        text = await request(method, url, headers=headers, data=data)
+    except QzoneActionError:
+        raise
+    except Exception as error:  # noqa: BLE001 - 与 `call_qzone_action` 同一个收敛口径
+        raise QzoneActionError(
+            '%s 调用异常（结果未知，请勿自动重试）：%s' % (action, error), action, None, True,
+        ) from error
     if text is None:
-        raise QzoneActionError('%s 失败：请求没有回执（网络或平台拦截）' % action, action, None, True)
+        # 与上面那条同一条文案口径：'结果未知，请勿自动重试' 是调用方认的那句话。
+        raise QzoneActionError(
+            '%s 调用异常（结果未知，请勿自动重试）：请求没有回执（网络或平台拦截）' % action,
+            action, None, True,
+        )
     if action == 'feed':
         items = cgi.feed_items_from_text(text)
         return {'feeds': items, 'count': len(items)}

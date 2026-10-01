@@ -3169,7 +3169,63 @@ class ModelCapabilitySelfCheckTests(unittest.TestCase):
         self.assertEqual(plugin.bridge.audio_capability_note(), '')
 
     def test_audio_note_is_suppressed_when_a_transcriber_is_named(self):
-        bridge = self._bridge_with('main-provider', ['text'], {'audio': {'provider_id': 'stt'}})
+        bridge = self._bridge_with('main-provider', ['text'], {
+            'audio': {'enabled': True, 'provider_id': 'stt'},
+        })
+        self.assertEqual(bridge.audio_capability_note(), '')
+
+    def test_master_switch_reads_the_nested_section_and_is_off_by_default(self):
+        """`model_center.audio.enabled`：缺键 = 关（与 core `load_native_audio` 同一把闸）。"""
+        bridge = self._bridge_with('main-provider', ['text', 'audio'], {'audio': {}})
+        self.assertFalse(bridge.audio_understanding_enabled())
+        bridge = self._bridge_with('main-provider', ['text', 'audio'],
+                                   {'audio': {'enabled': True}})
+        self.assertTrue(bridge.audio_understanding_enabled())
+        # 顶层 `audio` 是旧版本留下的错误段位，不算数（坑 34）。
+        bridge = _make_bridge({'audio': {'enabled': True}})
+        self.assertFalse(bridge.audio_understanding_enabled())
+
+    def test_master_off_with_a_named_transcriber_says_the_truth(self):
+        """（关音频 / 开转写）：配了转写模型但总开关关着 —— **不能**报"没问题"。
+
+        这是 v1.7.5 留下的那句假话：总开关关着时 core 一条音频都不加载，配好的转写
+        模型一次都不会被调用，而旧口径返回空串（= 一切正常）。
+        """
+        bridge = self._bridge_with('main-provider', ['text'], {
+            'audio': {'enabled': False, 'stt_enabled': True, 'provider_id': 'whisper-local'},
+        })
+        note = bridge.audio_capability_note()
+        self.assertIn('启用语音原生理解', note)
+        self.assertIn('whisper-local', note)
+        self.assertIn('不会被调用', note)
+        self.assertNotIn('已指定', note)
+
+    def test_master_off_stays_quiet_when_nobody_configured_voice(self):
+        """默认配置（总开关关、没配转写）不刷警告：语音理解本来就是 opt-in。"""
+        bridge = self._bridge_with('main-provider', ['text'], {'audio': {'enabled': False}})
+        self.assertEqual(bridge.audio_capability_note(), '')
+
+    def test_the_master_switch_is_reported_even_when_the_main_model_has_no_audio(self):
+        """总开关关着 + 主模型也没有音频能力：说清"先开总开关"，别只说换模型/配转写。"""
+        bridge = self._bridge_with('main-provider', ['text'], {
+            'audio': {'enabled': False, 'provider_id': 'stt'},
+        })
+        self.assertIn('启用语音原生理解', bridge.audio_capability_note())
+
+    def test_the_stt_off_main_model_gap_is_still_explained_when_the_master_is_on(self):
+        """（开音频 / 关转写）：沿用 v1.7.5 的解释（说清是开关，别让用户去换模型）。"""
+        bridge = self._bridge_with('main-provider', ['text'], {
+            'audio': {'enabled': True, 'stt_enabled': False, 'provider_id': 'stt'},
+        })
+        note = bridge.audio_capability_note()
+        self.assertIn('语音转文字', note)
+        self.assertIn('是关的', note)
+
+    def test_master_on_and_stt_off_with_an_audio_capable_model_is_fine(self):
+        """（开音频 / 关转写）+ 主模型声明了音频：语音按音频证据进主模型，没有提示。"""
+        bridge = self._bridge_with('main-provider', ['text', 'audio'], {
+            'audio': {'enabled': True, 'stt_enabled': False, 'provider_id': 'stt'},
+        })
         self.assertEqual(bridge.audio_capability_note(), '')
 
     def test_any_provider_loaded_tracks_the_host_manager(self):

@@ -1207,6 +1207,34 @@ class ReceiveGroupTests(ServiceHarness):
         self.assertIn('收到群聊消息', self.sink.text())
 
     @needs('receive_group', 'append_entry', 'buffer_group_message')
+    async def test_a_group_voice_counts_as_addressing_her_and_rides_the_buffer(self) -> None:
+        """群语音（v1.7.6）：语音没法带 @，所以 `mention-only` 下它也算"叫了她"；
+        语音来源随消息进缓冲（上游 `bufferGroupMessage` 的 `audioSources` / `audioSession`），
+        群音频的批次预算靠它逐条算。"""
+        service = self.make_service(self._config(group_rule_stub(responseMode='mention-only')))
+        self.make_story()
+        session = group_session(content='<record file="ABC.silk"/>')
+        self.assertTrue(await service.receive_group(session, STORY_TIME))
+
+        turn = service.buffered_group_turns['%s:9' % SHARED_STORY_ID]
+        message = turn['messages'][0]
+        self.assertEqual(message['audioSources'], ['onebot-file:ABC.silk'])
+        self.assertIs(message['audioSession'], session)
+
+    @needs('receive_group', 'append_entry', 'buffer_group_message')
+    async def test_a_group_message_without_audio_keeps_the_old_shape(self) -> None:
+        """没语音的消息**不写** `audioSources` 键（上游是展开空对象，别留空数组）。"""
+        service = self.make_service(self._config())
+        self.make_story()
+        self.assertTrue(await service.receive_group(
+            group_session(content='@bot 在吗', elements=[{'type': 'at', 'attrs': {'id': '1'}}]),
+            STORY_TIME,
+        ))
+        message = service.buffered_group_turns['%s:9' % SHARED_STORY_ID]['messages'][0]
+        self.assertNotIn('audioSources', message)
+        self.assertNotIn('audioSession', message)
+
+    @needs('receive_group', 'append_entry', 'buffer_group_message')
     async def test_paused_story_is_not_accepted(self) -> None:
         service = self.make_service(self._config())
         self.make_story(status='paused')
@@ -1833,6 +1861,99 @@ class FlushGroupTurnTests(ServiceHarness):
         self.assertLess(service.group_willingness['key']['score'], 1.0)
         self.assertEqual(ctx['compacted'], [PRIVATE_STORY_ID])
         self.assertNotIn('key', service.buffered_group_turns)
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_the_group_audio_batch_reaches_the_model_with_the_budget(self) -> None:
+        """群语音（v1.7.6）：`flush_group_turn` 要按**批次预算**逐条加载语音并交给模型。
+
+        v1.7.6 之前这里恒传 `[]`——群里发的语音从来没作为音频证据进过 payload。
+        本用例把"逐条消息 → `load_native_audio`（带剩余条数）→ 附件带 `group-audio-N`
+        编号进 `try_decide`"这条链接钉住；上游语义见 `service.ts:2197-2215`。
+        """
+        config = make_config(model={'audio': {'enabled': True, 'maxPerMessage': 2}})
+        service = self.make_service(config)
+        self.make_story()
+        rule = group_rule_stub(debounceSeconds=0)
+        service.buffered_group_turns['key'] = {
+            'story_id': PRIVATE_STORY_ID, 'group_id': '9', 'rule': rule,
+            'channel_id': '9', 'latest_session': group_session(), 'revision': 3,
+            'messages': [
+                {'content': '听听', 'audioSources': ['onebot-file:A.silk']},
+                {'content': '还有', 'audioSources': ['onebot-file:B.silk', 'onebot-file:C.silk']},
+            ],
+            'mentioned_bot': True, 'quoted_bot': False,
+        }
+        loads: list[tuple[Any, Any]] = []
+        seen: dict[str, Any] = {}
+
+        async def load(story: Any, sources: Any, session: Any = None, max_count: Any = None) -> Any:
+            loads.append((list(sources), max_count))
+            return [{'format': 'mp3', 'base64': 'QUJD'} for _ in sources]
+
+        async def decide(*args: Any, **_kwargs: Any) -> dict[str, Any]:
+            seen['args'] = args
+            return {'decision': {'groupReply': {'mode': 'none'}}, 'succeeded': True}
+
+        async def persist(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'messages': [], 'commit': None, 'scriptEntry': None, 'script_entry': None}
+
+        async def send(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'deliveredSegments': [], 'complete': True, 'segmentOutcomes': []}
+
+        service.load_native_audio = load
+        service.try_decide = decide
+        service.persist_decision = persist
+        service.send_group_message = send
+        service.semantic_turn_embedding_enabled = lambda: False
+        service.sticker_catalog_for_session = _empty_list
+        service.group_chat_capabilities = lambda _session, _messages: None
+        service.schedule_compaction = _noop
+
+        await service.flush_group_turn('key', 3)
+
+        # 逐条消息加载，且每次带上"批次还剩几条"（条数上限 = maxPerMessage×4 = 8）。
+        self.assertEqual(
+            loads,
+            [(['onebot-file:A.silk'], 8), (['onebot-file:B.silk', 'onebot-file:C.silk'], 7)],
+        )
+        audio = seen['args'][10]
+        self.assertEqual([item['id'] for item in audio],
+                         ['group-audio-1', 'group-audio-2', 'group-audio-3'])
+        self.assertTrue(all(item['format'] == 'mp3' for item in audio))
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_the_group_audio_batch_is_empty_when_the_master_switch_is_off(self) -> None:
+        """总开关关着（默认）：群里也不加载语音，只有占位事实（上游 `audioConfig.enabled`）。"""
+        service = self.make_service(make_config(model={'audio': {'enabled': False}}))
+        self.make_story()
+        service.buffered_group_turns['key'] = {
+            'story_id': PRIVATE_STORY_ID, 'group_id': '9', 'rule': group_rule_stub(debounceSeconds=0),
+            'channel_id': '9', 'latest_session': group_session(), 'revision': 3,
+            'messages': [{'content': '听听', 'audioSources': ['onebot-file:A.silk']}],
+            'mentioned_bot': True, 'quoted_bot': False,
+        }
+        seen: dict[str, Any] = {}
+
+        async def decide(*args: Any, **_kwargs: Any) -> dict[str, Any]:
+            seen['args'] = args
+            return {'decision': {'groupReply': {'mode': 'none'}}, 'succeeded': True}
+
+        async def persist(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'messages': [], 'commit': None, 'scriptEntry': None, 'script_entry': None}
+
+        async def send(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'deliveredSegments': [], 'complete': True, 'segmentOutcomes': []}
+
+        service.try_decide = decide
+        service.persist_decision = persist
+        service.send_group_message = send
+        service.semantic_turn_embedding_enabled = lambda: False
+        service.sticker_catalog_for_session = _empty_list
+        service.group_chat_capabilities = lambda _session, _messages: None
+        service.schedule_compaction = _noop
+
+        await service.flush_group_turn('key', 3)
+        self.assertEqual(seen['args'][10], [])
 
     @needs('flush_group_turn', 'group_cooldown_active')
     async def test_cooldown_skips_the_model(self) -> None:

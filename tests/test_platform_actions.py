@@ -138,6 +138,78 @@ class QzoneVisibilityTests(unittest.TestCase):
         self.assertIn('tid', reason)
 
 
+class QzoneUgcRightEnumTests(unittest.TestCase):
+    """发说说的 `ugc_right` 与「改可见范围」的 `visible` **共用同一份枚举**（v1.7.6）。
+
+    同一件事两种写法（一边中文、一边 1/4/16/64/128）会把模型绕晕，而写错的后果是
+    **隐私事故**（选了「仅自己可见」却发成「好友可见」）。所以两边不但值要一致，
+    **声明的那一份常量也得是同一个**；旧提示词记下的裸整数走 `aliases` 兼容口，
+    校验层按同一张数值表译成整数交给 wire。
+    """
+
+    def _enum(self, action_id: str, param_name: str) -> pa.ActionParam:
+        return pa.ACTIONS[action_id].param(param_name)
+
+    def test_both_params_declare_the_same_enum_in_the_same_order(self):
+        published = self._enum('publish_qzone_post', 'ugc_right')
+        visible = self._enum('set_qzone_visibility', 'visible')
+        self.assertEqual(published.choices, pa.QZONE_VISIBILITY_LABELS)
+        self.assertEqual(visible.choices, pa.QZONE_VISIBILITY_LABELS)
+        self.assertEqual(published.choices, visible.choices, '两处必须共用同一份枚举')
+        # 旧参数是 int 范围，现在是标签枚举：类型跟着变，模型看到的才是中文。
+        self.assertEqual(published.type, 'string')
+        self.assertIsNone(published.minimum)
+        self.assertIsNone(published.maximum)
+        self.assertIn('所有人可见', published.describe())
+
+    def test_the_legacy_integer_spellings_still_validate_and_map_to_the_same_rights(self):
+        """模型手里可能还留着旧提示词的记忆：裸 int（1/4/16/64/128）照旧认。"""
+        for label, value in pa.QZONE_VISIBILITY_CHOICE_VALUES.items():
+            with self.subTest(label=label):
+                for spelling in (value, str(value), ' %d ' % value, float(value)):
+                    with self.subTest(spelling=spelling):
+                        normalized, reason = pa.validate_action('publish_qzone_post', {
+                            'content': '今天天气不错', 'ugc_right': spelling,
+                        })
+                        self.assertEqual(reason, '')
+                        self.assertEqual(normalized['params']['ugc_right'], value,
+                                         '校验层按同一张表译成整数（wire 照旧收数字）')
+                # 中文标签也走同一条路。
+                normalized, reason = pa.validate_action('publish_qzone_post', {
+                    'content': '今天天气不错', 'ugc_right': label,
+                })
+                self.assertEqual(reason, '')
+                self.assertEqual(normalized['params']['ugc_right'], value)
+
+    def test_the_alias_table_is_derived_from_the_single_rights_table(self):
+        from plugin.core import qzone  # noqa: PLC0415
+
+        self.assertEqual(pa.QZONE_VISIBILITY_CHOICE_VALUES, qzone.QZONE_VISIBILITY_VALUES)
+        self.assertEqual(
+            pa.QZONE_VISIBILITY_ALIASES,
+            {str(value): label for label, value in qzone.QZONE_VISIBILITY_VALUES.items()},
+        )
+
+    def test_an_unknown_tier_is_rejected_with_the_list_of_allowed_values(self):
+        for bad in (0, 2, 8, 256, '8', 'friends', '部分好友可见', 'friends-only'):
+            with self.subTest(bad=bad):
+                normalized, reason = pa.validate_action('publish_qzone_post', {
+                    'content': '今天天气不错', 'ugc_right': bad,
+                })
+                self.assertIsNone(normalized)
+                self.assertIn('ugc_right', reason)
+                for label in pa.QZONE_VISIBILITY_LABELS:
+                    self.assertIn(label, reason, '拒绝时要给出可选值清单')
+
+    def test_the_target_uin_requirement_survives_the_rename(self):
+        """16/128 两档要名单：目录里仍是「可见性为…时必填」这句（校验留给执行侧）。"""
+        target = self._enum('publish_qzone_post', 'target_uins')
+        self.assertEqual(target.type, 'list')
+        self.assertFalse(target.required)
+        self.assertIn('部分人可见', target.note)
+        self.assertIn('部分人不可见', target.note)
+
+
 class PermissionTests(unittest.TestCase):
     def test_normalize_drops_unknown_actions_and_unknown_tiers(self):
         table = pa.normalize_permissions({

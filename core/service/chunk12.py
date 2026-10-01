@@ -38,6 +38,7 @@ from ..scheduled_command import (
     normalize_cron,
     parse_iso_datetime,
 )
+from ..qzone import QZONE_VISIBILITY_VALUES, qzone_visible_value
 from ..time import iso
 from .base import ServiceBase, pick
 from .config import merge_legacy_section_values, read_section_path
@@ -612,6 +613,14 @@ class ServiceChunk12(ServiceBase):
         if target_uin:
             payload['targetUin'] = str(target_uin).strip()
         ugc_right = params.get('ugc_right') or params.get('ugcRight')
+        if isinstance(ugc_right, str) and ugc_right.strip():
+            # v1.7.6：目录给模型看的是**五档中文标签**（与 `set_qzone_visibility.visible`
+            # 同一份枚举），校验层已经把它译成整数；这里再兜一次手写调用——
+            # 可见性写错是隐私事故，宁可当场报错也**不许**静默落到默认那一档。
+            resolved_right = qzone_visible_value(ugc_right.strip())
+            if resolved_right is None:
+                return {'ok': False, 'error': '可见性只能是这五档之一：%s' % ' / '.join(QZONE_VISIBILITY_VALUES)}
+            ugc_right = resolved_right
         if isinstance(ugc_right, int) and not isinstance(ugc_right, bool):
             payload['ugcRight'] = ugc_right
         # v1.7.5：可见范围那一档传的是**五档中文标签**（`visible`），由 `qzone_execute`

@@ -1464,6 +1464,31 @@ class ConfigurationSchemaTest(unittest.TestCase):
         body = adapter.split("async def _transcribe", 1)[1].split("async def ", 1)[0]
         self.assertIn("audio_transcription_enabled()", body)
 
+    def test_the_audio_master_switch_is_a_real_gate_not_a_dead_switch(self):
+        """`audio.enabled`（上游 `audioConfig.enabled`，v1.7.6 收口）：缺键=关，且真的有人读。
+
+        这条键从 1.0.1 起就是上游的，上游在 `loadNativeAudio` 里拿它放行附件；本移植版
+        一开始就接了 core 那把闸（`chunk3.load_native_audio`）。这条用例把**三处**钉在
+        一起：schema 的默认值（保持现状=上游=关）、core 的闸、适配层的能力提示——
+        少任何一处都会变成"界面说着开、实际没生效"或反过来的假话。
+        """
+        audio = self.section("model_center.audio")
+        self.assertIs(audio["enabled"]["default"], False,
+                      "默认必须保持现状：上游缺省就是关（语音理解 opt-in）")
+        hint = audio["enabled"]["hint"]
+        self.assertIn("总开关", hint, "总开关与转写开关的分工要写在 hint 里")
+        self.assertIn("转写", hint)
+        core = read(os.path.join(PLUGIN_ROOT, "core", "service", "chunk3.py"))
+        self.assertIn("def load_native_audio", core)
+        body = core.split("async def load_native_audio", 1)[1].split("async def ", 1)[0]
+        self.assertIn("'enabled'", body, "core 的加载闸必须读这个键")
+        adapter = read(os.path.join(PLUGIN_ROOT, "adapters", "astrbot_bridge.py"))
+        self.assertIn("def audio_understanding_enabled", adapter)
+        self.assertIn("audio_understanding_enabled()", adapter)
+        note = adapter.split("def audio_capability_note", 1)[1].split("async def ", 1)[0]
+        self.assertIn("audio_understanding_enabled()", note,
+                      "能力提示必须认总开关，否则会报出一个不存在的毛病")
+
     def test_every_type_is_in_the_astrbot_allowed_set(self):
         bad = [(path, spec.get("type")) for path, _, spec in iter_fields(self.schema)
                if spec.get("type") not in ALLOWED_TYPES]

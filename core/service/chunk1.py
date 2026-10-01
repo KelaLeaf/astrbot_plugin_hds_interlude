@@ -81,6 +81,7 @@ from .helpers import (
     clip,
     describe_group_attachments,
     describe_quoted_message,
+    extract_session_audio_sources,
     extract_session_file_facts,
     extract_session_voice_count,
     format_group_speaker,
@@ -89,6 +90,9 @@ from .helpers import (
     normalize_group_visible_reply,
     normalize_participant_state,
 )
+# 群音频的批次预算（上游 2197-2215）住在 chunk3：那里有 `audioConfig` 的解析与
+# `load_native_audio`。chunk3 **不** import chunk1，所以这条模块级依赖不成环。
+from .chunk3 import _load_group_batch_audio
 
 __all__ = ['ServiceChunk1']
 
@@ -1033,7 +1037,14 @@ class ServiceChunk1(ServiceBase):
         rule = self.group_rule_or_default(group_id)
         mentioned_bot = _mentions_bot(session)
         quoted_bot = _quotes_bot(session)
-        if pick(rule, 'responseMode', 'response_mode') == 'mention-only' and not mentioned_bot:
+        # v1.7.6：群里的语音也是**音频证据**（上游 1900）。语音消息没法带 @，所以
+        # `mention-only` 下它也算"叫了她"——这条与私聊那条 `session.content?.trim()`
+        # 的例外同源。没开语音理解时它仍然只留一条占位事实（见 `load_group_batch_audio`）。
+        audio_sources = extract_session_audio_sources(session)
+        if (
+            pick(rule, 'responseMode', 'response_mode') == 'mention-only'
+            and not mentioned_bot and not audio_sources
+        ):
             self.note_group_skip(
                 session,
                 '这条群消息没 @ 机器人，而该群的 response_mode=mention-only（引用机器人不算）',
@@ -1090,7 +1101,9 @@ class ServiceChunk1(ServiceBase):
         message['content'] = message_content
         message['occurredAt'] = now
         message['direction'] = 'user'
-        self.buffer_group_message(story, rule, session, message, mentioned_bot, quoted_bot)
+        self.buffer_group_message(
+            story, rule, session, message, mentioned_bot, quoted_bot, audio_sources,
+        )
         self.report_operation(
             'summary', 'info', story, 'user-message',
             '收到群聊消息 群=%s 发送者=%s', group_id, sender_id,
@@ -1346,12 +1359,16 @@ class ServiceChunk1(ServiceBase):
         message: dict[str, Any],
         mentioned_bot: bool,
         quoted_bot: bool,
+        audio_sources: Any = None,
     ) -> None:
         """上游 `bufferGroupMessage(story, rule, session, message, mentionedBot, quotedBot)`
         （`src/service.ts:1750`）。
 
         按 `故事:群` 聚合一批消息，用 `debounceSeconds` 计时器 + 单调递增的 `revision`
         保证只有最后一次安排会真正刷出；@ 与引用机器人的事实是**累积**的。
+
+        v1.7.6：带上这条消息的语音来源（上游 2099 的 `audioSources` + `audioSession`）
+        ——群音频的**批次预算**靠它逐条算（见 `load_group_batch_audio`）。
         """
         story_id = pick(story, 'id')
         group_id = normalize_group_id(pick(rule, 'groupId', 'group_id'))
@@ -1366,6 +1383,10 @@ class ServiceChunk1(ServiceBase):
             turn['timer']()
         turn['channel_id'] = _session_read(session, 'channelId', 'channel_id')
         turn['latest_session'] = session
+        sources = [str(item) for item in (audio_sources or []) if str(item or '').strip()]
+        if sources:
+            # 上游同一形状：有语音才写这两个键，没有就**不出现**（别留空数组）。
+            message = {**message, 'audioSources': sources, 'audioSession': session}
         turn.setdefault('messages', []).append(message)
         turn['mentioned_bot'] = bool(turn.get('mentioned_bot')) or bool(mentioned_bot)
         turn['quoted_bot'] = bool(turn.get('quoted_bot')) or bool(quoted_bot)
@@ -1530,9 +1551,15 @@ class ServiceChunk1(ServiceBase):
             sticker_catalog = await self.sticker_catalog_for_session(
                 turn.get('latest_session'), turn_query_embedding,
             )
+            # 上游 2197-2215：群音频走**批次预算**（条数 = `maxPerMessage×4`、
+            # 字节 = `maxFileSizeMB×4`），超出的延后 / 跳过并各留一条 warn。
+            # v1.7.6 之前这里恒传 `[]`，于是"群里发的语音"从来没有作为音频证据进过 payload。
+            group_audio = await _load_group_batch_audio(
+                self, snapshot['story'], batch, turn.get('latest_session'),
+            )
             decision_result = await self.try_decide(
                 snapshot['story'], None, 'user-message', snapshot['from'], snapshot['now'],
-                user_message, [], [], group_context, [], [], chat_capabilities, [],
+                user_message, [], [], group_context, [], group_audio, chat_capabilities, [],
                 sticker_catalog, turn_query_embedding,
             )
             decision = pick(decision_result, 'decision') or {}

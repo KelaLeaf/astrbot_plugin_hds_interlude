@@ -553,20 +553,23 @@ class ServiceChunk13(ServiceBase):
         except Exception as error:  # noqa: BLE001 - 上游同样是 catch-all
             message = str(error)
             # `ambiguous` = 请求可能已到达服务端（超时/断连）：记 `unknown` 而非
-            # `failed`——`unknown` 保守计入配额（可能已发生），语义上禁止自动重试。
+            # `failed`——`unknown` 保守计入配额（**可能已发生**），语义上禁止自动重试。
+            # 这一条是**所有写路径共用**的收口（发帖 / 评论 / 点赞 / 转发 / 改可见范围
+            # 都从这里出去），所以漏标的可能只出在"抛出来的异常是不是
+            # `QzoneActionError`"这一层——`call_qzone_action`（SnowLuma）与
+            # `call_qzone_cgi`（NapCat WS）两条通道都已经按同一口径打标。
             ambiguous = isinstance(error, QzoneActionError) and error.ambiguous
+            note = '（结果未知：请求可能已生效，为避免重复不会自动重试。）' if ambiguous else ''
             await self._qzone_set_status(pending_id, {
                 'status': 'unknown' if ambiguous else 'failed',
-                'error': message[:QZONE_ERROR_MAX_CHARS],
+                # 审计行本身也要写明"可能已发生"：光看 status 字面看不出它的分量。
+                'error': (message + note)[:QZONE_ERROR_MAX_CHARS],
             })
             self.report_standalone(
-                'warn', 'QQ 空间动作%s 类型=%s 错误=%s',
+                'warn', 'QQ 空间动作%s 类型=%s 无法确认是否生效 错误=%s',
                 '结果未知' if ambiguous else '失败', kind, message,
             )
-            return {
-                'ok': False, 'tid': '',
-                'error': message + '（结果未知：请求可能已生效，为避免重复不会自动重试。）' if ambiguous else message,
-            }
+            return {'ok': False, 'tid': '', 'error': message + note}
 
     async def _qzone_apply_visibility(
         self,

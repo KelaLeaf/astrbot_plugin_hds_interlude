@@ -43,6 +43,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from .qzone import QZONE_VISIBILITY_VALUES
+
 __all__ = [
     'ACTIONS',
     'ACTION_CATEGORIES',
@@ -53,6 +55,8 @@ __all__ = [
     'action_config_group',
     'PERMISSION_TIERS',
     'PLATFORM_ACTION_FIELD',
+    'QZONE_VISIBILITY_ALIASES',
+    'QZONE_VISIBILITY_CHOICE_VALUES',
     'QZONE_VISIBILITY_LABELS',
     'RISK_LEVELS',
     'RISK_WARNING',
@@ -85,7 +89,10 @@ RISK_WARNING = '此标签下功能具有一定风险，易误操作，请谨慎�
 class ActionParam:
     """一个动作参数的声明（校验与提示词都读它）。"""
 
-    __slots__ = ('name', 'label', 'type', 'required', 'minimum', 'maximum', 'choices', 'note')
+    __slots__ = (
+        'name', 'label', 'type', 'required', 'minimum', 'maximum', 'choices', 'note',
+        'aliases', 'choice_values',
+    )
 
     def __init__(
         self,
@@ -97,6 +104,8 @@ class ActionParam:
         maximum: Optional[float] = None,
         choices: Sequence[str] = (),
         note: str = '',
+        aliases: Optional[Mapping[str, str]] = None,
+        choice_values: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.name = name
         self.label = label or name
@@ -106,6 +115,14 @@ class ActionParam:
         self.maximum = maximum
         self.choices = tuple(choices)
         self.note = note
+        #: **旧写法 → 规范枚举值**（v1.7.6）。给"模型手里还留着老提示词记忆"的参数留的
+        #: 兼容口：键是历史上允许过的标量写法，值是 `choices` 里那一项。校验层先查它，
+        #: 命中就按规范值继续走；查不到又不在 `choices` 里 —— 照旧拒绝并列可选值。
+        self.aliases: dict[str, str] = dict(aliases or {})
+        #: **规范枚举值 → 对外（wire / 平台）取值**。缺省表示"枚举值本身就是对外取值"
+        #: （例如 `set_qzone_visibility.visible` 直接吃中文标签）。写动作的枚举常常
+        #: 比平台值的可读性好得多，这一层把两件事拆开：模型看标签，平台收数字。
+        self.choice_values: dict[str, Any] = dict(choice_values or {})
 
     def describe(self) -> str:
         parts = [self.name]
@@ -169,6 +186,18 @@ QZONE_VISIBILITY_LABELS: tuple[str, ...] = (
     '部分人不可见',
     '仅自己可见',
 )
+
+#: 「五档中文标签 → 打到腾讯的 `ugc_right` 整数」——**唯一数值表**在
+#: `core/qzone.py::QZONE_VISIBILITY_VALUES`（权威依据见 `core/qzone_cgi.py::QZONE_VISIBLE`）。
+#: 这里只在模块内派生两份**视图**，一处都不重抄：
+#:
+#: * `QZONE_VISIBILITY_CHOICE_VALUES`：规范枚举值 → 整数（`ugc_right` 的对外取值）；
+#: * `QZONE_VISIBILITY_ALIASES`：旧的裸整数写法（`'1'`/`'4'`/…）→ 规范枚举值，
+#:   给"模型手里还留着旧提示词记忆"留的兼容口（v1.7.6）。
+QZONE_VISIBILITY_CHOICE_VALUES: dict[str, int] = dict(QZONE_VISIBILITY_VALUES)
+QZONE_VISIBILITY_ALIASES: dict[str, str] = {
+    str(value): label for label, value in QZONE_VISIBILITY_VALUES.items()
+}
 
 #: 动作类别 → 中文标签（控制台与提示词分组用）。
 ACTION_CATEGORIES: dict[str, str] = {
@@ -664,10 +693,17 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
         '以她本人身份发一条 QQ 空间说说。',
         params=(
             _p('content', '正文', required=True),
-            _p('ugc_right', '可见性', type='int', minimum=1, maximum=128,
-               note='1 所有人 / 4 好友（默认）/ 16 部分好友 / 64 仅自己 / 128 部分不可见'),
+            # v1.7.6：可见性**统一成与 `set_qzone_visibility.visible` 同一份枚举**
+            # （同字符串、同顺序，都指向 `QZONE_VISIBILITY_LABELS`）——同一件事两种写法
+            # 会把模型绕晕。旧提示词里的裸整数（1/4/16/64/128）仍然认（`aliases`），
+            # 校验层按**同一张数值表**译成 `ugc_right`；wire 层照旧发数字。
+            _p('ugc_right', '可见性', choices=QZONE_VISIBILITY_LABELS,
+               aliases=QZONE_VISIBILITY_ALIASES,
+               choice_values=QZONE_VISIBILITY_CHOICE_VALUES,
+               note='默认「仅 QQ 好友可见」；旧的裸数字 1/4/16/64/128 也认'),
             _p('images', '配图', type='list', note='图片路径/URL/base64，最多 9 张（NapCat 原生支持）'),
-            _p('target_uins', '可见性作用的 QQ', type='list', note='ugc_right 为 16/128 时必填'),
+            _p('target_uins', '可见性作用的 QQ', type='list',
+               note='可见性为「部分人可见」/「部分人不可见」时必填'),
         ),
         risk='sensitive',
         returns='说说 tid + 可见性',
@@ -998,6 +1034,49 @@ def _coerce(value: Any, kind: str) -> Any:
 _BAD = object()
 
 
+def _choice_alias_key(value: Any) -> Optional[str]:
+    """枚举参数的**旧写法**查表键；不是标量就返回 `None`（交给 `_coerce` 判类型错）。
+
+    只做"数字 / 数字串 → 去空白的规范文本"这一件事：`4` / `'4'` / `' 4 '` / `4.0`
+    都指向同一个键，`True` 不算（`bool` 是 `int` 的子类，别让它蒙到 `'1'`）。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if float(value).is_integer() else None
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+
+def _resolve_choice(param: ActionParam, value: Any) -> Any:
+    """把枚举参数的输入收敛成 `choices` 里的一项；不是枚举参数就原样返回。
+
+    顺序：**先查 `aliases`（旧写法）**再查 `choices`。旧写法命中就换成规范值继续走；
+    数字写法既不在 `aliases` 也不在 `choices` 里时直接报**可选值清单**——比
+    "类型不对（应为 string）" 有用得多（模型写的 8 是"档位不存在"，不是"类型错"）。
+    """
+    if not param.choices:
+        return value
+    if isinstance(value, str) and value in param.choices:
+        return value
+    if param.aliases:
+        key = _choice_alias_key(value)
+        if key is not None:
+            mapped = param.aliases.get(key)
+            if mapped is not None:
+                return mapped
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return _CHOICE_REJECTED
+    return value
+
+
+#: `_resolve_choice` 的"这个写法不存在"哨兵（避免在这里拼错误文案，调用方统一报）。
+_CHOICE_REJECTED = object()
+
+
 def validate_action(
     action_id: Any,
     params: Any = None,
@@ -1031,6 +1110,12 @@ def validate_action(
             if param.required:
                 return None, '动作 %s 缺少必填参数 %s' % (name, param.name)
             continue
+        if param.choices:
+            value = _resolve_choice(param, value)
+            if value is _CHOICE_REJECTED:
+                return None, '动作 %s 的参数 %s 只能是 %s' % (
+                    name, param.name, '|'.join(param.choices),
+                )
         coerced = _coerce(value, param.type)
         if coerced is _BAD:
             return None, '动作 %s 的参数 %s 类型不对（应为 %s）' % (name, param.name, param.type)
@@ -1043,6 +1128,10 @@ def validate_action(
                 return None, '动作 %s 的参数 %s 超过上限 %g' % (name, param.name, param.maximum)
         if param.type == 'string' and len(str(coerced)) > 2000:
             return None, '动作 %s 的参数 %s 过长' % (name, param.name)
+        # 枚举的"对外取值"映射放在最后：模型/界面看到的是标签，wire 与平台拿到的是
+        # 目录声明的那份值（例如 `ugc_right` 的 1/4/16/64/128）。
+        if param.choice_values and coerced in param.choice_values:
+            coerced = param.choice_values[coerced]
         normalized[param.name] = coerced
     return {'action': name, 'params': normalized}, ''
 

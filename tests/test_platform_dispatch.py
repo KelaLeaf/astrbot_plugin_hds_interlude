@@ -367,6 +367,41 @@ class CoreActionTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(rejected, [])
 
+    async def test_publish_ugc_right_is_a_chinese_label_on_the_way_in_and_an_int_on_the_wire(self):
+        """发说说的可见性（v1.7.6）：模型/提示词看到的是与 `visible` 同一份五档中文枚举，
+        到执行侧已经是 `ugcRight` 整数——wire 与审计行一个字都没变。
+        """
+        host = self._host(config={'robot_actions': {'qzone': {'publish_qzone_post': True}}})
+        seen: list[tuple] = []
+
+        async def fake_execute(story, kind, payload=None, prefer_self_id=''):
+            seen.append((kind, dict(payload or {})))
+            return {'ok': True, 'tid': 'TID-9', 'error': ''}
+
+        host.qzone_execute = fake_execute  # type: ignore[method-assign]
+
+        async def publish(right):
+            return await host.dispatch_platform_actions(STORY, {
+                'platformActions': [{
+                    'action': 'publish_qzone_post',
+                    'params': {'content': '今天天气不错', 'ugc_right': right},
+                }],
+            })
+
+        # 中文标签 → 64；旧的裸整数写法 → 还是 64（模型手里可能留着旧提示词的记忆）。
+        for spelling in ('仅自己可见', 64, '64'):
+            with self.subTest(spelling=spelling):
+                outcomes = await publish(spelling)
+                self.assertTrue(outcomes[0]['ok'], outcomes[0])
+                self.assertEqual(seen[-1][0], 'post')
+                self.assertEqual(seen[-1][1]['ugcRight'], 64)
+        # 非法档位：校验阶段就拒，绝不落一个默认档（可见性写错是隐私事故）。
+        seen.clear()
+        outcomes = await publish(8)
+        self.assertEqual(outcomes, [])
+        self.assertTrue(any('ugc_right' in message for _l, message in host.reports), host.reports)
+        self.assertEqual(seen, [])
+
     async def test_list_and_cancel_scheduled_messages(self):
         host = self._host()
         await host.dispatch_platform_actions(STORY, {

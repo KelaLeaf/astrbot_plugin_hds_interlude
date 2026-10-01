@@ -2131,7 +2131,11 @@ class AstrbotTransport:
         data: Optional[dict[str, str]] = None,
         timeout_ms: int = 20_000,
     ) -> Optional[str]:
-        """原始 HTTP（QQ 空间的 NapCat WebSocket 方案要用：自带 Cookie / Referer）。"""
+        """原始 HTTP（QQ 空间的 NapCat WebSocket 方案要用：自带 Cookie / Referer）。
+
+        与 `AstrbotBridge.request_text` 同一口径：失败回 `None`；万一抛了异常
+        （超时 / 断连），`call_qzone_cgi` 也按"请求可能已发生"处理（v1.7.6）。
+        """
         return await self.bridge.request_text(
             method, url, headers=headers, data=data, timeout_ms=timeout_ms,
         )
@@ -4045,6 +4049,16 @@ class AstrbotBridge:
             if note:
                 log_fallback('warn', '%s', note)
 
+    def audio_understanding_enabled(self) -> bool:
+        """`model_center.audio.enabled`：「语音 / 音频理解」的**总开关**（上游 `audioConfig.enabled`）。
+
+        缺键按 **False**：上游是 `configured?.enabled === true`，core 的
+        `ServiceChunk3.load_native_audio` 也拿同一把闸放行附件（缺键 = 不加载）。
+        这个开关管的是"语音要不要当**音频证据**"，与 `stt_enabled`（要不要调转写模型）
+        是两件事，但顺序在前：总开关关着时，语音既不进主模型、也没有东西可转写。
+        """
+        return self.section('audio').get('enabled') is True
+
     def audio_transcription_enabled(self) -> bool:
         """`model_center.audio.stt_enabled`（v1.7.5）：「语音转文字」开关。
 
@@ -4057,8 +4071,20 @@ class AstrbotBridge:
         return True if value is None else bool(value)
 
     def audio_capability_note(self) -> str:
-        """主叙事当前能不能吃音频；不能时返回一句给人看的话，否则空串。"""
+        """主叙事当前能不能吃音频；不能时返回一句给人看的话，否则空串。
+
+        v1.7.6 起**先看总开关**：`enabled=false`（默认）时语音根本不会被当成音频证据
+        加载（`load_native_audio` 直接返回空），所以那个组合下"已指定转写模型"是句假话
+        ——配好的转写模型一次都不会被调用。只有用户明显以为它在跑（绑了转写模型）时
+        才出声，免得默认配置的每次启动都刷一条警告。
+        """
         transcript_provider = self.task_model_id('audio')
+        if not self.audio_understanding_enabled():
+            if not transcript_provider:
+                return ''
+            return ('「语音 / 音频理解」的「启用语音原生理解」是关的（默认如此）：语音不会'
+                    '作为音频附件加载，「语音转写模型」（%s）也就不会被调用——只会留一条'
+                    '"收到了一条语音"的事实。要让她听懂语音，先打开这个总开关。' % transcript_provider)
         if transcript_provider and self.audio_transcription_enabled():
             return ''  # 已指定语音转写模型且开关是开的，音频不进主模型
         provider_id = self.task_model_id('main') or self._resolved_chat_provider_id
@@ -4071,7 +4097,8 @@ class AstrbotBridge:
             # 指定了转写模型却把「语音转文字」关了：说清是开关造成的，别让用户去换模型。
             return ('「语音 / 音频理解」里的「语音转文字」是关的，而当前主模型又未声明音频能力，'
                     '语音会被忽略：打开那个开关，或把主模型换成支持音频输入的')
-        return '当前主模型未声明音频能力，语音会被忽略，建议在「语音 / 音频理解」里指定语音转写模型'
+        return ('当前主模型未声明音频能力，语音会被忽略：先打开「语音 / 音频理解」里的'
+                '「启用语音原生理解」，再指定语音转写模型')
 
     async def resolve_chat_provider_id(self) -> str:
         """解析当前会话的 AstrBot 聊天 Provider id。
@@ -4636,6 +4663,8 @@ class AstrbotBridge:
 
         腾讯那几个 CGI 只认 `application/x-www-form-urlencoded`，所以这里不用
         `post_json`。失败只记 debug 并返回 `None`（QQ 空间是可选能力，不进叙事主链）。
+        这层把异常也吞成 `None`；万一将来漏出去，`call_qzone_cgi` 照样按"可能已发生"
+        处理（v1.7.6，见 `core/qzone.py`）。
         """
         verb = _text(method).strip().upper() or 'GET'
         try:

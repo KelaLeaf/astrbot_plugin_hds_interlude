@@ -178,6 +178,10 @@ class Transport(Protocol):
         `method` 只认 `'GET'` / `'POST'`；POST 用 `application/x-www-form-urlencoded`
         编码 `data`（腾讯那几个 CGI 就是这个形状）。失败返回 `None` 并记日志 —— 
         **绝不抛**：QQ 空间是可选能力，不能拖垮叙事主链。
+
+        v1.7.6 补一句口径：调用方 `core/qzone.py::call_qzone_cgi` **两种失败都接得住**
+        ——回 `None` 与抛异常（某些 HTTP 客户端把超时/断连报成异常）都按"请求可能已经
+        打到腾讯"处理（`ambiguous`，禁止自动重试）。实现方仍以回 `None` 为准。
         """
         raise NotImplementedError
 

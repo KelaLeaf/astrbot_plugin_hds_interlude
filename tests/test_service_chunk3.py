@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from plugin.core.service import chunk3
-from plugin.core.service.chunk3 import ServiceChunk3
+from plugin.core.service.chunk3 import ServiceChunk3, _load_group_batch_audio
 from plugin.core.service.session import SessionView
 from plugin.core.service.transport import NullTransport
 
@@ -1089,6 +1089,86 @@ class TestNativeAudio(unittest.IsolatedAsyncioTestCase):
         host.transport = FakeTransport(fetch_audio=self._fetch(b'ID3\x04\x00\x00'))
         audio = await ServiceChunk3.load_native_audio(host, {'id': 's'}, ['data:audio/mp3;base64,QUJD'])
         self.assertEqual(audio, [])
+
+    async def test_the_master_switch_blocks_loading_even_with_the_stt_switch_on(self) -> None:
+        """（关音频 / 开转写）：总开关关着时**一条音频都不加载**，转写开关开着也没用。
+
+        两个开关的分工：`enabled` 决定"语音要不要当音频证据加载"，`stt_enabled` 决定
+        "加载之后要不要调转写模型"。总开关在前——这一条不成立的话，用户配好的转写模型
+        会被"看不见的闸"绕过（或者反过来，语音静默进了主模型）。
+        """
+        host = _MediaHost(config={'model': {'audio': {
+            'enabled': False, 'stt_enabled': True, 'maxPerMessage': 3,
+        }}})
+        host.transport = FakeTransport(fetch_audio=self._fetch(b'ID3\x04\x00\x00'))
+        sources = ['data:audio/mp3;base64,QUJD'] * 3
+        self.assertEqual(
+            await ServiceChunk3.load_native_audio(host, {'id': 's'}, sources), [],
+            '总开关关着 = 没有音频证据，转写开关开着也无从转起',
+        )
+        self.assertEqual(
+            await _load_group_batch_audio(host, {'id': 's'}, [{'audio_sources': sources}]),
+            [],
+        )
+
+    async def test_the_master_switch_on_keeps_todays_loading_behaviour(self) -> None:
+        """（开音频 / 关转写）：加载照旧（要不要转写由适配层那一侧决定，core 不参与）。"""
+        host = _MediaHost(config={'model': {'audio': {
+            'enabled': True, 'stt_enabled': False, 'maxPerMessage': 2,
+        }}})
+        host.transport = FakeTransport(fetch_audio=self._fetch(b'ID3\x04\x00\x00'))
+        audio = await ServiceChunk3.load_native_audio(
+            host, {'id': 's'}, ['data:audio/mp3;base64,QUJD', 'data:audio/mp3;base64,QUJD'],
+        )
+        self.assertEqual([item['id'] for item in audio], ['turn-audio-1', 'turn-audio-2'])
+        self.assertTrue(all('base64' in item for item in audio))
+
+    async def test_the_group_batch_budget_caps_count_and_bytes(self) -> None:
+        """上游 2197-2215 的**群音频批次预算**（v1.7.6 补上的 `audioConfig` 消费点）。
+
+        条数上限 = `maxPerMessage × 4`、字节上限 = `maxFileSizeMB × 4MB`；超出的部分
+        延后 / 跳过，各留一条 warn。少了这道闸，一个群里连发语音会把上下文一次塞满。
+        """
+        payload = b'ID3\x04\x00\x00' * 4
+        host = _MediaHost(config={'model': {'audio': {
+            'enabled': True, 'maxPerMessage': 1, 'maxFileSizeMB': 1,
+        }}})
+        host.transport = FakeTransport(fetch_audio=self._fetch(payload))
+        batch = [{'audio_sources': ['data:audio/mp3;base64,QUJD']} for _ in range(6)]
+
+        audio = await _load_group_batch_audio(host, {'id': 's'}, batch)
+
+        # maxPerMessage=1 → 条数上限 4；每条几百字节，远小于 4MB，所以先撞条数。
+        self.assertEqual([item['id'] for item in audio],
+                         ['group-audio-1', 'group-audio-2', 'group-audio-3', 'group-audio-4'])
+        self.assertTrue(
+            any('群音频批次达到资源上限' in str(entry) for entry in host.logs),
+            host.logs,
+        )
+
+    async def test_the_group_batch_budget_stops_on_bytes_and_says_so(self) -> None:
+        """字节上限那条分支：一条音频就超预算时**跳过它**并留 warn（不是静默丢掉）。"""
+        host = _MediaHost(config={'model': {'audio': {
+            'enabled': True, 'maxPerMessage': 3, 'maxFileSizeMB': 1,
+        }}})
+
+        async def fake_load(story, sources, session=None, max_count=None):
+            return [{'format': 'mp3', 'base64': 'A' * (4 * 1_000_000 + 10)}]
+
+        host.load_native_audio = fake_load  # type: ignore[method-assign]
+        audio = await _load_group_batch_audio(host, {'id': 's'}, [{'audio_sources': ['x']}])
+        self.assertEqual(audio, [])
+        self.assertTrue(any('群音频批次达到字节上限' in str(entry) for entry in host.logs), host.logs)
+
+    async def test_the_group_batch_never_touches_audio_when_the_master_switch_is_off(self) -> None:
+        """总开关关着：群批次连平台都不问（不加载、不留 warn）。"""
+        host = _MediaHost(config={'model': {'audio': {'enabled': False, 'maxPerMessage': 3}}})
+        host.transport = FakeTransport(fetch_audio=self._fetch(b'ID3\x04\x00\x00'))
+        audio = await _load_group_batch_audio(
+            host, {'id': 's'}, [{'audio_sources': ['data:audio/mp3;base64,QUJD']}],
+        )
+        self.assertEqual(audio, [])
+        self.assertEqual(host.logs, [])
 
     @staticmethod
     def _fetch(payload: bytes) -> Any:
