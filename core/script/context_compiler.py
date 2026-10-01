@@ -200,6 +200,8 @@ def compile_narrative_context(
             'groupContext': _field(payload, 'groupContext', 'group_context'),
             'chatCapabilities': _field(payload, 'chatCapabilities', 'chat_capabilities'),
             'stickerCatalog': _field(payload, 'stickerCatalog', 'sticker_catalog'),
+            # 两级选择的第一段（§48 甲）：分组目录（不列条目）。与 `stickerCatalog` 互斥出现。
+            'stickerGroupCatalog': _field(payload, 'stickerGroupCatalog', 'sticker_group_catalog'),
             # M4 §十：确定性通道标注——命中五规则时注入 `channelContext` + 简短标记；
             # 未命中时这个键整个不出现（单平台零影响）。
             **({'channelContext': channel_annotation} if channel_annotation is not None else {}),

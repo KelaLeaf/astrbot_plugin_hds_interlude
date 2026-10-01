@@ -1434,5 +1434,228 @@ class PromptSectionTests(unittest.TestCase):
         self.assertEqual(c.to_schema_shape(None), {})
 
 
+# --------------------------------------------------------------------------- #
+# 两级表情选择 / 描述时定组（§48 的纯函数部分）
+# --------------------------------------------------------------------------- #
+
+class StickerGroupDirectoryTests(unittest.TestCase):
+    """`stickerGroupDirectory` 的等价物：模型可见的**同一份**分组目录。"""
+
+    def _assets(self):
+        return [
+            {'assetId': 'a-1', 'group': 'collected'},
+            {'assetId': 'a-2', 'group': 'collected'},
+            {'assetId': 'b-1', 'group': '猫猫'},
+            {'assetId': 'c-1', 'group': 'legacy-dir'},
+            {'assetId': 'd-1', 'group': ''},
+        ]
+
+    def _rows(self):
+        # 描述表的行：**键就是目录名**，没有 `name` 列（组名 = 目录名）。
+        return [
+            {'groupId': '猫猫', 'description': '猫、躺平', 'createdAt': '2026-01-01'},
+            {'groupId': '空组', 'description': '还没素材', 'createdAt': '2026-01-02'},
+            {'groupId': 'collected', 'description': '改过描述', 'createdAt': ''},
+        ]
+
+    def _dirs(self):
+        # 磁盘上真有目录的（含一个刚建好、还没素材、也没描述行的空组）。
+        return ['猫猫', '空组', 'legacy-dir', 'disk-only']
+
+    def test_directories_list_only_what_the_caller_needs(self):
+        assets, rows, dirs = self._assets(), self._rows(), self._dirs()
+        sending = h.sticker_group_directory(assets, rows, directories=dirs)
+        self.assertEqual(
+            [(item['groupId'], item['name'], item['description'], item['count']) for item in sending],
+            [('collected', h.COLLECTED_STICKER_GROUP_NAME, '改过描述', 2),  # 内置组永远第一
+             ('猫猫', '猫猫', '猫、躺平', 1),                                # 描述行按 createdAt
+             ('legacy-dir', 'legacy-dir', '', 1)],                        # 没有描述行的目录名照样列
+            '甲：只列真的有条目的组（空组选了也空手而归），空 group 桶不列',
+        )
+        organising = h.sticker_group_directory(assets, rows, include_empty=True, directories=dirs)
+        self.assertEqual([item['groupId'] for item in organising],
+                         ['collected', '猫猫', '空组', 'disk-only', 'legacy-dir'],
+                         '乙：还没素材的组也要列（描述行的 + 磁盘上的空目录）')
+        self.assertEqual(organising[2]['count'], 0)
+        # 没有素材、也没有描述行的空目录**只在乙里出现**（甲里选了也空手而归）。
+        self.assertNotIn('disk-only', [item['groupId'] for item in sending])
+        self.assertEqual(
+            [item['groupId'] for item in h.sticker_group_directory(
+                assets, rows, limit=2, directories=dirs)],
+            ['collected', '猫猫'],
+            '提示词里的目录有上限',
+        )
+
+    def test_builtin_defaults_come_from_the_shared_constants(self):
+        directory = h.sticker_group_directory(
+            [{'assetId': 'a', 'group': 'collected'}], [],
+        )
+        self.assertEqual(directory[0]['name'], h.COLLECTED_STICKER_GROUP_NAME)
+        self.assertEqual(directory[0]['description'], h.COLLECTED_STICKER_GROUP_DESCRIPTION)
+        self.assertEqual(h.COLLECTED_STICKER_GROUP_ID, 'collected', 'id 是目录名，不许动')
+
+    def test_items_need_a_description_and_respect_the_limit(self):
+        assets = [
+            {'assetId': 'a-1', 'group': 'g-1', 'description': '一只猫'},
+            {'assetId': 'a-2', 'group': 'g-1', 'description': '  '},
+            {'assetId': 'a-3', 'group': 'g-2', 'description': '一只狗'},
+            {'assetId': '', 'group': 'g-1', 'description': '没有 id'},
+        ]
+        self.assertEqual(
+            h.sticker_group_items(assets, 'g-1'),
+            [{'assetId': 'a-1', 'description': '一只猫'}],
+            '没描述的条目进不了候选（模型只能靠描述挑）',
+        )
+        self.assertEqual(h.sticker_group_items(assets, 'g-2', limit=1),
+                         [{'assetId': 'a-3', 'description': '一只狗'}])
+        self.assertEqual(h.sticker_group_items(assets, ''), [])
+        self.assertEqual(
+            h.sticker_group_directory_ids([{'groupId': 'x'}, {'groupId': ''}, 'noise']), {'x'},
+        )
+
+
+class StickerGroupNameTests(unittest.TestCase):
+    """分组名 = **目录名**：命名规则的唯一定义处（`safe_sticker_group_name`）。"""
+
+    def test_cjk_and_common_symbols_are_allowed(self):
+        for name in ('猫猫', '日常（打招呼）', 'dogs-and_cats.v2', '表情 包', 'a b', '狗狗2'):
+            with self.subTest(name=name):
+                self.assertEqual(h.safe_sticker_group_name(name), name)
+                self.assertEqual(h.sticker_group_name_problem(name), '')
+
+    def test_path_separators_and_reserved_characters_are_rejected(self):
+        for name in ('a/b', 'a\\b', 'a:b', 'a*b', 'a?b', 'a"b', 'a<b', 'a>b', 'a|b', '..',
+                     '.hidden', 'a\nb', 'a\tb', '\x00abc'):
+            with self.subTest(name=name):
+                self.assertEqual(h.safe_sticker_group_name(name), '')
+                self.assertTrue(h.sticker_group_name_problem(name), name)
+
+    def test_length_limit_is_in_bytes_not_characters(self):
+        """文件系统按**字节**算：33 个汉字（99 字节）行，34 个（102 字节）不行。"""
+        self.assertEqual(h.safe_sticker_group_name('猫' * 33), '猫' * 33)
+        self.assertEqual(h.safe_sticker_group_name('猫' * 34), '')
+        self.assertEqual(len('猫' * 33), 33, '33 个**字符**——上一版按字符限长就挡不住了')
+
+    def test_outer_whitespace_is_normalized_away(self):
+        # 归一化（而不是拒绝）：写进磁盘的名字里永远没有首尾空白，界面回的是真值。
+        self.assertEqual(h.safe_sticker_group_name('  猫猫  '), '猫猫')
+        self.assertEqual(h.safe_sticker_group_name('   '), '')
+        self.assertTrue(h.sticker_group_name_problem('   '))
+
+    def test_the_root_bucket_name_is_reserved_only_for_writes(self):
+        """`default` = 根目录素材的桶：**写入侧**拒（保留名），读侧照收（老目录要能显示）。"""
+        self.assertEqual(h.STICKER_GROUP_ROOT_BUCKET, 'default')
+        self.assertIn('default', h.STICKER_GROUP_RESERVED_NAMES)
+        # 文件系统合法性那一关**不**拒它：扫描遇到既有的 default 目录照常收录。
+        self.assertEqual(h.sticker_group_name_problem('default'), '')
+        self.assertEqual(h.safe_sticker_group_name('default'), 'default')
+        # 写入侧（新建 / 改名 / 移动 / 上传的目标）一律拒，并给出明确文案。
+        self.assertIn('保留名', h.sticker_group_name_problem('default', reserved=True))
+        self.assertEqual(h.safe_sticker_group_name('default', reserved=True), '')
+        # 别的名字不受影响（保留名只钉这一个）。
+        self.assertEqual(h.safe_sticker_group_name('默认组', reserved=True), '默认组')
+        self.assertEqual(h.safe_sticker_group_name('Defaults', reserved=True), 'Defaults')
+
+
+class StickerSelectionParsingTests(unittest.TestCase):
+    """模型原样返回的 JSON：两种拼写都认，拿不准一律回空 / None。"""
+
+    def test_group_choice_reads_local_media_first_then_the_top_level(self):
+        self.assertEqual(
+            h.parse_sticker_group_choice({'localMedia': {'stickerGroupId': '猫猫'}}), '猫猫',
+            '中文组名是常态：它现在**就是目录名**',
+        )
+        self.assertEqual(
+            h.parse_sticker_group_choice({'localMedia': {'sticker_group_id': 'g-2'}}), 'g-2',
+        )
+        self.assertEqual(h.parse_sticker_group_choice({'stickerGroupId': 'g-3'}), 'g-3')
+        self.assertEqual(h.parse_sticker_group_choice({'sticker_group_id': 'g-4'}), 'g-4')
+        # localMedia 优先：它就是"要发什么"的那一处。
+        self.assertEqual(
+            h.parse_sticker_group_choice(
+                {'localMedia': {'stickerGroupId': 'g-1'}, 'stickerGroupId': 'g-9'},
+            ),
+            'g-1',
+        )
+        for junk in ({}, None, [], {'localMedia': {}}, {'localMedia': {'stickerGroupId': ''}},
+                     {'stickerGroupId': '../etc'}, {'stickerGroupId': '  '},
+                     {'stickerGroupId': 'a/b'}, {'stickerGroupId': '.hidden'},
+                     {'stickerGroupId': 'x' * 200}):
+            with self.subTest(junk=junk):
+                self.assertEqual(h.parse_sticker_group_choice(junk), '')
+
+    def test_selection_receipt_normalizes_without_deciding(self):
+        self.assertEqual(
+            h.parse_sticker_selection_receipt(
+                {'stickerAssetId': 'a-1', 'willingness': 0.8, 'content': '正文'},
+            ),
+            {'assetId': 'a-1', 'content': '正文', 'willingness': 0.8},
+        )
+        self.assertEqual(
+            h.parse_sticker_selection_receipt({'sticker_asset_id': 'a-2', 'content': ''}),
+            {'assetId': 'a-2', 'content': '', 'willingness': None},
+        )
+        self.assertEqual(h.parse_sticker_selection_receipt(None), {})
+        # 兼容 `assetId`：老提示词（平铺目录）回的也是它。
+        self.assertEqual(h.parse_sticker_selection_receipt({'assetId': 'a-3'})['assetId'], 'a-3')
+
+    def test_auto_group_receipt_cleans_text_and_rejects_bad_shapes(self):
+        self.assertEqual(
+            h.parse_sticker_auto_group({'group': {'existing': 'g-1'}}),
+            {'mode': 'existing', 'groupId': 'g-1'},
+        )
+        self.assertEqual(
+            h.parse_sticker_auto_group({'group': {'new': {'name': '  猫   猫  ', 'description': 'a\nb'}}}),
+            {'mode': 'new', 'name': '猫 猫', 'description': 'a b'},
+            '控制字符换空格、压空白（名字要能进提示词）',
+        )
+        # 名字会变成**磁盘目录名**：与人工建组同一条规则（按字节限长 + 禁路径字符）。
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'new': {'name': 'x' * 200}}}))
+        self.assertIsNone(h.parse_sticker_auto_group(
+            {'group': {'new': {'name': '猫' * 40}}},  # 40 × 3 字节 = 120 > 100
+        ))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'new': {'name': 'a/b'}}}))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'new': {'name': '..'}}}))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'existing': '../x'}}))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': {'new': {'name': '   '}}}))
+        self.assertIsNone(h.parse_sticker_auto_group({'group': 'nonsense'}))
+        self.assertIsNone(h.parse_sticker_auto_group({'description': '只有描述'}))
+        self.assertIsNone(h.parse_sticker_auto_group(None))
+
+    def test_follow_up_content_only_fills_a_missing_visible_reply(self):
+        """正文**以第一段为准**（§48.1）：第二段只能填空，不能覆盖。"""
+        # 第一段写了正文 → 一字不动（这就是"第二段不许重写"的那条协议）。
+        written = {'interaction': {'reply': {'mode': 'immediate', 'content': '第一段写的'}}}
+        self.assertFalse(h.apply_sticker_follow_up_content(written, '第二段想改的'))
+        self.assertEqual(written['interaction']['reply']['content'], '第一段写的')
+        group_written = {'groupReply': {'mode': 'immediate', 'content': '群里的第一段'}}
+        self.assertFalse(h.apply_sticker_follow_up_content(group_written, '第二段想改的'))
+        self.assertEqual(group_written['groupReply']['content'], '群里的第一段')
+        # 该说话但正文是空的 → 才补。
+        private = {'interaction': {'reply': {'mode': 'immediate', 'content': '   '}}}
+        self.assertTrue(h.apply_sticker_follow_up_content(private, '补上的'))
+        self.assertEqual(private['interaction']['reply']['content'], '补上的')
+        group = {'groupReply': {'mode': 'immediate', 'content': ''}}
+        self.assertTrue(h.apply_sticker_follow_up_content(group, '补上的'))
+        self.assertEqual(group['groupReply']['content'], '补上的')
+        # 沉默 / 延后 / 没有回复位：不许凭空造一条消息出来。
+        for decision in (
+            {'interaction': {'reply': {'mode': 'none', 'content': ''}}},
+            {'interaction': {'reply': {'mode': 'deferred', 'content': ''}}},
+            {'interaction': {}},
+            {'groupReply': {'mode': 'none', 'content': ''}},
+            {},
+        ):
+            with self.subTest(decision=decision):
+                self.assertFalse(h.apply_sticker_follow_up_content(decision, '新的'))
+        self.assertFalse(h.apply_sticker_follow_up_content(private, '   '))
+        self.assertEqual(
+            h.visible_reply_text({'interaction': {'reply': {'mode': 'immediate', 'content': '  '}}}), '',
+        )
+        self.assertEqual(
+            h.visible_reply_text({'groupReply': {'mode': 'immediate', 'content': '群里的'}}), '群里的',
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

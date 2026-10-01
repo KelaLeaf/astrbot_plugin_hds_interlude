@@ -103,11 +103,26 @@ from .config import (
 )
 from .helpers import (
     COLLECTED_STICKER_DIR,
+    COLLECTED_STICKER_GROUP_ID,
+    COLLECTED_STICKER_GROUP_NAME,
     GUESS_STICKER_KIND,
     SEMANTIC_STICKER_LIMIT,
+    STICKER_AUTO_GROUP_MAX_GROUPS,
+    STICKER_AUTO_GROUP_MAX_NEW_PER_DAY,
+    STICKER_AUTO_GROUP_WINDOW_HOURS,
+    STICKER_DESCRIPTION_MAX,
     STICKER_FILE_SUFFIX,
+    STICKER_FOLLOW_UP_MAX_PER_TURN,
+    STICKER_FOLLOW_UP_TIMEOUT_SECONDS,
+    STICKER_GROUP_DESCRIPTION_MAX,
+    STICKER_GROUP_INLINE_ASSET_LIMIT,
+    STICKER_GROUP_ITEM_LIMIT,
+    STICKER_GROUP_RESERVED_NAMES,
+    STICKER_GROUP_ROOT_BUCKET,
+    STICKER_NAME_MAX,
     _turn_get,
     _turn_set,
+    apply_sticker_follow_up_content,
     calibrated_native_face_willingness,
     clip,
     collected_sticker_asset_id,
@@ -122,12 +137,22 @@ from .helpers import (
     normalize_allowed_reactions,
     normalize_expression_threshold,
     normalize_quoted_message_context,
+    parse_sticker_auto_group,
+    parse_sticker_group_choice,
+    parse_sticker_selection_receipt,
     rank_sticker_catalog,
+    safe_sticker_group_name,
     should_supersede_narrative_request,
     stable_sticker_asset_id,
     sticker_guess_candidate,
     sticker_guess_result,
+    sticker_group_directory,
+    sticker_group_directory_ids,
+    sticker_group_items,
+    sticker_group_name_problem,
+    uploaded_sticker_asset_id,
     verify_sticker_image_bytes,
+    visible_reply_text,
 )
 #: 上游 `normalizeVisibleMessageContent`（`src/service.ts:7649`，模块级导出函数）。
 #: `helpers.py` 把它实现成下划线私有（同文件里由 `normalizeGroupVisibleReply` 使用），
@@ -1298,6 +1323,16 @@ class ServiceChunk2(ServiceBase):
             'auto_collect_guess': _config_value(
                 configured, 'autoCollectGuess', 'auto_collect_guess',
             ) is True,
+            # 本移植版新增（受控偏离 §48）：模型发表情改两级选择（先点名分组、再挑条目）。
+            # **默认真**；关掉即回到 v1.8.3 的"平铺整份目录"。`is not False` 与
+            # `auto_collect` 同一把尺子：缺失 / NULL / 字符串都按默认（开）走。
+            'group_selection': _config_value(
+                configured, 'groupSelection', 'group_selection',
+            ) is not False,
+            # 本移植版新增（受控偏离 §48）：整理未描述素材时顺手定组 / 建组。**默认真**。
+            'auto_group': _config_value(
+                configured, 'autoGroup', 'auto_group',
+            ) is not False,
             'directory': str(directory if directory else 'data/hds-interlude/stickers').strip(),
             'max_file_size_mb': max(1.0, min(
                 30.0, _config_number(configured, 'maxFileSizeMB', 'max_file_size_mb', 10),
@@ -1409,6 +1444,8 @@ class ServiceChunk2(ServiceBase):
             }
             seen: set[str] = set()
             pending: list[dict[str, Any]] = []
+            #: 已经记过 debug 的不合规目录名（同一轮扫描里每个名字只报一次）。
+            warned_group_names: set[str] = set()
             max_bytes = float(config.get('max_file_size_mb') or 10) * 1024 * 1024
             for file in files or []:
                 file_path = os.path.relpath(file, root).replace('\\', '/')
@@ -1447,13 +1484,31 @@ class ServiceChunk2(ServiceBase):
                             and age_ms < STICKER_DESCRIPTION_RETRY_COOLDOWN
                         ):
                             continue
-                    group = file_path.split('/')[0] if '/' in file_path else 'default'
+                    group = (
+                        file_path.split('/')[0] if '/' in file_path
+                        else STICKER_GROUP_ROOT_BUCKET
+                    )
+                    # 目录名不合规（含 `/` 之类建不出来的字符）的既有目录**照常收录**：
+                    # 规则管的是"新写入的名字"，不是"让别人的素材消失"。只记一条 debug
+                    # （每个目录名一条，不是每个文件一条）。
+                    if group not in warned_group_names:
+                        warned_group_names.add(group)
+                        problem = sticker_group_name_problem(group)
+                        if problem:
+                            self.report_standalone_operation(
+                                'standard', 'debug',
+                                '表情库目录名不合规（照常收录，控制台可改名）：%s（%s）',
+                                group, problem,
+                            )
+                    # 模型定过的归属（§48 乙）**不在磁盘布局里**：它是库里的数据，
+                    # 扫描按目录名重算一次就会把模型刚归好的组悄悄改回去（而文件根本
+                    # 没动过）。所以"模型定过"的行，group 一栏扫描不许碰。
+                    group_guessed = bool(isinstance(prior, dict) and prior.get('groupGuessed') in (True, 1))
                     asset_id = stable_sticker_asset_id(file_path, digest)
                     now = self.now()
                     base: dict[str, Any] = {
                         'assetId': asset_id,
                         'filePath': file_path,
-                        'group': group[:128],
                         'mimeType': sticker_mime(file_path),
                         'animated': bool(re.search(r'\.gif$', file_path, re.IGNORECASE)),
                         'size': len(payload),
@@ -1461,12 +1516,20 @@ class ServiceChunk2(ServiceBase):
                         # 名字由用户手工给（控制台可改）；扫描只维护一个稳定短名。
                         'name': ((prior or {}).get('name') if isinstance(prior, dict) else '') or '',
                         'source': 'manual',
+                        # 人把文件放进某个**风格目录**= 人为归属，自动定组不许再动它；
+                        # 内置「未整理」与根目录的 `default` 桶是落脚点，仍可被归组。
+                        'groupManual': (not group_guessed) and group not in (
+                            COLLECTED_STICKER_DIR, STICKER_GROUP_ROOT_BUCKET,
+                        ),
+                        'groupGuessed': group_guessed,
                         'description': '',
                         'descriptionManual': False,
                         'aliases': [],
                         'status': 'pending',
                         'updatedAt': now,
                     }
+                    if not group_guessed:
+                        base['group'] = group[:128]
                     if isinstance(prior, dict) and prior.get('id') is not None:
                         await self.db_set('interlude_sticker', {'id': prior.get('id')}, dict(base))
                         asset = {**prior, **base}
@@ -1534,6 +1597,13 @@ class ServiceChunk2(ServiceBase):
             # （受控偏离 §45.2；扫描与自动收藏都要走这条判定，所以放在这个方法里）。
             return False
         description: Any = None
+        # 顺手定组（§48 乙）：提示词里带上现有分组目录（id + 名字 + 描述），模型才能
+        # 真的在"已有组"里挑——目录文本与两级选择读的是**同一份**（唯一事实源）。
+        # 开关关着就不带，模型也压根不会回 group。
+        groups = (
+            await self.sticker_group_directory_for_model(include_empty=True)
+            if self.sticker_config.get('auto_group') is not False else None
+        )
         try:
             visual = await self.image_bytes_to_native(payload, asset_row.get('mimeType'))
             if visual:
@@ -1545,6 +1615,7 @@ class ServiceChunk2(ServiceBase):
                     asset_row.get('filePath'),
                     asset_row.get('animated'), settings.get('description_response_format'),
                     settings.get('description_max_tokens'),
+                    groups=groups,
                 )
         except Exception as error:
             self.report_standalone_operation(
@@ -1569,6 +1640,10 @@ class ServiceChunk2(ServiceBase):
         await self._index_sticker_description(
             item_id, pick(description, 'description'), pick(description, 'aliases') or [],
         )
+        # 描述**已经存好**了才轮到归组：这一步失败只是"没归组"，描述一个字都不会回滚
+        # （§48 乙的硬要求）。开关关着时连解析都不做。
+        if groups is not None:
+            await self.apply_sticker_auto_group(item_id, asset_row, description)
         self.report_standalone_operation(
             'standard', 'info', '表情包描述完成 素材=%s 分组=%s',
             asset_row.get('assetId'), asset_row.get('group'),
@@ -1896,7 +1971,10 @@ class ServiceChunk2(ServiceBase):
         base: dict[str, Any] = {
             'assetId': asset_id,
             'filePath': file_path,
+            # 落进内置「未整理」= 落脚点，不是人定的归属：描述时可以被模型归组（§48 乙）。
             'group': COLLECTED_STICKER_DIR,
+            'groupManual': False,
+            'groupGuessed': False,
             'mimeType': mime,
             'animated': mime == 'image/gif',
             'size': len(payload),
@@ -2284,6 +2362,797 @@ class ServiceChunk2(ServiceBase):
         await self.refresh_sticker_catalog()
         return True
 
+    # ------------------------------------------------------------------ #
+    # 表情库分组（本移植版新增 v1.8.3，v1.8.5 改成"目录即分组"；§47）
+    #
+    # **磁盘目录结构是分组的唯一事实来源**：`interlude_sticker.group` 存的就是一级
+    # 子目录名（上游 `database.ts:164` 本来就有这一列），表 `interlude_sticker_groups`
+    # 只补"描述与时间"（主键就是目录名）。所以这里的写路径都落到磁盘上：
+    # 新建 = 建目录、改名 = 重命名目录 + 批量改行、删除 = 先把素材搬到目标目录再删目录、
+    # 移动 / 上传 = 把**文件**放进 `<表情库根>/<目录名>/`。
+    # 与素材那五条写入路径同一套纪律：控制台只做参数校验与错误映射，写盘写库全在这里。
+    # ------------------------------------------------------------------ #
+
+    async def sticker_group_rows(self) -> list[dict[str, Any]]:
+        """分组**描述**表的原始行（表没建 / 读失败一律空列表）。
+
+        表里没有行**不是**"未注册分组"：只说明这一组还没有描述。分组的成员资格来自
+        "磁盘上有这个目录"或"库里有素材挂着它"。
+        """
+        try:
+            rows = await self.db_get('interlude_sticker_groups', {})
+        except Exception as error:  # noqa: BLE001 - 旧库没这张表也不该让面板打不开
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '读取表情库分组描述失败（按空处理）：%s', error,
+            )
+            return []
+        return [row for row in (rows or []) if isinstance(row, dict)]
+
+    async def sticker_group_directories(self) -> list[str]:
+        """`<表情库根>` 下的**一级子目录名**（目录即分组；不存在 / 读不出来回空列表）。
+
+        与 `_list_sticker_files()` 的"一级目录名 = `group` 列"是同一条约定：
+        这里是它的**写侧**读法——控制台要能看见磁盘上真实存在的组（哪怕还没有描述、
+        甚至还没有素材），否则"新建分组"与随后手动 `mkdir` 的目录就看不见了。
+        """
+        def listdir() -> list[str]:
+            root = self.sticker_library_root()
+            if not os.path.isdir(root):
+                return []
+            return sorted(
+                name for name in os.listdir(root)
+                if os.path.isdir(os.path.join(root, name))
+            )
+
+        try:
+            return await asyncio.to_thread(listdir)
+        except OSError as error:
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '列出表情库分组目录失败（按空处理）：%s', error,
+            )
+            return []
+
+    @staticmethod
+    def _sticker_group_dir(root: str, name: str) -> str:
+        """`<表情库根>/<名字>` 的绝对路径；越界当场抛（**第二道闸**）。
+
+        第一道闸是 `safe_sticker_group_name()`（禁 `/ \\ : * ? " < > |`、首字符不许 `.`），
+        正常到不了这里——多一层是因为 `os.path.join` 的语义容易被改坏，
+        而这里拼出来的路径**真的会拿去建目录 / 搬文件**。
+        """
+        target = os.path.abspath(os.path.join(root, name))
+        try:
+            inside = os.path.commonpath([os.path.abspath(target), os.path.abspath(root)]) == os.path.abspath(root)
+        except ValueError:
+            # 跨盘（Windows 上不同盘符）/ 绝对路径混进来——`commonpath` 自己会抛。
+            inside = False
+        if not inside:
+            raise ValueError('分组目录越界，已拒绝：%s' % name)
+        return target
+
+    async def _sticker_group_in_use(self, group_id: str) -> bool:
+        """这个 `group` 值当下真的被素材用着吗。"""
+        try:
+            count = await asyncio.to_thread(self.db.count, 'interlude_sticker', {'group': group_id})
+        except Exception:  # noqa: BLE001 - 数不出来就当没被用（保守：拒绝）
+            return False
+        return int(count or 0) > 0
+
+    async def _sticker_group_exists(self, group_id: Any) -> bool:
+        """这个分组存在吗：内置组、磁盘上有目录、描述表里有行、或库里有素材挂着它。
+
+        四者任一就算存在——这正是"磁盘目录结构是分组的唯一事实来源"的判据面：
+        表里的行只是**描述**，没有行也照样是分组。
+        """
+        wanted = str(group_id if group_id is not None else '').strip()
+        if not wanted:
+            return False
+        if wanted == COLLECTED_STICKER_GROUP_ID:
+            return True
+        if wanted in await self.sticker_group_directories():
+            return True
+        if any(str(row.get('groupId')) == wanted for row in await self.sticker_group_rows()):
+            return True
+        return await self._sticker_group_in_use(wanted)
+
+    # ---- 目录搬迁：素材行 ↔ 磁盘文件（plan / apply / 写库三段）---- #
+
+    def _sticker_group_relative(self, group_id: str, file_path: Any) -> str:
+        """素材在新分组里的 `filePath` 尾巴：相对**组目录**的那一段（没前缀就取 basename）。
+
+        组目录里的文件带出子目录结构（`g/sub/a.png` → `<新组>/sub/a.png`）；
+        文件不在本组目录里的（模型归的组就是这种：文件还在 `collected/`）只带文件名。
+        """
+        relative = str(file_path if file_path is not None else '').replace('\\', '/').lstrip('/')
+        if not relative:
+            return ''
+        prefix = '%s/' % group_id
+        if group_id and relative.startswith(prefix):
+            return relative[len(prefix):]
+        return relative.split('/')[-1]
+
+    def _plan_sticker_relocation(
+        self, rows: Any, target_group: str,
+    ) -> list[dict[str, Any]]:
+        """把若干素材行搬到 `target_group` 的**计划**（只读盘做校验，不动任何东西）。
+
+        每条：`{'row', 'target', 'source', 'dest', 'filePath', 'oldFilePath', 'drop_source'}`。
+
+        三道判断都在这里（**先校验后写**）：
+        * 源 / 目的路径都要落在表情库根里（`_sticker_group_dir` 的第二道闸）；
+        * 目的文件已存在时**读出字节比对**：一样 → 只删源文件（同一张图的两份拷贝
+          合成一份）；不一样 → **抛错拒绝，绝不覆盖**；
+        * 源文件不在盘上（`missing` 行）→ 只改库，不动磁盘。
+        """
+        root = os.path.abspath(self.sticker_library_root())
+        plan: list[dict[str, Any]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            current_group = str(row.get('group') or '').strip()
+            old_file_path = str(row.get('filePath') or '').replace('\\', '/').lstrip('/')
+            tail = self._sticker_group_relative(current_group, old_file_path)
+            if not tail:
+                # 没有 `filePath` 的坏行：只改 `group`，不碰磁盘。
+                plan.append({
+                    'row': row, 'target': target_group, 'source': '', 'dest': '',
+                    'filePath': '', 'oldFilePath': old_file_path, 'drop_source': False,
+                })
+                continue
+            file_path = '%s/%s' % (target_group, tail)
+            dest = self._sticker_group_dir(root, file_path)
+            source = ''
+            if old_file_path:
+                candidate = os.path.abspath(os.path.join(root, old_file_path))
+                try:
+                    if os.path.commonpath([candidate, root]) == root:
+                        source = candidate
+                except ValueError:
+                    source = ''
+            plan.append({
+                'row': row, 'target': target_group, 'source': source, 'dest': dest,
+                'filePath': file_path, 'oldFilePath': old_file_path, 'drop_source': False,
+            })
+            self._check_sticker_relocation(plan[-1], tail)
+        return plan
+
+    @staticmethod
+    def _check_sticker_relocation(entry: dict[str, Any], tail: str) -> None:
+        """一个搬迁条目的落盘校验（同一个文件 / 文件不在盘上 / 目标撞名）。"""
+        source = entry.get('source') or ''
+        dest = entry.get('dest') or ''
+        if not source or not dest or os.path.abspath(source) == os.path.abspath(dest):
+            entry['source'] = ''
+            return
+        if not os.path.exists(source):
+            return
+        if not os.path.exists(dest):
+            return
+        try:
+            with open(source, 'rb') as left, open(dest, 'rb') as right:
+                same = left.read() == right.read()
+        except OSError as error:
+            raise ValueError('读取素材文件失败：%s' % error) from error
+        if not same:
+            raise ValueError('目标分组里已有同名文件：%s' % tail)
+        entry['drop_source'] = True
+
+    @staticmethod
+    def _apply_sticker_relocation(plan: Any) -> None:
+        """按计划搬文件（**绝不覆盖**：目的存在时只可能是同内容，走 `drop_source`）。"""
+        for entry in plan or []:
+            if not isinstance(entry, dict):
+                continue
+            source = entry.get('source') or ''
+            dest = entry.get('dest') or ''
+            if not source or not dest or not os.path.exists(source):
+                continue
+            if entry.get('drop_source'):
+                os.remove(source)
+                continue
+            directory = os.path.dirname(dest)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            os.rename(source, dest)
+
+    async def _write_sticker_relocation(self, plan: Any, *, manual: bool = False) -> int:
+        """搬完文件之后写库：`group` + `filePath`（+ 人放的位置那两个标记）。"""
+        now = self.now()
+        written = 0
+        for entry in plan or []:
+            if not isinstance(entry, dict):
+                continue
+            row = entry.get('row')
+            if not isinstance(row, dict) or row.get('id') is None:
+                continue
+            patch: dict[str, Any] = {'group': entry.get('target'), 'updatedAt': now}
+            if entry.get('filePath'):
+                patch['filePath'] = entry['filePath']
+            if manual:
+                # 这是**人**放的位置（控制台移动 / 上传指定 / 删组时的搬迁）：
+                # 打上 `groupManual`，模型的自动定组从此不许再动它（§48 乙）。
+                patch['groupManual'] = True
+                patch['groupGuessed'] = False
+            await self.db_set('interlude_sticker', {'id': row.get('id')}, patch)
+            written += 1
+        return written
+
+    def _sticker_stray_plan(self, source_group: str, target_group: str, plan: Any) -> list[dict[str, Any]]:
+        """删组前把组目录里**没入库**的残留文件也搬到目标目录（否则目录删不掉）。
+
+        只搬文件、不写库（这些文件根本没有行）。目标撞名同样走"同内容合成 / 不同内容拒绝"。
+        """
+        root = os.path.abspath(self.sticker_library_root())
+        try:
+            source_dir = self._sticker_group_dir(root, source_group)
+        except ValueError:
+            return []
+        if not os.path.isdir(source_dir):
+            return []
+        taken = {
+            os.path.abspath(entry['source']) for entry in (plan or [])
+            if isinstance(entry, dict) and entry.get('source')
+        }
+        strays: list[dict[str, Any]] = []
+        for current, _directories, names in os.walk(source_dir):
+            for name in names:
+                path = os.path.abspath(os.path.join(current, name))
+                if path in taken:
+                    continue
+                relative = os.path.relpath(path, source_dir).replace('\\', '/')
+                entry: dict[str, Any] = {
+                    'row': None, 'target': target_group, 'source': path,
+                    'dest': self._sticker_group_dir(root, '%s/%s' % (target_group, relative)),
+                    'filePath': '', 'oldFilePath': relative, 'drop_source': False,
+                }
+                self._check_sticker_relocation(entry, relative)
+                strays.append(entry)
+        return strays
+
+    def _remove_sticker_group_dir(self, group_id: str) -> None:
+        """删掉分组目录（自底向上 `rmdir`）；还剩东西就留着并记一条 warn。"""
+        root = os.path.abspath(self.sticker_library_root())
+        try:
+            target = self._sticker_group_dir(root, group_id)
+        except ValueError:
+            return
+        if not os.path.isdir(target):
+            return
+        for current, _directories, _names in os.walk(target, topdown=False):
+            try:
+                os.rmdir(current)
+            except OSError:
+                pass
+        if os.path.isdir(target):
+            self.report_standalone(
+                'warn', '表情库分组目录没能删掉（里面还有文件），已保留：%s', target,
+            )
+
+    # ---- 分组写路径 ---- #
+
+    async def _write_sticker_group_description(
+        self, group_id: str, description: str, prior: Any = None, created_at: Any = None,
+        ensure_row: bool = False, auto_created: bool = False,
+    ) -> dict[str, Any]:
+        """写一行的**描述**；表里还没有这一行就补一行。
+
+        "表里没有行 = 这一组还没有描述"是这一版的口径，所以：
+
+        * `ensure_row=True`（**新建分组**时）一定落一行——顺手记下创建时间（表补的就是
+          "描述与时间"），列表因此按建组顺序排；
+        * 给一个**本来就存在**的分组写空描述、而它又没有行 → 不落行（凭空写一个
+          "创建时间 = 现在"是假的时间；而且"没有行"本来就等于"没有描述"）；
+        * 清空一个**有行**的描述 → 保留那一行、描述置空（创建时间是真的）。
+        `created_at` 只在改名迁移描述行时给（把原来的创建时间带过去）。
+        `auto_created=True` = 这一行是**模型自动归组**建的（只有它计入自动建组额度）；
+        它只在插入那一支生效——改描述不动这一列（"是谁建的"是既成事实，不该被后写的
+        描述改写）。
+        """
+        now = self.now()
+        existing = prior if isinstance(prior, dict) else None
+        if existing is None and not description and not ensure_row and created_at is None:
+            return {
+                'groupId': group_id, 'description': '', 'autoCreated': False,
+                'createdAt': '', 'updatedAt': '',
+            }
+        if existing is None:
+            data: dict[str, Any] = {
+                'groupId': group_id, 'description': description,
+                'autoCreated': bool(auto_created),
+                'createdAt': str(created_at or '') or now, 'updatedAt': now,
+            }
+            try:
+                created = await self.db_create('interlude_sticker_groups', dict(data))
+            except Exception as error:  # noqa: BLE001 - 旧库缺这张表 / 主键撞了
+                raise ValueError('保存分组描述失败：%s' % error) from error
+            return created if isinstance(created, dict) else data
+        await self.db_set('interlude_sticker_groups', {'groupId': group_id}, {
+            'description': description, 'updatedAt': now,
+        })
+        return {**existing, 'description': description, 'updatedAt': now}
+
+    async def save_sticker_group(
+        self, group_id: Any = '', name: Any = '', description: Any = None,
+        auto_created: bool = False,
+    ) -> dict[str, Any]:
+        """新建 / 改名 / 写描述一个分组；返回写入后的**描述行**。
+
+        语义全部落在"**`groupId` 的字面量就是目录名**"这一条上：
+
+        * `group_id` 空 = **新建分组**：`name` 就是新目录名 → 建目录 `<表情库根>/<name>`
+          + 落一行描述（表里没有行 = 这一组没有描述）；
+        * `group_id` 非空 = 针对这个目录名的操作：`name` 与它相同 = 只写描述；
+          **不同 = 改名** → 重命名目录 + 批量更新该组素材的 `group` 与 `filePath`；
+        * 内置组 `collected` 的显示名固定「未整理」，**不许改名**（改名 = 换目录，
+          而老库里已经有素材在那个目录里了）；给它写描述照常；
+        * 保留名（`default` = 根目录素材的桶）**不能当新写入的名字**：新建 / 改名到它
+          一律拒；给一个**既有**的 `default/` 目录写描述、或把它改名成别的名字照常；
+        * `auto_created=True` 只由自动归组路径传（§48 乙）：它决定这一行算不算
+          自动建组的额度，人建的组不占模型的额度。
+        """
+        wanted = str(group_id if group_id is not None else '').strip()
+        # 给"已经在用的那个名字"写描述时**不**按保留名判（历史目录要能管理）；
+        # 只有"要写一个新名字"（新建 / 改名）才加严。
+        writing_new_name = not wanted or wanted != str(name if name is not None else '').strip()
+        problem = sticker_group_name_problem(name, reserved=writing_new_name)
+        if problem:
+            raise ValueError(problem)
+        text = safe_sticker_group_name(name)
+        desc = '' if description is None else str(description).strip()
+        if len(desc) > STICKER_GROUP_DESCRIPTION_MAX:
+            raise ValueError('分组描述最长 %d 个字符' % STICKER_GROUP_DESCRIPTION_MAX)
+        existing = await self.sticker_group_rows()
+        by_id = {str(row.get('groupId')): row for row in existing}
+        if not wanted:
+            if await self._sticker_group_exists(text):
+                raise ValueError('分组已存在：%s' % text)
+            root = os.path.abspath(self.sticker_library_root())
+            directory = self._sticker_group_dir(root, text)
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except OSError as error:
+                raise ValueError('新建分组目录失败：%s' % error) from error
+            # 目录是分组的本体，描述行只是补充：目录建好之后，这一组就已经存在了。
+            # 新建时**一定**落一行（顺手记下创建时间，列表因此按建组顺序排）。
+            return await self._write_sticker_group_description(
+                text, desc, None, ensure_row=True, auto_created=auto_created,
+            )
+        prior = by_id.get(wanted)
+        if wanted == COLLECTED_STICKER_GROUP_ID:
+            if text not in (COLLECTED_STICKER_GROUP_ID, COLLECTED_STICKER_GROUP_NAME):
+                raise ValueError(
+                    '内置分组的目录名不能改（显示名固定为「%s」）' % COLLECTED_STICKER_GROUP_NAME,
+                )
+            return await self._write_sticker_group_description(wanted, desc, prior)
+        problem = sticker_group_name_problem(wanted)
+        if problem:
+            raise ValueError(problem)
+        if not await self._sticker_group_exists(wanted):
+            raise ValueError('找不到这个分组：%s' % wanted)
+        if text == wanted:
+            return await self._write_sticker_group_description(wanted, desc, prior)
+        if await self._sticker_group_exists(text):
+            raise ValueError('分组已存在：%s' % text)
+        await self._rename_sticker_group(wanted, text)
+        return await self._move_sticker_group_description(wanted, text, desc, prior)
+
+    async def _move_sticker_group_description(
+        self, old: str, new: str, description: str, prior: Any,
+    ) -> dict[str, Any]:
+        """描述行跟着目录名走：新键写一行 + 删旧行（主键就是目录名，不能原地改）。"""
+        if not isinstance(prior, dict):
+            return await self._write_sticker_group_description(new, description, None)
+        moved = await self._write_sticker_group_description(
+            new, description, None, created_at=prior.get('createdAt'),
+        )
+        try:
+            await self.db_remove('interlude_sticker_groups', {'groupId': old})
+        except Exception as error:  # noqa: BLE001 - 旧库缺这张表：改名照常成功
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '分组改名时清理旧描述行失败（忽略）：%s', error,
+            )
+        return moved
+
+    async def _rename_sticker_group(self, old: str, new: str) -> None:
+        """改名：重命名目录 + 批量更新该组素材行的 `group` 与 `filePath`。
+
+        两件事必须一起做：`group` 列与 `filePath` 的第一段都是目录名，只改一样就等于
+        把素材行的"归属"与"文件在哪"拆开——下一次扫描会按目录名重算 `group`，
+        于是刚改的名又被改回去（而且素材还多出一条重复行）。
+        模型归的组（`groupGuessed` 的行）文件不在本组目录里：它只改 `group`，不动路径。
+        """
+        root = os.path.abspath(self.sticker_library_root())
+        old_dir = self._sticker_group_dir(root, old)
+        new_dir = self._sticker_group_dir(root, new)
+        if os.path.isdir(old_dir):
+            if os.path.exists(new_dir):
+                raise ValueError('目标目录已存在：%s' % new)
+            try:
+                os.rename(old_dir, new_dir)
+            except OSError as error:
+                raise ValueError('重命名分组目录失败：%s' % error) from error
+        now = self.now()
+        rows = await self.db_get('interlude_sticker', {'group': old})
+        prefix = '%s/' % old
+        for row in rows or []:
+            if not isinstance(row, dict) or row.get('id') is None:
+                continue
+            patch: dict[str, Any] = {'group': new, 'updatedAt': now}
+            relative = str(row.get('filePath') or '').replace('\\', '/')
+            if relative.startswith(prefix):
+                patch['filePath'] = '%s/%s' % (new, relative[len(prefix):])
+            await self.db_set('interlude_sticker', {'id': row.get('id')}, patch)
+        if rows:
+            await self.refresh_sticker_catalog()
+
+    async def move_sticker_assets(self, row_ids: Any, group_id: Any) -> int:
+        """把若干条素材改到另一个分组：**文件跟着搬进那个目录**，再写库。
+
+        搬的是**目录归属**：`interlude_sticker.group` 就是一级目录名，下一轮扫描按目录名
+        重算 `group`——只改库不改盘，"人摆好的位置"会被扫描下一次改回去。
+        返回搬动的行数（已经在目标组里的也算，幂等；**先校验后写**在调用方）。
+        """
+        problem = sticker_group_name_problem(group_id, reserved=True)
+        if problem:
+            raise ValueError(problem)
+        target = safe_sticker_group_name(group_id, reserved=True)
+        if not await self._sticker_group_exists(target):
+            raise ValueError('找不到这个分组：%s' % target)
+        rows: list[dict[str, Any]] = []
+        for row_id in row_ids or []:
+            if row_id is None:
+                continue
+            row = await self.sticker_asset_row(row_id)
+            if isinstance(row, dict):
+                rows.append(row)
+        if not rows:
+            return 0
+        plan = self._plan_sticker_relocation(rows, target)
+        try:
+            self._apply_sticker_relocation(plan)
+        except OSError as error:
+            raise ValueError('搬动素材文件失败：%s' % error) from error
+        await self._write_sticker_relocation(plan, manual=True)
+        await self.refresh_sticker_catalog()
+        return len(rows)
+
+    async def apply_sticker_auto_group(self, item_id: Any, asset_row: Any, receipt: Any) -> str:
+        """描述回执里顺手带来的分组选择 → 定组 / 建组（§48 乙）；返回落到的 groupId。
+
+        **只动"还没描述过"的素材**：能在这一步的素材，刚由 `describe_sticker_asset()`
+        自动补完描述；人写过的描述（`descriptionManual`）根本不进描述流程，这里再挡一次
+        （两层冗余是刻意的：本方法是独立单元，别的调用方将来也会走它）。
+
+        **失败绝不影响描述**：描述在调用本方法之前就已经写库了。任何一步出问题都只是
+        "没归组"，素材留在原组（通常是「未整理」），只记 debug。
+        """
+        row = asset_row if isinstance(asset_row, dict) else {}
+        if item_id is None:
+            return ''
+        # 人写过的描述 / 人摆过的位置 / 已经描述过的行——一律不碰（§48 乙的三条边界）。
+        if row.get('descriptionManual') in (True, 1):
+            self._report_sticker_auto_group_fallback('描述是人写的，不归组 素材=%s', row.get('assetId'))
+            return ''
+        if row.get('groupManual') in (True, 1):
+            self._report_sticker_auto_group_fallback('分组是人放的，不归组 素材=%s', row.get('assetId'))
+            return ''
+        choice = parse_sticker_auto_group(receipt)
+        if not choice:
+            self._report_sticker_auto_group_fallback('回执里没有可用的分组选择 素材=%s', row.get('assetId'))
+            return ''
+        try:
+            target = await self._resolve_auto_group_target(choice)
+            if not target:
+                return ''
+            current = str(row.get('group') or '').strip()
+            if target == current:
+                self._report_sticker_auto_group_fallback(
+                    '模型认为分组已经合适，未改动 素材=%s 分组=%s', row.get('assetId'), target,
+                )
+                return ''
+            await self.db_set('interlude_sticker', {'id': item_id}, {
+                'group': target, 'groupGuessed': True, 'groupManual': False,
+                'updatedAt': self.now(),
+            })
+            await self.refresh_sticker_catalog()
+            self.report_standalone_operation(
+                'standard', 'info', '表情包已由模型归组 素材=%s 分组=%s→%s 方式=%s',
+                row.get('assetId'), current, target, choice.get('mode'),
+            )
+            return target
+        except Exception as error:  # noqa: BLE001 - 归组失败绝不影响已经存好的描述
+            self._report_sticker_auto_group_fallback(
+                '自动归组失败（描述已保存）素材=%s 错误=%s', row.get('assetId'), error,
+            )
+            return ''
+
+    async def _resolve_auto_group_target(self, choice: dict[str, Any]) -> str:
+        """模型选的分组 → **可以落的 groupId**；拿不准回空串（调用方按"没归组"处理）。
+
+        四条防线（都在这一处）：
+
+        1. `existing` 必须是**当下分组目录里真的有**的组（有素材挂着的、有描述行的、
+           盘上有目录的都算，因为目录里就列着它）——模型编一个名字出来不会凭空造出目录；
+        2. `new` 的名字与**已有组同名**（strip + casefold，显示名与目录名都算）→ 归到
+           那一组，不新建（模型很爱把同一组换个大小写再报一次）；
+        3. 分组总数上限 `STICKER_AUTO_GROUP_MAX_GROUPS`；
+        4. 新建速率上限 `STICKER_AUTO_GROUP_MAX_NEW_PER_DAY` / 滚动
+           `STICKER_AUTO_GROUP_WINDOW_HOURS` 小时——**只数 `autoCreated` 的行**
+           （模型自己建的），人在控制台建的组不占这个额度。
+
+        注意第 2/3 条用的名字集合来自**不截断**的分组目录（提示词里有上限，
+        但"这个组真实存在吗"不该被截断否认）。
+        """
+        rows = await self.sticker_group_rows()
+        directory = await self.sticker_group_directory_for_model(include_empty=True, limit=None)
+        if choice.get('mode') == 'existing':
+            wanted = safe_sticker_group_name(choice.get('groupId'))
+            if not wanted or wanted not in sticker_group_directory_ids(directory):
+                self._report_sticker_auto_group_fallback('点名的分组不在目录里：%s', choice.get('groupId'))
+                return ''
+            return wanted
+        name = safe_sticker_group_name(choice.get('name'))
+        problem = sticker_group_name_problem(choice.get('name'), reserved=True)
+        if problem:
+            self._report_sticker_auto_group_fallback('新建分组的名字不合规（%s）', problem)
+            return ''
+        # 同名 = 同一组：**归过去**，不新建（防"名字爆炸"的第一道闸）。目录名与显示名
+        # 都参与比较——内置组的显示名是「未整理」，模型很可能就用这个名字点它。
+        folded: dict[str, str] = {}
+        for item in directory:
+            group_id = str(item.get('groupId') or '').strip()
+            if not group_id:
+                continue
+            folded.setdefault(group_id.casefold(), group_id)
+            display = str(item.get('name') or '').strip()
+            if display:
+                folded.setdefault(display.casefold(), group_id)
+        existing_id = folded.get(name.casefold())
+        if existing_id:
+            self._report_sticker_auto_group_fallback('同名分组已存在，归到它：%s', name)
+            return existing_id
+        if len(directory) >= STICKER_AUTO_GROUP_MAX_GROUPS:
+            self._report_sticker_auto_group_fallback(
+                '分组总数已达上限 %d，不新建：%s', STICKER_AUTO_GROUP_MAX_GROUPS, name,
+            )
+            return ''
+        now_ms = self.now_ms()
+        window_ms = int(STICKER_AUTO_GROUP_WINDOW_HOURS) * 3600 * 1000
+        # **只数自动建的行**（`autoCreated`，§48 乙）：人在控制台建的组、上传 / 扫描
+        # 带出来的组都不占模型的额度，模型自己建的组也不占人的（人这条路没有额度）。
+        # 旧库补列前写入的行是 NULL → 当"不是自动建的"（保守：不占额度）。
+        created_recently = 0
+        for row in rows:
+            if row.get('autoCreated') not in (True, 1):
+                continue
+            age_ms = now_ms - dt_ms(row.get('createdAt'))
+            if 0 <= age_ms < window_ms:
+                created_recently += 1
+        if created_recently >= STICKER_AUTO_GROUP_MAX_NEW_PER_DAY:
+            self._report_sticker_auto_group_fallback(
+                '新建分组太快（%d 小时内已有 %d 个），不新建：%s',
+                STICKER_AUTO_GROUP_WINDOW_HOURS, created_recently, name,
+            )
+            return ''
+        try:
+            created = await self.save_sticker_group(
+                '', name, choice.get('description'), auto_created=True,
+            )
+        except Exception as error:  # noqa: BLE001 - 名字撞车 / 目录建不出来都只是"没归组"
+            self._report_sticker_auto_group_fallback('新建分组失败：%s（%s）', name, error)
+            return ''
+        return safe_sticker_group_name((created or {}).get('groupId'))
+
+    def _report_sticker_auto_group_fallback(self, message: str, *args: Any) -> None:
+        """自动归组的兜底：**debug**。素材留在原组，描述照存（§48 乙）。"""
+        self.report_standalone_operation('diagnostic', 'debug', '自动归组回退：' + message, *args)
+
+    async def delete_sticker_group(self, group_id: Any = '', move_to: Any = '') -> dict[str, Any]:
+        """删一个分组：**先把组内素材搬到目标目录、再删目录与描述行**；回 `{moved, moveTo}`。
+
+        默认搬进内置「未整理」，目标必须是**已存在的分组**（"挪到一个拼错的地方"意味着
+        素材会落进一个没人认得的目录）。搬的是**文件**：`group` 列存的就是目录名，
+        只改库不改盘，下一轮扫描会把它们按磁盘目录改回去。
+        **绝不悄悄删素材**——素材是用户自己攒的，"删分组"不该变成"丢表情"；
+        组目录里**没入库**的残留文件也一并搬到目标目录（否则目录删不掉，也不该丢）。
+        """
+        wanted = str(group_id if group_id is not None else '').strip()
+        if not wanted:
+            raise ValueError('缺少 groupId')
+        if wanted == COLLECTED_STICKER_GROUP_ID:
+            raise ValueError('内置分组不能删除')
+        if not await self._sticker_group_exists(wanted):
+            raise ValueError('找不到这个分组：%s' % wanted)
+        target = str(move_to if move_to is not None else '').strip() or COLLECTED_STICKER_GROUP_ID
+        if target == wanted:
+            raise ValueError('不能把素材挪进正在删除的分组')
+        problem = sticker_group_name_problem(target, reserved=True)
+        if problem:
+            raise ValueError(problem)
+        target = safe_sticker_group_name(target, reserved=True)
+        if not await self._sticker_group_exists(target):
+            raise ValueError('找不到要挪入的分组：%s' % target)
+        rows = [
+            row for row in (await self.db_get('interlude_sticker', {'group': wanted}) or [])
+            if isinstance(row, dict)
+        ]
+        try:
+            plan = self._plan_sticker_relocation(rows, target)
+            plan.extend(self._sticker_stray_plan(wanted, target, plan))
+            self._apply_sticker_relocation(plan)
+        except (OSError, ValueError) as error:
+            # 搬不动就不删（否则素材成孤儿）；文件可能已经搬了一部分——记 warn，
+            # 下一次扫描会按磁盘目录把它们认回来。
+            self.report_standalone('warn', '表情库素材搬迁失败，未删除分组：%s', error)
+            raise ValueError('把素材挪到「%s」失败：%s' % (target, error)) from error
+        await self._write_sticker_relocation(plan)
+        self._remove_sticker_group_dir(wanted)
+        try:
+            await self.db_remove('interlude_sticker_groups', {'groupId': wanted})
+        except Exception as error:  # noqa: BLE001 - 旧库缺这张表：删组照常成功
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '删除分组时清理描述行失败（忽略）：%s', error,
+            )
+        await self.refresh_sticker_catalog()
+        return {'moved': len(rows), 'moveTo': target}
+
+    async def _resolve_upload_group(self, group_id: Any) -> str:
+        """上传落到哪个分组：没给就落内置「未整理」；给了必须是**真的存在的分组**。
+
+        "真的存在"= 盘上有这个目录、描述表里有这一行、或库里有素材挂着它
+        （`_sticker_group_exists`）——目录是分组的本体，落盘时目录不存在就建出来。
+        """
+        wanted = str(group_id if group_id is not None else '').strip()
+        if not wanted:
+            return COLLECTED_STICKER_GROUP_ID
+        problem = sticker_group_name_problem(wanted, reserved=True)
+        if problem:
+            raise ValueError(problem)
+        wanted = safe_sticker_group_name(wanted, reserved=True)
+        if not await self._sticker_group_exists(wanted):
+            raise ValueError('找不到这个分组：%s' % wanted)
+        return wanted
+
+    async def upload_sticker_asset(
+        self, payload: Any, group_id: Any = '', description: Any = None, name: Any = '',
+    ) -> dict[str, Any]:
+        """把**用户主动上传**的图片收进表情库；返回 `{assetId, duplicated, row}`。
+
+        与自动收藏共用同一批硬判据（魔数嗅探 / 体积上限 / 内容 sha256 去重），
+        但**不受"入站自动收藏"那套平台标记判据约束**：这是用户自己放进来的，
+        不需要任何人从 OneBot 原始段观测到"这是一张表情包"。
+
+        三条红线：
+
+        1. **文件名一律不可信**：落盘名是内容哈希 + 按嗅探 MIME 取的扩展名，
+           上传时带的 `filename` 一个字符都不进路径（它只用于错误提示，也不落库）；
+        2. **绝不覆盖**：命中已有内容直接回那一条（不新建文件、不改行、不写盘）；
+           万一目标路径上已经有一个同名文件，读到字节不一致就**拒绝**而不是覆盖；
+        3. **越界一律拒**：`groupId`（= 目录名）走 `safe_sticker_group_name` 的命名规则，
+           落盘前再确认解析结果真的在表情库根目录里（第二道保险）。
+
+        描述：上传时给了 `description` 就**立刻**用它（并置 `descriptionManual`，
+        自动扫描不得覆盖），没给才交给视觉模型（`describe_sticker_asset`）——
+        与自动收藏的"收完立刻描述"是同一条路。
+        """
+        if not payload:
+            raise ValueError('没有收到文件内容')
+        mime = verify_sticker_image_bytes(payload)
+        if not mime:
+            raise ValueError('这个文件不是图片（只认 PNG / JPEG / GIF / WebP）')
+        config = self.sticker_config
+        max_bytes = float(config.get('max_file_size_mb') or 10) * 1024 * 1024
+        if len(payload) > max_bytes:
+            raise ValueError('图片超过体积上限（%.0f MB）' % (max_bytes / (1024 * 1024)))
+        digest = hashlib.sha256(payload).hexdigest()
+        prior = await self._sticker_prior_by_hash(digest)
+        if prior is not None:
+            # 命中已有内容：**不新建文件、不覆盖、不改行**，直接把那一条回给用户。
+            # （哪怕它现在是 `missing` / `disabled` 也照此办理：那两行是"库里有这条记录"，
+            #  重复上传不该把用户的停用决定顶掉；文件被删的走「重扫表情库」复活。）
+            self.report_standalone_operation(
+                'standard', 'debug', '上传的表情库里已有同内容素材，未新建 素材=%s',
+                prior.get('assetId'),
+            )
+            return {
+                'assetId': prior.get('assetId'),
+                'duplicated': True,
+                'row': prior,
+            }
+        given_desc = '' if description is None else str(description).strip()
+        if len(given_desc) > STICKER_DESCRIPTION_MAX:
+            raise ValueError('描述最长 %d 个字符' % STICKER_DESCRIPTION_MAX)
+        given_name = str(name if name is not None else '').strip()
+        if len(given_name) > STICKER_NAME_MAX:
+            raise ValueError('名字最长 %d 个字符' % STICKER_NAME_MAX)
+        target_group = await self._resolve_upload_group(group_id)
+        root = os.path.abspath(self.sticker_library_root())
+        file_path = '%s/%s%s' % (
+            target_group, digest, STICKER_FILE_SUFFIX.get(mime, '.png'),
+        )
+        target = os.path.abspath(os.path.join(root, file_path.replace('/', os.sep)))
+        if os.path.commonpath([target, root]) != root:
+            # 结构性防御（第二道闸）：`safe_sticker_group_name` 已经挡掉了 `..` 与分隔符，
+            # 正常到不了这里。
+            raise ValueError('落盘路径越界，已拒绝')
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if os.path.exists(target):
+                with open(target, 'rb') as handle:
+                    on_disk = handle.read()
+                if on_disk != payload:
+                    # 同名不同内容 = 只有哈希碰撞才可能；覆盖会让"库里的行"与"盘上的字节"
+                    # 对不上，所以宁可拒收（用户改个名再传就是了）。
+                    raise ValueError('目标文件已存在且内容不同，已拒绝覆盖')
+            else:
+                with open(target, 'wb') as handle:
+                    handle.write(payload)
+        except OSError as error:
+            raise ValueError('保存文件失败：%s' % error) from error
+        asset_id = uploaded_sticker_asset_id(digest)
+        now = self.now()
+        base: dict[str, Any] = {
+            'assetId': asset_id,
+            'filePath': file_path,
+            'group': target_group,
+            'mimeType': mime,
+            'animated': mime == 'image/gif',
+            'size': len(payload),
+            'hash': digest,
+            'name': given_name or ('upload-%s' % digest[:8]),
+            # 上传是"用户放进来的"：与磁盘扫描同源，取值仍是冻结的两个之一（auto / manual）。
+            'source': 'manual',
+            'description': given_desc,
+            # 人写的描述要钉住（同 `save_sticker_description` 的排序式标记）。
+            'descriptionManual': bool(given_desc),
+            'aliases': [],
+            'status': 'active' if given_desc else 'pending',
+            'guessed': False,
+            # 人显式指定的分组 = 人为归属（模型不许后来把它搬走）；
+            # 没指定就落内置「未整理」，那是落脚点，等着被归组（§48 乙）。
+            'groupManual': target_group != COLLECTED_STICKER_GROUP_ID,
+            'groupGuessed': False,
+            'updatedAt': now,
+        }
+        try:
+            created = await self.db_create('interlude_sticker', {**base, 'createdAt': now})
+        except Exception as error:  # noqa: BLE001 - 唯一索引冲突 / 旧库缺列
+            # 并发同一个文件上传：两边都过了去重检查，一边赢了写入。
+            # 这时**回那一行**（内容一样、文件一样），别把用户的一次正常上传变成 400。
+            raced = await self._sticker_prior_by_hash(digest)
+            if raced is not None:
+                return {'assetId': raced.get('assetId'), 'duplicated': True, 'row': raced}
+            raise ValueError('建档失败：%s' % error) from error
+        asset = created if isinstance(created, dict) else {**base, 'createdAt': now}
+        self.report_standalone_operation(
+            'standard', 'info', '已上传表情包 素材=%s 分组=%s 大小=%dB',
+            asset_id, target_group, len(payload),
+        )
+        await self.refresh_sticker_catalog()
+        row_id = asset.get('id')
+        if given_desc:
+            if row_id is not None:
+                await self._index_sticker_description(row_id, given_desc, [])
+        else:
+            # 没配识图模型时这一条**要让用户看见**（坑 25 的能力缺失纪律）：
+            # 行会留在 `pending`、描述为空，界面据此提示"待描述"。
+            if not _provider_available(self.sticker_describer):
+                self.report_standalone_operation(
+                    'standard', 'warn',
+                    '上传的表情包已入库，但没有配置 useForStickers 的视觉模型，描述待补 素材=%s',
+                    asset_id,
+                )
+            # 没给描述就交给视觉模型（没配模型时它只回 False，行留在 pending，
+            # 下一次「重扫表情库」会补上）；描述完再刷一次目录，下一回合就能选它。
+            await self.describe_sticker_asset(asset, payload, config)
+            await self.refresh_sticker_catalog()
+        fresh = await self.sticker_asset_row(row_id) if row_id is not None else None
+        return {
+            'assetId': asset.get('assetId') or asset_id,
+            'duplicated': False,
+            'row': fresh if isinstance(fresh, dict) else asset,
+        }
+
     async def record_sticker_use(self, asset: Any) -> None:
         """投递成功后给素材的 `uses` 加一（控制台排序用）。
 
@@ -2371,6 +3240,164 @@ class ServiceChunk2(ServiceBase):
             for asset in assets
             if isinstance(asset, dict)
         ]
+
+    async def sticker_group_directory_for_model(
+        self, *, include_empty: bool = False, limit: Optional[int] = STICKER_AUTO_GROUP_MAX_GROUPS,
+    ) -> list[dict[str, Any]]:
+        """模型可见的**分组目录**（`helpers.sticker_group_directory` 是唯一事实源）。
+
+        两级选择的第一次 payload 与「描述时顺手定组」的提示词都读这一份。目录文本
+        写两份，迟早会演成"挑组时看到的描述"与"整理时看到的描述"不一致——那正是
+        §48 把甲/乙放进同一轮的原因。
+
+        `include_empty=True` 给乙用（**还没有素材的组也要列**，否则第一条素材永远进不了
+        一个刚建好的组）；`limit=None` 给"这个组存不存在"的校验用（提示词那边一定带
+        上限，校验那边不能因为截断就否认一个真实存在的组）。
+
+        名字集合 = 有素材挂着的 ∪ 描述表里有行的 ∪ **磁盘上真有目录的**
+        （`sticker_group_directories()`）——控制台看得见的组，模型也看得见。
+        """
+        return sticker_group_directory(
+            self.sticker_catalog, await self.sticker_group_rows(),
+            limit=limit, include_empty=include_empty,
+            directories=await self.sticker_group_directories(),
+        )
+
+    async def sticker_selection_for_session(
+        self, session: Any, turn_query_embedding: Optional[list[float]] = None,
+    ) -> dict[str, Any]:
+        """这一回合给模型看什么表情目录：`{'mode', 'assets', 'groups'}`。
+
+        **两级选择的判据只在这里一处**（返回 `mode` 就是全部结论）：
+
+        * `inline`：条目整份平铺（= v1.8.3 的原行为）。三种情况走这条——总开关关着 /
+          条目本来就不多（≤ `STICKER_GROUP_INLINE_ASSET_LIMIT`）/ 素材只落在一个组里
+          （"一组的两级选择"纯粹多烧一次模型调用）。前两种连注册表都不用读。
+        * `groups`：只给分组目录（`[{groupId, name, description, count}]`，**不列条目**）；
+          模型点名一组之后由 `resolve_sticker_selection()` 追问第二次。
+        """
+        assets = await self.sticker_catalog_for_session(session, turn_query_embedding)
+        inline: dict[str, Any] = {'mode': 'inline', 'assets': assets, 'groups': []}
+        if not assets or self.sticker_config.get('group_selection') is False:
+            return inline
+        groups_in_assets = {
+            str(asset.get('group') or '').strip() for asset in assets if isinstance(asset, dict)
+        }
+        groups_in_assets.discard('')
+        if len(assets) <= STICKER_GROUP_INLINE_ASSET_LIMIT or len(groups_in_assets) <= 1:
+            return inline
+        directory = await self.sticker_group_directory_for_model()
+        if len(directory) <= 1:
+            return inline
+        return {'mode': 'groups', 'assets': [], 'groups': directory}
+
+    async def resolve_sticker_selection(
+        self, decision: Any, selection: Any, follow_up_budget: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """把这一回合的表情草稿解析成**可投递的资产**（两级选择的第二步）。
+
+        * `inline`：与 v1.8.3 逐字一致——`resolve_sticker(localMedia, 平铺目录)`；
+        * `groups`：读模型点名的分组 → 追问一次（附该组条目）→ 仍然交回**同一个**
+          `resolve_sticker()` 判"候选里有没有它 + 意愿过不过阈值"。投递路径因此
+          一个字都没变（`send_sticker` 认的还是 `assetId`）。
+
+        **最多追问一次**（铁律）：回执里再点名一组也不接着问——`follow_up_budget`
+        是这一回合的追问计数，调用方每回合给一个新的空 dict。
+        """
+        data = selection if isinstance(selection, dict) else {}
+        assets = data.get('assets') if isinstance(data.get('assets'), list) else []
+        local_media = pick(decision, 'localMedia', 'local_media')
+        if data.get('mode') != 'groups':
+            return self.resolve_sticker(local_media, assets)
+        group_id = parse_sticker_group_choice(decision)
+        if not group_id:
+            self._report_sticker_selection_fallback('模型没有点名分组')
+            return None
+        items = sticker_group_items(self.sticker_catalog, group_id, STICKER_GROUP_ITEM_LIMIT)
+        if not items:
+            self._report_sticker_selection_fallback(
+                '点名的分组不存在或没有可挑的条目 分组=%s' % group_id,
+            )
+            return None
+        budget = follow_up_budget if isinstance(follow_up_budget, dict) else {}
+        asked = budget.get('count')
+        asked = int(asked) if isinstance(asked, (int, float)) and not isinstance(asked, bool) else 0
+        if asked >= STICKER_FOLLOW_UP_MAX_PER_TURN:
+            self._report_sticker_selection_fallback('本回合已经追问过，不再追问 分组=%s' % group_id)
+            return None
+        budget['count'] = asked + 1
+        receipt = await self.request_sticker_selection(decision, group_id, items)
+        if not receipt:
+            return None
+        if receipt.get('content'):
+            # 正文**以第一段为准**（§48.1）：判据在 `helpers.apply_sticker_follow_up_content()`
+            # **一处**——它只填"该说话却是空"的那个空位；第一段已经写了正文就一个字都不动
+            # （第二段手里的上下文比第一段少，不许它重写），`mode == "none"` 同样不补。
+            apply_sticker_follow_up_content(decision, receipt['content'])
+        willingness = receipt.get('willingness')
+        if isinstance(willingness, bool) or not isinstance(willingness, (int, float)):
+            # 两段式本身已经是意愿的表达（模型自己点名了一组、又自己挑了一条）；
+            # 回执漏给意愿时按 1.0 走，但仍由同一个 `resolve_sticker()` 判定。
+            willingness = 1.0
+        sticker = self.resolve_sticker(
+            {'assetId': receipt.get('assetId'), 'willingness': willingness}, items,
+        )
+        if sticker is None and receipt.get('assetId'):
+            self._report_sticker_selection_fallback(
+                '追问选中的素材不在候选里 素材=%s 分组=%s', receipt.get('assetId'), group_id,
+            )
+            return None
+        # 把选中的 `assetId` 写回**模型那份草稿**：落库的 `metadata.localMedia` 与投递账本
+        # 读的都是它（`delivery_ledger` 只认 `localMedia.assetId`）——不写回去就成了
+        # "图发出去了、账本上没有这一笔"。两种拼写指回同一个 dict（跨 chunk 双读的老规矩）。
+        draft = dict(local_media) if isinstance(local_media, dict) else {}
+        draft['assetId'] = pick(sticker, 'assetId', 'asset_id')
+        draft['willingness'] = willingness
+        if group_id:
+            draft['stickerGroupId'] = group_id
+        decision['localMedia'] = draft
+        decision['local_media'] = draft
+        return sticker
+
+    async def request_sticker_selection(
+        self, decision: Any, group_id: str, items: list[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """**追问一次**主模型：附上该组条目，让它挑一条并给出正文。
+
+        任何失败（没有这个能力 / 超时 / 抛错 / 回执不是 JSON）一律回 `None`，
+        调用方按"没有候选"继续——追问是锦上添花，绝不能把回合卡住或吞掉正文。
+        """
+        select = getattr(self.narrator, 'select_sticker', None)
+        if not callable(select):
+            self._report_sticker_selection_fallback('当前模型不支持表情追问 分组=%s' % group_id)
+            return None
+        message = visible_reply_text(decision)
+        try:
+            receipt = await asyncio.wait_for(
+                select(items, message, self.expression_threshold, group_id),
+                STICKER_FOLLOW_UP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self._report_sticker_selection_fallback('表情追问超时 分组=%s' % group_id)
+            return None
+        except Exception as error:  # noqa: BLE001 - 追问失败只是没有候选
+            self._report_sticker_selection_fallback(
+                '表情追问失败 分组=%s 错误=%s', group_id, error,
+            )
+            return None
+        parsed = parse_sticker_selection_receipt(receipt)
+        if not parsed or not (parsed.get('assetId') or parsed.get('content')):
+            # 既没挑到素材、也没给正文 = 这次追问没有任何可用信息（空对象 / 全是 null）。
+            self._report_sticker_selection_fallback('表情追问回执无法解析 分组=%s' % group_id)
+            return None
+        return parsed
+
+    def _report_sticker_selection_fallback(self, message: str, *args: Any) -> None:
+        """两级选择的每一次兜底都从这里出去：**debug**，不带候选继续。
+
+        用户要看见的（能力缺失 / 丢内容 / 降级）才用 warn；"这一次没挑到表情"不是。
+        """
+        self.report_standalone_operation('diagnostic', 'debug', '表情选择回退：' + message, *args)
 
     async def rank_sticker_assets(
         self, turn_query_embedding: Optional[list[float]] = None,

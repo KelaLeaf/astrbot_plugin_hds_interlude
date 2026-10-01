@@ -1577,7 +1577,12 @@ class ServiceChunk3(ServiceBase):
                 if quote:
                     # `messageIndex` 是发给模型的 wire format（上游 camelCase）。
                     quoted_messages.append({**_mapping(quote), 'messageIndex': index + 1})
-            sticker_catalog = await self.sticker_catalog_for_session(latest_session, turn_query_embedding)
+            # 两级表情选择（§48 甲）：一处判"这一回合平铺条目还是只给分组目录"。
+            sticker_selection = await self.sticker_selection_for_session(
+                latest_session, turn_query_embedding,
+            )
+            sticker_catalog = sticker_selection['assets']
+            sticker_groups = sticker_selection['groups']
             chat_capabilities = self.private_chat_capabilities(latest_session)
             image_sources = _unique([
                 source for message in batch
@@ -1654,6 +1659,7 @@ class ServiceChunk3(ServiceBase):
                 snapshot['from'], snapshot['now'], user_message, snapshot['due'], superseded,
                 None, images, audio, chat_capabilities, quoted_messages, sticker_catalog,
                 turn_query_embedding, visual_observations, on_early_reply, attachments,
+                sticker_groups,
             )
             # 上游 M4：批次端点集合只描述刚被消费的这一批——标注算完即清空，
             # 否则下一回合会把上一批的多端点事实当成自己的（规则 2 会误命中）。
@@ -1665,7 +1671,16 @@ class ServiceChunk3(ServiceBase):
             decision = dict(decision) if is_record(decision) else {}
             if early['delivered'] and early['interaction']:
                 decision = {**decision, 'interaction': early['interaction']}
-            sticker = self.resolve_sticker(pick(decision, 'localMedia', 'local_media'), sticker_catalog)
+            # 两级选择（§48 甲）：每回合一个**新的**追问预算（最多多问一次，铁律）。
+            # 首条回复已经提前投递（early）时不再追问——正文已经发出去了，追问改不动它，
+            # 只会在投递之后凭空多出一张图。
+            sticker_follow_up: dict[str, Any] = {}
+            sticker = (
+                self.resolve_sticker(pick(decision, 'localMedia', 'local_media'), sticker_catalog)
+                if early['delivered'] else await self.resolve_sticker_selection(
+                    decision, sticker_selection, sticker_follow_up,
+                )
+            )
             native_face = None if sticker else self.resolve_native_face(decision, chat_capabilities)
 
             async def commit_task() -> dict[str, Any]:

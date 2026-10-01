@@ -1705,6 +1705,18 @@
         "default": false,
         "hint": "拿不准就不收；会增加识图调用。"
       },
+      "group_selection": {
+        "type": "bool",
+        "description": "模型先选分组再选表情",
+        "default": true,
+        "hint": "开启后先看分组目录（名称与描述）点名一组，再在该组内挑一张；关掉则整份平铺给模型。"
+      },
+      "auto_group": {
+        "type": "bool",
+        "description": "整理表情时顺便归组",
+        "default": true,
+        "hint": "补描述时顺便从已有分组里挑一组，都不合适才新建（新建有数量与速率上限）。"
+      },
       "provider_id": {
         "type": "string",
         "default": "",

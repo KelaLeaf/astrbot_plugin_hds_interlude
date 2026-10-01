@@ -242,17 +242,30 @@ class _FakeMultiDict(dict):
 
 
 class _FakeWebRequest:
-    """插件页请求的桩：`files()` / `json()` / `query` 由各用例按需设置。"""
+    """插件页请求的桩：`files()` / `form()` / `json()` / `query` 由各用例按需设置。
 
-    def __init__(self, uploads=None, body=None, query=None):
+    `form()` 对应真实宿主的 `PluginRequest.form()`（multipart 里的**文本字段**）：
+    上传表情的 `groupId` / `description` / `name` 就走它（v1.8.3，§47）。
+    """
+
+    def __init__(self, uploads=None, body=None, query=None, form=None, form_error=None):
         self.uploads = _FakeMultiDict(uploads or {})
         self.body = body
         #: 真实宿主的 `request.query` 是个 MultiDict（`sticker-file` 的 `assetId` /
         #: `inline` 就从这里读）；桩里缺了它 = 拿不到查询参数的插件页测不了。
         self.query = _FakeMultiDict(query or {})
+        self.form_fields = _FakeMultiDict(form or {})
+        #: 让 `form()` 抛异常：真实宿主在没有 form()（老版本）/ 请求不是 multipart 时
+        #: 会走到这条分支，上传路径必须照样能用查询串把参数带进去。
+        self.form_error = form_error
 
     async def files(self):
         return self.uploads
+
+    async def form(self):
+        if self.form_error is not None:
+            raise self.form_error
+        return self.form_fields
 
     async def json(self, default=None):
         return self.body if self.body is not None else default
@@ -366,6 +379,9 @@ def _install_astrbot_stub():
 
         async def files(self):
             return await self._current().files()
+
+        async def form(self):
+            return await self._current().form()
 
         async def json(self, default=None):
             return await self._current().json(default=default)
@@ -977,11 +993,13 @@ def _make_plugin(config=None, context=None):
     return plugin
 
 
-def _install_web_request(uploads=None, body=None, query=None):
+def _install_web_request(uploads=None, body=None, query=None, form=None, form_error=None):
     """把插件页请求桩装进 `astrbot.api.web`，返回还原回调。"""
     web = sys.modules['astrbot.api.web']
     previous = web._hdsi_fake_request
-    web._hdsi_fake_request = _FakeWebRequest(uploads=uploads, body=body, query=query)
+    web._hdsi_fake_request = _FakeWebRequest(
+        uploads=uploads, body=body, query=query, form=form, form_error=form_error,
+    )
 
     def restore():
         web._hdsi_fake_request = previous
@@ -2497,6 +2515,12 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/sticker-restore-description',
             f'/{main_module.PLUGIN_NAME}/console/sticker-delete',
             f'/{main_module.PLUGIN_NAME}/console/sticker-rescan',
+            # 表情库分组与上传（v1.8.3，§47）：分组清单 / 新建改名 / 删除 / 批量移动 / 上传。
+            f'/{main_module.PLUGIN_NAME}/console/sticker-groups',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-group-save',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-group-delete',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-move',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-upload',
             f'/{main_module.PLUGIN_NAME}/config-export',
             f'/{main_module.PLUGIN_NAME}/config-import-preview',
             f'/{main_module.PLUGIN_NAME}/config-import-apply',
@@ -2554,6 +2578,11 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/sticker-restore-description',
             f'/{main_module.PLUGIN_NAME}/console/sticker-delete',
             f'/{main_module.PLUGIN_NAME}/console/sticker-rescan',
+            # 表情库分组与上传（§47）：新建改名 / 删除 / 批量移动 / 上传（一律 POST）
+            f'/{main_module.PLUGIN_NAME}/console/sticker-group-save',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-group-delete',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-move',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-upload',
         ])
 
     def test_every_registration_carries_a_description(self):

@@ -500,8 +500,12 @@ class _FlushHost(FakeService):
     def semantic_turn_embedding_enabled(self) -> bool:
         return False
 
-    async def sticker_catalog_for_session(self, session: Any, turn_query_embedding: Any = None) -> list[Any]:
-        return []
+    async def sticker_selection_for_session(
+        self, session: Any, turn_query_embedding: Any = None,
+    ) -> dict[str, Any]:
+        # §48 甲：本文件只关心"位置参数与上游对齐"，目录一律走 `inline` + 空条目
+        # （两级选择本身由 `test_service_chunk2` 覆盖）。
+        return {'mode': 'inline', 'assets': [], 'groups': []}
 
     def private_chat_capabilities(self, session: Any) -> Any:
         return None
@@ -519,6 +523,13 @@ class _FlushHost(FakeService):
         }
 
     def resolve_sticker(self, draft: Any, catalog: Any) -> Any:
+        return None
+
+    async def resolve_sticker_selection(
+        self, decision: Any, selection: Any, follow_up_budget: Any = None,
+    ) -> Any:
+        # §48 甲：inline 模式下 `resolve_sticker_selection` 就是旧的 `resolve_sticker`
+        # （本替身里两条都回 None = 没有选中的表情）。
         return None
 
     def resolve_native_face(self, decision: Any, capabilities: Any) -> Any:

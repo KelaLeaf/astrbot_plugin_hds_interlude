@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -20,6 +21,7 @@ from unittest import mock
 from plugin.tests.test_astrbot_bridge import (
     TEST_DATA_DIR,
     FakeContext,
+    _FakeUpload,
     _ProviderStub,
     _install_web_request,
     _make_bridge,
@@ -30,6 +32,7 @@ from plugin.adapters import console_api as console_module
 from plugin.adapters.console_api import ConsoleApi, ConsoleError, CONSOLE_TASKS, mask_endpoint
 from plugin.core import platform_actions
 from plugin.core.database import Database
+from plugin.core.service import helpers as helpers_module
 from plugin.core.service.base import InterludeContext
 from plugin.core.service.chunk2 import ServiceChunk2
 from plugin.core.service.transport import NullTransport
@@ -3036,3 +3039,859 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
         payload = _run(self.api.stickers())
         self.assertEqual(payload['items'], [])
         self.assertTrue(payload['root'].endswith('stickers'))
+
+
+class ConsoleStickerGroupTests(unittest.TestCase):
+    """表情库**分组 = 目录**与**上传**（v1.8.3 起，v1.8.5 返工；`docs/PORTING_NOTES.md` §47）。
+
+    跑的是真实的 `ConsoleApi` + 真实的 `ServiceChunk2` 写路径（只有模型/传输是桩），
+    与 `ConsoleStickerLibraryTests` 同一套夹具。**磁盘是真的**：移动 / 改名 / 删除
+    都会真的搬文件，所以夹具按"文件的第一个目录段 = `group`"来造。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = self._tmp.name
+        self.root = os.path.join(self.tmp, 'stickers')
+        os.makedirs(os.path.join(self.root, 'collected'))
+        self.bridge = _make_bridge({'stickers': {'enabled': True, 'directory': 'stickers'}})
+        self.database = Database(':memory:')
+        self.addCleanup(self.database.close)
+        self.database.register_tables()
+        self.bridge.db = self.database
+        self.service = _StickerService(self.tmp, self.database)
+        self.bridge.service = self.service
+        self.api = ConsoleApi(self.bridge)
+
+    # ---- 造数据 ----
+
+    def _row(self, asset_id, **patch):
+        base = {
+            'assetId': asset_id,
+            'filePath': '%s.png' % asset_id,
+            'group': 'collected',
+            'mimeType': 'image/png',
+            'animated': False,
+            'size': len(_PNG_BYTES),
+            'hash': asset_id,
+            'description': '一只挥手的猫',
+            'aliases': [],
+            'status': 'active',
+            'embedding': [],
+            'name': '',
+            'source': 'manual',
+            'uses': 0,
+            'descriptionManual': False,
+            'guessed': False,
+            'createdAt': '2026-09-01T10:00:00.000Z',
+            'updatedAt': '2026-09-01T10:00:00.000Z',
+        }
+        base.update(patch)
+        if 'filePath' not in patch:
+            # 组名就是一级目录名：默认让文件真的躺在自己那一组的目录里。
+            group = str(base.get('group') or '').strip()
+            base['filePath'] = ('%s/%s.png' % (group, asset_id)) if group else ('%s.png' % asset_id)
+        return base
+
+    def _insert(self, asset_id, body=_PNG_BYTES, **patch):
+        row = self._row(asset_id, **patch)
+        row['id'] = self.database.insert('interlude_sticker', row)
+        path = os.path.join(self.root, row['filePath'].replace('/', os.sep))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as handle:
+            handle.write(body)
+        return row
+
+    def _group(self, item):
+        return {group['groupId']: group for group in item['items']}
+
+    def _stored(self, asset_id):
+        rows = self.database.all('interlude_sticker', {'assetId': asset_id})
+        self.assertEqual(len(rows), 1, asset_id)
+        return rows[0]
+
+    # ---- 分组列表 ----
+
+    def test_the_builtin_default_group_is_always_in_the_list(self):
+        """没有素材、表里也没有行时也要有内置默认组（「未整理」）——否则收藏的素材无所属。"""
+        payload = _run(self.api.sticker_groups())
+        self.assertEqual(payload['total'], 1)
+        self.assertEqual(payload['defaultGroupId'], 'collected')
+        item = payload['items'][0]
+        self.assertEqual(item['groupId'], 'collected')
+        # v1.8.4（§48）：显示名从「自动收藏」改成「未整理」（目录名 `collected` 一字未动）。
+        # 这是**唯一**一个"显示名 ≠ 目录名"的特例。
+        self.assertEqual(item['name'], '未整理')
+        # 描述：描述行没写过就回落到**内置那句默认描述**（v1.8.4，§48.5）——控制台与
+        # 模型目录看到的必须是同一句话，两处说法不一致就是"两处判据"。
+        self.assertEqual(item['description'], console_module.COLLECTED_STICKER_GROUP_DESCRIPTION)
+        self.assertEqual(
+            item['description'], '自动收藏与手动上传都先落这里，还没归组。',
+        )
+        self.assertEqual(item['count'], 0)
+        self.assertTrue(item['builtin'])
+        self.assertTrue(item['registered'], '兼容字段恒 true：表里有行 = 有描述，不是"注册"')
+        self.assertFalse(payload['truncated'])
+
+    def test_the_builtin_group_description_prefers_the_description_row(self):
+        """§48.5：描述行写了自己的描述就用它，没写才回落内置那句（两处同一句话）。"""
+        default = console_module.COLLECTED_STICKER_GROUP_DESCRIPTION
+        before = self._group(_run(self.api.sticker_groups()))['collected']
+        self.assertEqual(before['description'], default, '没写过 → 内置那句')
+        _run(self.api.save_sticker_group({
+            'groupId': 'collected', 'name': '未整理', 'description': '她自己写的',
+        }))
+        after = self._group(_run(self.api.sticker_groups()))['collected']
+        self.assertEqual(after['description'], '她自己写的', '描述行有描述 → 用描述行的')
+        self.assertTrue(after['builtin'], '写描述不改"内置组"这件事')
+        self.assertEqual(after['name'], '未整理', '内置组的显示名是常量，写描述不会改它')
+
+    def test_sticker_items_expose_the_two_group_ownership_flags(self):
+        """§48：素材 item **只加**两个归属字段（`groupGuessed` / `groupManual`），旧字段一个没动。"""
+        self._insert('a-1', group='collected')
+        self.database.update('interlude_sticker', {'assetId': 'a-1'},
+                             {'groupGuessed': True, 'groupManual': False})
+        self._insert('a-2', group='g-1')
+        self.database.update('interlude_sticker', {'assetId': 'a-2'},
+                             {'groupGuessed': False, 'groupManual': True})
+        self._insert('a-3', group='g-1')
+        listing = _run(self.api.stickers())
+        by_id = {item['assetId']: item for item in listing['items']}
+        self.assertTrue(by_id['a-1']['groupGuessed'])
+        self.assertFalse(by_id['a-1']['groupManual'])
+        self.assertTrue(by_id['a-2']['groupManual'])
+        self.assertFalse(by_id['a-2']['groupGuessed'])
+        # 旧库补列前写入的行是 NULL → 两个都当 false（不是 None / 缺键）。
+        self.assertIs(by_id['a-3']['groupGuessed'], False)
+        self.assertIs(by_id['a-3']['groupManual'], False)
+        # 既有字段名一个都没动。
+        for key in ('assetId', 'group', 'groupId', 'groupName', 'manual', 'guessed'):
+            with self.subTest(key=key):
+                self.assertIn(key, by_id['a-1'])
+
+    def test_every_group_comes_from_the_disk_and_no_asset_disappears(self):
+        """目录即分组：磁盘上的目录 / 有素材挂着的值**一律是正常分组**，素材一条不少。"""
+        self._insert('a-1', group='collected')
+        self._insert('a-2', group='collected')
+        self._insert('b-1', group='default')
+        self._insert('c-1', group='', source='manual')
+        os.makedirs(os.path.join(self.root, '手工建的', 'sub'))  # 盘上有目录、没素材、没描述
+        groups = self._group(_run(self.api.sticker_groups()))
+        self.assertEqual(groups['collected']['count'], 2)
+        self.assertEqual(groups['collected']['name'], '未整理')
+        self.assertTrue(groups['collected']['builtin'])
+        # 有素材挂着的目录名：它就是一个正常分组（名字就是目录名，没有"未注册"这一等）。
+        self.assertEqual(groups['default']['name'], 'default')
+        self.assertTrue(groups['default']['registered'])
+        self.assertEqual(groups['default']['count'], 1)
+        # 磁盘上**真的存在**的空目录也在列表里（新建分组 / 手动 mkdir 之后看得见）。
+        self.assertEqual(groups['手工建的']['count'], 0)
+        self.assertEqual(groups['手工建的']['name'], '手工建的')
+        # 空 group 的旧行单列"未分组"，计数不被吞掉。
+        self.assertEqual(groups['']['name'], console_module.STICKER_UNGROUPED_NAME)
+        self.assertEqual(groups['']['count'], 1)
+        # 素材一个都没少，而且每一条都能说出自己的组名。
+        payload = _run(self.api.stickers())
+        self.assertEqual(payload['total'], 4)
+        by_id = {item['assetId']: item for item in payload['items']}
+        self.assertEqual(by_id['a-1']['groupId'], 'collected')
+        self.assertEqual(by_id['a-1']['groupName'], '未整理')
+        self.assertEqual(by_id['b-1']['groupName'], 'default')
+        self.assertEqual(by_id['c-1']['groupName'], console_module.STICKER_UNGROUPED_NAME)
+        # 老字段 `group` 没变（只加字段，不动已有字段名）。
+        self.assertEqual(by_id['b-1']['group'], 'default')
+
+    def test_group_list_survives_a_missing_service_and_a_missing_table(self):
+        """服务层没起来 / 表没建：列表仍是空壳 + 内置默认组，从不 500。"""
+        self.bridge.service = None
+        payload = _run(self.api.sticker_groups())
+        self.assertEqual([item['groupId'] for item in payload['items']], ['collected'])
+
+        # 没建表的库（`_safe_all` / `count_by` 都取不到 → 空壳）。
+        bare = Database(':memory:')
+        self.addCleanup(bare.close)
+        self.bridge.db = bare
+        self.bridge.service = self.service
+        payload = _run(self.api.sticker_groups())
+        self.assertEqual([item['groupId'] for item in payload['items']], ['collected'])
+        self.assertEqual(payload['items'][0]['count'], 0)
+
+    def test_stickers_can_be_filtered_by_group_id(self):
+        self._insert('a-1', group='collected')
+        self._insert('b-1', group='default')
+        self.assertEqual(_run(self.api.stickers(group='collected'))['total'], 1)
+        self.assertEqual(
+            _run(self.api.stickers(group='collected'))['items'][0]['assetId'], 'a-1',
+        )
+        self.assertEqual(_run(self.api.stickers(group='nope'))['total'], 0)
+        # 空 = 不过滤（与其他筛选项同一条规矩）。
+        self.assertEqual(_run(self.api.stickers(group=''))['total'], 2)
+
+    # ---- 新建 / 改名 ----
+
+    def test_create_group_makes_a_directory_named_after_the_group(self):
+        """**新建分组 = 建目录**：`groupId` 就是目录名（这里用的是中文组名）。"""
+        payload = _run(self.api.save_sticker_group({
+            'name': '猫猫', 'description': '撒娇、求摸头的时候用',
+        }))
+        group_id = payload['groupId']
+        self.assertEqual(group_id, '猫猫', 'id 的字面量就是磁盘目录名，不再由服务端生成')
+        self.assertTrue(os.path.isdir(os.path.join(self.root, '猫猫')))
+        self.assertEqual(payload['item']['name'], '猫猫', '组名 = 目录名')
+        self.assertEqual(payload['item']['description'], '撒娇、求摸头的时候用')
+        self.assertEqual(payload['item']['count'], 0)
+        self.assertFalse(payload['item']['builtin'])
+        self.assertTrue(payload['item']['registered'])
+        self.assertTrue(payload['item']['createdAt'])
+        stored = self.database.all('interlude_sticker_groups', {'groupId': group_id})[0]
+        self.assertEqual(stored['description'], '撒娇、求摸头的时候用')
+
+        # 改名 = **重命名目录**（`groupId` 跟着变），描述跟着走。
+        renamed = _run(self.api.save_sticker_group({
+            'groupId': group_id, 'name': '猫猫们', 'description': '换了个说法',
+        }))
+        self.assertEqual(renamed['groupId'], '猫猫们')
+        self.assertEqual(renamed['item']['name'], '猫猫们')
+        self.assertEqual(renamed['item']['description'], '换了个说法')
+        self.assertFalse(os.path.exists(os.path.join(self.root, '猫猫')))
+        self.assertTrue(os.path.isdir(os.path.join(self.root, '猫猫们')))
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 1)
+
+    def test_asset_items_report_the_directory_name(self):
+        created = _run(self.api.save_sticker_group({'name': '猫猫'}))
+        group_id = created['groupId']
+        self._insert('a-1', group=group_id)
+        item = _run(self.api.stickers())['items'][0]
+        self.assertEqual(item['groupId'], group_id)
+        self.assertEqual(item['groupName'], '猫猫', '组名就是目录名')
+
+    def test_duplicate_group_name_is_rejected(self):
+        _run(self.api.save_sticker_group({'name': '猫猫'}))
+        for name in ('猫猫', ' 猫猫 '):
+            with self.subTest(name=name):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.save_sticker_group({'name': name}))
+                self.assertIn('已存在', str(caught.exception))
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 1)
+        self.assertEqual(sorted(os.listdir(self.root)), ['collected', '猫猫'], '不许建出第二个目录')
+
+    def test_group_name_and_description_are_validated(self):
+        cases = (
+            ({'name': ''}, '不能为空'),
+            ({'name': '   '}, '不能为空'),
+            # 上限按**字节**：33 个汉字（99 字节）行，40 个（120 字节）不行。
+            ({'name': '猫' * 40}, '最长'),
+            ({'name': 'x' * (helpers_module.STICKER_GROUP_NAME_MAX_BYTES + 1)}, '最长'),
+            ({'name': 'a/b'}, '不能包含'),
+            ({'name': '..'}, '开头'),
+            ({'name': 'ok', 'description': 'x' * (helpers_module.STICKER_GROUP_DESCRIPTION_MAX + 1)}, '最长'),
+            ({'name': 'ok', 'description': 5}, 'description'),
+            ({'description': '没有名字'}, 'name'),
+        )
+        for body, needle in cases:
+            with self.subTest(body=str(body)[:40]):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.save_sticker_group(body))
+                self.assertIn(needle, str(caught.exception))
+        # 一律先校验后写：上面这些一条都没落库、也没建目录。
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 0)
+        self.assertEqual(os.listdir(self.root), ['collected'])
+
+    def test_the_root_bucket_name_is_reserved_for_write_targets(self):
+        """收尾②：`default` 是保留名——新建 / 改名 / 移动 / 上传 / 删组目标全是 400。"""
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.save_sticker_group({'name': 'default'}))
+        self.assertIn('保留名', str(caught.exception))
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        for body in (
+            {'groupId': group_id, 'name': 'default'},
+            {'groupId': 'collected', 'name': 'default'},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.save_sticker_group(body))
+                self.assertIn('default', str(caught.exception))
+        self._insert('a-1')
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.move_stickers({'assetIds': ['a-1'], 'groupId': 'default'}))
+        self.assertIn('保留名', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.upload_sticker(_PNG_BYTES, group_id='default'))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': group_id, 'moveTo': 'default'}))
+        self.assertIn('保留名', str(caught.exception))
+        self.assertEqual(self._stored('a-1')['group'], 'collected')
+        self.assertEqual(sorted(os.listdir(self.root)), ['collected', '猫猫'], '一个目录都不许建出来')
+
+    def test_a_legacy_default_group_still_shows_up_and_can_be_managed(self):
+        """既有 `default` 目录/桶：照样在列表里、照样能写描述、能当**来源**删掉。"""
+        self._insert('a-1', group='default')
+        groups = self._group(_run(self.api.sticker_groups()))
+        self.assertEqual(groups['default']['count'], 1)
+        self.assertEqual(groups['default']['name'], 'default')
+        saved = _run(self.api.save_sticker_group({
+            'groupId': 'default', 'name': 'default', 'description': '根桶遗留',
+        }))
+        self.assertEqual(saved['item']['description'], '根桶遗留')
+        payload = _run(self.api.delete_sticker_group({'groupId': 'default'}))
+        self.assertTrue(payload['deleted'])
+        self.assertEqual(payload['moved'], 1)
+        self.assertEqual(self._stored('a-1')['group'], 'collected')
+
+    def test_group_items_expose_auto_created(self):
+        """收尾①：接口如实带出 `autoCreated`（要不要显示由前端定；人工建的一律 false）。"""
+        _run(self.api.save_sticker_group({'name': '猫猫'}))
+        self.database.insert('interlude_sticker_groups', {
+            'groupId': '模型建的', 'description': '', 'autoCreated': True,
+            'createdAt': '2026-09-01T10:00:00.000Z', 'updatedAt': '2026-09-01T10:00:00.000Z',
+        })
+        groups = self._group(_run(self.api.sticker_groups()))
+        self.assertIs(groups['collected']['autoCreated'], False, '内置组不是自动建的')
+        self.assertIs(groups['猫猫']['autoCreated'], False)
+        self.assertIs(groups['模型建的']['autoCreated'], True)
+        # 旧库补列前的行是 NULL → false（不是 None / 缺键）。
+        self.database.insert('interlude_sticker_groups', {
+            'groupId': '老行', 'description': '',
+            'createdAt': '2026-09-01T10:00:00.000Z', 'updatedAt': '2026-09-01T10:00:00.000Z',
+        })
+        self.assertIs(self._group(_run(self.api.sticker_groups()))['老行']['autoCreated'], False)
+    def test_group_endpoints_reject_fields_outside_the_whitelist(self):
+        for body in (
+            {'name': 'ok', 'count': 3},
+            {'name': 'ok', 'builtin': True},
+            {'groupId': 'g-1', 'name': 'ok', 'createdAt': 'x'},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.save_sticker_group(body))
+                self.assertIn('不认识这些字段', str(caught.exception))
+
+    def test_unknown_group_id_cannot_be_saved(self):
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.save_sticker_group({'groupId': 'nope', 'name': '凭空捏造'}))
+        self.assertIn('找不到这个分组', str(caught.exception))
+
+    def test_writing_a_description_for_an_existing_directory_is_just_a_save(self):
+        """**没有"采纳"这个动作了**：给一个历史目录补描述 = `groupId == name` 的写入。
+
+        唯一的门槛是"这个分组真的存在"（有素材挂着 / 盘上有目录）——否则就是凭空捏造。
+        """
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.save_sticker_group({
+                'groupId': 'default', 'name': 'default', 'description': '顺手存的',
+            }))
+        self.assertIn('找不到这个分组', str(caught.exception))
+        self._insert('b-1', group='default')
+        payload = _run(self.api.save_sticker_group({
+            'groupId': 'default', 'name': 'default', 'description': '顺手存的',
+        }))
+        self.assertEqual(payload['groupId'], 'default')
+        self.assertTrue(payload['item']['registered'])
+        self.assertEqual(payload['item']['count'], 1)
+        self.assertEqual(payload['item']['name'], 'default', '写描述不会顺手改名')
+        self.assertEqual(payload['item']['description'], '顺手存的')
+        # 素材的 groupName 就是目录名（没有被改名）。
+        self.assertEqual(_run(self.api.stickers())['items'][0]['groupName'], 'default')
+        # 盘上真有目录的也一样（哪怕还没有素材）。
+        os.makedirs(os.path.join(self.root, '手工建的'))
+        written = _run(self.api.save_sticker_group({
+            'groupId': '手工建的', 'name': '手工建的', 'description': '手动放的目录',
+        }))
+        self.assertEqual(written['item']['description'], '手动放的目录')
+
+    def test_unsafe_group_ids_are_rejected(self):
+        for group_id in ('../evil', 'a/b', 'a\\b', '.hidden', 'a:b', 'x' * 200):
+            with self.subTest(group_id=group_id):
+                with self.assertRaises(ConsoleError):
+                    _run(self.api.save_sticker_group({'groupId': group_id, 'name': 'ok'}))
+        self.assertEqual(os.listdir(self.root), ['collected'], '一个目录都不许建出来')
+
+    def test_the_builtin_group_cannot_be_renamed_but_takes_a_description(self):
+        """内置组的目录名不许改（老库里已经有素材在 `collected/`），写描述照常。"""
+        payload = _run(self.api.save_sticker_group({
+            'groupId': 'collected', 'name': '未整理', 'description': '别人发来的表情包',
+        }))
+        self.assertEqual(payload['groupId'], 'collected')
+        self.assertTrue(payload['item']['builtin'])
+        self.assertEqual(payload['item']['name'], '未整理')
+        self.assertEqual(payload['item']['description'], '别人发来的表情包')
+        self._insert('a-1', group='collected')
+        item = _run(self.api.stickers())['items'][0]
+        self.assertEqual(item['groupName'], '未整理')
+        # 改名请求：400，而且目录一个字节都没动。
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.save_sticker_group({'groupId': 'collected', 'name': '收藏夹'}))
+        self.assertIn('不能改', str(caught.exception))
+        self.assertTrue(os.path.isdir(os.path.join(self.root, 'collected')))
+
+    def test_group_writes_need_a_service(self):
+        self.bridge.service = None
+        with self.assertRaises(ConsoleError):
+            _run(self.api.save_sticker_group({'name': 'ok'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.save_sticker_group({'groupId': 'collected', 'name': 'ok'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker_group({'groupId': 'g-1'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.move_stickers({'assetIds': ['a-1'], 'groupId': 'collected'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.upload_sticker(_PNG_BYTES))
+
+    # ---- 删除分组 ----
+
+    def test_deleting_a_group_moves_its_assets_instead_of_deleting_them(self):
+        """红线：**绝不悄悄删素材**——删组 = 把文件搬进目标目录 + 删目录与描述行。"""
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        for index in range(3):
+            self._insert('cat-%d' % index, group=group_id)
+        self.assertTrue(os.path.isdir(os.path.join(self.root, '猫猫')))
+        payload = _run(self.api.delete_sticker_group({'groupId': group_id}))
+        self.assertTrue(payload['deleted'])
+        self.assertEqual(payload['moved'], 3)
+        self.assertEqual(payload['moveTo'], 'collected')
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 0)
+        self.assertFalse(os.path.exists(os.path.join(self.root, '猫猫')), '组目录该没了')
+        for index in range(3):
+            stored = self._stored('cat-%d' % index)
+            self.assertEqual(stored['group'], 'collected')
+            self.assertEqual(stored['filePath'], 'collected/cat-%d.png' % index)
+            self.assertTrue(os.path.isfile(os.path.join(self.root, stored['filePath'])))
+        # 三条素材一条都没少，而且现在属于默认组。
+        listing = _run(self.api.stickers())
+        self.assertEqual(listing['total'], 3)
+        self.assertEqual({item['groupName'] for item in listing['items']}, {'未整理'})
+
+    def test_delete_group_honours_move_to(self):
+        first = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        second = _run(self.api.save_sticker_group({'name': '狗狗'}))['groupId']
+        self._insert('cat-1', group=first)
+        payload = _run(self.api.delete_sticker_group({
+            'groupId': first, 'moveTo': second,
+        }))
+        self.assertEqual(payload['moved'], 1)
+        self.assertEqual(payload['moveTo'], second)
+        self.assertEqual(self._stored('cat-1')['group'], second)
+
+    def test_delete_rejects_the_builtin_group_and_unknown_targets(self):
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': 'collected'}))
+        self.assertIn('内置分组不能删除', str(caught.exception))
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        # 带 `moveTo`（指向一个真实存在的分组）也照样 400：内置组的素材不能被搬空。
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': 'collected', 'moveTo': group_id}))
+        self.assertIn('内置分组不能删除', str(caught.exception))
+        self._insert('cat-1', group=group_id)
+        # moveTo 指向不存在的组：400，而且**什么都没动**（素材还在原组，组也还在）。
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': group_id, 'moveTo': 'nope'}))
+        self.assertIn('找不到要挪入的分组', str(caught.exception))
+        self.assertEqual(self._stored('cat-1')['group'], group_id)
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 1)
+        # 挪进"正在删除的组"也是 400。
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker_group({'groupId': group_id, 'moveTo': group_id}))
+        # 删一个根本没注册的 id：400。
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.delete_sticker_group({'groupId': 'nope'}))
+        self.assertIn('找不到这个分组', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker_group({}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker_group({'groupId': group_id, 'purge': True}))
+
+    # ---- 批量移动 ----
+
+    def test_move_reassigns_assets_and_returns_the_fresh_rows(self):
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        self._insert('a-1')
+        self._insert('a-2')
+        payload = _run(self.api.move_stickers({
+            'assetIds': ['a-1', 'a-2'], 'groupId': group_id,
+        }))
+        self.assertEqual(payload['moved'], 2)
+        self.assertEqual([item['assetId'] for item in payload['item']], ['a-1', 'a-2'])
+        self.assertEqual({item['groupName'] for item in payload['item']}, {'猫猫'})
+        self.assertEqual(self._stored('a-1')['group'], group_id)
+        self.assertEqual(self._stored('a-2')['group'], group_id)
+        # 已经在目标组里的也算"移动成功"（幂等：重复点不会报错）。
+        again = _run(self.api.move_stickers({'assetIds': ['a-1'], 'groupId': group_id}))
+        self.assertEqual(again['moved'], 1)
+
+    def test_move_validates_every_id_before_writing_anything(self):
+        """先校验后写：有一条不合法就一条都不写（批量操作"改了一半"最难收拾）。"""
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        self._insert('a-1')
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.move_stickers({'assetIds': ['a-1', 'nope'], 'groupId': group_id}))
+        self.assertIn('找不到这条素材', str(caught.exception))
+        self.assertEqual(self._stored('a-1')['group'], 'collected', '前一条也不许被改')
+
+    def test_move_rejects_bad_payloads(self):
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        self._insert('a-1')
+        cases = (
+            ({'assetIds': [], 'groupId': group_id}, 'assetIds'),
+            ({'assetIds': 'a-1', 'groupId': group_id}, 'assetIds'),
+            ({'assetIds': [''], 'groupId': group_id}, '空值'),
+            ({'assetIds': [None], 'groupId': group_id}, '空值'),
+            ({'assetIds': ['x' * 300], 'groupId': group_id}, '过长'),
+            ({'assetIds': ['a-1']}, 'groupId'),
+            ({'assetIds': ['a-1'], 'groupId': ''}, 'groupId'),
+            ({'assetIds': ['a-1'], 'groupId': '../evil'}, '分组名'),
+            # 不存在的组名不能当目标（先建组再挪），否则它会变成谁都能写进去的暗号。
+            # `default` 是保留名（根目录素材的桶）：先撞保留名那条闸。
+            ({'assetIds': ['a-1'], 'groupId': 'default'}, '保留名'),
+            ({'assetIds': ['a-1'], 'groupId': group_id, 'purge': True}, '不认识这些字段'),
+        )
+        for body, needle in cases:
+            with self.subTest(body=str(body)[:50]):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.move_stickers(body))
+                self.assertIn(needle, str(caught.exception))
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.move_stickers({
+                'assetIds': ['a-%d' % index for index in range(console_module.STICKER_MOVE_MAX + 1)],
+                'groupId': group_id,
+            }))
+        self.assertIn('最多', str(caught.exception))
+        self.assertEqual(self._stored('a-1')['group'], 'collected')
+
+    def test_the_service_layer_owns_the_same_gates_on_its_own(self):
+        """服务层的写入路径**自己**也要挡：控制台只是第一层。
+
+        路径安全不嫌两层——控制台判一次（请求形状 + 快速失败 + 好文案），服务层再判一次
+        （它是**唯一写入路径**，别的调用方也会走它）。这条**直接调服务层**，
+        所以哪一层被改坏都能分别被抓住（只测控制台的话，服务层那道闸永远不会红）。
+        """
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        row = self._insert('a-1')
+
+        with self.assertRaises(ValueError):
+            _run(self.service.move_sticker_assets([row['id']], '../evil'))
+        with self.assertRaises(ValueError):
+            _run(self.service.delete_sticker_group('collected'))
+        # 带 `moveTo` 指向**另一个真实分组**时，唯一挡得住的就是"内置组不许删"那一条
+        # （没有 moveTo 时 `target == wanted` 也会挡，所以这一条才是真正的闸门用例）。
+        with self.assertRaises(ValueError):
+            _run(self.service.delete_sticker_group('collected', move_to=group_id))
+        with self.assertRaises(ValueError):
+            _run(self.service.delete_sticker_group(group_id, move_to='nope'))
+        with self.assertRaises(ValueError):
+            _run(self.service.upload_sticker_asset(_PNG_BYTES, '../evil'))
+        with self.assertRaises(ValueError):
+            _run(self.service.upload_sticker_asset(_PNG_BYTES, group_id='nope'))
+        with self.assertRaises(ValueError):
+            _run(self.service.save_sticker_group('', '   '))
+        with self.assertRaises(ValueError):
+            _run(self.service.save_sticker_group('', 'a/b'))
+        with self.assertRaises(ValueError):
+            _run(self.service.save_sticker_group('nope', '凭空捏造'))
+        # 内置组的目录名不许改（改名 = 让已有素材集体换目录）。
+        with self.assertRaises(ValueError):
+            _run(self.service.save_sticker_group('collected', '收藏夹'))
+
+        # 服务层拒绝之后**什么都没动**（素材还在原组、组目录还在、没多出素材）。
+        self.assertEqual(self._stored('a-1')['group'], 'collected')
+        self.assertEqual(self.database.count('interlude_sticker_groups'), 1)
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+        self.assertEqual(sorted(os.listdir(self.root)), ['collected', '猫猫'])
+
+    # ---- 上传 ----
+
+    def test_upload_writes_the_file_by_content_hash_and_never_trusts_the_name(self):
+        payload = _run(self.api.upload_sticker(_PNG_BYTES, name='坏笑的猫'))
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        self.assertFalse(payload['duplicated'])
+        self.assertEqual(payload['assetId'], 'upload-%s' % digest[:16])
+        item = payload['item']
+        self.assertEqual(item['name'], '坏笑的猫')
+        self.assertEqual(item['mimeType'], 'image/png')
+        self.assertEqual(item['size'], len(_PNG_BYTES))
+        self.assertEqual(item['source'], 'manual')
+        self.assertEqual(item['groupId'], 'collected')
+        self.assertEqual(item['groupName'], '未整理')
+        self.assertFalse(item['manual'])
+        # 落盘名 = 内容哈希 + 嗅探出来的扩展名（文件名参数根本不在路径里）。
+        self.assertEqual(item['file'], '%s.png' % digest)
+        stored = self._stored(payload['assetId'])
+        self.assertEqual(stored['hash'], digest)
+        self.assertEqual(stored['filePath'], 'collected/%s.png' % digest)
+        self.assertEqual(stored['status'], 'pending', '没给描述 → 等模型/重扫')
+        self.assertTrue(os.path.isfile(os.path.join(self.root, 'collected', '%s.png' % digest)))
+
+    def test_upload_rejects_non_image_bytes(self):
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.upload_sticker(b'<html>not an image</html>'))
+        self.assertIn('不是图片', str(caught.exception))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.upload_sticker(b''))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.upload_sticker('not bytes'))
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+        self.assertEqual(os.listdir(os.path.join(self.root, 'collected')), [])
+
+    def test_upload_rejects_oversized_images_before_touching_the_disk(self):
+        self.service.cached_sticker_config = {
+            'enabled': True, 'directory': 'stickers', 'max_file_size_mb': 0.0001,
+            'catalog_limit': 40,
+        }
+        big = b'\x89PNG\r\n\x1a\n' + b'x' * 400
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.upload_sticker(big))
+        self.assertIn('体积上限', str(caught.exception))
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+        self.assertEqual(os.listdir(os.path.join(self.root, 'collected')), [])
+
+    def test_duplicate_upload_returns_the_existing_row_and_writes_nothing(self):
+        """同一个文件再传一次：回已存在那条，**不新建文件、不覆盖、不改行**。"""
+        first = _run(self.api.upload_sticker(_PNG_BYTES, description='第一次的描述'))
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        path = os.path.join(self.root, 'collected', '%s.png' % digest)
+        before = os.stat(path).st_mtime_ns
+        second = _run(self.api.upload_sticker(
+            _PNG_BYTES, group_id='', description='第二次想改的描述', name='另一个名字',
+        ))
+        self.assertTrue(second['duplicated'])
+        self.assertEqual(second['assetId'], first['assetId'])
+        # 已存在那条的描述 / 名字 / 手工标记都没被第二次上传顶掉。
+        self.assertEqual(second['item']['description'], '第一次的描述')
+        self.assertTrue(second['item']['manual'])
+        self.assertEqual(second['item']['name'], 'upload-%s' % digest[:8])
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+        self.assertEqual(os.stat(path).st_mtime_ns, before, '重复上传不该重写文件')
+
+    def test_duplicate_upload_matches_disabled_and_missing_rows_too(self):
+        """去重看**内容**，不看状态：停用过的素材再传一次仍然回那一条（不复活、不顶替）。"""
+        first = _run(self.api.upload_sticker(_PNG_BYTES))
+        _run(self.api.update_sticker({'assetId': first['assetId'], 'disabled': True}))
+        again = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertTrue(again['duplicated'])
+        self.assertTrue(again['item']['disabled'], '不许把停用决定顶掉')
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+
+    def test_upload_without_a_describer_stays_pending_and_warns(self):
+        """没配识图模型：行留在 `pending`、描述为空，而且**有一条 warn**。
+
+        这是"能力缺失"（坑 25）：用户刚上传完，得能看见"它还没被描述"，
+        而不是以为模型会自己搞定。下一次「重扫表情库」会补上。
+        """
+        self.service.sticker_describer = None
+        payload = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertEqual(payload['item']['status'], 'pending')
+        self.assertEqual(payload['item']['description'], '')
+        self.assertFalse(payload['item']['manual'])
+        self.assertTrue(
+            any('视觉模型' in str(args) for args in self.service.reports),
+            '能力缺失必须留一条 warn：%s' % (self.service.reports,),
+        )
+
+    def test_upload_losing_a_concurrent_race_returns_the_winning_row(self):
+        """并发上传同一个文件：一边赢了写入，另一边**回那一行**，而不是 400。
+
+        模拟：去重检查那一次假装库里没有（同时"另一边"已经把行写进去了），
+        于是 `db_create` 撞 `assetId` 唯一索引——这时必须回过头按内容哈希找回那一行。
+        """
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        winner_id = 'upload-%s' % digest[:16]
+        original = self.service._sticker_prior_by_hash
+        calls = []
+
+        async def _first_miss_then_hit(value):
+            calls.append(value)
+            if len(calls) == 1:
+                row = self._row(winner_id, hash=digest, filePath='collected/%s.png' % digest)
+                row['id'] = self.database.insert('interlude_sticker', row)
+                return None
+            return await original(value)
+
+        self.service._sticker_prior_by_hash = _first_miss_then_hit
+        payload = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertTrue(payload['duplicated'])
+        self.assertEqual(payload['assetId'], winner_id)
+        self.assertEqual(len(calls), 2, '去重查一次、撞索引后再查一次')
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+
+    def test_upload_with_a_description_pins_it_and_never_calls_the_model(self):
+        async def _boom(*_args, **_kwargs):
+            raise AssertionError('上传时给了描述就不该再调视觉模型')
+
+        self.service.describe_sticker_asset = _boom
+        payload = _run(self.api.upload_sticker(
+            _PNG_BYTES, description='她手写的：一只挥手的猫', name='挥手',
+        ))
+        item = payload['item']
+        self.assertEqual(item['description'], '她手写的：一只挥手的猫')
+        self.assertTrue(item['manual'], '人写的描述要置 descriptionManual（扫描不得覆盖）')
+        self.assertFalse(item['disabled'])
+        stored = self._stored(payload['assetId'])
+        self.assertEqual(stored['status'], 'active', '有描述 = 立刻进目录')
+        self.assertEqual(stored['descriptionManual'], 1)
+
+    def test_upload_without_a_description_asks_the_model_then_refreshes_the_catalog(self):
+        calls = []
+
+        async def _describe(asset, data, config=None):
+            calls.append((asset.get('assetId'), bytes(data)))
+            # 模拟真实描述成功：写库 + 刷新目录（真实实现在 chunk2.describe_sticker_asset）。
+            await self.service.db_set('interlude_sticker', {'id': asset.get('id')}, {
+                'description': '模型写的描述', 'status': 'active',
+            })
+            return True
+
+        self.service.describe_sticker_asset = _describe
+        payload = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertEqual(len(calls), 1, '没给描述就必须问一次模型')
+        self.assertEqual(calls[0][1], _PNG_BYTES, '把**原始字节**交给描述器')
+        self.assertEqual(payload['item']['description'], '模型写的描述')
+        self.assertFalse(payload['item']['manual'])
+        self.assertEqual(
+            [row.get('assetId') for row in self.service.sticker_catalog],
+            [payload['assetId']],
+            '描述完要刷目录，下一回合的 stickerCatalog 里才有它',
+        )
+
+    def test_upload_lands_in_the_named_group(self):
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        payload = _run(self.api.upload_sticker(_PNG_BYTES, group_id=group_id))
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        self.assertEqual(payload['item']['groupId'], group_id)
+        self.assertEqual(payload['item']['groupName'], '猫猫')
+        self.assertEqual(self._stored(payload['assetId'])['group'], group_id)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, group_id, '%s.png' % digest)))
+        # 分组计数跟着涨（面板的"每组多少张"是精确的）。
+        groups = self._group(_run(self.api.sticker_groups()))
+        self.assertEqual(groups[group_id]['count'], 1)
+
+    def test_upload_rejects_an_unknown_or_unsafe_group(self):
+        for group_id in ('nope', 'default', '../evil', 'a/b'):
+            with self.subTest(group_id=group_id):
+                with self.assertRaises(ConsoleError):
+                    _run(self.api.upload_sticker(_PNG_BYTES, group_id=group_id))
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+        self.assertEqual(os.listdir(os.path.join(self.root, 'collected')), [])
+
+    def test_upload_is_refused_while_the_library_is_off(self):
+        self.bridge.config = {'stickers': {'enabled': False, 'directory': 'stickers'}}
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertIn('未启用', str(caught.exception))
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+
+    def test_upload_refuses_to_overwrite_a_different_file_at_the_same_path(self):
+        """同名不同内容（只可能是哈希碰撞）：**拒绝**，绝不覆盖。"""
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        path = os.path.join(self.root, 'collected', '%s.png' % digest)
+        with open(path, 'wb') as handle:
+            handle.write(b'\x89PNG\r\n\x1a\n' + b'DIFFERENT' * 8)
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertIn('拒绝覆盖', str(caught.exception))
+        with open(path, 'rb') as handle:
+            self.assertIn(b'DIFFERENT', handle.read(), '盘上那份必须原封不动')
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+
+    def test_upload_reuses_an_orphan_file_with_identical_bytes(self):
+        """盘上有同名文件但库里没行（比如手删了行）：内容一致就直接复用，不重写。"""
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        path = os.path.join(self.root, 'collected', '%s.png' % digest)
+        with open(path, 'wb') as handle:
+            handle.write(_PNG_BYTES)
+        before = os.stat(path).st_mtime_ns
+        payload = _run(self.api.upload_sticker(_PNG_BYTES))
+        self.assertFalse(payload['duplicated'])
+        self.assertEqual(os.stat(path).st_mtime_ns, before)
+        self.assertEqual(self.database.count('interlude_sticker'), 1)
+
+    # ---- 上传路由（multipart 的两条参数通道） ----
+
+    def _page(self, **kwargs):
+        self.addCleanup(_install_web_request(**kwargs))
+        plugin = _make_plugin({})
+        plugin._console = self.api
+        return _run(plugin.page_console_sticker_upload())
+
+    def test_group_routes_are_wired_to_the_real_handlers(self):
+        """四条分组路由的接线（`_console_json` / `_console_write`）+ 400 映射。
+
+        只调 `ConsoleApi` 断言不到"路由注册没注册、方法对不对"——所以这里跑真的 handler
+        （宿主响应用桩），与 `console/sticker-file` 那两条分支同一套做法。
+        """
+        plugin = _make_plugin({})
+        plugin._console = self.api
+
+        self.addCleanup(_install_web_request(query={}))
+        listed = _run(plugin.page_console_sticker_groups())
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.payload['defaultGroupId'], 'collected')
+        self.assertEqual(len(listed.payload['items']), 1)
+
+        self.addCleanup(_install_web_request(body={'name': '猫猫', 'description': '撒娇用'}))
+        saved = _run(plugin.page_console_sticker_group_save())
+        self.assertEqual(saved.status_code, 200)
+        group_id = saved.payload['groupId']
+        self.assertEqual(saved.payload['item']['name'], '猫猫')
+
+        self._insert('a-1')
+        self.addCleanup(_install_web_request(
+            body={'assetIds': ['a-1'], 'groupId': group_id},
+        ))
+        moved = _run(plugin.page_console_sticker_move())
+        self.assertEqual(moved.status_code, 200)
+        self.assertEqual(moved.payload['moved'], 1)
+        self.assertEqual(moved.payload['item'][0]['groupName'], '猫猫')
+
+        self.addCleanup(_install_web_request(body={'groupId': group_id}))
+        deleted = _run(plugin.page_console_sticker_group_delete())
+        self.assertEqual(deleted.status_code, 200)
+        self.assertTrue(deleted.payload['deleted'])
+        self.assertEqual(deleted.payload['moved'], 1)
+        self.assertEqual(deleted.payload['moveTo'], 'collected')
+
+        # 校验失败一律 400 + 原文案（不是 500）。
+        self.addCleanup(_install_web_request(body={'name': '   '}))
+        bad = _run(plugin.page_console_sticker_group_save())
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn('不能为空', bad.payload['message'])
+
+    def test_upload_route_reads_the_file_field_and_form_options(self):
+        response = self._page(
+            uploads={'file': _FakeUpload('../../evil.png', _PNG_BYTES)},
+            form={'groupId': '', 'description': '上传时写的描述', 'name': '猫猫图'},
+        )
+        self.assertEqual(response.status_code, 200)
+        item = response.payload['item']
+        self.assertFalse(response.payload['duplicated'])
+        self.assertEqual(item['name'], '猫猫图')
+        self.assertEqual(item['description'], '上传时写的描述')
+        self.assertTrue(item['manual'])
+        # 上传的文件名（`../../evil.png`）绝不进路径。
+        self.assertNotIn('..', item['file'])
+        self.assertNotIn('evil', item['file'])
+
+    def test_upload_route_falls_back_to_query_params(self):
+        """宿主 bridge 的 `upload(endpoint, file)` 只能发 `file` 一个字段——
+        所以参数必须能从查询串带进来（老宿主没有 `form()` 也一样）。"""
+        group_id = _run(self.api.save_sticker_group({'name': '猫猫'}))['groupId']
+        response = self._page(
+            uploads={'file': _FakeUpload('x.png', _PNG_BYTES)},
+            query={'group_id': group_id, 'description': '走查询串的描述'},
+            form_error=RuntimeError('老宿主没有 form()'),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.payload['item']['groupId'], group_id)
+        self.assertEqual(response.payload['item']['description'], '走查询串的描述')
+
+    def test_upload_route_without_a_file_is_a_400(self):
+        response = self._page()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('没有收到文件内容', response.payload['message'])
+        response = self._page(uploads={'file': _FakeUpload('x.png', b'')})
+        self.assertEqual(response.status_code, 400)
+
+    def test_upload_route_maps_console_errors_to_400(self):
+        response = self._page(uploads={'file': _FakeUpload('x.txt', b'not an image')})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('不是图片', response.payload['message'])
+        self.assertEqual(self.database.count('interlude_sticker'), 0)

@@ -80,6 +80,36 @@ __all__ = [
     'COLLECTIBLE_STICKER_KINDS',
     'STICKER_IMAGE_MIMES',
     'STICKER_FILE_SUFFIX',
+    # ---- 表情库分组 / 上传（本移植版新增，§47）----
+    'COLLECTED_STICKER_GROUP_ID',
+    'COLLECTED_STICKER_GROUP_NAME',
+    'COLLECTED_STICKER_GROUP_DESCRIPTION',
+    'STICKER_GROUP_NAME_MAX_BYTES',
+    'STICKER_GROUP_NAME_FORBIDDEN',
+    'STICKER_GROUP_RESERVED_NAMES',
+    'STICKER_GROUP_ROOT_BUCKET',
+    'STICKER_GROUP_DESCRIPTION_MAX',
+    'STICKER_NAME_MAX',
+    'STICKER_DESCRIPTION_MAX',
+    'safe_sticker_group_name',
+    'sticker_group_name_problem',
+    'uploaded_sticker_asset_id',
+    # ---- 两级表情选择 / 描述时定组（本移植版新增，§48）----
+    'STICKER_GROUP_INLINE_ASSET_LIMIT',
+    'STICKER_GROUP_ITEM_LIMIT',
+    'STICKER_FOLLOW_UP_MAX_PER_TURN',
+    'STICKER_FOLLOW_UP_TIMEOUT_SECONDS',
+    'STICKER_AUTO_GROUP_MAX_GROUPS',
+    'STICKER_AUTO_GROUP_MAX_NEW_PER_DAY',
+    'STICKER_AUTO_GROUP_WINDOW_HOURS',
+    'sticker_group_directory',
+    'sticker_group_directory_ids',
+    'sticker_group_items',
+    'parse_sticker_group_choice',
+    'parse_sticker_selection_receipt',
+    'parse_sticker_auto_group',
+    'visible_reply_text',
+    'apply_sticker_follow_up_content',
     # ---- 第二层：普通图片的模型判定（本移植版新增，§45.7）----
     'GUESS_STICKER_KIND',
     'GUESS_STICKER_MAX_DIMENSION',
@@ -304,6 +334,11 @@ def resolve_sticker_config(value: Any = None) -> dict[str, Any]:
     directory = config_get(configured, 'directory')
     return {
         'enabled': config_get(configured, 'enabled') is True,
+        # 两级表情选择 / 描述时定组（v1.8.4，§48）：**默认真**，只有显式 false 才关。
+        # `is not False` 是刻意的：缺失 / NULL / 字符串一律按默认（开）走——
+        # 这两把闸的默认行为就是今天已经验收过的那套（关掉即回到平铺目录）。
+        'group_selection': config_get(configured, 'group_selection', 'groupSelection') is not False,
+        'auto_group': config_get(configured, 'auto_group', 'autoGroup') is not False,
         'directory': str(directory if directory else 'data/hds-interlude/stickers').strip(),
         'max_file_size_mb': max(1.0, min(30.0, _config_number_or(
             configured, 'maxFileSizeMB', 'max_file_size_mb', 10,
@@ -859,6 +894,429 @@ STICKER_FILE_SUFFIX = {
     'image/gif': '.gif',
     'image/webp': '.webp',
 }
+
+# --------------------------------------------------------------------------- #
+# 表情库分组（本移植版新增，见 `docs/PORTING_NOTES.md` §47）
+#
+# **磁盘目录结构是分组的唯一事实来源**：`interlude_sticker.group` 一直就是
+# "素材落在哪个子目录"的字符串（上游 `database.ts:164` 本来就有这一列 +
+# `group` 索引），子目录名 = 分组名。本移植版只补了两件上游没有的东西：
+# **描述**（给模型看的那一份）与**建组 / 改名 / 上传的操作面**。
+# 表 `interlude_sticker_groups` 因此只存"描述与时间"，键就是目录名。
+# --------------------------------------------------------------------------- #
+
+#: 内置默认组的目录名（= `groupId`）。它**永远**出现在分组列表里（哪怕没有素材、
+#: 表里也没有行），否则自动收藏与手动上传的素材无所属。
+COLLECTED_STICKER_GROUP_ID = COLLECTED_STICKER_DIR
+
+#: 内置默认组的**显示名**。这是全库**唯一**一个"显示名 ≠ 目录名"的特例：
+#: `collected` 是老库里已有素材的目录（改目录名 = 让已有素材集体搬家），
+#: 所以它的显示名固定成「未整理」；它同时**不许改名**（改名 = 换目录）。
+#:
+#: v1.8.4 起叫「未整理」：它不是一个"风格分组"，而是**落脚点**——自动收藏与
+#: 手动上传都先落这里，等着被（人或模型）归组。旧名「自动收藏」只描述了来源，
+#: 会让模型以为"这一组 = 自动收来的"，从而永远不去动它。
+COLLECTED_STICKER_GROUP_NAME = '未整理'
+
+#: 内置默认组的**模型可见描述**（用户在控制台写了描述就覆盖它）。它同时也是给模型的
+#: 那句"这一组怎么用"：没有它，模型只看到一个叫「未整理」的桶，不会想到把里面的素材
+#: 归到更合适的组里（§48 乙）。
+COLLECTED_STICKER_GROUP_DESCRIPTION = '自动收藏与手动上传都先落这里，还没归组。'
+
+#: 分组名 = **目录名**，所以规则按文件系统来（不是"标识符"）：
+#:
+#: * 字节上限（不是字符数）：文件系统按字节算，100 字节 ≈ 33 个汉字；
+#: * 禁字符集：路径分隔符与各平台的保留字符（Windows 上这几个真的建不出目录）；
+#: * 首字符不许 `.`（`..` / 隐藏目录因此**结构性**进不来）、首尾空白一律去掉、
+#:   空名字拒、控制字符拒。
+#:
+#: **允许**中日韩文字、字母、数字、空格、`-` `_` `.` `（）` 这类常见符号——
+#: 中文目录名是这个库的常态，上一版"ASCII only"的白名单会把它整个挡在门外。
+STICKER_GROUP_NAME_MAX_BYTES = 100
+STICKER_GROUP_NAME_FORBIDDEN = frozenset('/\\:*?"<>|')
+
+#: 根目录素材的桶名：`scan_sticker_library()` 给**没有子目录**的文件打的 `group` 值
+#: （`<根>/a.png` → `group = 'default'`）。它**不是目录**，所以它同时是**保留名**——
+#: 见下。一处定义：扫描写它、保留名集合也读它。
+STICKER_GROUP_ROOT_BUCKET = 'default'
+
+#: **保留名**：这些名字已经被"别的桶"占用，不能当**新写入的**分组名（新建 / 改名 /
+#: 移动 / 上传的目标一律 400）。现在只有一个：
+#:
+#: * `default` = 根目录素材的桶（上面那个常量）。允许建同名目录的话，`default` 这个
+#:   计数会把"散在根目录的"和"`default/` 里的"混在一起——用户根本分不清谁是谁。
+#:
+#: ⚠️ 只在**写入**这一侧判：**既有**的 `default/` 目录照常收录、照常显示、照常写描述
+#: （规则管的是"新写入的名字"，不是"让别人的素材消失"，与扫描那条同一条纪律）。
+STICKER_GROUP_RESERVED_NAMES = frozenset({STICKER_GROUP_ROOT_BUCKET})
+
+#: 分组描述上限（它要进提示词：50 组 × 500 字就是上限量级）。
+STICKER_GROUP_DESCRIPTION_MAX = 500
+
+#: 一条素材的短名 / 描述上限。单一事实源在这里：控制台（`console_api`）与服务层
+#: （`chunk2` 的上传管线）读同一份数字，不各抄一个（抄一份就会漂移一次）。
+STICKER_NAME_MAX = 60
+STICKER_DESCRIPTION_MAX = 2_000
+
+# --------------------------------------------------------------------------- #
+# 两级表情选择 / 描述时定组（本移植版新增，见 `docs/PORTING_NOTES.md` §48）
+#
+# 模型想发表情时的两步：先看**分组目录**（只有 id / 名字 / 描述 / 条数）点名一组，
+# 宿主再把该组的条目给它挑。省一次模型调用的办法是"条目本来就少"——直接内联。
+# --------------------------------------------------------------------------- #
+
+#: 内联阈值：目录里的条目**总数**不超过它就整份平铺（不花第二次调用）。
+STICKER_GROUP_INLINE_ASSET_LIMIT = 8
+
+#: 追问时一次最多给模型看多少条候选（与 `catalog_limit` 同量级；超出的截断）。
+STICKER_GROUP_ITEM_LIMIT = 40
+
+#: 一个回合最多额外问几次模型。**1 是铁律**：追问的回执里再点名一组也不许接着问，
+#: 否则"模型想说话 → 宿主无限追问"会变成一个死循环。
+STICKER_FOLLOW_UP_MAX_PER_TURN = 1
+
+#: 追问的总超时（秒）。追问是**锦上添花**：超时按"没有候选"继续，
+#: 正文照发、绝不让一次表情选择把整个回合卡住。
+STICKER_FOLLOW_UP_TIMEOUT_SECONDS = 20.0
+
+#: 自动定组的分组总数上限（模型看到的目录再大也不该长过这个数）。
+STICKER_AUTO_GROUP_MAX_GROUPS = 30
+
+#: 自动定组的**新建速率**上限与窗口：`STICKER_AUTO_GROUP_MAX_NEW_PER_DAY` 个 /
+#: `STICKER_AUTO_GROUP_WINDOW_HOURS` 小时（滚动窗口，看注册行的 `createdAt`）。
+#: 用滚动窗口而不是"自然日"是因为 `Database` 只有等值 `where`（没有范围算子，见坑 54 一带），
+#: 而读回来的注册表本来就在手上——在 Python 侧数一遍比加一张计数表省得多。
+STICKER_AUTO_GROUP_MAX_NEW_PER_DAY = 5
+STICKER_AUTO_GROUP_WINDOW_HOURS = 24
+
+
+def sticker_group_name_problem(value: Any, *, reserved: bool = False) -> str:
+    """分组名（= 目录名）不合法时回**中文原因**，合法回空串。
+
+    这是命名规则的**唯一定义处**：新建分组 / 改名 / 上传 / 移动 / 自动定组全走它，
+    控制台与服务层读的是同一句话（两处各写一份判据，迟早会一处宽一处严）。
+    扫描遇到不合规的既有目录名**照常收录**（只记 debug）——规则管的是"新写入的名字"，
+    不是"删掉别人已经放好的文件"。
+
+    首尾空白**归一化**（去掉）而不是拒绝：写进磁盘的名字里因此永远没有首尾空白，
+    比"拒一次、让用户自己回去删空格"更省事，也不留"名字看起来一样、实际两个目录"的坑。
+    中间的换行 / 制表符则直接拒——它会让一个目录名在界面上显示成两行。
+
+    `reserved=True` 是**写入侧**的加严：连保留名（`default` = 根目录素材的桶）也拒。
+    给既有的 `default/` 目录写描述、或把它改名成别的名字时**不传**它（历史目录要能管理）。
+    """
+    text = _str(value).strip()
+    if not text:
+        return '分组名不能为空'
+    if reserved and text in STICKER_GROUP_RESERVED_NAMES:
+        return '「%s」是保留名（那是根目录素材用的桶，不是一个分组），不能当分组名' % text
+    if text.startswith('.'):
+        return '分组名不能以「.」开头'
+    if len(text.encode('utf-8')) > STICKER_GROUP_NAME_MAX_BYTES:
+        return '分组名最长 %d 字节（一个汉字算 3 字节）' % STICKER_GROUP_NAME_MAX_BYTES
+    for character in text:
+        if character in STICKER_GROUP_NAME_FORBIDDEN:
+            return '分组名不能包含 %s' % character
+        if ord(character) < 32 or ord(character) == 127:
+            return '分组名不能包含控制字符'
+        if character.isspace() and character != ' ':
+            return '分组名不能包含换行或制表符'
+    return ''
+
+
+def safe_sticker_group_name(value: Any, *, reserved: bool = False) -> str:
+    """分组名归一化：合法回**去首尾空白后**的名字，不合法回空串（调用方据此拒绝）。
+
+    "拿不准 = 拒绝"：这个名字会被拼进文件路径（`<表情库根>/<目录名>/<hash>.<ext>`），
+    所以 `/` `\\` `:` 等一律拒；`..` 因为"首字符不许 `.`"**结构性**进不来，不靠调用方
+    记得过滤。落盘前控制台 / 服务层还会再复验一次 `commonpath`（第二道闸）。
+    `reserved=True` 见 `sticker_group_name_problem()`。
+    """
+    text = _str(value).strip()
+    if sticker_group_name_problem(text, reserved=reserved):
+        return ''
+    return text
+
+
+def _dual_field(value: Any, camel: str, snake: Optional[str] = None) -> Any:
+    """读**外部**（模型原样返回 / 跨 chunk 传递）的 dict：两种拼写都认，**优先 camelCase**。
+
+    与 `config_get()` 的方向刻意相反：配置层由 `normalize_config()` 归一成 snake_case，
+    而模型回的是 camelCase（键名法）。本模块只读模型与数据库那一侧，所以这里 camel 优先。
+    """
+    if not isinstance(value, dict):
+        return None
+    if camel in value:
+        return value[camel]
+    if snake is not None and snake in value:
+        return value[snake]
+    return None
+
+
+def sticker_group_directory(
+    assets: Any, rows: Any, limit: Optional[int] = STICKER_AUTO_GROUP_MAX_GROUPS,
+    include_empty: bool = False, directories: Any = None,
+) -> list[dict[str, Any]]:
+    """模型可见的**分组目录**：`[{groupId, name, description, count}]`（**不列条目**）。
+
+    这是 §48 的**唯一事实源**：两级选择的第一次 payload 与「描述时定组」的提示词
+    都读这一份。目录文本写两份，迟早会漂移成"模型挑组时看到的描述"与"整理时看到的
+    描述"不一样——那正是这一轮要避免的事。
+
+    **分组的名字就是目录名**（`groupId`）。`rows` 是描述表 `interlude_sticker_groups`
+    的行——表里没有行不是"未注册"，只是**这一组还没有描述**；组的成员资格来自
+    "有素材挂着它"或"磁盘上真有这个目录"（`directories`）。
+
+    口径：
+
+    * `include_empty=False`（甲：**要把表情发出去**）：只列真的有条目的组——选一个空组
+      只能空手而归，白烧一次调用；
+    * `include_empty=True`（乙：**要把素材归进去**）：没有条目的组也要列（描述行里的、
+      以及 `directories` 里那些刚建好的空目录）——不然第一条素材永远进不了一个
+      刚建好、还没东西的分组（这是这一功能的入口本身）；
+    * 内置默认组永远排第一，名字固定 `COLLECTED_STICKER_GROUP_NAME`（唯一一个
+      "显示名 ≠ 目录名"的特例），描述缺省用 `COLLECTED_STICKER_GROUP_DESCRIPTION`
+      （用户在控制台写过就听用户的）；
+    * 空 `group`（"未分组"桶）**不列**：它不是合法目标（目录名规则会拒）；
+    * `limit=None` = 不截断（"这个组合法吗"的校验用得上，提示词那边一定带上限）。
+    """
+    counts: dict[str, int] = {}
+    for asset in assets or []:
+        if not isinstance(asset, dict):
+            continue
+        group_id = _str(asset.get('group')).strip()
+        if not group_id:
+            continue
+        counts[group_id] = counts.get(group_id, 0) + 1
+    described: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        group_id = _str(row.get('groupId')).strip()
+        if group_id and group_id not in described:
+            described[group_id] = row
+    on_disk = {
+        _str(name).strip() for name in (directories or []) if _str(name).strip()
+    }
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(group_id: str, name: str, description: str) -> None:
+        seen.add(group_id)
+        items.append({
+            'groupId': group_id, 'name': name, 'description': description,
+            'count': counts.get(group_id, 0),
+        })
+
+    def describe(group_id: str) -> str:
+        row = described.get(group_id) or {}
+        return _str(row.get('description')).strip()
+
+    if counts.get(COLLECTED_STICKER_GROUP_ID) or include_empty:
+        add(
+            COLLECTED_STICKER_GROUP_ID,
+            COLLECTED_STICKER_GROUP_NAME,
+            describe(COLLECTED_STICKER_GROUP_ID) or COLLECTED_STICKER_GROUP_DESCRIPTION,
+        )
+    # 描述表按 `createdAt` 升序（与控制台列表同一条规矩），同刻按目录名定序保证可复现。
+    for group_id in sorted(described, key=lambda key: (_str(described[key].get('createdAt')), key)):
+        if group_id in seen or not (counts.get(group_id) or include_empty):
+            continue
+        add(group_id, group_id, describe(group_id))
+    # 剩下的：磁盘上有目录的、以及有素材挂着的（都没描述行）——按目录名排序。
+    for group_id in sorted(
+        key for key in (set(counts) | on_disk)
+        if key and key not in seen and (counts.get(key) or include_empty)
+    ):
+        add(group_id, group_id, '')
+    if limit is None:
+        return items
+    return items[:max(1, int(limit))]
+
+
+def sticker_group_directory_ids(directory: Any) -> set[str]:
+    """目录里出现过的 groupId 集合（"这一组存在吗"的**唯一**判据）。"""
+    return {
+        _str(item.get('groupId')).strip()
+        for item in (directory or [])
+        if isinstance(item, dict) and _str(item.get('groupId')).strip()
+    }
+
+
+def sticker_group_items(
+    assets: Any, group_id: Any, limit: int = STICKER_GROUP_ITEM_LIMIT,
+) -> list[dict[str, Any]]:
+    """某分组里**可以让模型挑**的条目：`[{assetId, description}]`（**不含图字节**）。
+
+    没描述的条目不进候选：模型只能靠描述挑图，给一条没有描述的等于让它瞎猜
+    （而投递时真会发出去那张图）。
+    """
+    wanted = _str(group_id).strip()
+    if not wanted:
+        return []
+    items: list[dict[str, Any]] = []
+    for asset in assets or []:
+        if not isinstance(asset, dict):
+            continue
+        if _str(asset.get('group')).strip() != wanted:
+            continue
+        asset_id = _str(asset.get('assetId')).strip()
+        description = _str(asset.get('description')).strip()
+        if not asset_id or not description:
+            continue
+        items.append({'assetId': asset_id, 'description': description})
+        if len(items) >= max(1, int(limit)):
+            break
+    return items
+
+
+def parse_sticker_group_choice(decision: Any) -> str:
+    """模型**点名了哪个分组**：`localMedia.stickerGroupId` 优先，其次顶层同名字段。
+
+    双读 camelCase / snake_case（键名法：模型原样返回的 JSON 两种拼写都认）。
+    拿不准一律回空串——调用方据此走"没有候选"的兜底，绝不替模型猜一个组。
+    """
+    local_media = _dual_field(decision, 'localMedia', 'local_media')
+    for container in (local_media, decision):
+        if not isinstance(container, dict):
+            continue
+        for key in ('stickerGroupId', 'sticker_group_id'):
+            if key in container:
+                candidate = safe_sticker_group_name(container.get(key))
+                if candidate:
+                    return candidate
+    return ''
+
+
+def parse_sticker_selection_receipt(payload: Any) -> dict[str, Any]:
+    """追问回执 → `{assetId, content, willingness}`；**只归一化，不做决定**。
+
+    发不发那张图仍由 `resolve_sticker()`（意愿阈值 + 目录成员资格）一处判——
+    这里多一个判据，就会出现"两处都以为对方会拦"的空档。
+    """
+    if not isinstance(payload, dict):
+        return {}
+    asset_id = ''
+    for camel, snake in (('stickerAssetId', 'sticker_asset_id'), ('assetId', 'asset_id')):
+        value = _dual_field(payload, camel, snake)
+        if isinstance(value, str) and value.strip():
+            asset_id = value.strip()
+            break
+    content = ''
+    value = _dual_field(payload, 'content')
+    if isinstance(value, str) and value.strip():
+        content = value
+    return {
+        'assetId': asset_id,
+        'content': content,
+        'willingness': _dual_field(payload, 'willingness'),
+    }
+
+
+def parse_sticker_auto_group(receipt: Any) -> Optional[dict[str, Any]]:
+    """描述回执里的分组选择 → `{'mode': 'existing'|'new', …}`；没有 / 坏形状回 `None`。
+
+    形状契约（§48 乙）：
+
+    ```jsonc
+    {"description": "…", "group": {"existing": "<groupId>"}}
+    {"description": "…", "group": {"new": {"name": "…", "description": "…"}}}
+    ```
+
+    这里只做**形状与字面**校验：名字压掉控制字符与多余空白、过一遍与人工建组**同一条**
+    命名规则（`sticker_group_name_problem`：允许中文，禁路径分隔符等）；描述压掉控制字符、
+    截到 `STICKER_GROUP_DESCRIPTION_MAX`。名字会变成**磁盘目录名**，所以这条规则不能松。
+    **新建**那一支还要连**保留名**（`default`）一起拒（`reserved=True`）——那是根目录素材
+    的桶，不是分组；**点名已有组**那一支不传它（模型指着一个既有的 `default` 桶说
+    "归这里"是合法的）。
+    "这个组到底存不存在 / 该不该新建"是策略，在服务层判（那里才知道磁盘与描述表）。
+    """
+    raw = _dual_field(receipt, 'group')
+    if not isinstance(raw, dict):
+        return None
+    existing = _clean_group_text(_dual_field(raw, 'existing'))
+    if existing and not sticker_group_name_problem(existing):
+        return {'mode': 'existing', 'groupId': existing}
+    new = _dual_field(raw, 'new')
+    if isinstance(new, dict):
+        name = _clean_group_text(_dual_field(new, 'name'))
+        if name and not sticker_group_name_problem(name, reserved=True):
+            return {
+                'mode': 'new',
+                'name': name,
+                'description': _clean_group_text(_dual_field(new, 'description'))[
+                    :STICKER_GROUP_DESCRIPTION_MAX
+                ],
+            }
+    return None
+
+
+def _clean_group_text(value: Any) -> str:
+    """模型给的分组名 / 描述：控制字符换空格、压缩空白、去首尾（一行可读文本）。"""
+    text = re.sub(r'[\x00-\x1f\x7f]+', ' ', _str(value))
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def visible_reply_text(decision: Any) -> str:
+    """本回合**已经写好的可见正文**（群回复优先，其次 `interaction.reply`）。
+
+    只有 `mode == 'immediate'` 才算"要说的话"：`none` / `deferred` 是模型明确的
+    沉默或延后，追问回执不许把它们变成一条消息。
+    """
+    if not isinstance(decision, dict):
+        return ''
+    group_reply = _dual_field(decision, 'groupReply', 'group_reply')
+    if isinstance(group_reply, dict) and group_reply.get('mode') == 'immediate':
+        text = group_reply.get('content')
+        if isinstance(text, str) and text.strip():
+            return text
+    interaction = _dual_field(decision, 'interaction')
+    reply = interaction.get('reply') if isinstance(interaction, dict) else None
+    if isinstance(reply, dict) and reply.get('mode') == 'immediate':
+        text = reply.get('content')
+        if isinstance(text, str) and text.strip():
+            return text
+    return ''
+
+
+def apply_sticker_follow_up_content(decision: Any, content: Any) -> bool:
+    """把追问回执里的正文**补**进 decision 的空正文处；没补成回 `False`。
+
+    **正文以第一段为准**（§48.1）：第一段带着完整叙事上下文写出来的，第二段手里只有
+    "分组条目 + 那一句话"——让它重写等于用信息更少的一次调用覆盖信息更多的一次，
+    文本质量风险 > 收益。所以这里**只填空**：`mode == 'immediate'`（本来就要说话）
+    但正文是空 / 全空白时，才用回执里的正文补进去；第一段已经写了正文，一个字都不动
+    （返回 `False`，调用方据它记 debug）。`mode == 'none'` 是模型明确的沉默，同样不补。
+    """
+    text = _str(content).strip()
+    if not text or not isinstance(decision, dict):
+        return False
+    group_reply = _dual_field(decision, 'groupReply', 'group_reply')
+    if (
+        isinstance(group_reply, dict) and group_reply.get('mode') == 'immediate'
+        and not _str(group_reply.get('content')).strip()
+    ):
+        group_reply['content'] = text
+        return True
+    interaction = _dual_field(decision, 'interaction')
+    reply = interaction.get('reply') if isinstance(interaction, dict) else None
+    if (
+        isinstance(reply, dict) and reply.get('mode') == 'immediate'
+        and not _str(reply.get('content')).strip()
+    ):
+        reply['content'] = text
+        return True
+    return False
+
+
+def uploaded_sticker_asset_id(content_hash: Any) -> str:
+    """上传素材的 `assetId`：`upload-<哈希前 16 位>`。
+
+    与自动收藏（`sticker-…`）分居两个命名空间，日志与控制台里一眼可分来源；
+    同一个文件重复上传**必然**被内容哈希去重掉，所以这个 id 不会撞。
+    """
+    digest = re.sub(r'[^a-fA-F0-9]', '', _str(content_hash)).lower()[:16] or 'unhashed'
+    return 'upload-%s' % digest
 
 
 def collectible_sticker_kind(value: Any) -> str:

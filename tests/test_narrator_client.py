@@ -1117,6 +1117,60 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body['messages'][1]['content'][0]['text'].endswith('animated: true.'))
         self.assertEqual(body['messages'][1]['content'][1]['image_url'], {'url': 'data:image/png;base64,AAA', 'detail': 'low'})
 
+    async def test_describe_sticker_carries_the_group_directory_and_returns_the_choice(self):
+        """§48 乙：带上分组目录 → 提示词里多一段 + 回执里的 `group` 原样交出去。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'description': '一只挥手的猫',
+            'aliases': ['打招呼'],
+            'group': {'existing': 'g-1'},
+        }, ensure_ascii=False)}}]}])
+        config = make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)])
+        describer = create_sticker_describer(http, config)
+        groups = [{'groupId': 'g-1', 'name': '猫猫', 'description': '猫、躺平', 'count': 2}]
+        result = await describer.describe_sticker(
+            'data:image/png;base64,AAA', 'image/png', 'cat.png', False, groups=groups,
+        )
+        self.assertEqual(result['group'], {'existing': 'g-1'})
+        system = http.posts[0]['body']['messages'][0]['content']
+        self.assertIn('g-1', system)
+        self.assertIn('"group"', system)
+        # 不给目录：老问法逐字不变、回执里也不会有 `group`。
+        http2 = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'description': '一只猫', 'aliases': [], 'group': {'existing': 'g-1'},
+        }, ensure_ascii=False)}}]}])
+        plain = create_sticker_describer(http2, config)
+        result2 = await plain.describe_sticker('data:image/png;base64,AAA', 'image/png', 'cat.png', False)
+        self.assertNotIn('group', result2)
+        self.assertNotIn('"group"', http2.posts[0]['body']['messages'][0]['content'])
+
+    async def test_select_sticker_asks_the_main_route_for_one_asset_and_the_message(self):
+        """§48 甲：第二步走**主叙事**连接，把该组条目与已写好的正文一起给它。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'stickerAssetId': 'a-2', 'willingness': 0.9, 'content': '哈哈哈',
+        }, ensure_ascii=False)}}], 'usage': {'prompt_tokens': 20, 'completion_tokens': 8}}])
+        usages: list = []
+        config = make_config(providers=[make_provider(use_for_main=True)])
+        client = self.make_narrator(http, config, on_usage=usages.append)
+        items = [{'assetId': 'a-1', 'description': '猫'}, {'assetId': 'a-2', 'description': '狗'}]
+        receipt = await client.select_sticker(items, '哈哈哈', 0.7, 'g-1')
+        self.assertEqual(receipt['stickerAssetId'], 'a-2')
+        body = http.posts[0]['body']
+        self.assertIn('stickerAssetId', body['messages'][0]['content'])
+        sent = json.loads(body['messages'][1]['content'])
+        self.assertEqual(sent['groupId'], 'g-1')
+        self.assertEqual(sent['stickerCandidates'], items)
+        self.assertEqual(sent['message'], '哈哈哈')
+        self.assertEqual(body['max_tokens'], 256)
+        self.assertEqual(usages[0]['task'], '表情选择')
+
+    async def test_select_sticker_degrades_to_none_on_broken_json(self):
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '不是 JSON'}}]}])
+        config = make_config(providers=[make_provider(use_for_main=True)])
+        client = self.make_narrator(http, config)
+        self.assertIsNone(await client.select_sticker([{'assetId': 'a', 'description': 'x'}], 'x', 0.7, 'g'))
+        silent = SilentNarrator()
+        self.assertIsNone(await silent.select_sticker([{'assetId': 'a'}], 'x', 0.7, 'g'))
+
     async def test_describe_sticker_degrades_quietly(self):
         http = FakeHttpClient(responses=[{'choices': [{'message': {'content': ''}}]}])
         config = make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)])

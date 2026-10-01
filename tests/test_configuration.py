@@ -680,6 +680,18 @@ class ConfigurationSchemaTest(unittest.TestCase):
             "让识图模型判断普通图片是不是表情包",
         )
         self.assertEqual(stickers["auto_collect_guess"]["hint"], "拿不准就不收；会增加识图调用。")
+        # 本移植版新增（v1.8.4，§48）：两级表情选择 + 描述时顺手归组。**都默认开**——
+        # 这两件事在默认路径上就是"少给一点 token、多归一次组"，不是额外花钱的功能；
+        # 关掉任一个都回到 v1.8.3 的行为（平铺目录 / 不归组）。
+        self.assertIs(stickers["group_selection"]["default"], True)
+        self.assertEqual(stickers["group_selection"]["description"], "模型先选分组再选表情")
+        self.assertIs(stickers["auto_group"]["default"], True)
+        self.assertEqual(stickers["auto_group"]["description"], "整理表情时顺便归组")
+        # 标题短、代价写在 hint 里（用户唯一需要预知的是"这会不会多花调用"）。
+        for key in ("group_selection", "auto_group"):
+            with self.subTest(key=key):
+                self.assertIn("hint", stickers[key])
+                self.assertNotIn("http", stickers[key]["hint"])
 
     # -- 上游第 4 条：Blind Mode defaults --------------------------------------
 
@@ -1043,7 +1055,12 @@ class ConfigurationSchemaTest(unittest.TestCase):
             "governor_min_call_interval_ms", "governor_breaker_failures",
             "governor_breaker_cooldown_seconds",
         },
-        "stickers": {"provider_id", "auto_collect", "auto_collect_guess"},
+        "stickers": {
+            "provider_id", "auto_collect", "auto_collect_guess",
+            # v1.8.4（§48）：两级表情选择（先点名分组、再挑条目）与"整理时顺手归组"。
+            # 两把闸都**默认开**，与 `auto_collect` 同一把尺子（只有显式 false 才关）。
+            "group_selection", "auto_group",
+        },
         # v1.3.0 受控偏离：三张名单各自的"仅处理名单内"开关（上游只有一个总闸 `enabled`，
         # 本移植版删掉它、换成这三个正交开关）。见 `docs/PORTING_NOTES.md` §22。
         "qq_access": {"bot_accounts_only", "user_accounts_only", "group_chats_only"},

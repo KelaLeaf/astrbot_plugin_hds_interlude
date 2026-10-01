@@ -38,9 +38,11 @@ export interface StickerFilters {
   kind: string
   source: string
   q: string
+  /** 分组 id（精确匹配）。空串 = 不过滤——**"未分组"桶筛不出来**，别拿空串当它。 */
+  group: string
 }
 
-export const EMPTY_FILTERS: StickerFilters = { status: '', kind: '', source: '', q: '' }
+export const EMPTY_FILTERS: StickerFilters = { status: '', kind: '', source: '', q: '', group: '' }
 
 export interface StickerDraft {
   description: string
@@ -92,10 +94,13 @@ export function stickerParams(
   const kind = clean(filters?.kind)
   const source = clean(filters?.source)
   const needle = clean(filters?.q)
+  const group = clean(filters?.group)
   if (status) params.status = status
   if (kind) params.kind = kind
   if (source) params.source = source
   if (needle) params.q = needle
+  // 分组：**空串一定是"不过滤"**（后端的口径），所以只有非空才带上这个键。
+  if (group) params.group = group
   return params
 }
 
@@ -106,6 +111,7 @@ export function activeFilterCount(filters: StickerFilters): number {
   if (clean(filters?.kind)) total += 1
   if (clean(filters?.source)) total += 1
   if (clean(filters?.q)) total += 1
+  if (clean(filters?.group)) total += 1
   return total
 }
 
@@ -329,6 +335,21 @@ export function mergeStickerItems(
     const fresh = patched[row?.assetId]
     return fresh ? { ...row, ...fresh } : row
   })
+}
+
+/**
+ * 写操作响应里的 `item[]` → 就地更新的映射（批量移动一次回好几条）。
+ *
+ * 没有 `assetId` 的行直接丢掉：拿不到键就没法回填，硬塞一行进去只会让列表里
+ * 多出一条看不见来源的素材。
+ */
+export function overrideMap(items: StickerItem[]): Record<string, StickerItem> {
+  const out: Record<string, StickerItem> = {}
+  for (const item of Array.isArray(items) ? items : []) {
+    const assetId = item?.assetId
+    if (assetId) out[assetId] = item
+  }
+  return out
 }
 
 /**

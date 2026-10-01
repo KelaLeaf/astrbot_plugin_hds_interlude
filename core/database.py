@@ -432,11 +432,18 @@ STICKER = TableSpec(
         #: `guessed` = 这一条是**识图模型猜出来的**（`kind == 'image'` 的普通图片经判定入库）。
         #: `source` 仍是 `auto`（前端契约只有 auto / manual 两个取值，不加第三个），
         #: 所以"模型猜的"这件事必须有自己的一列；控制台以额外字段 `guessed` 暴露。
+        #:
+        #: 本移植版新增（v1.8.4 描述时定组，§48）：「归属是谁定的」要看得出来——
+        #: `groupGuessed` = 这一组的归属是**模型**读描述时顺手定的（可回溯）；
+        #: `groupManual` = 归属是**人**定的（控制台移动 / 上传指定 / 扫描目录带进来的），
+        #: 自动定组一律不碰它（把人摆好的素材搬走是最讨人厌的一类副作用）。
         'name': _spec('string(255)'),
         'source': _spec('string(16)'),
         'uses': _spec('unsigned'),
         'descriptionManual': _spec('boolean'),
         'guessed': _spec('boolean'),
+        'groupGuessed': _spec('boolean'),
+        'groupManual': _spec('boolean'),
         'createdAt': _spec('timestamp'),
         'updatedAt': _spec('timestamp'),
     },
@@ -444,6 +451,43 @@ STICKER = TableSpec(
     auto_increment=True,
     unique=('assetId',),
     indexes=('status', 'group', 'updatedAt'),
+    added_later=True,
+)
+
+#: `interlude_sticker_groups` —— 表情库分组**描述表**（本移植版新增，见 `docs/PORTING_NOTES.md` §47）。
+#:
+#: **磁盘目录结构是分组的唯一事实来源**：上游 `interlude_sticker.group` 本来就是
+#: "素材落在哪个一级子目录"的字符串，子目录名 = 分组名（内置 `collected` 的显示名
+#: 是唯一特例）。所以这张表**不是注册表**——它只补两件上游没有的东西：
+#: **描述**（给模型看的那一份）与**时间**。键 `groupId` 就是目录名本身。
+#:
+#: * 表里**没有行** = 这一组还没有描述，**不是**"未注册"；磁盘上有目录、库里有用它
+#:   的素材，它就照样是一个正常分组；
+#: * 内置默认组（`groupId = 'collected'`，显示名「未整理」）**不依赖这张表里的行**：
+#:   列表里永远有它一条，这样自动收藏的素材不会无所属。
+#:
+#: ⚠️ **表名是复数**（`interlude_sticker_groups`），这不是笔误：索引名按
+#: `<表名>_<列名>` 生成，而 `interlude_sticker.group` 的索引恰好叫
+#: `interlude_sticker_group`——SQLite 里索引与表共用同一个命名空间，
+#: 单数表名会因为"这个名字已被索引占用"直接建不出来。
+STICKER_GROUP = TableSpec(
+    name='interlude_sticker_groups',
+    fields={
+        #: 分组名 = **素材落盘的一级目录名**（宽度与 `interlude_sticker.group` 同为 128，
+        #: 好让任何一个既有的 `group` 值都能有描述行）。命名规则只有一处：
+        #: `helpers.safe_sticker_group_name`（按**字节**上限 100 + 禁路径字符）。
+        'groupId': _spec('string(128)'),
+        'description': _spec('text'),
+        #: 这一行是不是**模型自动归组**（§48 乙）建出来的。只有它计入自动建组的
+        #: 24h/5 个速率额度——人在控制台建的组不该吃模型的额度（反过来也一样：
+        #: 人工建组不受任何额度约束）。
+        #: 旧库补列前写入的行是 NULL = "不是自动建的"（保守：不占额度）。
+        'autoCreated': _spec('boolean'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='groupId',
+    indexes=('updatedAt',),
     added_later=True,
 )
 
@@ -632,8 +676,9 @@ WORK = TableSpec(
 TABLES: dict[str, TableSpec] = {
     spec.name: spec for spec in (
         STORY, PARTICIPANT, SCRIPT_ENTRY, MEMORY, INTENT, SCENE, ARC, FACT, STATE_PATCH,
-        WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, SCHEDULE_PREPLAN, SEEDED_EVENT,
-        ENDPOINT, STORY_ALIAS, TOKEN_USAGE, QZONE_POST, SCHEDULED_COMMAND, WORK,
+        WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, STICKER_GROUP, SCHEDULE_PREPLAN,
+        SEEDED_EVENT, ENDPOINT, STORY_ALIAS, TOKEN_USAGE, QZONE_POST, SCHEDULED_COMMAND,
+        WORK,
     )
 }
 
@@ -669,7 +714,7 @@ def auto_increment(table: str) -> bool:
 
 
 def table_names() -> list[str]:
-    """13 张表的表名（上游 `registerTables` 的注册顺序）。"""
+    """所有已注册表的表名（上游 `registerTables` 的注册顺序）。"""
     return list(TABLES)
 
 
@@ -988,6 +1033,33 @@ class Database:
         row = self.conn.execute(sql, params).fetchone()
         return int(row[0]) if row is not None else 0
 
+    def count_by(
+        self,
+        table: str,
+        column: str,
+        where: Optional[dict[str, Any]] = None,
+    ) -> dict[str, int]:
+        """按某一列**分组计数**：`{列值: 行数}`（`NULL` 折成空串）。
+
+        控制台「表情库」的分组列表要的是"每一组有多少张"。在 Python 侧把整张
+        `interlude_sticker` 拉出来只为数个数是控制台最容易犯的错（每行还带
+        `embedding` 的 JSON，几千行就是几十 MB），所以这里用一次 `GROUP BY` 换掉它。
+
+        列名必须属于该表——`_where_clause` 同一条纪律：防注入、也防拼错列名
+        （拼错在 SQLite 里只是回空结果，静默给出 0 张比报错更难查）。
+        """
+        spec = _require_table(table)
+        if column not in spec.fields:
+            raise KeyError(f'unknown column {column!r} for table {spec.name!r}')
+        clauses, params = self._where_clause(where, spec)
+        sql = 'SELECT %s, COUNT(*) FROM %s%s GROUP BY %s' % (
+            quote_ident(column), quote_ident(spec.name), clauses, quote_ident(column),
+        )
+        counts: dict[str, int] = {}
+        for value, total in self.conn.execute(sql, params).fetchall():
+            counts['' if value is None else str(value)] = int(total)
+        return counts
+
     def _select_sql(
         self,
         spec: TableSpec,
@@ -1177,7 +1249,7 @@ def _serialized(method: Callable[..., T]) -> Callable[..., T]:
 
 for _name in (
     'list_tables', 'columns', 'table_exists', 'indexes', 'index_columns',
-    'register_tables', 'get', 'all', 'count', 'insert', 'update', 'remove',
+    'register_tables', 'get', 'all', 'count', 'count_by', 'insert', 'update', 'remove',
     'upsert', 'commit',
 ):
     setattr(Database, _name, _serialized(getattr(Database, _name)))

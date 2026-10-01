@@ -35,6 +35,19 @@ from ..core.service.config import (
 )
 #: 图片 MIME 的**唯一**嗅探实现（`inline=1` 信封用它；不另抄一份扩展名表）。
 from ..core.service.helpers import guess_image_mime
+#: 表情库分组 / 上传的常量与纯函数：**单一事实源在 `core/service/helpers.py`**，
+#: 服务层的上传管线读同一份（控制台不另抄一套上限数字——抄一份就漂移一次）。
+#: 分组名（= 目录名）的命名规则因此只有一处定义：控制台用 `sticker_group_name_problem`
+#: 快速失败给出中文原因，服务层再判一次（它才是唯一写入路径）。
+from ..core.service.helpers import (
+    COLLECTED_STICKER_GROUP_DESCRIPTION,
+    COLLECTED_STICKER_GROUP_ID,
+    COLLECTED_STICKER_GROUP_NAME,
+    STICKER_DESCRIPTION_MAX,
+    STICKER_NAME_MAX,
+    safe_sticker_group_name,
+    sticker_group_name_problem,
+)
 from ..core.token_stats import normalize_range, range_bounds, summarize_usage
 from ..core.story_state import decode_story_state
 # 作品正文 / 创作意图 / 修改理由的上限与分段长度：**单一事实源在 `core/works.py`**，
@@ -106,11 +119,16 @@ STICKER_ROW_LIMIT = 500
 #: `limit` 查询参数的上限（前端翻页；真到 500 条说明页面该筛选了）。
 STICKER_PAGE_MAX = 200
 
-#: 一个素材最多接受多长的描述（与 `interlude_work` 的正文上限同一量级；
-#: 描述是要进提示词的，几万字会直接把上下文顶爆）。
-STICKER_DESCRIPTION_MAX = 2_000
-#: 短名上限（列表里显示的标签，不是提示词的一部分）。
-STICKER_NAME_MAX = 60
+#: 分组描述表一次最多读多少行（分组名 = 目录名，正常个位数；卡上限是防脏库）。
+STICKER_GROUP_ROW_LIMIT = 200
+#: 一次批量移动最多接受多少个 assetId（防一次请求改掉整库；超了 400）。
+STICKER_MOVE_MAX = 500
+#: `group` 是空串 / 缺失的旧行在列表里显示的组名（它没有 groupId 可归属）。
+STICKER_UNGROUPED_NAME = '未分组'
+
+#: 一个素材最长多长的描述 / 短名：**上限定义在 `core/service/helpers.py`**
+#: （服务层的上传管线读同一份），上面的 import 把这两个名字带进本模块命名空间，
+#: 本模块与测试按 `console_api.STICKER_DESCRIPTION_MAX` / `STICKER_NAME_MAX` 引用即可。
 
 #: 允许改的字段（**白名单**；其余一律 400，与 `set_config_value` 同一条纪律）。
 STICKER_EDITABLE_FIELDS: tuple[str, ...] = ('description', 'name', 'disabled')
@@ -167,11 +185,32 @@ def sticker_relative_file(row: Any) -> str:
     return os.path.basename(_text(_record(row).get('filePath')).replace('\\', '/'))
 
 
-def sticker_item(row: Any) -> dict[str, Any]:
-    """一行 `interlude_sticker` → 面板列表项（wire camelCase + 契约里的 `file`）。"""
+def sticker_group_display_name(names: Any, raw: Any) -> str:
+    """`group` 值 → 列表里显示的组名（§47）。
+
+    **组名就是目录名**，所以默认原样回显；`names` 只用来覆盖**唯一那个特例**
+    （内置组 `collected` 显示成「未整理」）。空值回「未分组」——这一条不消失、
+    也不假装属于某个正式分组。
+    """
+    value = _text(raw).strip()
+    if not value:
+        return STICKER_UNGROUPED_NAME
+    if isinstance(names, dict):
+        return _text(names.get(value)).strip() or value
+    return value
+
+
+def sticker_item(row: Any, group_names: Any = None) -> dict[str, Any]:
+    """一行 `interlude_sticker` → 面板列表项（wire camelCase + 契约里的 `file`）。
+
+    `group_names` 是 `groupId → 显示名` 的映射（`ConsoleApi._sticker_group_names()`，
+    现在只有内置组那一条）；不给就按目录名回显。**只加字段**：`group` 保持原样，
+    新增的 `groupId` / `groupName` 供前端分组筛选与显示，老字段一个都没改。
+    """
     record = _record(row)
     asset_id = _text(record.get('assetId') or record.get('asset_id'))
     file_name = sticker_relative_file(record)
+    group_id = _text(record.get('group')).strip()
     return {
         'assetId': asset_id,
         'name': _text(record.get('name')),
@@ -187,7 +226,10 @@ def sticker_item(row: Any) -> dict[str, Any]:
         # 扩展字段（前端可以直接忽略）：状态、分组、体积、别名、MIME 都是列表里
         # 想显示 / 想筛的东西，多回几个比让前端再发一次请求便宜。
         'status': _text(record.get('status')),
-        'group': _text(record.get('group')),
+        'group': group_id,
+        #: v1.8.3（§47）新增：分组的**稳定 id**（筛选、移动都用它）与可直接显示的组名。
+        'groupId': group_id,
+        'groupName': sticker_group_display_name(group_names, group_id),
         'size': _int(record.get('size'), 0),
         'aliases': record.get('aliases') if isinstance(record.get('aliases'), list) else [],
         'mimeType': _text(record.get('mimeType')),
@@ -196,6 +238,12 @@ def sticker_item(row: Any) -> dict[str, Any]:
         #: 所以"猜的"这件事只能靠这个额外字段暴露——控制台**暂未显示**这个徽章，
         #: 留给下一轮（见 `docs/PORTING_NOTES.md` §45.7）。
         'guessed': _truthy_boolean(record.get('guessed')),
+        #: v1.8.4（§48）新增的两个归属标记（**只加字段**，老字段一个都没动）：
+        #: `groupGuessed` = 这一组的归属是**模型**读描述时顺手定的（前端可打"模型归的"徽章）；
+        #: `groupManual` = 归属是**人**定的（控制台移动 / 上传时指定 / 目录扫描带进来的），
+        #: 自动定组不碰这类素材。旧库补列前写入的行是 NULL → 都当 false。
+        'groupGuessed': _truthy_boolean(record.get('groupGuessed')),
+        'groupManual': _truthy_boolean(record.get('groupManual')),
         #: 前端可直接用的**相对**地址（宿主会把插件页请求拼到插件名下）。
         'file': file_name,
         'thumbnailUrl': 'console/sticker-file?assetId=%s' % asset_id if asset_id else '',
@@ -2296,6 +2344,7 @@ class ConsoleApi:
         query: str = '',
         limit: Any = 60,
         offset: Any = 0,
+        group: str = '',
     ) -> dict[str, Any]:
         """本地表情库清单（**空库返回空壳，从不 500**）。
 
@@ -2304,6 +2353,8 @@ class ConsoleApi:
 
         筛选（都可选）：`status` = `active` / `pending` / `missing` / `disabled`；
         `kind` = `animated` / `image`；`source` = `auto` / `manual`；
+        `group` = **分组 id**（`console/sticker-groups` 的 `groupId`，精确匹配；
+        留空 = 不过滤——与其他筛选项同一条"空即不过滤"的规矩）；
         `query` 在描述 / 名字 / assetId 里做子串匹配（大小写不敏感）。
         """
         rows = [
@@ -2317,10 +2368,12 @@ class ConsoleApi:
             reverse=True,
         )
         truncated = len(rows) >= STICKER_ROW_LIMIT
-        items = [sticker_item(row) for row in rows]
+        names = await self._sticker_group_names()
+        items = [sticker_item(row, names) for row in rows]
         wanted_status = _text(status).strip().lower()
         wanted_kind = _text(kind).strip().lower()
         wanted_source = _text(source).strip().lower()
+        wanted_group = _text(group).strip()
         needle = _text(query).strip().lower()
         if wanted_status:
             items = [item for item in items if _text(item.get('status')).lower() == wanted_status]
@@ -2328,6 +2381,8 @@ class ConsoleApi:
             items = [item for item in items if item.get('kind') == wanted_kind]
         if wanted_source:
             items = [item for item in items if item.get('source') == wanted_source]
+        if wanted_group:
+            items = [item for item in items if _text(item.get('groupId')) == wanted_group]
         if needle:
             items = [
                 item for item in items
@@ -2579,7 +2634,316 @@ class ConsoleApi:
             'added': max(0, after - before),
         }
 
+    # ---- 表情库分组（v1.8.3，§47）：列表 / 新建改名 / 删除 / 批量移动 ---- #
+
+    async def sticker_groups(self) -> dict[str, Any]:
+        """分组列表（**空库 / 没建表 / 服务层没起来都是空壳 + 内置默认组**）。
+
+        三条口径（都是"磁盘目录结构是分组的唯一事实来源"的推论）：
+
+        1. **内置默认组永远在列表里**——哪怕没有素材、表里也没有行。否则自动收藏的
+           素材会无所属（它们落在 `collected/`，那正是默认组）；
+        2. **磁盘上有目录的、或者库里有素材挂着的，一律是一个正常分组**：前者让
+           "新建分组 / 手动 `mkdir` 的空目录"看得见，后者让"没写描述的老目录"
+           不至于因为少一行记录就让素材消失。表里的行**只是描述**；
+        3. **计数是精确的**：一次 `GROUP BY`（`Database.count_by`）拿到每组的张数，
+           不把整张素材表拉进内存（每行还带 `embedding`，几千行就是几十 MB）。
+        """
+        items, truncated = await self._sticker_group_view()
+        return {
+            'items': items,
+            'total': len(items),
+            'truncated': truncated,
+            #: 默认分组的 id（"删除分组时素材挪去哪" / "上传不给 groupId 落哪"都是它）。
+            #: 前端不该把这个字符串写死在自己的代码里。
+            'defaultGroupId': COLLECTED_STICKER_GROUP_ID,
+        }
+
+    async def save_sticker_group(self, payload: Any) -> dict[str, Any]:
+        """新建 / 改名 / 写描述一个分组；回 `{groupId, item}`。
+
+        请求体**只认** `groupId` / `name` / `description`，多一个键就 400
+        （与 `sticker-update` 同一条白名单纪律：静默丢字段会让用户以为改了、其实没改）。
+        **语义只有一条：`groupId` 的字面量就是磁盘目录名。**
+
+        * 没有 `groupId` = **新建分组** → `name` 就是新目录名（服务层建目录）；
+        * 有 `groupId` 且 `name` 与它相同 = 只写描述（"给一个老目录补描述"也是这条路，
+          不再有单独的"采纳"动作）；
+        * 有 `groupId` 且 `name` 不同 = **改名** → 重命名目录 + 批量改该组素材的行。
+        """
+        body = _record(payload)
+        unknown = sorted(
+            key for key in body
+            if key not in ('groupId', 'group_id', 'name', 'description')
+        )
+        if unknown:
+            raise ConsoleError(
+                '只能提交 groupId、name、description；不认识这些字段：%s' % '、'.join(unknown),
+            )
+        group_id = _text(body.get('groupId', body.get('group_id'))).strip()
+        if group_id:
+            # 它会被当目录名用；不合法就当场拒，别留到落盘那一步。
+            problem = sticker_group_name_problem(group_id)
+            if problem:
+                raise ConsoleError(problem)
+        name = body.get('name')
+        if not isinstance(name, str):
+            raise ConsoleError('缺少 name（必须是字符串）')
+        description = body.get('description')
+        if description is not None and not isinstance(description, str):
+            raise ConsoleError('description 必须是字符串（清空请传空串）')
+        self._require_service()
+        row = await self._call_service('save_sticker_group', group_id, name, description)
+        record = _record(row)
+        saved_id = _text(record.get('groupId')).strip() or group_id
+        items, _truncated = await self._sticker_group_view()
+        return {
+            'groupId': saved_id,
+            'item': self._sticker_group_item(items, saved_id),
+        }
+
+    async def delete_sticker_group(self, payload: Any) -> dict[str, Any]:
+        """删一个分组：**组内素材先搬进目标目录**（默认内置默认组），再删目录与描述行。
+
+        红线：**绝不悄悄删素材**。内置默认组不许删（400）。`moveTo` 指向不存在的
+        分组也是 400——"挪到一个拼错的地方"意味着素材会落到一个没人认得的组里。
+        """
+        body = _record(payload)
+        unknown = sorted(
+            key for key in body
+            if key not in ('groupId', 'group_id', 'moveTo', 'move_to')
+        )
+        if unknown:
+            raise ConsoleError(
+                '只能提交 groupId、moveTo；不认识这些字段：%s' % '、'.join(unknown),
+            )
+        group_id = _text(body.get('groupId', body.get('group_id'))).strip()
+        if not group_id:
+            raise ConsoleError('缺少 groupId')
+        if group_id == COLLECTED_STICKER_GROUP_ID:
+            raise ConsoleError('内置分组不能删除（%s）' % COLLECTED_STICKER_GROUP_NAME)
+        move_to = _text(body.get('moveTo', body.get('move_to'))).strip()
+        if move_to:
+            problem = sticker_group_name_problem(move_to, reserved=True)
+            if problem:
+                raise ConsoleError(problem)
+        self._require_service()
+        result = await self._call_service('delete_sticker_group', group_id, move_to)
+        outcome = _record(result)
+        await self._refresh_sticker_catalog()
+        return {
+            'groupId': group_id,
+            'deleted': True,
+            'moved': _int(outcome.get('moved'), 0),
+            'moveTo': _text(outcome.get('moveTo')).strip() or COLLECTED_STICKER_GROUP_ID,
+        }
+
+    async def move_stickers(self, payload: Any) -> dict[str, Any]:
+        """批量改归属：`{assetIds:[…], groupId}` → `{moved, item:[…]}`。
+
+        **先校验后写**（用户点名的那条）：所有 `assetId` 都必须命中库里的行、
+        目标分组必须存在，任何一条不合法就 400 且**一条都不写**——
+        批量操作里"改了一半"是最难收拾的状态。返回的 `item` 是改完之后**库里那一行**
+        （前端据此就地刷新，不必再拉一次整页）。
+        """
+        body = _record(payload)
+        unknown = sorted(
+            key for key in body
+            if key not in ('assetIds', 'asset_ids', 'groupId', 'group_id')
+        )
+        if unknown:
+            raise ConsoleError(
+                '只能提交 assetIds、groupId；不认识这些字段：%s' % '、'.join(unknown),
+            )
+        raw_ids = body.get('assetIds', body.get('asset_ids'))
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ConsoleError('缺少 assetIds（非空数组）')
+        if len(raw_ids) > STICKER_MOVE_MAX:
+            raise ConsoleError('一次最多移动 %d 条素材' % STICKER_MOVE_MAX)
+        asset_ids: list[str] = []
+        for value in raw_ids:
+            text = _text(value).strip()
+            if not text:
+                raise ConsoleError('assetIds 里有空值')
+            if len(text) > 255:
+                raise ConsoleError('assetId 过长')
+            if text not in asset_ids:
+                asset_ids.append(text)
+        group_id = _text(body.get('groupId', body.get('group_id'))).strip()
+        if not group_id:
+            raise ConsoleError('缺少 groupId')
+        problem = sticker_group_name_problem(group_id, reserved=True)
+        if problem:
+            raise ConsoleError(problem)
+        self._require_service()
+        items, _truncated = await self._sticker_group_view()
+        # 目标必须是**列表里看得见的组**（磁盘上有目录 / 有描述行 / 有素材挂着）：
+        # 空 `group` 桶不进 `known`，其他一律可以当目标（"目录即分组"没有第二等公民）。
+        known = {_text(item.get('groupId')) for item in items if _text(item.get('groupId'))}
+        if group_id not in known:
+            raise ConsoleError('找不到这个分组（先在「分组」里新建它）：%s' % group_id)
+        rows = [self._sticker_row_for_write(asset_id) for asset_id in asset_ids]
+        moved = await self._call_service(
+            'move_sticker_assets', [row.get('id') for row in rows], group_id,
+        )
+        await self._refresh_sticker_catalog()
+        return {
+            'moved': _int(moved, 0),
+            'item': [self._sticker_item_by_id(row.get('id')) for row in rows],
+        }
+
+    async def upload_sticker(
+        self, data: Any, group_id: Any = '', description: Any = None, name: Any = '',
+    ) -> dict[str, Any]:
+        """上传一张表情进库；回 `{assetId, duplicated, item}`。
+
+        字节已经在手上（multipart 的 `file` 字段，文件名**一律不信、也不落库**），
+        校验 / 去重 / 落盘 / 建档 / 描述全在服务层的 `upload_sticker_asset()` 里——
+        控制台这里只做"字节是不是字节"和错误映射，不另写一份判据。
+
+        库总闸关着时 400（与「重扫表情库」同一句话）：让用户先看见"这个库现在是关的"，
+        而不是上传成功、模型却永远看不到。
+        """
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise ConsoleError('没有收到文件内容（multipart 的 file 字段）')
+        section = self.bridge.section('stickers')
+        if section.get('enabled') is not True:
+            raise ConsoleError('本地表情包库未启用（配置 → 本地表情包 → 启用本地表情包库）')
+        description_text = None if description is None else _text(description)
+        name_text = '' if name is None else _text(name)
+        self._require_service()
+        result = await self._call_service(
+            'upload_sticker_asset',
+            bytes(data),
+            _text(group_id).strip(),
+            description_text,
+            name_text,
+        )
+        outcome = _record(result)
+        row = _record(outcome.get('row'))
+        row_id = row.get('id')
+        item = self._sticker_item_by_id(row_id) if row_id is not None else {}
+        if not item:
+            # 服务层没回 id（旧版服务层 / 极旧的库）：至少把这一行按素材项的形状回出去。
+            item = sticker_item(row, await self._sticker_group_names())
+        return {
+            'assetId': _text(outcome.get('assetId')).strip() or _text(row.get('assetId')),
+            'duplicated': outcome.get('duplicated') is True,
+            'item': item,
+        }
+
     # ---- 表情库面板的内部工具 ---- #
+
+    async def _sticker_group_rows(self) -> tuple[list[dict[str, Any]], bool]:
+        """分组**描述**表的行（窗口 + `truncated`；表没建 / 读失败都是空列表）。
+
+        实现只有同步那一份（`_sticker_group_rows_sync`）：写路径在同步上下文里
+        要回一条 item，读路径是协程——两处各写一份就迟早分家（读的窗口、排序、
+        容错必须完全一致）。
+        """
+        return self._sticker_group_rows_sync()
+
+    def _sticker_group_dirs(self) -> list[str]:
+        """表情库根下的一级子目录名（**目录即分组**：磁盘上有的就是分组）。
+
+        读不出来（没配置 / 目录不存在 / 服务层没起来）一律空列表——分组视图的
+        主体仍是"素材挂着的 group 值 + 描述表的行"，这条只是让**刚建好还没素材**
+        的目录也看得见。`os.listdir` 一次，不递归。
+        """
+        try:
+            root = self._sticker_root()
+        except Exception:  # noqa: BLE001 - 路径推不出来就不列目录
+            return []
+        try:
+            return sorted(
+                name for name in os.listdir(root)
+                if os.path.isdir(os.path.join(root, name))
+            )
+        except OSError:  # 目录不存在 / 没权限：不是错误，只是没有目录可列
+            return []
+
+    async def _sticker_group_view(self) -> tuple[list[dict[str, Any]], bool]:
+        """分组视图：内置默认组 + 描述表 + 磁盘目录 + 有用它的素材（唯一实现处）。
+
+        列表与校验（移动 / 上传的目标分组）都读这一份，避免"校验认得的组"与
+        "列表里看得见的组"两处推导漂移。
+
+        `name` 一律等于 `groupId`（**组名就是目录名**），只有内置组那一条例外
+        （`collected` 显示成「未整理」，见 §47）。`registered` 是**留给旧前端的
+        兼容字段**：新模型里"磁盘上有目录 / 表里有行 / 有素材挂着"都算正式分组，
+        所以它恒为 `true`——下一轮前端会把这个字段删掉。
+        """
+        rows, truncated = await self._sticker_group_rows()
+        counts = self._sticker_group_counts()
+        described: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            group_id = _text(row.get('groupId')).strip()
+            if group_id and group_id not in described:
+                described[group_id] = row
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(group_id: str, name: str, description: str, row: Any, builtin: bool) -> None:
+            if group_id in seen:
+                return
+            seen.add(group_id)
+            record = _record(row)
+            items.append({
+                'groupId': group_id,
+                'name': name,
+                'description': description,
+                'count': _int(counts.get(group_id), 0),
+                'builtin': builtin,
+                #: 兼容字段（恒 true）：新模型里表里有行 = 有描述，不是"注册"。
+                'registered': True,
+                #: 这一组是不是**模型自动归组**建出来的（只有它占自动建组额度）；
+                #: 前端要不要显示成徽章由前端定，这里只如实带出来。
+                'autoCreated': bool(record.get('autoCreated')) if row else False,
+                'createdAt': _timestamp_text(record.get('createdAt')),
+                'updatedAt': _timestamp_text(record.get('updatedAt')),
+            })
+
+        # 1. 内置默认组：**永远第一条**（没素材、表里没行也照样有）。
+        #    名字固定「未整理」（唯一一个"显示名 ≠ 目录名"的特例），描述在描述行
+        #    **没写**时回落到内置常量（v1.8.4，§48.5）：控制台与模型目录看到的必须是
+        #    **同一句话**——两处说法不一致就是"两处判据"。
+        builtin_row = described.get(COLLECTED_STICKER_GROUP_ID) or {}
+        add(
+            COLLECTED_STICKER_GROUP_ID,
+            COLLECTED_STICKER_GROUP_NAME,
+            _text(builtin_row.get('description')).strip() or COLLECTED_STICKER_GROUP_DESCRIPTION,
+            builtin_row, True,
+        )
+        # 2. 描述表里其余分组：按 `createdAt` 升序（= 建组顺序），同刻按目录名定序。
+        for group_id in sorted(described, key=lambda key: (_text(described[key].get('createdAt')), key)):
+            add(group_id, group_id, _text(described[group_id].get('description')), described[group_id], False)
+        # 3. 剩下的分组：**磁盘上有目录的**与**有素材挂着的**——表里没有行只说明"还没描述"，
+        #    绝不是"未注册"，更不许因此让素材消失。
+        for group_id in sorted(set(counts) | set(self._sticker_group_dirs())):
+            if group_id:
+                add(group_id, group_id, '', {}, False)
+        # 4. 空 `group` 的旧行（没有分组可归属）：单列一个"未分组"桶，计数不被吞掉。
+        if counts.get(''):
+            add('', STICKER_UNGROUPED_NAME, '', {}, False)
+        return items, truncated
+
+    def _sticker_group_counts(self) -> dict[str, int]:
+        """每个 `group` 值下的素材张数（精确计数，失败回空表）。"""
+        try:
+            return dict(self.bridge.db.count_by('interlude_sticker', 'group') or {})
+        except Exception:  # noqa: BLE001 - 表没建 / 旧库缺列都不该让面板打不开
+            return {}
+
+    async def _sticker_group_names(self) -> dict[str, str]:
+        """`groupId → 显示名`；**只有内置组那一条**（其余组的显示名就是目录名）。"""
+        return {COLLECTED_STICKER_GROUP_ID: COLLECTED_STICKER_GROUP_NAME}
+
+    def _sticker_group_item(self, items: list[dict[str, Any]], group_id: str) -> dict[str, Any]:
+        """从分组视图里取一条（写完之后回**库里那一份**，而不是回显请求）。"""
+        for item in items:
+            if _text(item.get('groupId')) == group_id:
+                return item
+        return {}
 
     def _service(self) -> Any:
         """拿服务层（未就绪时是 `None`，调用方自己决定回空壳还是报错）。"""
@@ -2658,11 +3022,26 @@ class ConsoleApi:
         return None
 
     def _sticker_item_by_id(self, row_id: Any) -> dict[str, Any]:
-        """写完之后回**库里那一行**（而不是回显请求），界面才是真值。"""
+        """写完之后回**库里那一行**（而不是回显请求），界面才是真值。
+
+        组名（`groupName`）现在只有内置组那一个特例（其余组的显示名就是目录名），
+        所以不必再读描述表——`sticker_item()` 缺省就按目录名回显。
+        """
         row = self._sticker_row_by_id(row_id)
         if row is None:
             return {}
-        return sticker_item(row)
+        names = {COLLECTED_STICKER_GROUP_ID: COLLECTED_STICKER_GROUP_NAME}
+        return sticker_item(row, names)
+
+    def _sticker_group_rows_sync(self) -> tuple[list[dict[str, Any]], bool]:
+        """`_sticker_group_rows()` 的同步版（写路径在同步上下文里回 item 用）。"""
+        rows = [
+            row for row in _safe_all(
+                self.bridge.db, 'interlude_sticker_groups', None,
+                'createdAt ASC', STICKER_GROUP_ROW_LIMIT,
+            ) if isinstance(row, dict)
+        ]
+        return rows, len(rows) >= STICKER_GROUP_ROW_LIMIT
 
     # ------------------------------------------------------------------ #
     # 内部

@@ -1174,6 +1174,7 @@ class ServiceChunk4(ServiceBase):
         timeline_plan: Any = None,
         on_early_reply: Any = None,
         attachments: Optional[list[dict[str, Any]]] = None,
+        sticker_groups: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """上游 `decide(story, participant, phase, from, now, ...)`（`:3437`）。
 
@@ -1181,6 +1182,10 @@ class ServiceChunk4(ServiceBase):
         `docs/PORTING_NOTES.md` §29）：本轮附带的媒体种类（照片 / 表情包 / 动画表情 /
         QQ 商城表情 / 小程序卡片）。上游没有这个概念——它的适配器把种类信息丢在
         解析层，模型只能一律看到 `[图片]`。追加在末尾，位置参数调用不受影响。
+
+        `sticker_groups` 同样追加在末尾（受控偏离 §48 甲）：**分组目录**
+        （`[{groupId, name, description, count}]`，不列条目）——两级选择的第一段。
+        与 `sticker_catalog` 互斥：给了分组目录就不平铺条目（那正是省 token 的地方）。
 
         主模型上下文的**唯一入口**。返回的 `NarrativeRequest` 是**发给模型的 wire
         format**：顶层与嵌套键全部保持上游 camelCase（见模块 docstring 第 3 条）。
@@ -1192,6 +1197,7 @@ class ServiceChunk4(ServiceBase):
         extra_web_context = extra_web_context or []
         quoted_messages = quoted_messages or []
         sticker_catalog = sticker_catalog or []
+        sticker_groups = sticker_groups or []
         visual_observations = visual_observations or []
         # 上游 1.0.1-rc23/rc26：到点世界事件在**本回合开始前**排水注入，于是它们本回合
         # 就出现在 recentScript 里（先进账、后写作）。`low` 只在非 user-message 相位
@@ -1515,6 +1521,9 @@ class ServiceChunk4(ServiceBase):
             request['quotedMessages'] = quoted_messages
         if sticker_catalog and phase == 'user-message':
             request['stickerCatalog'] = sticker_catalog
+        # 两级选择的第一段（§48 甲）：只给分组目录、不列条目。
+        if sticker_groups and phase == 'user-message':
+            request['stickerGroupCatalog'] = sticker_groups
         # 上轮上下文构成（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.4）：只记装配侧的量，
         # 真正的 token 账单在模型中心的用量账里。诊断记账失败不影响本回合。
         await self.record_context_metrics(
@@ -1787,18 +1796,23 @@ class ServiceChunk4(ServiceBase):
         visual_observations: Optional[list[str]] = None,
         on_early_reply: Any = None,
         attachments: Optional[list[dict[str, Any]]] = None,
+        sticker_groups: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """上游 `tryDecide(...)`（`:3720`）。
 
         参数顺序与上游**逐字对齐**（位置参数），因为 `chunk3.flush_buffered_narrative`
         等兄弟成员按位置调用它。返回 dict 同时提供 `timelinePlan` / `timeline_plan`
         与 `effectiveNow` / `effective_now`（跨 chunk 双读）。
+
+        `sticker_groups`（末位追加，受控偏离 §48 甲）是两级选择第一段的分组目录，
+        原样透传给 `decide()`（三次重写调用都要带上，否则重写那一遍会退回平铺目录）。
         """
         superseded_intents = superseded_intents or []
         images = images or []
         audio = audio or []
         quoted_messages = quoted_messages or []
         sticker_catalog = sticker_catalog or []
+        sticker_groups = sticker_groups or []
         visual_observations = visual_observations or []
         immediate_observations: list[dict[str, Any]] = []
         effective_now = now
@@ -1859,6 +1873,7 @@ class ServiceChunk4(ServiceBase):
                 superseded_intents, group_context, images, audio, [], False, chat_capabilities,
                 quoted_messages, sticker_catalog, turn_query_embedding, visual_observations,
                 timeline_plan, early_reply if can_early_reply else None, attachments,
+                sticker_groups,
             )
             immediate = None
             if (
@@ -1884,7 +1899,7 @@ class ServiceChunk4(ServiceBase):
                     superseded_intents, group_context, images, audio, immediate_observations, False,
                     chat_capabilities, quoted_messages, sticker_catalog, turn_query_embedding,
                     visual_observations, timeline_plan, early_reply if can_early_reply else None,
-                    attachments,
+                    attachments, sticker_groups,
                 )
             # 用户自报的钟点（「八点赶到」）对守卫背书：模型复述它们不是时间越界。
             # 提取是 O(消息长度) 的本地正则，只在实况用户回合发生一次。
@@ -1941,7 +1956,7 @@ class ServiceChunk4(ServiceBase):
                     superseded_intents, group_context, images, audio, immediate_observations, True,
                     chat_capabilities, quoted_messages, sticker_catalog, turn_query_embedding,
                     visual_observations, timeline_plan, early_reply if can_early_reply else None,
-                    attachments,
+                    attachments, sticker_groups,
                 )
                 recovered_time_overflow = detect_live_script_time_overflow(
                     _raw_decision(decision, 'script'), phase, from_, effective_now, timezone, endorsed_clocks,

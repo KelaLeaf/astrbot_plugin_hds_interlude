@@ -250,6 +250,70 @@ def _pick(value: Any, camel: str, snake: Optional[str] = None) -> Any:
     return value.get(snake) if snake else None
 
 
+#: 上传表情时允许随请求带的三个可选参数（表单字段名，也是查询串上的名字）。
+_STICKER_UPLOAD_FIELDS: tuple[tuple[str, str], ...] = (
+    ('groupId', 'group_id'),
+    ('description', 'description'),
+    ('name', 'name'),
+)
+
+
+async def _sticker_upload_payload() -> tuple[Optional[bytes], dict[str, str]]:
+    """从插件页请求里取**上传的表情字节 + 可选参数**（控制台「上传表情」）。
+
+    两条通道的来由（宿主 bridge 的实际能力，见 astrbot 的 `plugin_page_bridge.js`
+    里 `files:upload` 分支）：
+
+    * 字节只走 `multipart/form-data` 的 **`file`** 字段——宿主 `upload(endpoint, file)`
+      的字段名是写死的（`form.append("file", …)`），`upload` 只是给手敲 curl 的宽容别名；
+    * `groupId` / `description` / `name` **表单字段优先，其次查询串**：bridge 只能发
+      一个文件字段，前端唯一能带参数的路就是把它们挂在端点的查询串上。
+      两种拼写都认（wire 是 camelCase，手敲 curl 的人常写 snake_case）。
+
+    **上传的文件名一个字符都不进业务**：命名一律用内容哈希（见
+    `chunk2.upload_sticker_asset`），这里连 `upload.filename` 都不读。
+    """
+    from astrbot.api.web import request  # noqa: PLC0415 - 宿主 API，测试里用桩
+
+    try:
+        form = await request.form()
+    except Exception:  # noqa: BLE001 - 不是 multipart / 老宿主没有 form()
+        form = None
+    options: dict[str, str] = {}
+    for camel, snake in _STICKER_UPLOAD_FIELDS:
+        value: Any = None
+        if form is not None:
+            try:
+                value = form.get(camel)
+            except Exception:  # noqa: BLE001 - 表单桩缺 get 就当没给
+                value = None
+        if value is None:
+            try:
+                value = request.query.get(camel)
+                if value is None and snake != camel:
+                    value = request.query.get(snake)
+            except Exception:  # noqa: BLE001 - 拿不到查询参数就是没给
+                value = None
+        if value is not None:
+            options[camel] = value if isinstance(value, str) else str(value)
+
+    data: Optional[bytes] = None
+    try:
+        files = await request.files()
+    except Exception:  # noqa: BLE001 - 不是 multipart
+        files = None
+    if files:
+        upload = files.get('file') or files.get('upload')
+        if upload is not None:
+            try:
+                data = await upload.read()
+            except Exception:  # noqa: BLE001
+                data = None
+            if isinstance(data, str):  # 桩/老宿主回文本时按字节处理，别把 str 传下去
+                data = data.encode('utf-8', errors='replace')
+    return data, options
+
+
 def _text(value: Any) -> str:
     return '' if value is None else str(value)
 
@@ -554,6 +618,17 @@ class HDSInterludePlugin(Star):
              '控制台：删除表情包（默认只标记，purge 才删文件）'),
             (f'/{PLUGIN_NAME}/console/sticker-rescan', self.page_console_sticker_rescan, ['POST'],
              '控制台：重扫表情库目录'),
+            # 表情库分组与上传（v1.8.3，§47）：新建分组 / 删除分组 / 批量移动 / 上传表情。
+            (f'/{PLUGIN_NAME}/console/sticker-groups', self.page_console_sticker_groups, ['GET'],
+             '控制台：表情库分组清单'),
+            (f'/{PLUGIN_NAME}/console/sticker-group-save', self.page_console_sticker_group_save,
+             ['POST'], '控制台：新建 / 修改表情库分组'),
+            (f'/{PLUGIN_NAME}/console/sticker-group-delete', self.page_console_sticker_group_delete,
+             ['POST'], '控制台：删除表情库分组（组内素材先挪走）'),
+            (f'/{PLUGIN_NAME}/console/sticker-move', self.page_console_sticker_move, ['POST'],
+             '控制台：批量移动表情到分组'),
+            (f'/{PLUGIN_NAME}/console/sticker-upload', self.page_console_sticker_upload, ['POST'],
+             '控制台：上传表情（multipart，字段名 file）'),
             # 配置备份（原 config-backup 页并入控制台）
             (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
              '导出 HDS Interlude 配置'),
@@ -805,6 +880,55 @@ class HDSInterludePlugin(Star):
     async def page_console_sticker_rescan(self):
         """重扫表情库目录（跑完整 `scan_sticker_library()`）。"""
         return await self._console_write(lambda api, body: api.rescan_stickers(body))
+
+    # ---- 控制台的「表情库」面板：分组与上传（v1.8.3，§47） ---- #
+
+    async def page_console_sticker_groups(self):
+        """表情库分组清单（**目录即分组**：内置默认组永远在，磁盘上有目录的也在）。"""
+        return await self._console_json(lambda api, _q: api.sticker_groups())
+
+    async def page_console_sticker_group_save(self):
+        """新建 / 改名 / 写描述（白名单在 `ConsoleApi.save_sticker_group` 里）。"""
+        return await self._console_write(lambda api, body: api.save_sticker_group(body))
+
+    async def page_console_sticker_group_delete(self):
+        """删分组：组内素材**先搬进目标目录**（默认进内置默认组），绝不悄悄删素材。"""
+        return await self._console_write(lambda api, body: api.delete_sticker_group(body))
+
+    async def page_console_sticker_move(self):
+        """批量改归属（**先校验后写**：有一条 assetId 不合法就一条都不写）。"""
+        return await self._console_write(lambda api, body: api.move_stickers(body))
+
+    async def page_console_sticker_upload(self):
+        """上传一张表情（`multipart/form-data`，字段名固定 **`file`**）。
+
+        与其它控制台写操作的区别只有一处：请求体不是 JSON，所以这里不用
+        `_console_write` 的 JSON 解析，而是自己取字节 + 三个可选参数
+        （`groupId` / `description` / `name`，表单字段或查询串，见
+        `_sticker_upload_payload()` 的两条通道说明）。
+
+        校验 / 去重 / 落盘 / 建档 / 描述全在 `ConsoleApi.upload_sticker()` →
+        服务层的 `upload_sticker_asset()`；`ConsoleError` 映射成 400 + 原文案。
+        """
+        from astrbot.api.web import error_response, json_response
+
+        from .adapters.console_api import ConsoleError
+
+        data, options = await _sticker_upload_payload()
+        if not data:
+            return error_response('没有收到文件内容（multipart 的 file 字段）', status_code=400)
+        try:
+            payload = await self._console.upload_sticker(
+                data, options.get('groupId', ''), options.get('description'),
+                options.get('name', ''),
+            )
+        except ConsoleError as error:
+            return error_response(str(error), status_code=400)
+        except Exception as error:  # noqa: BLE001
+            logger.warning('hds-interlude：上传表情失败：%s' % error)
+            return error_response('上传失败：%s' % error, status_code=500)
+        logger.warning('hds-interlude：控制台上传了表情：%s' % payload.get('assetId', '?'))
+        return json_response(payload)
 
     async def _console_write(self, action):
         """跑一个控制台写操作。

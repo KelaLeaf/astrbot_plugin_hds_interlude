@@ -1562,9 +1562,12 @@ class ServiceChunk1(ServiceBase):
                 )
             else:
                 turn_query_embedding = None
-            sticker_catalog = await self.sticker_catalog_for_session(
+            # 两级表情选择（§48 甲）：`selection` 一处判"这一回合平铺条目还是只给分组目录"。
+            sticker_selection = await self.sticker_selection_for_session(
                 turn.get('latest_session'), turn_query_embedding,
             )
+            sticker_catalog = sticker_selection['assets']
+            sticker_groups = sticker_selection['groups']
             # 上游 2197-2215：群音频走**批次预算**（条数 = `maxPerMessage×4`、
             # 字节 = `maxFileSizeMB×4`），超出的延后 / 跳过并各留一条 warn。
             # v1.7.6 之前这里恒传 `[]`，于是"群里发的语音"从来没有作为音频证据进过 payload。
@@ -1574,12 +1577,16 @@ class ServiceChunk1(ServiceBase):
             decision_result = await self.try_decide(
                 snapshot['story'], None, 'user-message', snapshot['from'], snapshot['now'],
                 user_message, [], [], group_context, [], group_audio, chat_capabilities, [],
-                sticker_catalog, turn_query_embedding,
+                sticker_catalog, turn_query_embedding, None, None, None, sticker_groups,
             )
             decision = pick(decision_result, 'decision') or {}
             succeeded = bool(pick(decision_result, 'succeeded'))
             chat_actions = normalize_group_chat_actions(decision, chat_capabilities, group_context)
-            sticker = self.resolve_sticker(pick(decision, 'localMedia', 'local_media'), sticker_catalog)
+            # 每回合一个**新的**追问预算（同回合最多多问一次，铁律见 §48 兜底表）。
+            sticker_follow_up: dict[str, Any] = {}
+            sticker = await self.resolve_sticker_selection(
+                decision, sticker_selection, sticker_follow_up,
+            )
             native_face = None if sticker else self.resolve_native_face(decision, chat_capabilities)
 
             async def persist_task() -> dict[str, Any]:

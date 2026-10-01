@@ -30,6 +30,9 @@ from plugin.core.narrator_prompts import (
     compact_prompt_entries,
     prompt_visible_message_content,
     recent_script_ownership,
+    sticker_description_instruction,
+    sticker_instruction,
+    sticker_selection_instruction,
     story_state_for_prompt,
     system_prompt,
     to_prompt_payload,
@@ -467,6 +470,46 @@ class NarrativePromptTests(unittest.TestCase):
         self.assertNotRegex(absent, r'CURRENT LOCAL STICKER LIBRARY')
         self.assertRegex(enabled, r'CURRENT LOCAL STICKER LIBRARY')
         self.assertRegex(enabled, r'at most one exact listed sticker')
+
+    def test_group_catalog_replaces_the_flat_catalog_for_the_two_step_choice(self) -> None:
+        """§48 甲：第一段只给分组目录（不列条目），第二段的提示词另有一条。"""
+        groups = [{'groupId': 'collected', 'name': '未整理', 'description': '还没归组。', 'count': 3}]
+        prompt = system_prompt_6(
+            'user-message', False, False, False, False, False, None, False, None, False, False,
+            False, False, None, None, False, groups,
+        )
+        self.assertRegex(prompt, r'CURRENT LOCAL STICKER LIBRARY')
+        self.assertRegex(prompt, r'stickerGroupCatalog')
+        self.assertRegex(prompt, r'localMedia: \{"stickerGroupId"')
+        self.assertNotRegex(prompt, r'at most one exact listed sticker', '第一段没有条目可挑')
+        # 平铺目录（inline）那一段**逐字未变**：两级选择不许动老路径的提示词。
+        flat = system_prompt_6('user-message', False, False, False, False, False, None, False, [
+            {'assetId': 'a-1', 'group': 'g', 'description': '一只猫', 'aliases': [], 'animated': False},
+        ])
+        self.assertRegex(flat, r'at most one exact listed sticker')
+        self.assertNotRegex(flat, r'stickerGroupCatalog')
+        self.assertEqual(sticker_instruction(None, 0.7, None), '')
+        self.assertEqual(sticker_instruction(None, 0.7, []), '')
+
+    def test_describe_instruction_asks_for_a_group_only_when_one_is_supplied(self) -> None:
+        """§48 乙：不带目录时那次描述调用的问法逐字不变。"""
+        plain = sticker_description_instruction(None)
+        self.assertRegex(plain, r'Describe this local chat sticker')
+        self.assertNotRegex(plain, r'"group"')
+        with_groups = sticker_description_instruction(
+            [{'groupId': 'g-1', 'name': '猫猫', 'description': '猫、躺平', 'count': 2}],
+        )
+        self.assertRegex(with_groups, r'"group":\{"existing"')
+        self.assertRegex(with_groups, r'"new"')
+        self.assertIn('猫猫', with_groups)
+        self.assertIn('prefer an existing group', with_groups)
+
+    def test_selection_instruction_asks_for_one_asset_and_the_message(self) -> None:
+        text = sticker_selection_instruction(0.7)
+        self.assertRegex(text, r'stickerAssetId')
+        self.assertRegex(text, r'"content"')
+        self.assertRegex(text, r'0\.7')
+        self.assertRegex(text, r'never invent an assetId')
 
 
 class PositiveNarrativePromptTests(unittest.TestCase):

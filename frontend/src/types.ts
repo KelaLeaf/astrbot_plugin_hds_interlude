@@ -729,6 +729,10 @@ export interface StickerItem {
   /** `active` | `pending` | `missing` | `disabled`。 */
   status: string
   group: string
+  /** 分组的**稳定 id**（= 磁盘目录名；筛选、移动都用它，空串 = 未分组桶）。 */
+  groupId: string
+  /** 分组显示名（只有内置组会与 `groupId` 不同）。 */
+  groupName: string
   size: number
   aliases: unknown[]
   mimeType: string
@@ -784,4 +788,62 @@ export interface StickerRescanResult {
   assets: number
   /** 这一轮新增了几条。 */
   added: number
+}
+
+/* ------------------------------- 表情库分组（`console/sticker-groups`，v1.8.4） */
+
+/**
+ * 一个分组。**`groupId` 的字面量就是磁盘上的目录名**（后端 v1.8.4 起）：顺序 =
+ * 内置组 → 有描述的（按建组时间）→ 其余目录 / 有素材挂着的 → 空桶，就是后端给的顺序。
+ *
+ * 接口还会回一个 `registered` 兼容字段（恒 `true`）——**前端不读**："磁盘上有目录 /
+ * 表里有行 / 有素材挂着"都算正式分组，读了它就会凭空多出"未注册"这种第二等公民。
+ */
+export interface StickerGroup {
+  /** 目录名。空串 = 未分组桶（它筛不出来，也不能当移动 / 上传的目标）。 */
+  groupId: string
+  /** 显示名。**只有内置组**会与 `groupId` 不同（`collected` → 「未整理」）。 */
+  name: string
+  /** 给模型看的那份描述（"这一组什么风格、什么场合用"）；空串 = 没写。 */
+  description: string
+  /** 组里的素材张数（精确计数）。 */
+  count: number
+  /** 内置默认组：目录名不许改、也不给删除入口（后端都会 400）。 */
+  builtin: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface StickerGroupListPayload {
+  items: StickerGroup[]
+  total: number
+  truncated: boolean
+  /** 删组分素材默认挪去哪 / 上传不给分组落哪。**直接用，别在前端写死**。 */
+  defaultGroupId: string
+}
+
+export interface StickerGroupSaveResult {
+  groupId: string
+  item: StickerGroup
+}
+
+export interface StickerGroupDeleteResult {
+  groupId: string
+  deleted: boolean
+  /** 被挪走的素材条数（删组**绝不删素材**）。 */
+  moved: number
+  moveTo: string
+}
+
+export interface StickerMoveResult {
+  moved: number
+  /** 改完之后库里那几行（据此就地更新列表）。 */
+  item: StickerItem[]
+}
+
+export interface StickerUploadResult {
+  assetId: string
+  /** `true` = 库里已有同内容（不新建、不覆盖）。 */
+  duplicated: boolean
+  item: StickerItem
 }

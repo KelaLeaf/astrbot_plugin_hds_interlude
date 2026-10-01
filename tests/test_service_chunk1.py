@@ -1661,6 +1661,8 @@ class _GroupGuessingDescriber:
     def __init__(self) -> None:
         self.guessed: list[Any] = []
         self.described: list[Any] = []
+        #: 每次描述调用带下去的分组目录（§48 乙）。
+        self.described_groups: list[Any] = []
 
     def available(self) -> bool:
         return True
@@ -1678,8 +1680,11 @@ class _GroupGuessingDescriber:
     async def describe_sticker(
         self, data_uri: str, mime_type: str, file_name: str, animated: Any,
         response_format: Any = 'json-object', max_tokens: Any = 768,
+        groups: Any = None,
     ) -> Any:
+        # §48 乙：描述这一次调用会带上现有分组目录（`groups`）；替身照生产签名收下。
         self.described.append((data_uri, mime_type, file_name, animated))
+        self.described_groups.append(groups)
         return {'description': '描述流程补的', 'aliases': []}
 
 
