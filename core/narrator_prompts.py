@@ -61,6 +61,8 @@ from .specialization import (
     ADMIN_NOTES_FULL,
     BUBBLE_AFFORDANCE,
     BUBBLE_AFFORDANCE_TEMPLATE,
+    BUBBLE_VOICE_AFFORDANCE,
+    BUBBLE_VOICE_DISABLED,
     CHANNEL_CONTEXT_FULL,
     CHANNELS_FULL,
     CONTENT_ONLY_TRANSPORT,
@@ -625,6 +627,10 @@ def writing_affordances(options: Optional[dict[str, Any]] = None) -> str:
     自定义 `messageSeparator` 时用模板插值 `JSON.stringify(separator)` 的等价形态，
     保证默认值与上游常量逐字一致。末尾按 rc18 追加重复气泡守卫（只有命中时才渲染）。
     browser 段未变。
+
+    v1.7.7 受控偏离：气泡段后面按 `ttsEnabled` 追加**正文语音标记** `<tts/>` 的说明
+    （只在开关开着时教它用；关掉时那段改成"不要写语音标记"，与
+    `splitReplyMessages is False` 时气泡段的写法同一个模式）。
     """
     separator = _pick(options, 'messageSeparator', 'message_separator')
     separator = separator.strip() if isinstance(separator, str) else ''
@@ -637,6 +643,12 @@ def writing_affordances(options: Optional[dict[str, Any]] = None) -> str:
     else:
         bubbles = BUBBLE_AFFORDANCE_TEMPLATE.replace(
             '${JSON.stringify(separator)}', json.dumps(separator, ensure_ascii=False))
+    # 缺键按「开着」（= 今天的默认行为）：只有显式 `false` 才是关掉。
+    voice = (
+        BUBBLE_VOICE_DISABLED
+        if _pick(options, 'ttsEnabled', 'tts_enabled') is False
+        else BUBBLE_VOICE_AFFORDANCE
+    )
     browser_mode = _pick(options, 'browserMode', 'browser_mode')
     if browser_mode == 'disabled':
         browser = 'New browsing is unavailable in this turn. Existing webContext remains usable evidence; leave browserIntents empty.'
@@ -645,7 +657,7 @@ def writing_affordances(options: Optional[dict[str, Any]] = None) -> str:
     else:
         browser = 'Browsing uses deferred work in this turn. Return at most one browserIntent with timing=deferred when the scene motivates it; its result becomes evidence only after observation.'
     repetition = repetition_guard_instruction(_pick(options, 'messageRepetition', 'message_repetition'))
-    return f'{bubbles}\n{browser}' + (f'\n{repetition}' if repetition else '')
+    return f'{bubbles}\n{voice}\n{browser}' + (f'\n{repetition}' if repetition else '')
 
 
 # ======================================================================================

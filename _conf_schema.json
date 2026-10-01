@@ -199,6 +199,12 @@
             "description": "每个事件音频数上限",
             "default": 1
           },
+          "tts_enabled": {
+            "type": "bool",
+            "description": "文字转语音",
+            "default": true,
+            "hint": "关掉后她要发语音只能改走文字：正文里的语音标记会被忽略，发语音动作也不再下发。"
+          },
           "tts_provider_id": {
             "type": "string",
             "default": "",

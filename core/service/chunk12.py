@@ -25,6 +25,7 @@ from typing import Any, Iterable, Optional
 from ..platform_actions import (
     ACTIONS,
     PLATFORM_ACTION_FIELD,
+    VOICE_ACTION_IDS,
     action_config_group,
     describe_actions,
     effective_permission,
@@ -157,7 +158,14 @@ class ServiceChunk12(ServiceBase):
 
         注意与坑 36 同一类陷阱：这里**不把缺失当 false**——插件升级后旧配置里没有
         新分组，若把缺失当 false，所有新动作会静默全关（用户以为"没生效"）。
+
+        v1.7.7：语音类动作（`send_voice` / `list_voices`）多一道**总闸**——
+        「模型中心 → 语音 / 音频理解设置」的 `tts_enabled`。关掉后这两个动作按既有的
+        "动作开关关掉"路径变成不可用（`resolve_permission` 收到 `False`），
+        与正文 `<tts/>` 标记被忽略是同一个开关的两种表现，**不另造一套判定**。
         """
+        if action_id in VOICE_ACTION_IDS and not self.voice_reply_enabled:
+            return False
         action = ACTIONS.get(action_id)
         if action is None:
             return None

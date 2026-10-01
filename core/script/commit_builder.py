@@ -31,6 +31,7 @@ import json
 from datetime import datetime
 from typing import Any, Required, TypedDict
 
+from ..bubbles import bubble_texts, strip_voice_marker
 from ..time import iso
 from ..types import NarrativeDecision, NarrativePhase
 from .contract import (
@@ -350,10 +351,17 @@ def _canonical_bubble_content(
     separator: str | None = _DEFAULT_SEPARATOR,
     enabled: bool | None = True,
 ) -> str:
-    """上游私有 `canonicalBubbleContent`：开启分条时，内容以分隔符重排为准。"""
+    """上游私有 `canonicalBubbleContent`：开启分条时，内容以分隔符重排为准。
+
+    关闭分条时原样回正文——**但正文里的字面 `<tts/>` 一律删掉**（v1.7.7）：
+    它是投递意图，不是她说的字。少了这一步，成稿校验会拿"删过标记的气泡"与
+    "没删标记的正文"比对，判成 `content mismatch` 而整条丢掉。
+    """
     enabled = _js_default(enabled, True)
     separator = _js_default(separator, _DEFAULT_SEPARATOR)
-    return (separator or _DEFAULT_SEPARATOR).join(bubbles) if enabled else content
+    if not enabled:
+        return strip_voice_marker(content)[0]
+    return (separator or _DEFAULT_SEPARATOR).join(bubbles)
 
 
 def _split_bubbles(
@@ -361,14 +369,14 @@ def _split_bubbles(
     separator: str | None = _DEFAULT_SEPARATOR,
     enabled: bool | None = True,
 ) -> list[str]:
-    """上游私有 `splitBubbles`：按分隔符切分、去空白、丢空段；切不出就退回整条。"""
+    """上游私有 `splitBubbles`：按分隔符切分、去空白、丢空段；切不出就退回整条。
+
+    逐字保留上游口径，只多一件事（v1.7.7）：气泡里的字面 `<tts/>` 删掉。
+    剧本正文、投递账本与用户可见的字因此都不带标记（标记本身绝不出现在发出的文本里）。
+    """
     enabled = _js_default(enabled, True)
     separator = _js_default(separator, _DEFAULT_SEPARATOR)
-    if not enabled or not separator or separator not in content:
-        return [content]
-    bubbles = [item.strip() for item in content.split(separator)]
-    bubbles = [item for item in bubbles if item]
-    return bubbles if bubbles else [content]
+    return bubble_texts(content, separator, bool(enabled))
 
 
 def _stable_commit_id(input: ScriptFirstDecisionInput, participant_id: str, prose: str) -> str:

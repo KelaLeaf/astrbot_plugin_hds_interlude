@@ -41,6 +41,7 @@ import time
 import unittest
 from typing import Any, Optional
 
+from plugin.core.bubbles import VOICE_MARKER
 from plugin.core.database import Database
 from plugin.core.script.episode_index import episode_excerpt
 from plugin.core.script.recall_navigation import (
@@ -171,12 +172,18 @@ class _MemoryRecorderTransport:
 
     def __init__(self) -> None:
         self.group_calls: list[tuple[str, str, Optional[str]]] = []
+        #: 以语音投递的分段（正文 `<tts/>` 标记指定的那些）。
+        self.voiced: list[str] = []
         self.fail_on: tuple[str, ...] = ()
         self.reacted: list[tuple[str, str]] = []
         self.face: tuple[str, str, bool] = ('', '', False)
 
-    async def send_group(self, channel_id: str, content: str, reply_to: Optional[str] = None) -> dict[str, Any]:
+    async def send_group(self, channel_id: str, content: str, reply_to: Optional[str] = None,
+                         **kwargs: Any) -> dict[str, Any]:
+        # 语音意图（v1.7.7）只在真要发语音时才作为关键字传下来 → 记进独立的那一列。
         self.group_calls.append((channel_id, content, reply_to))
+        if kwargs.get('voice') is True:
+            self.voiced.append(content)
         if content in self.fail_on:
             return {'ok': False, 'error': 'boom'}
         return {'ok': True, 'message_ids': ['m-%d' % len(self.group_calls)]}
@@ -974,6 +981,29 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('boom', result['segment_outcomes'][1]['reason'])
         self.assertEqual(transport.group_calls[0], ('chan', '第一段', 'reply-9'))
         self.assertEqual(transport.group_calls[1], ('chan', '第二段', None), '只有第一段带引用')
+
+    async def test_marked_group_segments_go_out_as_voice_in_order(self):
+        """群聊里的 `<sep/>` + `<tts/>`：分段投递，带标记的那几段走语音，顺序不变。"""
+        transport = _MemoryRecorderTransport()
+        host = _host(transport=transport)
+        story = {'id': 's', 'platform': 'onebot', 'selfId': 'bot'}
+
+        result = await host.send_group_message(
+            story, 'chan', '先打字<sep/>这段语音<tts/><sep/>再打字',
+        )
+        self.assertEqual([item['content'] for item in result['segment_outcomes']],
+                         ['先打字', '这段语音', '再打字'])
+        self.assertTrue(all(VOICE_MARKER not in item['content'] for item in result['segment_outcomes']))
+        self.assertEqual(transport.voiced, ['这段语音'], '只有带标记的那一段走语音')
+
+    async def test_voice_disabled_group_reply_is_plain_text_without_the_marker(self):
+        host = _host(config={'model': {'audio': {'tts_enabled': False}}},
+                     transport=_MemoryRecorderTransport())
+        story = {'id': 's', 'platform': 'onebot', 'selfId': 'bot'}
+        result = await host.send_group_message(story, 'chan', '甲' + VOICE_MARKER + '<sep/>乙')
+        self.assertEqual([item['content'] for item in result['segment_outcomes']], ['甲', '乙'],
+                         '关掉开关 = 退回发文字，内容一字不少')
+        self.assertEqual(host.transport.voiced, [])
 
     async def test_send_group_message_degrades_when_no_transport_is_installed(self):
         """「没有可用机器人账号」的等价降级：整段失败而不是抛异常。"""

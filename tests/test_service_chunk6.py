@@ -177,13 +177,14 @@ class _RecordingTransport(NullTransport):
         self.ok = True
         self.error = 'adapter exploded'
 
-    async def send_private(self, participant: Any, content: str, reply_to: Any = None) -> dict[str, Any]:
+    async def send_private(self, participant: Any, content: str, reply_to: Any = None,
+                           **kwargs: Any) -> dict[str, Any]:
         self.sent.append({'kind': 'private', 'participant': participant, 'content': content,
-                          'reply_to': reply_to})
+                          'reply_to': reply_to, **kwargs})
         return {'ok': self.ok, 'error': None if self.ok else self.error}
 
-    async def send_session(self, session: Any, content: str) -> dict[str, Any]:
-        self.sent.append({'kind': 'session', 'session': session, 'content': content})
+    async def send_session(self, session: Any, content: str, **kwargs: Any) -> dict[str, Any]:
+        self.sent.append({'kind': 'session', 'session': session, 'content': content, **kwargs})
         return {'ok': self.ok, 'error': None if self.ok else self.error}
 
 
@@ -320,6 +321,39 @@ class DeliveryLedgerChunk6Tests(unittest.TestCase):
             else:
                 # 读失败时根本走不到写：M6.1 是观察性的，不影响确认与后续排期。
                 self.assertEqual(stub.ledger_patches, [], failure)
+
+    def test_marked_later_segments_schedule_voice_intents_in_order(self) -> None:
+        """`<sep/>` + `<tts/>`：每个分段各排一条意图，带标记的那几条写 `voice`。
+
+        分段是**延迟投递**的：语音意图必须随 payload 一起排期，否则等它到期时
+        已经无从知道那一段本来要用语音发（顺序仍然按分段顺序）。
+        """
+        commit = _commit_fixture()
+        event = find_outgoing_script_event(commit, 'alice')
+        stub = _ConfirmOutgoingStub('none', commit)
+        message = prepare_outgoing_delivery(
+            attach_message_event({'participant_id': 'alice', 'content': event['content']}, event, 42),
+            [{'content': '第一句', 'voice': False},
+             {'content': '第二句', 'voice': False},
+             {'content': '第三句', 'voice': True}],
+        )
+        asyncio.run(ServiceChunk6.confirm_outgoing_deliveries(stub, {'id': 'story:1'}, [message]))
+        self.assertEqual([item['payload']['content'] for item in stub.intents],
+                         ['第二句', '第三句'])
+        self.assertNotIn('voice', stub.intents[0]['payload'], '没写标记的分段不许凭空多一个键')
+        self.assertIs(stub.intents[1]['payload']['voice'], True)
+
+    def test_unmarked_segments_never_write_a_voice_key(self) -> None:
+        commit = _commit_fixture()
+        event = find_outgoing_script_event(commit, 'alice')
+        stub = _ConfirmOutgoingStub('none', commit)
+        message = prepare_outgoing_delivery(
+            attach_message_event({'participant_id': 'alice', 'content': event['content']}, event, 42),
+            [{'content': '第一句', 'voice': False}, {'content': '第二句', 'voice': False}],
+        )
+        asyncio.run(ServiceChunk6.confirm_outgoing_deliveries(stub, {'id': 'story:1'}, [message]))
+        self.assertEqual(len(stub.intents), 1)
+        self.assertNotIn('voice', stub.intents[0]['payload'])
 
 
 # =========================================================================== #
@@ -997,6 +1031,25 @@ class SendOutgoingMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.sent[0]['content'], '你好')
         self.assertIsNone(transport.sent[0]['reply_to'])
         self.assertEqual(stub.failures, [])
+
+    async def test_a_marked_segment_reaches_the_transport_as_voice(self) -> None:
+        """正文 `<tts/>` 的意图最终就是 `voice=True` 这个出站参数（投递层照办）。"""
+        transport = _RecordingTransport()
+        stub = _SendStub([dict(self.PARTICIPANT)])
+        stub.transport = transport
+        delivered = await ServiceChunk6.send_outgoing_messages(
+            stub, self.STORY, [self._message('晚安', voice=True)],
+        )
+        self.assertEqual(delivered, [self._message('晚安', voice=True)])
+        self.assertIs(transport.sent[0]['voice'], True)
+
+    async def test_unmarked_messages_keep_the_historical_call_shape(self) -> None:
+        """没有语音意图时**不许**多传这个关键字：老实现 / 极简测试桩的签名里没有它。"""
+        transport = _RecordingTransport()
+        stub = _SendStub([dict(self.PARTICIPANT)])
+        stub.transport = transport
+        await ServiceChunk6.send_outgoing_messages(stub, self.STORY, [self._message('你好')])
+        self.assertNotIn('voice', transport.sent[0])
 
     async def test_empty_message_list_short_circuits(self) -> None:
         transport = _RecordingTransport()

@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .bubbles import normalize_bubble_segments
+
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 
@@ -86,11 +88,22 @@ def attach_message_event(
     return {**message, 'script_event': script_event}
 
 
-def prepare_outgoing_delivery(message: dict[str, Any], bubbles: list[str]) -> Optional[dict[str, Any]]:
-    """上游 `prepareOutgoingDelivery()`：拆成首条 + 后续段（首条为空则放弃投递）。"""
-    first = bubbles[0] if bubbles else None
-    later = bubbles[1:]
-    if not first:
+def prepare_outgoing_delivery(message: dict[str, Any], bubbles: list[Any]) -> Optional[dict[str, Any]]:
+    """上游 `prepareOutgoingDelivery()`：拆成首条 + 后续段（首条为空则放弃投递）。
+
+    `bubbles` 两种形状都收（`core/bubbles.normalize_bubble_segments`）：
+
+    * `list[str]` —— 剧本事件的 `bubbles`（上游形状，无语音意图）；
+    * `list[dict]` —— `[{'content', 'voice'}]`（v1.7.7 的正文 `<tts/>` 标记路径）。
+
+    分段带语音意图时，首条以 `voice=True` 落在待投递消息上（与 `content` 同级），
+    后续段以 `later_segments_voice` 与 `later_segments` 一一对应；**没有语音时不写这两个
+    键**——非语音路径的 payload 形状与历史版本逐字一致。
+    """
+    segments = normalize_bubble_segments(bubbles)
+    first = segments[0] if segments else None
+    later = segments[1:]
+    if not first or not first['content']:
         return None
     script_event = None
     existing = _get(message, 'script_event', 'scriptEvent')
@@ -98,14 +111,18 @@ def prepare_outgoing_delivery(message: dict[str, Any], bubbles: list[str]) -> Op
         script_event = {
             **existing,
             'bubble_index': 0,
-            'bubble_count': len(bubbles),
+            'bubble_count': len(segments),
             'full_content': _get(existing, 'full_content', 'fullContent') or message.get('content'),
         }
         script_event.pop('scriptEvent', None)
-    prepared: dict[str, Any] = {**message, 'content': first}
+    prepared: dict[str, Any] = {**message, 'content': first['content']}
     prepared.pop('scriptEvent', None)
+    if first['voice']:
+        prepared['voice'] = True
     if later:
-        prepared['later_segments'] = later
+        prepared['later_segments'] = [item['content'] for item in later]
+        if any(item['voice'] for item in later):
+            prepared['later_segments_voice'] = [bool(item['voice']) for item in later]
     if script_event:
         prepared['script_event'] = script_event
     return prepared

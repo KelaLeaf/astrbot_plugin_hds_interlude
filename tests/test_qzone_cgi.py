@@ -40,6 +40,7 @@ from plugin.core.qzone_cgi import (
     QZONE_UA,
     QZONE_URLS,
     QZONE_ALLOW_UINS_SEPARATOR,
+    QZONE_UPLOAD_RECEIPT_FIELDS,
     QZONE_VISIBLE,
     QZONE_VISIBLE_TARGETED,
     QZoneAuth,
@@ -48,14 +49,17 @@ from plugin.core.qzone_cgi import (
     build_delete_request,
     build_feed_request,
     build_forward_request,
+    build_image_richval,
     build_like_request,
     build_mood_list_request,
     build_publish_request,
     build_update_visibility_request,
+    build_upload_image_request,
     compute_g_tk,
     extract_cookie,
     feed_items_from_text,
     hex_decode,
+    image_upload_receipt,
     parse_feed_item,
     parse_jsonp,
     parse_mood,
@@ -306,14 +310,22 @@ class ConstantsTests(unittest.TestCase):
         self.assertIn("Chrome/120.0.0.0", QZONE_UA)
         self.assertTrue(QZONE_UA.startswith("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"))
 
-    def test_urls_are_the_eight_cgi_endpoints(self):
+    def test_urls_are_the_nine_cgi_endpoints(self):
         self.assertEqual(
             sorted(QZONE_URLS),
-            ["comment", "delete", "feed", "forward", "like", "mood_list", "publish", "update"],
+            ["comment", "delete", "feed", "forward", "like", "mood_list",
+             "publish", "update", "upload_image"],
         )
         prefix = "https://user.qzone.qq.com/proxy/domain/"
         for name, url in QZONE_URLS.items():
             with self.subTest(name=name):
+                if name == "upload_image":
+                    # 上传**不在** `/proxy/domain` 下面（参考实现 `api_zone.py` 的
+                    # `self.upload_url` 就是 `up.qzone.qq.com`）——别顺手"统一"掉。
+                    self.assertEqual(
+                        url, "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image",
+                    )
+                    continue
                 self.assertTrue(url.startswith(prefix), url)
         self.assertEqual(
             QZONE_URLS["publish"],
@@ -834,6 +846,187 @@ class RequestBuilderTests(unittest.TestCase):
                     self.assertIn("g_tk=", url)
                 else:
                     self.assertEqual(body["g_tk"], "")
+
+
+# ── 图片上传 + richval（v1.7.8）────────────────────────────────────────
+
+
+#: `cgi_upload_image` 的字段与顺序：逐字抄自参考实现
+#: `qzone_api/api/api_parms.py::build_upload_image_params` 的 dict 字面量。
+UPLOAD_KEYS = (
+    "filename", "zzpanelkey", "uploadtype", "albumtype", "exttype", "skey",
+    "zzpaneluin", "p_uin", "uin", "p_skey", "output_type", "qzonetoken",
+    "refer", "charset", "output_charset", "upload_hd", "hd_width", "hd_height",
+    "hd_quality", "backUrls", "url", "base64", "picfile",
+)
+
+#: 一份编的上传回执（`data` 里的六个字段就是 `build_image_richval` 的全部输入）。
+RECEIPT_ONE = {
+    "albumid": "ALB-1", "lloc": "LLOC-1", "sloc": "SLOC-1", "type": 1,
+    "height": 480, "width": 640, "url": "https://example.invalid/p?bo=BO-1&x=1",
+}
+RECEIPT_TWO = {
+    "albumid": "ALB-2", "lloc": "LLOC-2", "sloc": "SLOC-2", "type": 1,
+    "height": 100, "width": 200, "url": "https://example.invalid/p?bo=BO-2&x=1",
+}
+
+
+class ImageUploadTests(unittest.TestCase):
+    """`cgi_upload_image` 的请求构造 + 上传回执 → `richval` / `pic_bo`。
+
+    依据：参考实现 `qzone_api/api/api_parms.py` 的 `build_upload_image_params`
+    与 `build_image_richval`（逐字对照）。**上传成功是带图改可见范围的前提**，
+    所以"拼不出来就回空 dict"这条必须是硬断言。
+    """
+
+    def setUp(self):
+        self.auth = _auth()
+
+    def test_upload_body_matches_the_reference_field_list(self):
+        method, url, headers, body = build_upload_image_request(self.auth, "QUJD")
+        self.assertEqual(method, "POST")
+        self.assertEqual(
+            url,
+            f"{QZONE_URLS['upload_image']}?g_tk={self.auth.g_tk}",
+        )
+        self.assertTrue(url.startswith("https://up.qzone.qq.com/cgi-bin/upload/"))
+        self.assertEqual(tuple(body), UPLOAD_KEYS, "字段与顺序逐字对齐参考实现")
+        self.assertEqual(body["skey"], SKEY, "skey 直接从 Cookie 带进表单")
+        self.assertEqual(body["p_skey"], P_SKEY)
+        self.assertEqual(body["uin"], UIN)
+        self.assertEqual(body["zzpaneluin"], UIN)
+        self.assertEqual(body["p_uin"], UIN)
+        self.assertEqual(body["albumtype"], "7", "说说相册")
+        self.assertEqual(body["refer"], "shuoshuo")
+        self.assertEqual(body["output_type"], "json")
+        self.assertEqual(body["base64"], "1")
+        self.assertEqual(body["picfile"], "QUJD", "`picfile` 就是调用方给的 base64")
+        self.assertEqual(body["upload_hd"], "1")
+        self.assertEqual(body["hd_width"], "2048")
+        self.assertEqual(body["hd_height"], "10000")
+        self.assertEqual(body["hd_quality"], "96")
+        self.assertEqual(body["url"], url, "表单里的 url 与请求地址是同一个")
+        self.assertIn("upbak.photo.qzone.qq.com", body["backUrls"], "备用上传点在参考实现里")
+        self.assertTrue(all(isinstance(value, str) for value in body.values()))
+        self.assertEqual(tuple(headers), POST_HEADER_KEYS)
+
+    def test_upload_refuses_without_skey_or_p_skey(self):
+        """缺 skey / p_skey 本地就报错：它们空着必然被服务端拒，别让上层拿到含糊的 code。"""
+        base = QZoneAuth(cookies=COOKIES_FULL, g_tk=self.auth.g_tk, uin=UIN,
+                         skey=SKEY, p_skey=P_SKEY)
+        self.assertEqual(build_upload_image_request(base, "QUJD")[3]["skey"], SKEY)
+        for broken in (
+            dataclasses.replace(base, skey=""),
+            dataclasses.replace(base, p_skey=""),
+            dataclasses.replace(base, skey="", p_skey=""),
+        ):
+            with self.subTest(skey=broken.skey, p_skey=broken.p_skey):
+                with self.assertRaises(QZoneAuthError):
+                    build_upload_image_request(broken, "QUJD")
+
+    def test_image_upload_receipt_reads_the_data_field(self):
+        payload = {"code": 0, "data": dict(RECEIPT_ONE), "msg": "success"}
+        self.assertEqual(image_upload_receipt(payload), RECEIPT_ONE)
+        for broken in (None, {}, {"code": 0}, {"code": 0, "data": "nope"}, "text", 7):
+            with self.subTest(broken=broken):
+                self.assertEqual(image_upload_receipt(broken), {})
+
+    def test_richval_is_the_reference_literal(self):
+        """单图：`",{albumid},{lloc},{sloc},{type},{height},{width},,{height},{width}"`。"""
+        rich = build_image_richval([RECEIPT_ONE])
+        self.assertEqual(rich["richval"], ",ALB-1,LLOC-1,SLOC-1,1,480,640,,480,640")
+        self.assertEqual(rich["pic_bo"], "BO-1", "`bo` 从回执 url 里抠出来")
+        self.assertEqual(set(rich), {"richval", "pic_bo"})
+
+    def test_multi_image_richval_joins_with_tabs(self):
+        """组图：每张一段、段间 `\\t`（不是逗号——两种分隔符都在参考实现里，别"统一"）。"""
+        rich = build_image_richval([RECEIPT_ONE, RECEIPT_TWO])
+        self.assertEqual(
+            rich["richval"],
+            ",ALB-1,LLOC-1,SLOC-1,1,480,640,,480,640"
+            "\t,ALB-2,LLOC-2,SLOC-2,1,100,200,,100,200",
+        )
+        self.assertEqual(rich["pic_bo"], "BO-1\tBO-2")
+        self.assertEqual(rich["richval"].count(","), 18, "两张图各 9 个逗号")
+
+    def test_a_receipt_missing_any_field_yields_nothing(self):
+        """六个字段缺任何一个 → **空 dict**（调用方据此拒绝，不许拼半个 richval）。"""
+        self.assertEqual(
+            QZONE_UPLOAD_RECEIPT_FIELDS,
+            ("albumid", "lloc", "sloc", "type", "height", "width"),
+        )
+        for field in QZONE_UPLOAD_RECEIPT_FIELDS:
+            with self.subTest(field=field):
+                broken = dict(RECEIPT_ONE)
+                broken.pop(field)
+                self.assertEqual(build_image_richval([broken]), {})
+                broken[field] = ""
+                self.assertEqual(build_image_richval([broken]), {})
+
+    def test_richval_refuses_empty_or_non_mapping_input(self):
+        for broken in (None, [], (), [None], ["x"], [{"albumid": "a"}], 0, "x"):
+            with self.subTest(broken=broken):
+                self.assertEqual(build_image_richval(broken), {})
+
+    def test_a_missing_bo_only_loses_the_pic_bo(self):
+        """回执 url 里没有 `bo=`：`richval` 照拼，`pic_bo` 为空串（参考实现同口径）。"""
+        receipt = dict(RECEIPT_ONE, url="https://example.invalid/p?x=1")
+        self.assertEqual(
+            build_image_richval([receipt]),
+            {"richval": ",ALB-1,LLOC-1,SLOC-1,1,480,640,,480,640", "pic_bo": ""},
+        )
+
+
+class RichTextUpdateTests(unittest.TestCase):
+    """`emotion_cgi_update` 带富文本块（带图说说改可见范围）的字段映射。"""
+
+    def setUp(self):
+        self.auth = _auth()
+
+    def test_text_path_is_byte_identical_to_the_reference_list(self):
+        """不给 richval：字段集合与顺序**逐字**还是参考实现那一份（回归）。"""
+        body = build_update_visibility_request(self.auth, "tid-1", "正文", 4)[3]
+        self.assertEqual(tuple(body), UPDATE_KEYS)
+        self.assertNotIn("pic_bo", body)
+        self.assertEqual(body["richtype"], "")
+        self.assertEqual(body["subrichtype"], "")
+        self.assertEqual(body["richval"], "")
+
+    def test_rich_text_block_fills_the_slots_the_reference_provides(self):
+        body = build_update_visibility_request(
+            self.auth, "tid-1", "正文", 4,
+            richval=",A,B,C,1,2,3,,2,3", pic_bo="BO",
+        )[3]
+        self.assertEqual(body["richtype"], "1", "照发布分支（richtype / subrichtype = 1）")
+        self.assertEqual(body["subrichtype"], "1")
+        self.assertEqual(body["richval"], ",A,B,C,1,2,3,,2,3")
+        self.assertEqual(body["pic_bo"], "BO")
+        # 其余字段与顺序不受影响，`pic_bo` 只追加在末尾。
+        self.assertEqual(tuple(body), UPDATE_KEYS + ("pic_bo",))
+        self.assertEqual(body["con"], "正文")
+        self.assertEqual(body["ugc_right"], "4")
+
+    def test_pic_bo_is_only_sent_when_there_is_one(self):
+        """`pic_bo` 是受控偏离（参考实现的编辑清单里没有它）——空值绝不发。"""
+        body = build_update_visibility_request(
+            self.auth, "tid-1", "正文", 4, richval=",A,B,C,1,2,3,,2,3",
+        )[3]
+        self.assertEqual(tuple(body), UPDATE_KEYS)
+        self.assertNotIn("pic_bo", body)
+
+    def test_the_targeted_tiers_keep_allow_uins_with_a_rich_text_block(self):
+        body = build_update_visibility_request(
+            self.auth, "tid-1", "正文", 16, ["10001", "10002"],
+            richval=",A,B,C,1,2,3,,2,3",
+        )[3]
+        self.assertEqual(body["allow_uins"], "10001|10002")
+        self.assertEqual(body["richval"], ",A,B,C,1,2,3,,2,3")
+
+    def test_an_empty_content_still_raises_with_a_rich_text_block(self):
+        with self.assertRaises(QZoneAuthError):
+            build_update_visibility_request(
+                self.auth, "tid-1", "", 4, richval=",A,B,C,1,2,3,,2,3",
+            )
 
 
 # ── JSONP ──────────────────────────────────────────────────────────────

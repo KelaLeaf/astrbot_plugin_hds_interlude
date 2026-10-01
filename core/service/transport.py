@@ -33,16 +33,31 @@ from typing import Any, Optional, Protocol, runtime_checkable
 
 from .base import log_fallback
 
-__all__ = ['BackgroundDelivery', 'NullTransport', 'Transport']
+__all__ = ['BackgroundDelivery', 'NullTransport', 'Transport', 'voice_kwargs']
 
 #: `send_private` / `send_group` 的返回结构（上游 `SendMessageResult` 的等价物）。
 #: `ok=False` 时调用方按投递失败处理，`message_ids` 用于拆分投递的账本记录。
 SendResult = dict[str, Any]
 
 
+def voice_kwargs(flag: Any) -> dict[str, Any]:
+    """语音意图 → 出站调用的可选关键字（v1.7.7 的正文 `<tts/>` 标记）。
+
+    只有真的要发语音时才带上 `voice=True`：`send_private` / `send_group` /
+    `send_session` 的语音参数是**新增的可选能力**，恒传会在非语音路径上撞到
+    还没跟上这一步的实现（老适配器、极简测试桩）的 `TypeError`。
+    非语音投递的调用形状因此与历史版本逐字一致。
+    """
+    return {'voice': True} if flag is True else {}
+
+
 @runtime_checkable
 class BackgroundDelivery(Protocol):
-    """上游 `desktopDeliveryHandler` 的入参（`src/service.ts:712-715`）。"""
+    """上游 `desktopDeliveryHandler` 的入参（`src/service.ts:712-715`）。
+
+    `voice` 是本移植版 v1.7.7 加的可选字段：正文 `<tts/>` 标记要求这条以语音投递。
+    没有语音意图时**不写这个键**（老实现照旧只读它认识的那几个字段）。
+    """
 
     participant_id: str
     self_id: str
@@ -51,6 +66,7 @@ class BackgroundDelivery(Protocol):
     kind: str
     content: str
     quote_message_id: Optional[str]
+    voice: bool
 
 
 @runtime_checkable
@@ -64,11 +80,15 @@ class Transport(Protocol):
         participant: dict[str, Any],
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> SendResult:
         """给一条关系分支发私聊消息。上游 `sendPrivateMessage(participant...)`。
 
         `participant` 是 `InterludeParticipant` 的 dict（snake_case 内部字段，
         数据库行则是 camelCase；实现里用 `pick()` 双读）。
+
+        `voice=True`（v1.7.7）：这一段是正文 `<tts/>` 标记指定的语音。适配层负责
+        合成；**合成不了就退回发文字并打 warn**，绝不因为发不出语音而丢内容。
         """
         ...
 
@@ -77,14 +97,18 @@ class Transport(Protocol):
         channel_id: str,
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> SendResult:
-        """向群频道发送。上游 `sendGroupMessage(story, channelId, content, replyToMessageId)`。"""
+        """向群频道发送。上游 `sendGroupMessage(story, channelId, content, replyToMessageId)`。
+
+        `voice=True` 同 `send_private`（v1.7.7 的正文 `<tts/>`）。"""
         ...
 
-    async def send_session(self, session: Any, content: str) -> SendResult:
+    async def send_session(self, session: Any, content: str, voice: bool = False) -> SendResult:
         """对当前入站会话原路回复。上游 `session.send(outgoingContent)`（`:5156`）。
 
         等价于"给触发本回合的私聊/群聊回一条"，`session` 是 `SessionView`。
+        `voice=True` 同 `send_private`（v1.7.7 的正文 `<tts/>`）。
         """
         ...
 
@@ -226,6 +250,7 @@ class NullTransport:
         participant: dict[str, Any],
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> SendResult:
         log_fallback('debug', 'Transport 未安装：私聊投递已跳过')
         return {'ok': False, 'error': 'transport-unavailable'}
@@ -235,11 +260,12 @@ class NullTransport:
         channel_id: str,
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> SendResult:
         log_fallback('debug', 'Transport 未安装：群投递已跳过')
         return {'ok': False, 'error': 'transport-unavailable'}
 
-    async def send_session(self, session: Any, content: str) -> SendResult:
+    async def send_session(self, session: Any, content: str, voice: bool = False) -> SendResult:
         log_fallback('debug', 'Transport 未安装：会话回复已跳过')
         return {'ok': False, 'error': 'transport-unavailable'}
 

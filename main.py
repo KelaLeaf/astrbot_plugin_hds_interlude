@@ -1014,13 +1014,13 @@ class HDSInterludePlugin(Star):
         if not capture:
             return
         try:
-            replies = await self.bridge.handle_event(event)
+            await self.bridge.handle_event(event)
         except Exception as error:  # noqa: BLE001 - 私聊归属不能因为一次异常就漏给别的 Agent
             logger.error('hds-interlude：私聊事件处理失败，已吞掉事件以免其它 Agent 接手：%s' % error)
             event.stop_event()
             return
-        for reply in replies:
-            yield event.plain_result(reply)
+        for reply in self.bridge.turn_replies():
+            yield self._reply_result(event, reply)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
@@ -1040,9 +1040,22 @@ class HDSInterludePlugin(Star):
         if not allowed:
             self.bridge.service.note_group_skip(session, reason)
             return
-        replies = await self.bridge.handle_event(event)
-        for reply in replies:
-            yield event.plain_result(reply)
+        await self.bridge.handle_event(event)
+        for reply in self.bridge.turn_replies():
+            yield self._reply_result(event, reply)
+
+    @staticmethod
+    def _reply_result(event: AstrMessageEvent, reply: dict[str, Any]):
+        """本回合一条可见回复交回宿主的结果：语音段发 `Record`，其余发纯文本。
+
+        `reply['voice']` 是适配层**已经合成好的音频文件路径**（正文 `<tts/>` 标记
+        指定的分段）；空串表示这条照旧发文字——合不出来时适配层会退回文字并打 warn，
+        所以这里看到的永远是"要么有文件、要么是文字"，没有第三种。
+        """
+        path = reply.get('voice') if isinstance(reply, dict) else ''
+        if path:
+            return event.chain_result(AstrbotBridge.voice_components(path))
+        return event.plain_result(reply.get('content') if isinstance(reply, dict) else reply)
 
     # ------------------------------------------------------------------ #
     # 命令：档案与状态

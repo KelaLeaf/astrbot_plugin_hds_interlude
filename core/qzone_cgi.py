@@ -54,8 +54,37 @@ ok = success_or_error(parse_jsonp(raw) if isinstance(raw, str) else raw)
   （`packages/napcat-test/qzone.test.ts`）钉着 `'10001|10002'` ——用 **`|`**；
 * 编辑请求要不要 `who`：参考实现的编辑构造器**没有** `who`（发布有），照它，不加。
 
-刻意不做的事：图片上传（`cgi_upload_image` 不在这批交付里）、重试 / 限流 / 审计
-（属于调用方的策略层）、任何网络动作。
+**第九、十条接口 `upload_image` / 带图的 `update`（v1.7.8 新增）**，同样出自上面那份
+参考实现（`._ref/qzone_api-1.1.0`，**同一份**，逐字对照）：
+
+| 本模块 | 参考实现 | 用途 |
+| --- | --- | --- |
+| `build_upload_image_request` | `api_parms.py::build_upload_image_params` + `api_zone.py` 的 `upload_url` | 把一张图的 base64 传进说说相册 |
+| `image_upload_receipt` / `build_image_richval` | `api_parms.py::build_image_richval`（+ `api_feed.py::publish_image_message` 的用法） | 把上传回执拼成 `richval` / `pic_bo` |
+
+依据强度**必须说清**（这条链上有一处是推断，不是抓包）：
+
+* **上传请求**：逐字照抄，字段与顺序都来自参考实现的 dict 字面量 ✅；
+* **`richval` / `pic_bo` 的构造**：逐字照抄 `build_image_richval`
+  （每张图 `",{albumid},{lloc},{sloc},{type},{height},{width},,{height},{width}"`，
+  多张 `\t` 连接；`pic_bo` 取回执 `url` 里的 `bo=`）✅；
+* **`emotion_cgi_update` 带 `richval`**：参考实现的 `build_edit_message_params`
+  **没有**图片分支（它只是文本版构造器），所以"这条接口收下 `richval` 就照它重建图片"
+  是**推断**，没有任何参考实现或抓包直接覆盖它 ⚠️。可用的间接依据有三条：
+  ① 该构造器的字段清单里**就有** `pic_template` / `richtype` / `richval` /
+  `special_url` / `subrichtype` 这一整块富文本槽位（纯文本编辑用不到它们）；
+  ② 发布分支（`build_publish_image_params`、以及本项目 `build_publish_request`
+  的图片分支）用的就是这几个字段名，值 `richtype=1` / `subrichtype=1`；
+  ③ 调用方（`chunk13`）只在**上传成功、回执字段齐全**时才带上它们——
+  任何一步失败都明确拒绝，**绝不**用空 `richval` 硬发。
+
+`pic_bo` 是本模块对参考实现的**一处受控偏离**：参考实现的编辑字段清单里没有这个键，
+而发布带图时有，所以这里**只在拿到 `bo` 时才追加**（文本路径的字段集合与顺序一个字节都没动，
+`test_qzone_cgi.RequestBuilderTests` 钉着）。判断依据是风险不对称：少发一个服务端真要的
+字段 = 静默丢图；多发一个它不认的字段 = 大概率被忽略。这一条待真机确认。
+
+刻意不做的事：重试 / 限流 / 审计（属于调用方的策略层）、任何网络动作
+（图片字节的下载由调用方的 `Transport.fetch_image` 负责，这里只收 base64）。
 """
 
 from __future__ import annotations
@@ -72,6 +101,7 @@ __all__ = [
     "QZONE_URLS",
     "QZONE_APP_TYPES",
     "QZONE_VISIBLE",
+    "QZONE_UPLOAD_RECEIPT_FIELDS",
     "QZoneAuthError",
     "QZoneAuth",
     "compute_g_tk",
@@ -85,6 +115,9 @@ __all__ = [
     "build_like_request",
     "build_feed_request",
     "build_mood_list_request",
+    "build_upload_image_request",
+    "image_upload_receipt",
+    "build_image_richval",
     "hex_decode",
     "parse_jsonp",
     "parse_feed_item",
@@ -115,7 +148,18 @@ QZONE_URLS: Dict[str, str] = {
     "mood_list": f"{_QZONE_BASE}/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6",
     # 改已发说说的可见范围（参考实现 `qzone_api/api/api_zone.py::update_url`；注意**没有** `_v6`）。
     "update": f"{_QZONE_BASE}/taotao.qzone.qq.com/cgi-bin/emotion_cgi_update",
+    # 上传一张图到说说相册（参考实现 `qzone_api/api/api_zone.py` 的 `self.upload_url`）。
+    # ⚠️ 与上面几条**不同域**：上传走 `up.qzone.qq.com`，不在 `/proxy/domain` 下面。
+    "upload_image": "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image",
 }
+
+#: `cgi_upload_image` 回执的 `data` 里、拼 `richval` 必须用到的字段（缺一不可）。
+#:
+#: 逐字来自参考实现 `build_image_richval` 的 format 串；缺任何一个都**不能**拼出
+#: 合法的富文本块，所以 `build_image_richval` 见到缺字段直接返回空 dict（= 拒绝）。
+QZONE_UPLOAD_RECEIPT_FIELDS: tuple[str, ...] = (
+    "albumid", "lloc", "sloc", "type", "height", "width",
+)
 
 #: `allow_uins`（部分人可见 / 部分人不可见）生效的那两档 `ugc_right`。
 QZONE_VISIBLE_TARGETED: tuple[int, ...] = (16, 128)
@@ -332,19 +376,27 @@ def build_update_visibility_request(
     visible: int,
     target_uins: Any = (),
     ugcright_id: str = "",
+    richval: str = "",
+    pic_bo: str = "",
 ) -> QZoneRequest:
     """改一条**已发出**的说说的可见范围（`emotion_cgi_update`，v1.7.5）。
 
     参数与字段顺序**逐字**来自参考实现 `qzone_api/api/api_parms.py::build_edit_message_params`
-    （来源见模块 docstring）。三件事必须说清：
+    （来源见模块 docstring）。四件事必须说清：
 
     * `content` 是**必填**的：这条接口是"编辑说说"，服务端按整条重建——想只改可见性也得
       把当前正文原样带回去（调用方从说说列表里读到它）。传空串会把正文清掉，所以这里
       空串直接**抛 `QZoneAuthError`**（它继承 `ValueError`，属于"取参错误"那一类），
       宁可让上层报错，也不要把用户的正文擦掉。
-    * 带图说说的 `richval` **无法重建**（说说列表里拿不到 `albumid` / `lloc`），这里与参考
-      实现一致地发空串。所以**调用方必须先确认这条说说没有配图**再调本函数
-      （`core/qzone.py` 的动作侧就是这么把关的）——否则可能把图弄丢。
+    * `richval` 是**带图说说**的富文本块（`build_image_richval` 的产物，来自把原图
+      **重新上传**拿到的新回执；v1.7.8）。给了它就照发布分支填 `richtype=1` /
+      `subrichtype=1`——这两个槽位本来就在参考实现的编辑字段清单里（默认空串）。
+      **留空时请求与 v1.7.5 逐字一致**（文本路径一个字节没动）。
+      ⚠️ 调用方**必须**先确认"这条说说没有配图"或者"richval 是完整拼出来的"再调本函数：
+      "有图却发空 richval"是静默丢图的入口，这一层不替调用方兜底（也兜不了）。
+    * `pic_bo` 只在**非空**时追加（参考实现的编辑字段清单里没有这个键，发布带图有；
+      这是本模块的一处受控偏离，依据与风险权衡见模块 docstring）。追加位置在字段末尾，
+      文本路径仍与参考实现逐字对齐。
     * `target_uins` 只在 `visible` 为 16（部分人可见）/ 128（部分人不可见）时有意义，
       拼成 `allow_uins`（**`|` 分隔**，见 `QZONE_ALLOW_UINS_SEPARATOR` 的说明）；其余
       三档即使给了名单也**不带**这个字段（服务端不看，带了只会让请求更容易被判非法）。
@@ -373,10 +425,125 @@ def build_update_visibility_request(
         "format": "fs",
         "qzreferrer": referer,
     }
+    if richval:
+        # 照发布分支（`build_publish_request` 的图片分支）填同一组值。
+        data["richtype"] = "1"
+        data["subrichtype"] = "1"
+        data["richval"] = str(richval)
+        if pic_bo:
+            data["pic_bo"] = str(pic_bo)
     uins = _allow_uins(target_uins) if visible in QZONE_VISIBLE_TARGETED else ""
     if uins:
         data["allow_uins"] = uins
     return "POST", _authed_url("update", auth), _headers(auth, post=True), data
+
+
+def build_upload_image_request(
+    auth: Any, pic_base64: str, filename: str = "filename"
+) -> QZoneRequest:
+    """上传一张图片到说说相册（`cgi_upload_image`，v1.7.8）。
+
+    字段与顺序**逐字**照抄参考实现
+    `qzone_api/api/api_parms.py::build_upload_image_params`（含 `backUrls` 的两个备用
+    上传点、`upload_hd/hd_width/hd_height/hd_quality` 这组高清参数、以及
+    `base64=1` + `picfile=<base64>` 的传法；`output_type=json` 是回执格式）。
+
+    `skey` / `p_skey` **缺一个就抛 `QZoneAuthError`**：它们由 Cookie 直接带进表单
+    （不是算出来的），空着必然被服务端拒——本地先报错，比让上层拿到一个语焉不详的
+    `code != 0` 强。
+
+    图片字节的解码/下载不在这里（本层不做网络）：调用方从 `Transport.fetch_image`
+    拿到原始字节、`base64.b64encode(...)` 后传进来。
+    """
+    skey = str(_auth_field(auth, "skey") or "")
+    p_skey = str(_auth_field(auth, "p_skey") or "")
+    if not skey or not p_skey:
+        raise QZoneAuthError("图片上传需要 Cookie 里的 skey 与 p_skey（缺一个都会被服务端拒）")
+    uin = str(_auth_field(auth, "uin"))
+    upload_url = f"{QZONE_URLS['upload_image']}?g_tk={_auth_field(auth, 'g_tk')}"
+    data: Dict[str, str] = {
+        "filename": str(filename or "filename"),
+        "zzpanelkey": "",
+        "uploadtype": "1",
+        "albumtype": "7",
+        "exttype": "0",
+        "skey": skey,
+        "zzpaneluin": uin,
+        "p_uin": uin,
+        "uin": uin,
+        "p_skey": p_skey,
+        "output_type": "json",
+        "qzonetoken": "",
+        "refer": "shuoshuo",
+        "charset": "utf-8",
+        "output_charset": "utf-8",
+        "upload_hd": "1",
+        "hd_width": "2048",
+        "hd_height": "10000",
+        "hd_quality": "96",
+        "backUrls": (
+            "http://upbak.photo.qzone.qq.com/cgi-bin/upload/cgi_upload_image,"
+            "http://119.147.64.75/cgi-bin/upload/cgi_upload_image"
+        ),
+        "url": upload_url,
+        "base64": "1",
+        "picfile": str(pic_base64 or ""),
+    }
+    return "POST", upload_url, _headers(auth, post=True), data
+
+
+def image_upload_receipt(payload: Any) -> Dict[str, Any]:
+    """从 `cgi_upload_image` 的回执**顶层对象**里取出 `data`（一张图的描述）。
+
+    参考实现（`api_feed.py::upload_image` → `publish_image_message`）用的就是"回执的
+    `data` 字段"这个位置。拿不到（不是 Mapping / 没有 `data` / `data` 不是对象）
+    一律回**空 dict**，由调用方当"上传失败"处理。
+    """
+    if not isinstance(payload, Mapping):
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return {}
+    return dict(data)
+
+
+def build_image_richval(images: Any) -> Dict[str, str]:
+    """由上传回执的 `data` 列表拼出 `richval` / `pic_bo`（图片说说的富文本块）。
+
+    逐字照抄参考实现 `qzone_api/api/api_parms.py::build_image_richval`：
+
+    * 每张图一段 `",{albumid},{lloc},{sloc},{type},{height},{width},,{height},{width}"`
+      （注意**开头就有一个逗号**，中间 `,,` 是空槽位）；
+    * 多张之间用 **`\\t`** 连接（不是逗号——参考实现两种分隔符都用，别"统一"掉）；
+    * `pic_bo` 取回执 `url` 里的 `bo=` 参数（正则也照抄：`bo=([^&]+)`），同样 `\\t` 连接。
+
+    **与本层其它构造函数不同的地方**：拼不出来时返回**空 dict**（既不抛、也不给半成品）。
+    调用方（`chunk13`）必须把空 dict 当"拒绝"信号——半个 `richval` 发出去等于让服务端
+    按残缺的富文本块重建，那正是"静默丢图"的入口。
+
+    与参考实现的唯一差别：它用 `d["albumid"]` 直接取键（缺字段就 `KeyError`），这里改成
+    **先查再拼**并回空 dict——本层不许把异常当控制流（解析类函数的既有纪律）。
+    """
+    rows = list(images) if isinstance(images, (list, tuple)) else []
+    if not rows:
+        return {}
+    richvals: List[str] = []
+    pic_bos: List[str] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return {}
+        for field in QZONE_UPLOAD_RECEIPT_FIELDS:
+            if row.get(field) in (None, ""):
+                return {}
+        richvals.append(
+            ",{albumid},{lloc},{sloc},{type},{height},{width},,{height},{width}".format(
+                albumid=row["albumid"], lloc=row["lloc"], sloc=row["sloc"],
+                type=row["type"], height=row["height"], width=row["width"],
+            )
+        )
+        match = re.search(r"bo=([^&]+)", str(row.get("url") or ""))
+        pic_bos.append(match.group(1) if match else "")
+    return {"richval": "\t".join(richvals), "pic_bo": "\t".join(pic_bos)}
 
 
 def build_delete_request(

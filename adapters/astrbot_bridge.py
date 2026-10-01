@@ -1790,14 +1790,23 @@ class AstrbotTransport:
         participant: dict[str, Any],
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> dict[str, Any]:
-        """给一条关系分支发私聊消息。上游 `sendPrivateMessage(participant...)`。"""
+        """给一条关系分支发私聊消息。上游 `sendPrivateMessage(participant...)`。
+
+        `voice=True`（v1.7.7）：这一段由正文 `<tts/>` 标记指定要发语音。合成不了就
+        **退回发文字**（内容一个字都不少），并在日志里留一条 warn。
+        """
         participant = participant if isinstance(participant, dict) else {}
         platform = _text(pick(participant, 'platform'))
         self_id = _text(pick(participant, 'selfId', 'self_id'))
         user_id = _text(pick(participant, 'userId', 'user_id'))
         channel_id = _text(pick(participant, 'channelId', 'channel_id')) or user_id
         umo = self.bridge.private_umo(platform, self_id, user_id or channel_id)
+        if voice:
+            voiced = await self._send_marked_voice(umo, content, reply_to)
+            if voiced is not None:
+                return voiced
         components = chain_from_content(content)
         if reply_to:
             components.insert(0, Reply(id=_text(reply_to)))
@@ -1808,21 +1817,48 @@ class AstrbotTransport:
         channel_id: str,
         content: str,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> dict[str, Any]:
-        """向群频道发送。上游 `sendGroupMessage(story, channelId, content, quoteMessageId)`。"""
+        """向群频道发送。上游 `sendGroupMessage(story, channelId, content, quoteMessageId)`。
+
+        `voice=True` 同 `send_private`（正文 `<tts/>` 标记的分段语音）。
+        """
         umo = self.bridge.group_umo(channel_id)
+        if voice:
+            voiced = await self._send_marked_voice(umo, content, reply_to)
+            if voiced is not None:
+                return voiced
         components = chain_from_content(content)
         if reply_to:
             components.insert(0, Reply(id=_text(reply_to)))
         return await self._send_chain(umo, components)
 
-    async def send_session(self, session: Any, content: str) -> dict[str, Any]:
-        """对当前入站会话原路回复。上游 `session.send(outgoingContent)`（`:5156`）。"""
+    async def send_session(self, session: Any, content: str, voice: bool = False) -> dict[str, Any]:
+        """对当前入站会话原路回复。上游 `session.send(outgoingContent)`（`:5156`）。
+
+        `voice=True`（v1.7.7）：这一段由正文 `<tts/>` 指定。回合内的回复先落进
+        捕获缓冲、由 `main.py` 交回宿主，所以这里**先把语音合成成文件**再进缓冲
+        （合不出来就照旧收文字，warn 说明原因）——顺序与分段投递的顺序都跟着缓冲走。
+        """
         capture = self.bridge.capture
         if capture is not None and capture.matches(session):
+            if voice:
+                path, error = await self.synthesize_voice(content, capture.umo)
+                if error:
+                    log_fallback(
+                        'warn', '正文语音标记投递失败，已退回发文字（内容不丢）会话=%s 原因=%s',
+                        capture.umo, error,
+                    )
+                else:
+                    capture.append(content, voice_path=path)
+                    return self._result([], '', captured=True, voice=True, file=path)
             capture.append(content)
             return self._result([], '', captured=True)
         umo = self.bridge.session_umo(session)
+        if voice:
+            voiced = await self._send_marked_voice(umo, content)
+            if voiced is not None:
+                return voiced
         return await self._send_chain(umo, chain_from_content(content))
 
     async def send_image(self, channel_id: str, file_path: str, is_group: bool = False) -> dict[str, Any]:
@@ -2051,11 +2087,15 @@ class AstrbotTransport:
         入参是 `BackgroundDelivery`：`participant_id / self_id / platform /
         channel_id / kind / content / quote_message_id`。这里用 `participant_id`
         回查参与者行拿到投递坐标，查不到时退回入参里的字段。
+
+        `voice=True`（v1.7.7，可选键）：这一段由正文 `<tts/>` 指定要发语音；
+        合成不了就退回发文字（`send_private` / `send_group` 里那条降级）。
         """
         payload = delivery if isinstance(delivery, dict) else {}
         content = _text(pick(payload, 'content'))
         quote_id = pick(payload, 'quoteMessageId', 'quote_message_id')
         kind = _text(pick(payload, 'kind')).lower()
+        voice = pick(payload, 'voice') is True
         participant = await self.bridge.load_participant(_text(pick(payload, 'participantId', 'participant_id')))
         if participant is None:
             participant = {
@@ -2069,8 +2109,9 @@ class AstrbotTransport:
                 _text(pick(participant, 'channelId', 'channel_id') or pick(payload, 'channelId', 'channel_id')),
                 content,
                 _text(quote_id) or None,
+                voice=voice,
             )
-        return await self.send_private(participant, content, _text(quote_id) or None)
+        return await self.send_private(participant, content, _text(quote_id) or None, voice=voice)
 
     # ---- 平台动作执行层（`plugin/core/platform_actions.py` 的目录） ----
 
@@ -2334,17 +2375,65 @@ class AstrbotTransport:
         params: Mapping[str, Any],
         target: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """`send_voice`：走**宿主 TTS**（不是 NapCat 的 AI 声聊），再发 `Record`。"""
+        """`send_voice`：走**宿主 TTS**（不是 NapCat 的 AI 声聊），再发 `Record`。
+
+        合成这一段与正文 `<tts/>` 标记**共用** `synthesize_voice()`（v1.7.7）：
+        音色解析、指名服务商的纪律、失败语义只有一份，两条路径不会漂移。
+        """
         text = _clean(params.get('content'))
         if not text:
             return {'ok': False, 'error': 'send_voice 需要非空文本'}
         umo = self._target_umo(_clean(params.get('target')), target)
         if not umo:
             return {'ok': False, 'error': 'send_voice 找不到投递会话（当前没有可用的回合对象）'}
-        provider, provider_error = await self._tts_provider(umo, _clean(params.get('voice')))
+        path, error = await self.synthesize_voice(text, umo, _clean(params.get('voice')))
+        if error:
+            log_fallback('warn', '发语音失败：%s', error)
+            return {'ok': False, 'error': error}
+        result = await self._send_chain(umo, [_build_record({'file': path})])
+        if result.get('ok'):
+            result['data'] = {'umo': umo, 'voice': self._voice_label(), 'file': path}
+        return result
+
+    # ---- 文字转语音（v1.7.7）：正文 `<tts/>` 标记与 `send_voice` 动作共用一份合成 ----
+
+    def voice_reply_enabled(self) -> bool:
+        """`model_center.audio.tts_enabled`（v1.7.7）：「文字转语音」总开关。
+
+        **缺键按 `True`**：这个键是 v1.7.7 才有的，旧配置文件里没有它时不能把
+        "她能发语音"悄悄关掉（`send_voice` 从 v1.7.2 起就是可用的）。关掉之后：
+        正文 `<tts/>` 标记被忽略（退回发文字），`send_voice` / `list_voices` 也走
+        既有的"动作开关关掉"路径变成不可用——**同一个开关的两种表现**。
+        """
+        value = self.bridge.section('audio').get('tts_enabled')
+        return True if value is None else bool(value)
+
+    def _voice_label(self) -> str:
+        """回执里那句"用了哪个音色"：与 `_tts_provider` 同一套选择口径。
+
+        指名的服务商取它自己的标签；没指名就用宿主当前那个（列表第一个）；
+        列表都拿不到时退回配置里写的 id（信息性字段，取不到也不影响投递）。
+        """
+        wanted = self.tts_provider_id()
+        if wanted:
+            provider = self._tts_provider_by_id(wanted)
+            return self._provider_label(provider) if provider is not None else wanted
+        providers = self._tts_providers()
+        return self._provider_label(providers[0]) if providers else ''
+
+    async def synthesize_voice(
+        self, text: str, umo: str, voice: str = '',
+    ) -> tuple[str, str]:
+        """把一段文本合成为语音文件：返回 `(音频路径, 错误原因)`，成功时错误为空串。
+
+        **绝不抛异常**：调用方按返回值走"退回落文字"或"明确失败"分支。
+        这里是**唯一**的合成本体——`send_voice` 动作与正文 `<tts/>` 标记都走它。
+        """
+        if not self.voice_reply_enabled():
+            return '', '文字转语音已关闭（模型中心 → 语音 / 音频理解设置 → 文字转语音）'
+        provider, provider_error = await self._tts_provider(umo, _clean(voice))
         if provider is None:
-            log_fallback('warn', '发语音失败：%s', provider_error)
-            return {'ok': False, 'error': provider_error}
+            return '', provider_error
         # `_tts_provider` 已经过一遍 `_tts_capability_error`：拿到手的服务商一定有 get_audio。
         getter = provider.get_audio
         try:
@@ -2353,14 +2442,41 @@ class AstrbotTransport:
                 audio = await audio
         except Exception as error:  # noqa: BLE001 - 合成失败按投递失败处理
             log_fallback('warn', 'TTS 合成失败 提供者=%s 错误=%s', self._provider_label(provider), error)
-            return {'ok': False, 'error': 'TTS 合成失败：%s' % error}
+            return '', 'TTS 合成失败：%s' % error
         path = _clean(audio)
         if not path or not os.path.exists(path):
             log_fallback('warn', 'TTS 没有产出音频文件（%s）', path or '(空)')
-            return {'ok': False, 'error': 'TTS 没有产出可用的音频文件'}
-        result = await self._send_chain(umo, [_build_record({'file': path})])
+            return '', 'TTS 没有产出可用的音频文件'
+        return path, ''
+
+    async def _send_marked_voice(
+        self, umo: str, content: str, reply_to: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """正文 `<tts/>` 标记的投递：先合成语音，合成不了就**返回 `None`**（调用方发文字）。
+
+        只有"**平台一次都没被碰过**"的失败才退回文字（没配 TTS / 服务商不可用 /
+        合成报错 / 没有音频文件）——这些情况下发文字绝不会重复。
+        语音**已经交给平台、回执未知**时（`ok=False`）返回那份失败：与既有的文本投递
+        同一条纪律——**不重投**（重投会产生重复消息），由调用方按投递失败记账并打 warn。
+        """
+        path, error = await self.synthesize_voice(content, umo)
+        if error:
+            log_fallback(
+                'warn', '正文语音标记投递失败，已退回发文字（内容不丢）会话=%s 原因=%s', umo, error,
+            )
+            return None
+        components = [_build_record({'file': path})]
+        if reply_to:
+            components.insert(0, Reply(id=_text(reply_to)))
+        result = await self._send_chain(umo, components)
         if result.get('ok'):
-            result['data'] = {'umo': umo, 'voice': self._provider_label(provider), 'file': path}
+            result['data'] = {'umo': umo, 'voice': self._voice_label(), 'file': path, 'marked': True}
+            return result
+        log_fallback(
+            'warn',
+            '正文语音标记发送失败（回执未知，不再重投文字以免重复）会话=%s 错误=%s',
+            umo, result.get('error') or '',
+        )
         return result
 
     def _tts_providers(self) -> list[Any]:
@@ -3377,6 +3493,10 @@ class _TurnCapture:
     `yield` 回去（否则会和默认 LLM 管线抢发送）。因此回合内的原路回复先落进
     这个缓冲，`main.py` 再用 `event.plain_result()` 交回，顺序与上游一致，
     也不会重复发送。
+
+    v1.7.7：正文 `<tts/>` 标记指定的分段在这里**已经合成成音频文件**（`voice_paths`
+    与 `texts` 一一对应；合不出来时该位是空串 = 照旧发文字）。语音段也走同一个缓冲，
+    所以"分段发送语音"的顺序与分段文字完全一致。
     """
 
     platform: str
@@ -3384,6 +3504,7 @@ class _TurnCapture:
     scope: str
     umo: str
     texts: list[str] = field(default_factory=list)
+    voice_paths: list[str] = field(default_factory=list)
 
     def matches(self, session: Any) -> bool:
         if session is None:
@@ -3400,10 +3521,18 @@ class _TurnCapture:
             return False
         return (platform, self_id, scope) == (self.platform, self.self_id, self.scope)
 
-    def append(self, content: Any) -> None:
+    def append(self, content: Any, voice_path: str = '') -> None:
         text = _text(content).strip()
         if text:
             self.texts.append(text)
+            self.voice_paths.append(_text(voice_path))
+
+    def replies(self) -> list[dict[str, Any]]:
+        """本回合的可见回复（v1.7.7）：`[{'content', 'voice'}]`，`voice` 是音频路径或空串。"""
+        return [
+            {'content': text, 'voice': self.voice_paths[index] if index < len(self.voice_paths) else ''}
+            for index, text in enumerate(self.texts)
+        ]
 
 
 # =========================================================================== #
@@ -3625,6 +3754,8 @@ class AstrbotBridge:
         self._started = False
         self._start_lock = asyncio.Lock()
         self._capture: Optional[_TurnCapture] = None
+        #: 刚结束的那个回合的捕获（`main.py` 交回宿主时还要读它的语音段）。
+        self._last_capture: Optional[_TurnCapture] = None
         # 投递坐标登记表（出站时把 HDSI 的平台/账号翻回 AstrBot 的 UMO）。
         self._platform_ids: dict[tuple[str, str], str] = {}
         self._private_endpoints: dict[tuple[str, str, str], AstrbotEndpoint] = {}
@@ -4822,6 +4953,9 @@ class AstrbotBridge:
         **读取失败绝不阻断消费**：失败只留一条 warn，消息照常往下走（见那条路径的分支）。
         """
         await self.ensure_started()
+        # 本回合的回复缓冲从零开始：早退的分支（通知 / 命令 / 空事件）不进 `begin_capture`，
+        # 留上一回合那份会让 `main.py` 把上一条回复**再发一遍**。
+        self._last_capture = None
         endpoint = endpoint_for_event(event)
         non_message, kind_label = is_non_message_event(event)
         if non_message:
@@ -4983,6 +5117,8 @@ class AstrbotBridge:
     # ------------------------------------------------------------------ #
 
     def begin_capture(self, endpoint: AstrbotEndpoint) -> _TurnCapture:
+        # 新回合开始：上一回合的缓冲立即作废（`turn_replies` 只读刚结束的那一份）。
+        self._last_capture = None
         capture = _TurnCapture(
             platform=endpoint.platform,
             self_id=endpoint.self_id,
@@ -4993,15 +5129,29 @@ class AstrbotBridge:
         return capture
 
     def end_capture(self) -> None:
+        # 回合结束后 `main.py` 还要按"文字 / 语音"交回宿主（见 `turn_replies`），
+        # 所以把刚结束的那一份留着；下一次 `begin_capture` 覆盖它。
+        self._last_capture = self._capture
         self._capture = None
 
     @property
     def capture(self) -> Optional[_TurnCapture]:
         return self._capture
 
-    def capture_texts(self) -> list[str]:
-        capture = self._capture
-        return list(capture.texts) if capture is not None else []
+    def turn_replies(self) -> list[dict[str, Any]]:
+        """刚结束的回合里要交回宿主的可见回复：`[{'content', 'voice'}]`。
+
+        `voice` 是**已经合成好的音频文件路径**（正文 `<tts/>` 标记指定的分段），
+        空串表示这条照旧发文字。`main.py` 据此决定 `plain_result` 还是
+        `chain_result(voice_components(...))`——它不碰 astrbot 的消息组件细节。
+        """
+        capture = self._last_capture
+        return capture.replies() if capture is not None else []
+
+    @staticmethod
+    def voice_components(path: str) -> list[Any]:
+        """语音段的出站组件（`main.py` 用 `event.chain_result(...)` 交回宿主）。"""
+        return [_build_record({'file': _text(path)})]
 
     # ------------------------------------------------------------------ #
     # 配置读取（给 main.py 用，避免它 import core）

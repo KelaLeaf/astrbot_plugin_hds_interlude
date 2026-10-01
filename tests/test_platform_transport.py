@@ -381,6 +381,12 @@ class PlatformTransportTestCase(unittest.TestCase):
         self.addCleanup(self.bridge.end_capture)
         return endpoint
 
+    def _session(self):
+        """当前回合坐标对应的真实 `SessionView`（回合内 `send_session` 用）。"""
+        event = FakeMessageEvent()
+        endpoint = endpoint_for_event(event)
+        return session_view(event, endpoint)
+
     def set_action_config(self, category: str, **options) -> None:
         """给某个动作类别所在的配置组配上一份设置。
 
@@ -1277,6 +1283,218 @@ class VoiceProviderSelectionTests(PlatformTransportTestCase):
         result = self.run_action('send_voice', {'content': '晚安'})
         self.assertTrue(result['ok'], result)
         self.assertEqual(other.texts, ['晚安'], '音色命中 fish-audio 的 sweet')
+
+
+# =========================================================================== #
+# 6c. 正文语音标记 `<tts/>`（v1.7.7）：核心意图 → 适配层合成
+# =========================================================================== #
+
+class VoiceMarkerDeliveryTests(PlatformTransportTestCase):
+    """core 只说"这一段是语音"，合成与降级都在适配层，且与 `send_voice` 共用一份实现。"""
+
+    PARTICIPANT = {
+        'platform': 'onebot', 'selfId': '100001357', 'userId': '1000008890',
+        'channelId': '1000008890',
+    }
+
+    def _voice_file(self) -> str:
+        path = os.path.join(self._tmp.name, 'marked.wav')
+        with open(path, 'wb') as handle:
+            handle.write(b'RIFF0000WAVEfmt ')
+        return path
+
+    def _provider(self, identifier: str = 'edge-tts', **config) -> FakeTTSProvider:
+        return FakeTTSProvider(
+            self._voice_file(), config={'id': identifier, 'model': identifier, **config},
+        )
+
+    def _last_chain(self) -> list:
+        return self.context.sent[-1][1].chain
+
+    @staticmethod
+    def _kinds(chain: list) -> list:
+        """组件种类名（按结构判定）。
+
+        **不能用本文件的 `Record` / `Plain` 做 isinstance**：`astrbot` 桩是
+        先跑到的那个测试模块装的，按顺序跑时命中的是别人的类（坑 16 的同一类）。
+        """
+        return [type(component).__name__ for component in chain]
+
+    def _send_private(self, content: str, **kwargs):
+        return asyncio.run(
+            self.transport.send_private(self.PARTICIPANT, content, **kwargs),
+        )
+
+    def _send_group(self, content: str, **kwargs):
+        return asyncio.run(self.transport.send_group('7788', content, **kwargs))
+
+    # ---- 正常路径：标记 → 语音 ----
+
+    def test_a_marked_private_bubble_is_sent_as_a_record(self):
+        self.enter_session()
+        provider = self._provider()
+        self.context.tts_providers = [provider]
+        result = self._send_private('晚安', voice=True)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(provider.texts, ['晚安'])
+        chain = self._last_chain()
+        self.assertEqual(len(chain), 1)
+        self.assertEqual(self._kinds(chain), ['Record'])
+        self.assertEqual(chain[0].file, provider.path)
+        self.assertTrue(result['data']['marked'])
+
+    def test_a_marked_group_bubble_is_sent_as_a_record_and_keeps_the_quote(self):
+        self.enter_session(group_id='7788')
+        provider = self._provider()
+        self.context.tts_providers = [provider]
+        result = self._send_group('晚安', reply_to='m-9', voice=True)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(self._kinds(self._last_chain()), ['Reply', 'Record'])
+
+    def test_the_marker_path_and_the_action_share_one_synthesis_implementation(self):
+        """两处都调到**同一个**内部方法：分开写一份，音色解析与失败语义一定会漂移。"""
+        self.enter_session()
+        provider = self._provider()
+        self.context.tts_providers = [provider]
+        calls: list[tuple] = []
+        original = type(self.transport).synthesize_voice
+
+        async def spy(inner_self, text, umo, voice=''):
+            calls.append((text, umo, voice))
+            return await original(inner_self, text, umo, voice)
+
+        with mock.patch.object(type(self.transport), 'synthesize_voice', spy):
+            self.assertTrue(self._send_private('标记路径', voice=True)['ok'])
+            self.assertTrue(self.run_action('send_voice', {'content': '动作路径'})['ok'])
+
+        self.assertEqual([item[0] for item in calls], ['标记路径', '动作路径'],
+                         '两条路径必须都经过 synthesize_voice')
+        self.assertEqual(provider.texts, ['标记路径', '动作路径'])
+
+    def test_the_action_body_has_no_second_synthesis_copy(self):
+        """源码级哨兵：`send_voice` 的动作体里不许再出现第二段 `get_audio` 合成。"""
+        with open(os.path.join(PLUGIN_ROOT, 'adapters', 'astrbot_bridge.py'), encoding='utf-8') as handle:
+            source = handle.read()
+        body = source.split('async def _action_send_voice', 1)[1].split('    # ---- 文字转语音', 1)[0]
+        self.assertIn('synthesize_voice(', body)
+        self.assertNotIn('get_audio', body)
+
+    # ---- 降级：绝不静默丢内容 ----
+
+    def test_no_tts_provider_falls_back_to_text_with_a_warning(self):
+        self.enter_session()
+        result = self._send_private('晚安', voice=True)
+        self.assertTrue(result['ok'], '合成不出来也必须把话送到')
+        chain = self._last_chain()
+        self.assertEqual(self._kinds(chain), ['Plain'])
+        self.assertEqual(chain[0].text, '晚安')
+        self.assertWarned('退回发文字')
+
+    def test_synthesis_failure_falls_back_to_text_with_a_warning(self):
+        self.enter_session()
+        self.context.tts_providers = [FakeTTSProvider(error=RuntimeError('edge 挂了'))]
+        result = self._send_private('晚安', voice=True)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(self._last_chain()[0].text, '晚安')
+        self.assertWarned('edge 挂了')
+
+    def test_platform_rejection_after_synthesis_is_reported_without_a_text_retry(self):
+        """平台已经收到请求、回执未知 → **不重投**（重投会产生重复消息），按失败记账。"""
+        self.enter_session()
+        self.context.tts_providers = [self._provider()]
+        self.context.send_error = RuntimeError('connection lost')
+        result = self._send_private('晚安', voice=True)
+        self.assertFalse(result['ok'])
+        self.assertEqual(len(self.context.sent), 1, '不许再发一遍文字')
+        self.assertWarned('不再重投')
+
+    def test_switch_off_refuses_the_action_and_the_marker_path_sends_text(self):
+        self.enter_session()
+        self.context.tts_providers = [self._provider()]
+        write_section_path(self.bridge.config, 'model.audio', {'tts_enabled': False})
+        self.assertFalse(self.transport.voice_reply_enabled())
+        result = self.run_action('send_voice', {'content': '晚安'})
+        self.assertFalse(result['ok'])
+        self.assertIn('文字转语音', result['error'])
+        self.assertEqual(self.context.sent, [])
+        # 标记路径由 core 决定（开关关掉时它根本不表达语音意图）；适配层即使收到
+        # `voice=True` 也按"退回文字"处理，内容照发。
+        result = self._send_private('晚安', voice=True)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(self._last_chain()[0].text, '晚安')
+
+    def test_missing_switch_key_keeps_todays_behaviour(self):
+        """旧配置文件里没有 `tts_enabled` → 当成开着（`send_voice` 从 v1.7.2 起就能用）。"""
+        self.enter_session()
+        self.assertTrue(self.transport.voice_reply_enabled())
+
+    # ---- 回合内捕获路径（`send_session`）与后台投递 ----
+
+    def test_captured_voice_segment_is_synthesised_before_the_turn_returns(self):
+        self.enter_session()
+        provider = self._provider()
+        self.context.tts_providers = [provider]
+        session = self._session()
+        result = asyncio.run(self.transport.send_session(session, '晚安', voice=True))
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['captured'])
+        capture = self.bridge.capture
+        self.assertEqual(capture.texts, ['晚安'])
+        self.assertEqual(capture.voice_paths, [provider.path])
+        self.assertEqual(self.context.sent, [], '回合内的回复仍然由 main.py 交回，不在这里直发')
+
+    def test_capture_falls_back_to_text_when_synthesis_fails(self):
+        self.enter_session()
+        session = self._session()
+        result = asyncio.run(self.transport.send_session(session, '晚安', voice=True))
+        self.assertTrue(result['ok'], result)
+        capture = self.bridge.capture
+        self.assertEqual(capture.texts, ['晚安'])
+        self.assertEqual(capture.voice_paths, [''])
+        self.assertWarned('退回发文字')
+
+    def test_turn_replies_expose_voice_paths_after_the_capture_ends(self):
+        self.enter_session()
+        provider = self._provider()
+        self.context.tts_providers = [provider]
+        session = self._session()
+        asyncio.run(self.transport.send_session(session, '文字这条'))
+        asyncio.run(self.transport.send_session(session, '语音这条', voice=True))
+        self.bridge.end_capture()
+        self.assertEqual(self.bridge.turn_replies(), [
+            {'content': '文字这条', 'voice': ''},
+            {'content': '语音这条', 'voice': provider.path},
+        ])
+        self.assertIsNone(self.bridge.capture, '实时缓冲已释放；可读的是"刚结束的那一份"')
+
+    def test_a_turn_that_never_captures_does_not_replay_the_previous_turn(self):
+        """早退的回合（空事件 / 通知）不进缓冲：`turn_replies` 必须回空，
+        否则 `main.py` 会把上一条回复再发一遍。"""
+        endpoint = self.enter_session()
+        self.context.tts_providers = [self._provider()]
+        asyncio.run(self.transport.send_session(self._session(), '上一条'))
+        self.bridge.end_capture()
+        self.assertEqual(len(self.bridge.turn_replies()), 1)
+        # 下一个回合开始即作废上一份缓冲（早退的回合走不到 end_capture）。
+        self.bridge.begin_capture(endpoint)
+        self.assertEqual(self.bridge.turn_replies(), [])
+
+    def test_voice_components_build_a_record_chain(self):
+        components = AstrbotBridge.voice_components('/tmp/x.wav')
+        self.assertEqual(self._kinds(components), ['Record'])
+        self.assertEqual(components[0].file, '/tmp/x.wav')
+
+    def test_background_delivery_forwards_the_voice_intent(self):
+        self.enter_session()
+        provider = self._provider()
+        self.context.tts_providers = [provider]
+        result = asyncio.run(self.transport.deliver_background({
+            'participantId': 'p1', 'platform': 'onebot', 'selfId': '100001357',
+            'userId': '1000008890', 'channelId': '1000008890',
+            'kind': 'private', 'content': '晚安', 'voice': True,
+        }))
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(self._kinds(self._last_chain()), ['Record'])
 
 
 # =========================================================================== #

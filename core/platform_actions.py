@@ -52,6 +52,7 @@ __all__ = [
     'ACTION_CONFIG_GROUP_LABELS',
     'ACTION_CONFIG_GROUP_ROOTS',
     'ACTION_CONFIG_SECTION',
+    'VOICE_ACTION_IDS',
     'action_config_group',
     'PERMISSION_TIERS',
     'PLATFORM_ACTION_FIELD',
@@ -761,7 +762,8 @@ _ACTION_LIST: tuple[PlatformAction, ...] = (
     ),
     PlatformAction(
         'set_qzone_visibility', 'qzone', '改说说可见范围',
-        '改一条**她自己发的、纯文字**说说的可见范围（谁能看见）。带图的说说这条动作改不了。',
+        '改一条**她自己发的**说说的可见范围（谁能看见）。带图的说说会把原图**重新上传一次**'
+        '再改（图片在腾讯侧变成新副本）；转发的改不了。',
         params=(
             _p('tid', '说说 tid', required=True),
             _p('visible', '可见范围', required=True, choices=QZONE_VISIBILITY_LABELS),
@@ -880,6 +882,15 @@ def actions_by_category() -> dict[str, list[PlatformAction]]:
     for item in _ACTION_LIST:
         grouped.setdefault(item.category, []).append(item)
     return grouped
+
+
+#: 语音类动作 id（`category == 'voice'`）：`send_voice` / `list_voices`。
+#: 它们多一道总闸——「模型中心 → 语音 / 音频理解设置」的 `tts_enabled`（v1.7.7）：
+#: 关掉后这两个动作按既有的"动作开关关掉"路径不可用，与正文 `<tts/>` 标记被忽略
+#: 是同一个开关的两种表现。从目录派生，别在别处再抄一份 id 清单。
+VOICE_ACTION_IDS: frozenset[str] = frozenset(
+    item.id for item in _ACTION_LIST if item.category == 'voice'
+)
 
 
 def risky_actions() -> list[PlatformAction]:

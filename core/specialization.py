@@ -145,6 +145,15 @@ MULTI_PLATFORM_TRANSPORT_SELECTION = 'MULTI-PLATFORM TRANSPORT SELECTION: this s
 # -- narrator.ts writingAffordances() (default <sep/>)
 BUBBLE_AFFORDANCE = 'For a reply that naturally arrives as several separate chat bubbles, place the exact literal token "<sep/>" between message segments within the say action (or reply.content). Use it only when every segment is independently complete and natural as a chat bubble; keep one sentence, one unfinished thought, and one explanation unit inside the same segment. Do not add newlines around it, do not use it in script prose, and do not use it when one bubble is more natural. The plugin sends the first segment immediately and simulates typing before later segments.'
 
+# -- 本移植版（v1.7.7）受控偏离：正文语音标记 `<tts/>`
+# 上游没有"由模型决定这条回信用语音发"的机制（只有显式动作）。这一段与气泡段放在一起、
+# 用同一套措辞讲同一件事：标记写在正文里，投递层照着办。
+BUBBLE_VOICE_AFFORDANCE = 'To let a reply reach the other side as a voice message instead of text, place the exact literal token "<tts/>" in that message segment (or in reply.content); with the separator, each marked segment goes out as its own voice message. The token itself is never sent or spoken.'
+
+#: `tts_enabled=false` 时的替代文案：**不提标记本身**（关掉的东西不该被教），
+#: 与 `splitReplyMessages is False` 那段同一个模式。
+BUBBLE_VOICE_DISABLED = 'Voice replies are unavailable in this turn. Send everything as text and write no voice marker.'
+
 # -- narrator.ts repetitionGuardInstruction()
 REPETITION_GUARD_TAIL = 'When unsure, make this reply a single bubble.'
 

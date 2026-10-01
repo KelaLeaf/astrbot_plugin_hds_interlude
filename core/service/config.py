@@ -1789,7 +1789,15 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     # ---- 【必填 2】model（index.ts Model） ----
     'model': {
         'vision': {'enabled': False, 'mode': 'native', 'detail': 'auto', 'max_image_dimension': 1024},
-        'audio': {'enabled': False, 'out_format': 'mp3', 'max_file_size_mb': 10, 'max_per_message': 1},
+        'audio': {
+            'enabled': False, 'out_format': 'mp3', 'max_file_size_mb': 10, 'max_per_message': 1,
+            # v1.7.7：文字转语音总开关（正文 `<tts/>` 标记 + `send_voice` 动作共用）。
+            # 默认 True = 保持今天的行为（发语音这条动作从 v1.7.2 起就是可用的）。
+            # 注意它**不进** `resolve_audio_config` 的输出形状：那个 dict 是上游
+            # `audioConfig` 的逐字对应物，多一个键会让 `audio_config` 的相等断言漂移；
+            # 读它的是 `ServiceBase.voice_reply_enabled`。
+            'tts_enabled': True,
+        },
         'providers': [],
         'main_temperature': 0.8,
         'main_top_p': 1.0,

@@ -10,9 +10,10 @@
 | 只读的 `qzone_read` 不落审计行、不占配额 | 她"看一眼好友动态"就把当天的评论额度花光 | `QzoneReadTests` |
 | `napcat_actions()` = 那 9 条；`backend_labels` 顺序 = `backends` 顺序 | 面板把 NapCat 专属标丢 / 标签顺序与运行期优先级不一致 | `BackendCatalogTests` |
 | `forward` 走**评论**配额（不是点赞） | 转发把点赞额度吃掉 | `ForwardGateTests` |
+| 带图改可见范围：**先重传原图拿新 `richval`，再 update**；这条链上任何一步没成都拒绝 | 用空 `richval` 硬发 = 把用户的图**静默删掉** | `SetVisibilityTests`（`..._is_reuploaded_then_updated` / `..._upload_failure_refuses...`） |
 
-传输层按契约 stub（`call_onebot` + `request_text`），**绝不真实联网**；夹具里的
-QQ 号 / tid / cookie 全是编的。
+传输层按契约 stub（`call_onebot` + `request_text` + `fetch_image`），**绝不真实联网**；
+夹具里的 QQ 号 / tid / cookie / 图片字节全是编的。
 
 运行：`python3 -m unittest plugin.tests.test_qzone_napcat_channel -v`
 """
@@ -20,6 +21,7 @@ QQ 号 / tid / cookie 全是编的。
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import pathlib
 import sys
@@ -72,14 +74,40 @@ MOODS_TEXT_OTHER_TID = (
 )
 
 
-def _visibility_http(moods: str = MOODS_TEXT, result: str = '{"code":0}'):
-    """按 URL 分派：`msglist`（读正文）→ `moods`；`emotion_cgi_update` → `result`。"""
+#: 上传回执（编的）：`build_image_richval` 要的六个字段 + `url` 里的 `bo`。
+UPLOAD_RECEIPT = (
+    '{"code":0,"data":{"albumid":"ALB-1","lloc":"LLOC-1","sloc":"SLOC-1","type":1,'
+    '"height":480,"width":640,"url":"https://example.invalid/p?bo=BO-1&x=1"}}'
+)
+#: 参考实现 `build_image_richval` 对上面那张图的**逐字**产物。
+RICHVAL_ONE = ",ALB-1,LLOC-1,SLOC-1,1,480,640,,480,640"
+PIC_BO_ONE = "BO-1"
+#: 第二张图（组图：两段 `richval` 用 `\t` 连接，`pic_bo` 同样）。
+UPLOAD_RECEIPT_2 = (
+    '{"code":0,"data":{"albumid":"ALB-2","lloc":"LLOC-2","sloc":"SLOC-2","type":1,'
+    '"height":100,"width":200,"url":"https://example.invalid/p?bo=BO-2&x=1"}}'
+)
+RICHVAL_TWO = "\t".join([RICHVAL_ONE, ",ALB-2,LLOC-2,SLOC-2,1,100,200,,100,200"])
+#: 一条带**两张**图的说说（组图；`url1` 是原图地址，重新上传就用它）。
+MOODS_TEXT_TWO_PICS = (
+    '_preloadCallback({"code":0,"msglist":[{"tid":"TID-0001","content":"\u665a\u5b89",'
+    '"pic":[{"url1":"https://example.invalid/a.jpg"},'
+    '{"url1":"https://example.invalid/b.jpg"}]}]});'
+)
+
+
+def _visibility_http(moods: str = MOODS_TEXT, result: str = '{"code":0}',
+                     upload: str = UPLOAD_RECEIPT):
+    """按 URL 分派：`msglist`（读正文）→ `moods`；`cgi_upload_image` → `upload`；
+    `emotion_cgi_update` → `result`。"""
     calls: list[dict] = []
 
     def handler(method: str, url: str, headers: object, data: object) -> str:
         calls.append({'method': method, 'url': url, 'data': dict(data or {})})
         if 'emotion_cgi_msglist_v6' in url:
             return moods
+        if 'cgi_upload_image' in url:
+            return upload
         return result
 
     return handler, calls
@@ -100,18 +128,25 @@ def _napcat_handler(calls: list) -> object:
 
 
 class _NapcatTransport(_StubTransport):
-    """`call_onebot`（OneBot 直通 = NapCat WS）+ `request_text`（QZone CGI 的 HTTP）。
+    """`call_onebot`（OneBot 直通 = NapCat WS）+ `request_text`（QZone CGI 的 HTTP）
+    + `fetch_image`（原图字节，改带图说说的可见范围时要用）。
 
-    `has_http=False` 模拟"传输层没接原始 HTTP"（纯 SnowLuma 环境）。
+    `has_http=False` 模拟"传输层没接原始 HTTP"（纯 SnowLuma 环境）；
+    `has_fetch=False` 模拟"传输层不能下载图片"。
     """
 
-    def __init__(self, handler: object = None, http: object = None, has_http: bool = True) -> None:
+    def __init__(self, handler: object = None, http: object = None, has_http: bool = True,
+                 image: object = None, has_fetch: bool = True) -> None:
         super().__init__(handler)
         self.http_handler = http
         self.http_calls: list[dict] = []
+        self.image_bytes = image if image is not None else b'\x89PNG-fake-bytes'
+        self.fetch_calls: list[str] = []
         if not has_http:
             # `_qzone_cgi_request()` 用 getattr + callable 判能力：这里显式关掉。
             self.request_text = None  # type: ignore[assignment]
+        if not has_fetch:
+            self.fetch_image = None  # type: ignore[assignment]
 
     async def request_text(self, method: str, url: str, headers: object = None,
                            data: object = None) -> object:
@@ -127,6 +162,11 @@ class _NapcatTransport(_StubTransport):
         if isinstance(result, BaseException):
             raise result
         return result
+
+    async def fetch_image(self, url: str) -> object:
+        """原图字节（`Transport.fetch_image` 的契约：失败回 `None`，绝不抛）。"""
+        self.fetch_calls.append(url)
+        return self.image_bytes
 
 
 class _Host(_QzoneHost):
@@ -424,15 +464,21 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
 
     | 边界 | 出错的样子 |
     | --- | --- |
-    | 带图 / 转发 → 拒绝 | 图被静默弄丢（`richval` 还原不了） |
+    | 带图 → **先重新上传原图，再带新 `richval` update**（v1.7.8） | 用空 `richval` 硬发 = 图被静默删掉 |
+    | 上传链上任何一步没成（下载 / 上传 / 回执字段 / 张数） → 拒绝 | 半成品富文本块被服务端按残缺重建 |
+    | 转发 → 拒绝 | 转发目标还原不了，重建等于改掉转发 |
     | 正文找不回来 → 拒绝 | 服务端按整条重建，空 `con` = 把正文清掉 |
     | 没有 CGI 通道 → 明确失败 | 回落到平台打一个不存在的动作名，报错看不懂 |
     """
 
-    def _host(self, moods: str = MOODS_TEXT, result: str = '{"code":0}') -> tuple:
+    def _host(self, moods: str = MOODS_TEXT, result: str = '{"code":0}',
+              upload: str = UPLOAD_RECEIPT, image: object = None,
+              has_fetch: bool = True) -> tuple:
         host = _Host(config=dict(BASE_CONFIG, daily_post_cap=5, min_interval_minutes=0))
-        handler, calls = _visibility_http(moods, result)
-        host.transport = _NapcatTransport(_napcat_handler([]), http=handler)
+        handler, calls = _visibility_http(moods, result, upload)
+        host.transport = _NapcatTransport(
+            _napcat_handler([]), http=handler, image=image, has_fetch=has_fetch,
+        )
         return host, calls
 
     def _payload(self, **overrides: object) -> dict:
@@ -507,15 +553,163 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
             '通道选择要有一条 debug 记录（排查"到底走没走 NapCat"靠它）：%s' % host.standalone,
         )
 
-    async def test_a_post_with_images_is_refused_instead_of_losing_the_pictures(self):
+    async def test_a_post_with_images_is_reuploaded_then_updated(self):
+        """带图：**先重新上传原图 → 拿新 richval → 再 update**（v1.7.8）。
+
+        这条用例钉三件事：① 顺序（上传在 update 之前，且 `richval` 来自上传回执）；
+        ② `richval` / `pic_bo` 的**字面量**（照参考实现 `build_image_richval`）；
+        ③ "图片被重新上传"这件事在日志与剧本条目里**看得见**。
+        """
         host, calls = self._host(moods=MOODS_TEXT_WITH_PIC)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], result)
+
+        urls = [call['url'] for call in calls]
+        upload_index = next(i for i, url in enumerate(urls) if 'cgi_upload_image' in url)
+        update_index = next(i for i, url in enumerate(urls) if 'emotion_cgi_update' in url)
+        self.assertLess(upload_index, update_index, '必须先上传，再 update')
+
+        # 原图是用 `fetch_image` 从列表里的 `url1` 下载的（字节再 base64 进 picfile）。
+        self.assertEqual(host.transport.fetch_calls, ['https://example.invalid/a.jpg'])
+        upload = calls[upload_index]
+        self.assertEqual(upload['method'], 'POST')
+        self.assertIn('g_tk=%d' % cgi.compute_g_tk(P_SKEY), upload['url'])
+        self.assertEqual(upload['data']['skey'], '@abc123', 'skey 直接从 Cookie 带进表单')
+        self.assertEqual(upload['data']['p_skey'], P_SKEY)
+        self.assertEqual(upload['data']['base64'], '1')
+        self.assertEqual(
+            upload['data']['picfile'], base64.b64encode(b'\x89PNG-fake-bytes').decode('ascii'),
+        )
+
+        update = calls[update_index]
+        self.assertEqual(update['data']['richval'], RICHVAL_ONE, 'richval 必须来自上传回执')
+        self.assertEqual(update['data']['pic_bo'], PIC_BO_ONE)
+        self.assertEqual(update['data']['richtype'], '1')
+        self.assertEqual(update['data']['subrichtype'], '1')
+        self.assertEqual(update['data']['con'], '晚安')
+        self.assertEqual(update['data']['tid'], TID)
+
+        # 代价必须看得见：一条 warn（坑 25）+ 剧本条目里的追溯字段。
+        self.assertTrue(
+            any('重新上传' in text for _level, text in host.standalone),
+            '重新上传这件事要有可见记录：%s' % host.standalone,
+        )
+        self.assertTrue(
+            any(level == 'warn' and '重新上传' in text for level, text in host.standalone),
+            '按坑 25 这条走 warn，别塞进 debug：%s' % host.standalone,
+        )
+        self.assertEqual(host.entries[-1]['metadata']['qzone_images_reuploaded'], 1)
+        self.assertIn('配图 1 张已重新上传', host.entries[-1]['content'])
+        self.assertEqual(host.rows[-1]['status'], 'confirmed')
+
+    async def test_a_multi_picture_post_reuploads_every_picture(self):
+        """组图：逐张上传，`richval` / `pic_bo` 按参考实现用 `\\t` 连接。"""
+        host, calls = self._host(moods=MOODS_TEXT_TWO_PICS, upload=UPLOAD_RECEIPT)
+        # 两张图两次上传：第二次换一份回执（同一个 handler 会回同一份，所以按调用序改）。
+        receipts = [UPLOAD_RECEIPT, UPLOAD_RECEIPT_2]
+        seen: list[int] = []
+
+        def handler(method: str, url: str, headers: object, data: object) -> str:
+            calls.append({'method': method, 'url': url, 'data': dict(data or {})})
+            if 'emotion_cgi_msglist_v6' in url:
+                return MOODS_TEXT_TWO_PICS
+            if 'cgi_upload_image' in url:
+                index = len(seen)
+                seen.append(index)
+                return receipts[min(index, len(receipts) - 1)]
+            return '{"code":0}'
+
+        host.transport.http_handler = handler
+        calls.clear()
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(
+            host.transport.fetch_calls,
+            ['https://example.invalid/a.jpg', 'https://example.invalid/b.jpg'],
+        )
+        self.assertEqual(len(seen), 2, '两张图要传两次')
+        update = [call for call in calls if 'emotion_cgi_update' in call['url']][0]
+        self.assertEqual(update['data']['richval'], RICHVAL_TWO)
+        self.assertEqual(update['data']['pic_bo'], PIC_BO_ONE + "\t" + 'BO-2')
+        self.assertEqual(host.entries[-1]['metadata']['qzone_images_reuploaded'], 2)
+
+    async def test_an_upload_failure_refuses_instead_of_sending_a_broken_richval(self):
+        """**最重要的一条**：上传失败 → 明确拒绝、**不发 update**、绝不用空 richval 硬发。"""
+        host, calls = self._host(
+            moods=MOODS_TEXT_WITH_PIC,
+            upload='{"code":-3000,"message":"\u4e0a\u4f20\u5931\u8d25"}',
+        )
         result = await host.qzone_execute(STORY, 'visibility', self._payload())
         self.assertFalse(result['ok'], result)
         self.assertIn('图', result['error'])
-        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [],
-                         '拒绝时必须**没有**发出编辑请求')
+        self.assertIn('重新上传', result['error'])
+        self.assertIn('上传失败', result['error'], '要把真实原因带出来：%s' % result['error'])
+        self.assertEqual(
+            [call for call in calls if 'emotion_cgi_update' in call['url']], [],
+            '上传失败时**绝不能**发出编辑请求（空 richval = 静默丢图）',
+        )
         self.assertEqual(host.rows[-1]['status'], 'failed')
-        self.assertIn('reason', host.rows[-1] if 'reason' in host.rows[-1] else {'reason': ''})
+        self.assertEqual(host.entries, [], '失败不写剧本条目')
+
+    async def test_a_download_failure_refuses_before_uploading_anything(self):
+        """原图下载不到（`fetch_image` 回 None）→ 连上传都不发，明确拒绝。"""
+        host, calls = self._host(moods=MOODS_TEXT_WITH_PIC, image=None, has_fetch=True)
+        host.transport.image_bytes = None
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertEqual([call for call in calls if 'cgi_upload_image' in call['url']], [])
+        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [])
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+
+    async def test_a_receipt_without_the_richval_fields_refuses(self):
+        """回执缺 `albumid` 之类的字段 → 拼不出 richval → 拒绝（不许拼半个发出去）。"""
+        host, calls = self._host(
+            moods=MOODS_TEXT_WITH_PIC, upload='{"code":0,"data":{"lloc":"LLOC-1"}}',
+        )
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [])
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+
+    async def test_a_transport_without_fetch_image_refuses(self):
+        """传输层没有 `fetch_image` 能力 → 明确拒绝（旧行为：带图不做）。"""
+        host, calls = self._host(moods=MOODS_TEXT_WITH_PIC, has_fetch=False)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertIn('图', result['error'])
+        self.assertEqual([call for call in calls if 'emotion_cgi_update' in call['url']], [])
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+
+    async def test_too_many_pictures_are_refused_without_uploading(self):
+        """超过一条说说 9 张的上限（列表被拼坏）→ 不猜、不上传、明确拒绝。"""
+        pics = ','.join(
+            '{"url1":"https://example.invalid/%d.jpg"}' % index for index in range(10)
+        )
+        moods = (
+            '_preloadCallback({"code":0,"msglist":[{"tid":"TID-0001","content":"\u665a\u5b89",'
+            '"pic":[%s]}]});' % pics
+        )
+        host, calls = self._host(moods=moods)
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertFalse(result['ok'], result)
+        self.assertIn('9', result['error'])
+        self.assertEqual(host.transport.fetch_calls, [])
+        self.assertEqual([call for call in calls if 'cgi_upload_image' in call['url']], [])
+        self.assertEqual(host.rows[-1]['status'], 'failed')
+
+    async def test_the_text_path_still_sends_no_rich_text_block(self):
+        """回归：纯文字路径**一个字节都没变**（没有 richval / pic_bo / 上传调用）。"""
+        host, calls = self._host()
+        result = await host.qzone_execute(STORY, 'visibility', self._payload())
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(host.transport.fetch_calls, [])
+        self.assertEqual([call for call in calls if 'cgi_upload_image' in call['url']], [])
+        update = [call for call in calls if 'emotion_cgi_update' in call['url']][0]
+        self.assertNotIn('pic_bo', update['data'])
+        self.assertEqual(update['data']['richval'], '')
+        self.assertEqual(update['data']['richtype'], '')
+        self.assertEqual(update['data']['subrichtype'], '')
+        self.assertNotIn('qzone_images_reuploaded', host.entries[-1]['metadata'])
 
     async def test_a_forwarded_post_is_refused_too(self):
         host, _calls = self._host(moods=MOODS_TEXT_FORWARDED)

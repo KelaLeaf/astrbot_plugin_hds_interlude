@@ -33,9 +33,13 @@ from plugin.core.narrator_prompts import (
     story_state_for_prompt,
     system_prompt,
     to_prompt_payload,
+    writing_affordances,
 )
 from plugin.core.specialization import (
     ADMIN_NOTES_FULL,
+    BUBBLE_AFFORDANCE,
+    BUBBLE_VOICE_AFFORDANCE,
+    BUBBLE_VOICE_DISABLED,
     CHANNEL_CONTEXT_FULL,
     CHANNEL_CONTEXT_LITE,
     CHANNELS_FULL,
@@ -706,6 +710,60 @@ class ModelSpecialtyPromptTests(unittest.TestCase):
             system_prompt_specialty('user-message', {'tier': 'full', 'family': 'generic'},
                                     channel_selection_enabled=True),
         )
+
+
+class VoiceMarkerPromptTests(unittest.TestCase):
+    """正文语音标记 `<tts/>` 的提示词（v1.7.7 受控偏离）。
+
+    与 `<sep/>` 那段放在一起、同一套措辞：**想用语音回就写标记，配合分隔符就是
+    分段语音**。开关关掉时不许再教它用（照 `splitReplyMessages is False` 的既有写法）。
+    """
+
+    def test_the_marker_is_taught_next_to_the_bubble_separator(self) -> None:
+        affordances = writing_affordances({})
+        self.assertIn(BUBBLE_AFFORDANCE, affordances)
+        self.assertIn(BUBBLE_VOICE_AFFORDANCE, affordances)
+        self.assertIn('<tts/>', BUBBLE_VOICE_AFFORDANCE)
+        self.assertIn('with the separator, each marked segment goes out as its own voice message',
+                      BUBBLE_VOICE_AFFORDANCE, '要一句话说清"配合分隔符就是分段语音"')
+        self.assertLess(affordances.index(BUBBLE_AFFORDANCE), affordances.index(BUBBLE_VOICE_AFFORDANCE))
+        # 默认分隔符下，同一段提示词里同时出现两个标记（模型一次读齐）。
+        self.assertIn('<sep/>', affordances)
+        self.assertIn('<tts/>', affordances)
+
+    def test_absent_key_keeps_teaching_it(self) -> None:
+        """缺键 = 今天的行为（`tts_enabled` 默认开着）：老调用方拿到的提示词包含它。"""
+        for options in ({}, {'ttsEnabled': True}, {'tts_enabled': True}):
+            with self.subTest(options=options):
+                self.assertIn(BUBBLE_VOICE_AFFORDANCE, writing_affordances(options))
+
+    def test_disabled_switch_never_teaches_the_token(self) -> None:
+        for options in ({'ttsEnabled': False}, {'tts_enabled': False}):
+            with self.subTest(options=options):
+                affordances = writing_affordances(options)
+                self.assertIn(BUBBLE_VOICE_DISABLED, affordances)
+                self.assertNotIn(BUBBLE_VOICE_AFFORDANCE, affordances)
+                self.assertNotIn('<tts/>', affordances, '关掉的东西不该把 token 教给模型')
+
+    def test_both_blocks_render_together_in_the_full_system_prompt(self) -> None:
+        prompt = system_prompt_6('user-message')
+        self.assertIn(BUBBLE_AFFORDANCE, prompt)
+        self.assertIn(BUBBLE_VOICE_AFFORDANCE, prompt)
+
+        disabled = system_prompt_specialty(
+            'user-message', None, writing_options={'ttsEnabled': False},
+        )
+        self.assertIn(BUBBLE_AFFORDANCE, disabled)
+        self.assertIn(BUBBLE_VOICE_DISABLED, disabled)
+        self.assertNotIn('<tts/>', disabled)
+
+    def test_split_disabled_and_voice_disabled_render_together(self) -> None:
+        """两个开关都关：气泡段变成"别写分隔符"，语音段变成"别写语音标记"。"""
+        affordances = writing_affordances({'splitReplyMessages': False, 'ttsEnabled': False})
+        self.assertIn('Message splitting is disabled', affordances)
+        self.assertIn(BUBBLE_VOICE_DISABLED, affordances)
+        self.assertNotIn('<sep/>', affordances)
+        self.assertNotIn('<tts/>', affordances)
 
 
 if __name__ == '__main__':

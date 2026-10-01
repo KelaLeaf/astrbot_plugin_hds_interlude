@@ -75,6 +75,7 @@ from ..agency import (
     resolve_proactive_interval_minutes,
     resolve_proactive_threshold,
 )
+from ..bubbles import strip_voice_marker
 from ..delivery import (
     attach_message_event,
     delivery_entry_metadata,
@@ -313,6 +314,11 @@ def _cfg(section: Any, camel: str, default: Any = None) -> Any:
 
 def _record(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _without_voice_marker(value: Any) -> Any:
+    """删掉正文语音标记（v1.7.7）：只处理字符串，其它形状原样返回。"""
+    return strip_voice_marker(value)[0] if isinstance(value, str) else value
 
 
 def _automation(story: Any) -> dict[str, Any]:
@@ -899,6 +905,9 @@ class ServiceChunk4(ServiceBase):
                 'automatic_delivery': automatic_delivery,
                 'script_event': restore_message_event(intent.get('payload'), content),
             }
+            if payload.get('voice') is True:
+                # 正文 `<tts/>` 指定的语音分段（意图排期时写进 payload）。
+                message['voice'] = True
             delivered = await self.send_outgoing_messages(
                 story, [message], None, None,
                 lambda target: target.get('id') in self.interrupted_typing_participants,
@@ -1431,6 +1440,9 @@ class ServiceChunk4(ServiceBase):
             'writingOptions': {
                 'messageSeparator': (str(_cfg(runtime, 'messageSeparator', '')).strip() or '<sep/>'),
                 'splitReplyMessages': _cfg(runtime, 'splitReplyMessages', True) is not False,
+                # v1.7.7：正文语音标记 `<tts/>`。关掉时这段提示词改成"不要写语音标记"
+                # （模型压根不知道这个 token 存在，别教它用一个不会生效的东西）。
+                'ttsEnabled': bool(self.voice_reply_enabled),
                 # 上游 1.0.1-rc18：只在**私聊对话回合**注入条数守卫（推进回合与群聊不注入）。
                 **({
                     'messageRepetition': repetition,
@@ -2452,12 +2464,15 @@ class ServiceChunk4(ServiceBase):
             and reply.get('content') and reply.get('sendAt')
         ):
             send_at = parse_dt(reply['sendAt'])
+            # v1.7.7：延迟回复的 payload 是**给模型看的草稿**（到期回合会重新决策），
+            # 标记是投递意图、不是她要说的字——按同一口径删掉，别让 `<tts/>` 混进
+            # 提示词里的 "The protagonist wanted to send …"。
             await self.append_intent(story['id'], {
                 'type': 'delayed-reply',
                 'summary': 'The character decided to send a delayed reply.',
                 'not_before': reply['sendAt'],
                 'payload': {
-                    'content': reply['content'],
+                    'content': _without_voice_marker(reply['content']),
                     'userInitiated': phase == 'user-message',
                     'interaction': True,
                     **({
@@ -2540,7 +2555,7 @@ class ServiceChunk4(ServiceBase):
                     'summary': 'The character planned a message to another relationship branch.',
                     'not_before': send_at_value,
                     'payload': {
-                        'content': action.get('content'),
+                        'content': _without_voice_marker(action.get('content')),
                         'userInitiated': False,
                         'crossConversation': True,
                         'willingness': action.get('willingness'),
@@ -2563,7 +2578,7 @@ class ServiceChunk4(ServiceBase):
         prepared: list[dict[str, Any]] = []
         for message in messages:
             prepared_message = prepare_outgoing_delivery(
-                message, self.split_outgoing_message(message['content']),
+                message, self.split_outgoing_segments(message['content']),
             )
             if prepared_message:
                 prepared.append(prepared_message)

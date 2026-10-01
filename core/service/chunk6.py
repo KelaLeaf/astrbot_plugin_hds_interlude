@@ -96,6 +96,7 @@ import random
 from typing import Any, Callable, Optional
 
 from ..agency import active_agency_window, proactive_candidate_fingerprint
+from ..bubbles import VOICE_MARKER, runtime_bubble_segments
 from ..delivery import delivery_entry_metadata, restore_message_event, script_event_payload
 from ..script.delivery_ledger import update_script_delivery_actions
 from ..story_state import decode_story_state, encode_story_state
@@ -108,6 +109,7 @@ from ..urge import (
     urge_user_event,
 )
 from .base import ServiceBase, is_one_bot_platform, pick
+from .transport import voice_kwargs
 from .helpers import (
     active_rest_window,
     automatic_delivery_from_payload,
@@ -436,6 +438,10 @@ class ServiceChunk6(ServiceBase):
                         'automatic_delivery': automatic_delivery,
                         'script_event': restore_message_event(payload, content),
                     }
+                    if payload.get('voice') is True:
+                        # 这一段是正文 `<tts/>` 指定的语音（排期时写进 payload，见
+                        # `confirm_outgoing_deliveries`）。
+                        message['voice'] = True
                     delivered = await self.send_outgoing_messages(
                         story,
                         [message],
@@ -1004,6 +1010,9 @@ class ServiceChunk6(ServiceBase):
                 if literal_quote_message_id:
                     message['quote_message_id'] = literal_quote_message_id
                 outgoing_content = _QUOTE_PLACEHOLDER if literal_quote_message_id else content
+                # 正文 `<tts/>` 指定的语音意图：只在这一段本身有字要说时才成立
+                # （纯引用占位符只是"引用了某条消息"的文本标记，念出来没有意义）。
+                outgoing_voice = pick(message, 'voice') is True and not literal_quote_message_id
                 logging_config = _section(self.config, 'logging')
                 if _cfg(logging_config, 'logMessageContent', False):
                     preview_length = _cfg(logging_config, 'previewLength')
@@ -1027,7 +1036,9 @@ class ServiceChunk6(ServiceBase):
                             _QUOTE_PLACEHOLDER, literal_quote_message_id,
                         )
                     else:
-                        result = await self.transport.send_session(session, outgoing_content)
+                        result = await self.transport.send_session(
+                            session, outgoing_content, **voice_kwargs(outgoing_voice),
+                        )
                     error = _transport_failure(result)
                     if error is not None:
                         raise RuntimeError(error)
@@ -1048,6 +1059,9 @@ class ServiceChunk6(ServiceBase):
                     }
                     if message.get('quote_message_id'):
                         delivery['quoteMessageId'] = message['quote_message_id']
+                    if outgoing_voice:
+                        # 正文 `<tts/>` 意图随投递动作一起交给适配层（有才写这个键）。
+                        delivery['voice'] = True
                     outcome = await desktop_handler(delivery)
                     if not (isinstance(outcome, dict) and outcome.get('ok')):
                         failure = _record(outcome).get('error') or 'typ-0 宿主投递失败。'
@@ -1073,6 +1087,7 @@ class ServiceChunk6(ServiceBase):
                 delivery_target = sync(story, target) if callable(sync) else target
                 result = await self.transport.send_private(
                     delivery_target, outgoing_content, literal_quote_message_id,
+                    **voice_kwargs(outgoing_voice),
                 )
                 # 出站结果回写端点状态（deliverable 维）：失败进 5 分钟冷却。
                 note_outbound = getattr(self, 'note_endpoint_outbound', None)
@@ -1145,6 +1160,7 @@ class ServiceChunk6(ServiceBase):
                     )
                 delay = 0
                 later_segments = pick(message, 'laterSegments', 'later_segments') or []
+                later_voice = pick(message, 'laterSegmentsVoice', 'later_segments_voice') or []
                 for index, segment in enumerate(later_segments):
                     delay += self.typing_delay_milliseconds(segment)
                     # 本移植版：分段的等待 = 她在打这一条 → 非阻塞点亮输入状态，
@@ -1159,6 +1175,10 @@ class ServiceChunk6(ServiceBase):
                         'userInitiated': pick(message, 'userInitiated', 'user_initiated') is True,
                         **script_event_payload(message, index + 1),
                     }
+                    # v1.7.7：这一段由正文 `<tts/>` 指定要发语音。分段意图是延迟投递的，
+                    # 语音意图必须随 payload 一起排期，否则等它到期时已经无从知道。
+                    if index < len(later_voice) and later_voice[index] is True:
+                        payload['voice'] = True
                     if automatic_delivery:
                         payload['automaticDelivery'] = automatic_delivery
                     await self.append_intent(pick(story, 'id'), {
@@ -1486,17 +1506,29 @@ class ServiceChunk6(ServiceBase):
     # ------------------------------------------------------------------ #
 
     def split_outgoing_message(self, content: str) -> list[str]:
-        """上游 `splitOutgoingMessage(content)`（`:5372`）逐字移植。"""
-        runtime = _section(self.config, 'runtime')
-        if _cfg(runtime, 'splitReplyMessages', True) is False:
-            return [content]
-        separator = _cfg(runtime, 'messageSeparator')
-        separator = separator.strip() if isinstance(separator, str) else ''
-        if not separator:
-            separator = '<sep/>'
-        if not separator or separator not in content:
-            return [content]
-        return [part.strip() for part in content.split(separator) if part.strip()]
+        """上游 `splitOutgoingMessage(content)`（`:5372`）逐字移植（只要文本视图）。"""
+        return [segment['content'] for segment in self.split_outgoing_segments(content)]
+
+    def split_outgoing_segments(self, content: str) -> list[dict[str, Any]]:
+        """`splitOutgoingMessage` + 正文语音标记（v1.7.7）。
+
+        返回 `[{'content': str, 'voice': bool}, ...]`：切分口径与上游逐字一致，
+        另外把每个分段里的字面 `<tts/>` 删掉、把"这一段要发语音"记进 `voice`。
+
+        `model.audio.tts_enabled` 关掉时 `voice` 恒为 `False`——**标记照样删、
+        内容一字不少**，整条退回文字投递（不是丢消息）。这种情况留一条可见的 warn：
+        她的剧本散文里很可能写着"（发了条语音）"，模型与用户都要看得出标记**没生效**。
+        """
+        enabled = bool(self.voice_reply_enabled)
+        segments = runtime_bubble_segments(
+            _section(self.config, 'runtime'), content, enabled,
+        )
+        if not enabled and VOICE_MARKER in content:
+            self.report_standalone(
+                'warn',
+                '正文语音标记已忽略（文字转语音开关是关的），这一条按文字发出，内容不丢',
+            )
+        return segments
 
     # ------------------------------------------------------------------ #
     # typingDelayMilliseconds（上游 :5379）

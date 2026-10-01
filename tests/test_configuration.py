@@ -1489,6 +1489,40 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertIn("audio_understanding_enabled()", note,
                       "能力提示必须认总开关，否则会报出一个不存在的毛病")
 
+    def test_the_tts_switch_is_a_real_gate_not_a_dead_switch(self):
+        """「文字转语音」开关（v1.7.7）：schema 有它，核心与适配层都真的读它。
+
+        为什么它配得上一个开关：正文 `<tts/>` 标记会真的调宿主 TTS 合成并发 `Record`
+        （`upload`/`send_voice` 那条通路从 v1.7.2 起就可用），关掉后标记被忽略
+        （**退回发文字，不是丢消息**）、`send_voice` / `list_voices` 也不再下发。
+        默认必须是 **`true`** = 保持今天的行为。
+        """
+        audio = self.section("model_center.audio")
+        self.assertIs(audio["tts_enabled"]["default"], True, "默认必须保持现行为（发语音可用）")
+        self.assertTrue(audio["tts_enabled"]["description"])
+        hint = audio["tts_enabled"]["hint"]
+        self.assertIn("文字", hint, "hint 要说清关掉后只能改走文字")
+        self.assertIn("忽略", hint, "hint 要说清语音标记会被忽略")
+        core = read(os.path.join(PLUGIN_ROOT, "core", "service", "base.py"))
+        self.assertIn("def voice_reply_enabled", core)
+        chunk6 = read(os.path.join(PLUGIN_ROOT, "core", "service", "chunk6.py"))
+        body = chunk6.split("def split_outgoing_segments", 1)[1].split("def ", 1)[0]
+        self.assertIn("voice_reply_enabled", body, "标记解析必须真的读这个开关")
+        chunk12 = read(os.path.join(PLUGIN_ROOT, "core", "service", "chunk12.py"))
+        body = chunk12.split("def action_switch", 1)[1].split("def ", 1)[0]
+        self.assertIn("voice_reply_enabled", body, "关掉后语音动作要走既有的动作开关路径")
+        adapter = read(os.path.join(PLUGIN_ROOT, "adapters", "astrbot_bridge.py"))
+        self.assertIn("def voice_reply_enabled", adapter)
+        body = adapter.split("async def synthesize_voice", 1)[1].split("async def ", 1)[0]
+        self.assertIn("voice_reply_enabled()", body, "适配层的合成必须也认这个开关")
+        prompt = read(os.path.join(PLUGIN_ROOT, "core", "narrator_prompts.py"))
+        self.assertIn("ttsEnabled", prompt, "开关关掉时不许再教模型用这个标记")
+        writer = read(os.path.join(PLUGIN_ROOT, "core", "service", "chunk4.py"))
+        self.assertIn("'ttsEnabled': bool(self.voice_reply_enabled)", writer,
+                      "写作选项要把开关带给提示词（否则教了也用不了）")
+        defaults = read(os.path.join(PLUGIN_ROOT, "core", "service", "config.py"))
+        self.assertIn("'tts_enabled': True", defaults, "归一化默认值要与 schema 一致")
+
     def test_every_type_is_in_the_astrbot_allowed_set(self):
         bad = [(path, spec.get("type")) for path, _, spec in iter_fields(self.schema)
                if spec.get("type") not in ALLOWED_TYPES]

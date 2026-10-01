@@ -39,8 +39,9 @@
 
 from __future__ import annotations
 
+import base64
 import math
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from ..endpoints import endpoint_account_key
 from ..qzone import (
@@ -55,6 +56,7 @@ from ..qzone import (
     normalize_qzone_feed_entry,
     normalize_qzone_msg_entry,
     probe_qzone_available,
+    qzone_cgi_auth,
     qzone_feed_candidates,
     qzone_intent_from_payload,
     qzone_records_for_endpoint,
@@ -85,6 +87,11 @@ QZONE_AUTO_FEED_NOTE_INTERVAL_MS = 60 * 60 * 1000
 QZONE_POST_SUMMARY_CHARS = 120
 #: 改可见范围前回看多少条说说找"当前正文"（`emotion_cgi_update` 会按整条重建）。
 QZONE_VISIBILITY_LOOKUP_COUNT = 30
+#: 改带图说说的可见范围时，最多肯**重新上传**几张图（v1.7.8）。
+#:
+#: 一条说说的相册上限就是 9 张；超过这个数不可能来自一条正常说说（列表被拼坏 /
+#: 字段被污染），此时**明确拒绝**而不是"只传前 9 张"——静默少传一张就是丢内容。
+QZONE_UPLOAD_MAX_PICS = 9
 QZONE_COMMENT_SUMMARY_CHARS = 80
 
 _MILLISECONDS_PER_MINUTE = 60_000
@@ -587,11 +594,15 @@ class ServiceChunk13(ServiceBase):
         对空正文直接抛错）。所以：
 
         1. 用 `moods`（说说列表）按 `tid` 找回当前正文；
-        2. **带配图 / 转发的说说直接拒绝**——`richval`（图片）没法从列表里重建
-           （列表只给 url，不给 `albumid` / `lloc`），硬发空 `richval` 有可能把图弄丢，
-           属于"宁可少做也不猜"；拒绝时把原因说清楚，让模型改用「删说说 + 重发」或者
-           请用户手动改；
-        3. 这条动作**只有** NapCat WS 通道能做（NapCat / SnowLuma 都没有原生动作），
+        2. **带配图的说说先把原图重新上传一遍**（v1.7.8）：图片不在正文里，而在上传时由服务端
+           生成的 `richval`（`albumid` / `lloc` / `sloc` / …）里，说说列表只回图片 URL，拿不回
+           那串原文——所以走"下载原图 → 重新上传 → 用新回执拼 `richval` → 带着它 update"
+           这条路。代价是**图片在腾讯侧变成新上传的副本**（地址与相册记录都换了，点赞 / 评论 /
+           发布时间不受影响），用户已知并接受；这一步成功与失败都留**看得见**的记录。
+           **上传链上任何一步没成（下载失败 / 上传失败 / 回执字段不全 / 张数超限）一律明确拒绝**，
+           绝不带着空 `richval` 硬发——那等于让服务端按残缺的富文本块重建，是静默丢图的入口。
+        3. **转发的说说直接拒绝**——转发目标（`rt_con` / `rt_tid`）同样没法从列表里还原；
+        4. 这条动作**只有** NapCat WS 通道能做（NapCat / SnowLuma 都没有原生动作），
            拿不到 cookie 就明确失败，**不**回落平台。
 
         成功会：写剧本条目（她自己记得改了谁能看）+ 审计行 `confirmed` + 一条标准日志。
@@ -632,41 +643,136 @@ class ServiceChunk13(ServiceBase):
                 '找不到这条说说的当前正文（只回看最近 %d 条，且必须是她自己发的）；'
                 '不带上正文直接改会把正文清掉，所以这次不做。' % QZONE_VISIBILITY_LOOKUP_COUNT
             )
-        if _rows(pick(post, 'pic')):
-            return await fail(
-                '这条说说配了图：接口要求把整条说说重建回去，而图片信息（`richval`）'
-                '没法从列表里还原，硬改可能把图弄丢，所以不做。'
-            )
         if str(pick(post, 'rt_tid') or '').strip():
+            # 这条判断**必须在重新上传之前**：转发说说一样会被拒，而重传是**有副作用的**
+            # （腾讯侧真的多出一张副本）——先拒后传，别白传一趟。
             return await fail(
                 '这条是转发的说说：接口要求把整条说说重建回去，转发目标没法还原，所以不做。'
             )
+        pics = _rows(pick(post, 'pic'))
+        richval = ''
+        pic_bo = ''
+        shared_auth: Any = None
+        if pics:
+            # 带图：先把原图重新上传一遍，拿到新 `richval` 再 update（见方法 docstring）。
+            if len(pics) > QZONE_UPLOAD_MAX_PICS:
+                return await fail(
+                    '这条说说读回 %d 张配图，超过一条说说最多 %d 张的上限（列表数据可能被拼坏）：'
+                    '不敢猜哪几张是真的，所以不做。' % (len(pics), QZONE_UPLOAD_MAX_PICS)
+                )
+            try:
+                # 取一次凭据给整条链（N 张上传 + 一次 update）复用，省掉 N 次 get_cookies。
+                shared_auth = await qzone_cgi_auth(self._qzone_call_onebot())
+            except Exception as error:  # noqa: BLE001 - 拿不到凭据 = 这一步没成，明确拒绝
+                return await fail(
+                    '这条说说配了图：改可见范围前要把原图重新上传一次，但拿不到 QZone 凭证（%s），'
+                    '所以不做。' % error
+                )
+            richval, pic_bo, problem = await self._qzone_reupload_images(request, shared_auth, pics)
+            if not richval:
+                return await fail(
+                    '这条说说配了 %d 张图：接口要求把整条说说重建回去，原图的 `richval` 只能'
+                    '靠"重新上传一次"拿到，而这一步没成（%s）。为了不把图弄丢，这次不做。'
+                    % (len(pics), problem)
+                )
         content = str(pick(post, 'content') or '')
         if not content.strip():
             return await fail('这条说说读回来的正文是空的，不敢拿空正文去改（会把正文清掉）。')
         # ② 改可见范围（NapCat WS 通道；`QzoneCgiUnavailable` / CGI 失败由外层
         #    统一记 failed / unknown——"请求可能已到达"不自动重试）。
-        await call_qzone_cgi(request, self._qzone_call_onebot(), 'update_visibility', {
+        update_params: dict[str, Any] = {
             'tid': tid, 'content': content, 'ugcRight': right, 'targetUins': target_uins,
-        })
+        }
+        if richval:
+            update_params['richval'] = richval
+            if pic_bo:
+                update_params['pic_bo'] = pic_bo
+        await call_qzone_cgi(
+            request, self._qzone_call_onebot(), 'update_visibility', update_params,
+            auth=shared_auth,
+        )
         self.report_standalone('debug', 'QQ 空间动作走 NapCat WS 通道 动作=update_visibility')
         await self._qzone_set_status(pending_id, {
             'tid': tid, 'status': 'confirmed', 'postedAt': self.now(),
         })
+        if pics:
+            # 这是一笔**代价**（图片在腾讯侧变成新副本、地址与相册记录都换了），必须让用户
+            # 看得见——按坑 25 的口径走 warn，别塞进 diagnostic/debug。
+            self.report_standalone(
+                'warn',
+                'QQ 空间改可见范围：这条说说配了 %d 张图，已把原图**重新上传**一遍'
+                '（腾讯侧变成新上传的副本，图片地址已换）再重建了说说 tid=%s',
+                len(pics), tid,
+            )
         # 改的是"谁能看见"，对这段关系是有意义的事，所以进剧本（评论/点赞那种过细的才不进）。
+        metadata: dict[str, Any] = {'qzone_kind': 'visibility', 'tid': tid, 'ugc_right': right}
+        if pics:
+            # 事后追溯用：这条说说的配图被重新上传过（不是原图记录了）。
+            metadata['qzone_images_reuploaded'] = len(pics)
         await self.append_entry(story_id, {
             'kind': 'system', 'actor': 'character',
-            'content': '[空间动态] 她把说说的可见范围改成了「%s」：%s' % (
+            'content': '[空间动态] 她把说说的可见范围改成了「%s」：%s%s' % (
                 label, clip(content, QZONE_POST_SUMMARY_CHARS),
+                '（配图 %d 张已重新上传为新副本）' % len(pics) if pics else '',
             ),
             'occurredAt': iso(now),
-            'metadata': {'qzone_kind': 'visibility', 'tid': tid, 'ugc_right': right},
+            'metadata': metadata,
         }, now)
         self.report_operation(
             'standard', 'info', story, 'user-message',
-            'QQ 空间说说可见范围已改 tid=%s 可见性=%s（%s）', tid, right, label,
+            'QQ 空间说说可见范围已改 tid=%s 可见性=%s（%s）%s', tid, right, label,
+            '配图 %d 张已重新上传' % len(pics) if pics else '',
         )
         return {'ok': True, 'tid': tid, 'error': ''}
+
+    async def _qzone_reupload_images(
+        self, request: Any, auth: Any, pics: Sequence[Any],
+    ) -> tuple[str, str, str]:
+        """把这条说说原来的配图**重新上传**一遍，拼出新的 `richval` / `pic_bo`（v1.7.8）。
+
+        为什么非要重传：`emotion_cgi_update` 按整条重建，而图片不在正文里——它在**上传时**
+        由服务端生成的 `richval`（`albumid` / `lloc` / `sloc` / …）里，说说列表只回图片 URL，
+        拿不回那串原文。于是"下载原图 → 重新上传 → 用新回执拼 richval"。
+
+        返回 `(richval, pic_bo, 原因)`：`richval` 非空才算成功；失败时第三项是**给人看的
+        具体原因**（第几张、哪一步、什么错），由调用方写进审计行与 warn。
+        任何一步失败都立即回头，**绝不**"少一张也照发"——少一张就是静默丢内容。
+
+        多图按参考实现（`build_image_richval`）逐张拼、`\\t` 连接，组图与单图同一条路径；
+        `QZONE_UPLOAD_MAX_PICS` 以上的张数由调用方提前拒绝（这里不再截断）。
+        """
+        from ..qzone_cgi import build_image_richval
+
+        fetch = getattr(getattr(self, 'transport', None), 'fetch_image', None)
+        if not callable(fetch):
+            return '', '', '当前传输层没有下载图片的能力（fetch_image）'
+        receipts: list[Any] = []
+        for index, pic in enumerate(pics, start=1):
+            url = str(pick(pic, 'url', 'url1') or pick(pic, 'smallurl') or '').strip()
+            if not url:
+                return '', '', '第 %d 张图的地址是空的' % index
+            try:
+                raw = await fetch(url)
+            except Exception as error:  # noqa: BLE001 - 下载失败一律转成"这一步没成"
+                return '', '', '第 %d 张图下载失败：%s' % (index, error)
+            if not isinstance(raw, (bytes, bytearray)):
+                return '', '', '第 %d 张图下载失败（没拿到字节）' % index
+            try:
+                receipt = await call_qzone_cgi(
+                    request, self._qzone_call_onebot(), 'upload_image',
+                    {'picBase64': base64.b64encode(bytes(raw)).decode('ascii')},
+                    auth=auth,
+                )
+            except Exception as error:  # noqa: BLE001
+                return '', '', '第 %d 张图重新上传失败：%s' % (index, error)
+            receipts.append(receipt)
+        rich = build_image_richval(receipts)
+        if not rich:
+            return '', '', (
+                '上传回执里缺少拼 richval 需要的字段'
+                '（albumid/lloc/sloc/type/height/width）'
+            )
+        return str(rich.get('richval') or ''), str(rich.get('pic_bo') or ''), ''
 
     async def qzone_available(self, prefer_self_id: str = '') -> bool:
         """通道能力探测（上游 `qzoneAvailable`，只读）：`get_qzone_msg_list` 通不通。"""

@@ -923,6 +923,23 @@ class ServiceBase:
         )
 
     @property
+    def voice_reply_enabled(self) -> bool:
+        """`model.audio.tts_enabled`（v1.7.7）：**文字转语音**的总开关。
+
+        缺键按 **True**：这个键是 v1.7.7 才有的，旧配置文件里没有它时不能把
+        "她能用语音回话"悄悄关掉（`send_voice` 动作从 v1.7.2 起就是可用的，默认
+        必须保持今天的行为）。关掉之后：正文 `<tts/>` 标记被忽略（**退回发文字**，
+        标记照样从文本里删掉、内容一字不少），`send_voice` / `list_voices` 走既有的
+        "动作开关关掉"路径变成不可用。
+
+        与 `audio.enabled`（语音**理解**总开关）、`stt_enabled`（要不要调转写模型）
+        是三件互不相干的事，刻意各读各的键。段位同样是 `model.audio`——读顶层
+        `audio` 会永远拿到空段（见上面 `audio_config` 的同类说明）。
+        """
+        configured = _config_section(_config_section(self.config, 'model'), 'audio')
+        return _config_value(configured, 'ttsEnabled', 'tts_enabled') is not False
+
+    @property
     def sticker_config(self) -> dict[str, Any]:
         """上游 `get stickerConfig()`（`src/service.ts:2260`）：**顶层** `config.stickers`。
 

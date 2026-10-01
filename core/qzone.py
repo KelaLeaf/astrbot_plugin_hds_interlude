@@ -685,6 +685,17 @@ def qzone_cgi_request(action: str, auth: Any, params: Mapping[str, Any]) -> tupl
             auth, str(params.get('tid') or ''), str(params.get('content') or ''),
             int(_js_int_or(params.get('ugcRight', params.get('ugc_right')), 4) or 4),
             target_uins=params.get('targetUins', params.get('target_uins')) or (),
+            # v1.7.8：带图的说说在改可见范围前会把原图**重新上传**一次，这里带上新拼的
+            # 富文本块（空 = 纯文本路径，请求与 v1.7.5 逐字一致）。
+            richval=str(params.get('richval') or ''),
+            pic_bo=str(params.get('pic_bo') or ''),
+        )
+    if action == 'upload_image':
+        # v1.7.8：图片上传（改带图说说的可见范围时，先把原图重新传一遍拿新 richval）。
+        # 内部动作——不在 `QZONE_CGI_ACTIONS` / `QZONE_CGI_BY_ID` 里（模型看不到它）。
+        return cgi.build_upload_image_request(
+            auth, str(params.get('picBase64', params.get('pic_base64')) or ''),
+            str(params.get('filename') or 'filename'),
         )
     if action == 'delete':
         return cgi.build_delete_request(
@@ -721,12 +732,16 @@ def qzone_cgi_request(action: str, auth: Any, params: Mapping[str, Any]) -> tupl
 
 
 async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = None,
-                        login_call: Any = None) -> dict[str, Any]:
+                        login_call: Any = None, auth: Any = None) -> dict[str, Any]:
     """走 "NapCat WS 方案" 执行一次 QQ 空间动作。
 
     `request` 是 `Transport.request_text` 的绑定方法（原始 HTTP）。返回形状与
     `call_qzone_action` 对齐（成功回动作结果，失败抛 `QzoneActionError`），
     这样上层的限流/审计/剧本留痕那一套**不用改**。
+
+    `auth` 是给"一次动作要连打好几个 CGI"的场合准备的（v1.7.8 的带图改可见范围：
+    先上传 N 张图、再 update）：传进来就复用，不传就自己取一次（`qzone_cgi_auth`）
+    ——**不传时的行为与加这个参数之前逐字一致**。
 
     **失败分类与 `call_qzone_action` 同一套口径**（别在这里另造词汇）：
 
@@ -734,13 +749,16 @@ async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = Non
       `ambiguous=True`：请求**可能已经打到腾讯**了，结果未知，禁止自动重试；
     * 拿到响应而 `success_or_error` 判 `code != 0` → `ambiguous=False`：
       接口明确拒绝（没登录 / 风控 / 参数不对），重试是安全的；
-    * 成功 → 回动作结果。
+    * 成功 → 回动作结果。`upload_image` 回的是上传回执里的 `data`（一张图的描述：
+      `albumid` / `lloc` / `sloc` / `type` / `height` / `width` / `url`）——拿不到就
+      按失败抛（缺了它拼不出 `richval`，调用方必须能当场停下而不是硬发）。
     """
     from . import qzone_cgi as cgi
 
     if not callable(request):
         raise QzoneCgiUnavailable('QQ 空间（NapCat 通道）不可用：传输层没有原始 HTTP 能力', action, None, False)
-    auth = await qzone_cgi_auth(call, login_call)
+    if auth is None:
+        auth = await qzone_cgi_auth(call, login_call)
     method, url, headers, data = qzone_cgi_request(action, auth, params or {})
     try:
         # `Transport.request_text` 的约定是"失败返回 None、绝不抛"，但传输层实现
@@ -775,6 +793,16 @@ async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = Non
             '%s 失败：%s' % (action, result.get('message') or '未知错误'),
             action, result.get('code'), False,
         )
+    if action == 'upload_image':
+        # 上传回执有用的不是 `success_or_error` 那四个通用字段，而是 `data`（图片描述）。
+        # 拿不到就**当场失败**：没有它拼不出 `richval`，而调用方（改带图说说的可见范围）
+        # 唯一的安全出口是"拒绝"，绝不能带着空富文本块去重建说说。
+        receipt = cgi.image_upload_receipt(_json_or_none(text))
+        if not receipt:
+            raise QzoneActionError(
+                '%s 失败：回执里没有图片描述（data）' % action, action, result.get('code'), False,
+            )
+        return receipt
     return result
 
 

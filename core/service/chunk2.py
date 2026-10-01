@@ -77,6 +77,7 @@ import os
 import re
 from typing import Any, Optional
 
+from ..bubbles import runtime_bubble_segments
 from ..narrator_prompts import prompt_visible_message_content, recent_script_ownership
 from ..script.episode_index import (
     build_episode_index,
@@ -123,7 +124,7 @@ from .helpers import (
 #: `helpers.py` 把它实现成下划线私有（同文件里由 `normalizeGroupVisibleReply` 使用），
 #: 但 Chunk2 的流式早发路径同样需要它，这里按上游语义直接复用同一实现，避免两份漂移。
 from .helpers import _normalize_visible_message_content as normalize_visible_message_content
-from .transport import NullTransport
+from .transport import NullTransport, voice_kwargs
 
 __all__ = [
     'ServiceChunk2',
@@ -837,7 +838,9 @@ class ServiceChunk2(ServiceBase):
         把这条能力收敛到 `Transport.send_group`，因此「没有可用账号」等价于
         「没有可用的出站通道」。逐段投递并保留每段的结局，便于投递账本记账。
         """
-        segments = self.split_outgoing_message(content)
+        segments = runtime_bubble_segments(
+            _config_section(self.config, 'runtime'), content, bool(self.voice_reply_enabled),
+        )
         send = getattr(self.transport, 'send_group', None)
         if not callable(send):
             self.report(
@@ -849,7 +852,8 @@ class ServiceChunk2(ServiceBase):
                 'delivered_segments': [],
                 'complete': False,
                 'segment_outcomes': [
-                    {'index': index, 'content': segment, 'status': 'failed', 'reason': 'transport-unavailable'}
+                    {'index': index, 'content': segment['content'], 'status': 'failed',
+                     'reason': 'transport-unavailable'}
                     for index, segment in enumerate(segments)
                 ],
             }
@@ -857,18 +861,24 @@ class ServiceChunk2(ServiceBase):
         delivered_segments: list[str] = []
         segment_outcomes: list[dict[str, Any]] = []
         for index, segment in enumerate(segments):
+            segment_content = str(segment['content'])
             reply_to = reply_to_message_id if index == 0 and reply_to_message_id else None
             try:
-                result = await send(channel_id, segment, reply_to)
+                # 正文 `<tts/>` 指定的分段以语音投递（`voice_kwargs`：非语音路径
+                # 不传这个关键字，老实现的调用形状逐字不变）。
+                result = await send(
+                    channel_id, segment_content, reply_to,
+                    **voice_kwargs(segment.get('voice') is True and not reply_to),
+                )
                 if not isinstance(result, dict) or result.get('ok') is not True:
                     reason = pick(result, 'error') if isinstance(result, dict) else None
                     raise RuntimeError(str(reason or 'group-delivery-failed'))
-                delivered_segments.append(segment)
-                segment_outcomes.append({'index': index, 'content': segment, 'status': 'delivered'})
+                delivered_segments.append(segment_content)
+                segment_outcomes.append({'index': index, 'content': segment_content, 'status': 'delivered'})
             except Exception as error:
                 all_delivered = False
                 segment_outcomes.append({
-                    'index': index, 'content': segment, 'status': 'failed',
+                    'index': index, 'content': segment_content, 'status': 'failed',
                     'reason': clip(str(error), 500),
                 })
                 self.report(
@@ -1047,14 +1057,22 @@ class ServiceChunk2(ServiceBase):
             _message_characters(self.runtime_config),
             _config_value(self.runtime_config, 'messageSeparator', 'message_separator', '<sep/>'),
         )
-        if not content or len(self.split_outgoing_message(content)) != 1:
+        # v1.7.7：这条**不走** `prepareOutgoingDelivery`（早发直接进投递），
+        # 所以正文语音标记要在这里按同一口径处理：标记删掉（绝不进用户看到的字），
+        # 整条只有一段时它就是语音。多段内容本来就会被下面的单段守卫拒掉。
+        segments = runtime_bubble_segments(
+            _config_section(self.config, 'runtime'), content, bool(self.voice_reply_enabled),
+        )
+        if not content or len(segments) != 1:
             return False
+        early = segments[0]
         participant_id = pick(participant, 'id')
         delivered = await self.send_outgoing_messages(story, [{
             'participant_id': participant_id,
-            'content': content,
+            'content': early['content'],
             'interaction': interaction,
             'user_initiated': True,
+            **({'voice': True} if early['voice'] else {}),
         }], participant, session)
         if not delivered:
             return False
