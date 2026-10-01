@@ -8,10 +8,13 @@
  *
  * 1. **人工描述 vs 自动描述**（`manual`）：模型看到的素材目录里就是这句话，
  *    把"你写的"说成"自动写的"（或反过来）会直接误导用户去改错东西；
- * 2. **两段删除**：默认只标记（可恢复）与 `purge=true`（真删文件、不可恢复）
- *    必须是两套文案，按钮上就要看得出区别——"删错了"没有回收站；
+ * 2. **删除**：行内「删除」= 真删磁盘文件（不可逆），必须走就地二次确认——
+ *    按钮第一下变危险态、第二下才发请求；
  * 3. **`total` / `truncated`**：后端一次最多扫 500 行，只显示 60 条时用户会以为
  *    库里就这么多；数字与"还有多少没算进来"必须由这里给准话。
+ *
+ * 另外：这一页的用户可见文案一律短（状态词、动作词），**不写说明书**——
+ * 谁想解释一句"为什么"，请写进本文件的注释或 `docs/PORTING_NOTES.md`。
  */
 import type { StickerDeleteResult, StickerItem, StickerRescanResult } from './types'
 
@@ -24,9 +27,11 @@ export const NAME_LIMIT = 60
 export const DEFAULT_PAGE_SIZE = 60
 export const PAGE_SIZE_MAX = 200
 
-/** 两段删除的按钮文案：区别必须写在按钮上，不能只藏在确认里。 */
-export const MARK_DELETE_LABEL = '移除（可恢复）'
-export const PURGE_DELETE_LABEL = '彻底删除（不可恢复）'
+/** 行内两个动作的文案：说动作本身，不解释（解释是文档的事）。 */
+export const DELETE_LABEL = '删除'
+export const DELETE_CONFIRM_LABEL = '确认删除'
+export const DISABLE_LABEL = '停用'
+export const ENABLE_LABEL = '启用'
 
 export interface StickerFilters {
   status: string
@@ -164,7 +169,7 @@ export function resultSummary(input: {
   }
   const text = head.join(' · ')
   if (!input.truncated) return text
-  return `${text}；素材很多：后端只统计了最近的一批，更早的没算进来（重扫不会改变这一点，多筛选几次看）`
+  return `${text} · 只统计了最近一批`
 }
 
 /* ------------------------------------------------------------ 徽章映射 */
@@ -174,7 +179,7 @@ export function statusLabel(status: unknown): string {
   const value = clean(status).toLowerCase()
   if (value === 'active') return '在用'
   if (value === 'pending') return '待自动描述'
-  if (value === 'missing') return '已移除'
+  if (value === 'missing') return '缺失'
   if (value === 'disabled') return '已停用'
   return value || '未知状态'
 }
@@ -185,16 +190,6 @@ export function statusTone(status: unknown): Tone {
   if (value === 'pending') return 'warn'
   if (value === 'missing') return 'danger'
   return 'neutral'
-}
-
-/** 状态徽章的悬停说明：四种状态各自"发生了什么、怎么办"。 */
-export function statusHint(status: unknown): string {
-  const value = clean(status).toLowerCase()
-  if (value === 'active') return '在用：她挑素材时能选到这一条'
-  if (value === 'pending') return '还没有描述：下一次「重新扫描」会用视觉模型描述它'
-  if (value === 'missing') return '不在库里了：可能是你移除了它，也可能是文件本身不在了；文件还在磁盘上的话，重扫能找回来'
-  if (value === 'disabled') return '已停用：文件和描述都留着，只是不参与她的挑选'
-  return '后端给了个不认识的状态，照原样显示'
 }
 
 /** 素材形式：静止图 / 动图。 */
@@ -213,19 +208,11 @@ export function sourceLabel(source: unknown): string {
   return value || '未知来源'
 }
 
-export function sourceHint(source: unknown): string {
-  const value = clean(source).toLowerCase()
-  if (value === 'auto') return '她收到别人发的表情包时自动收进来的'
-  if (value === 'manual') return '从表情库目录里扫描进来的（你自己放进去的文件）'
-  return '后端给了个不认识的来源'
-}
-
 export interface DescriptionOwner {
   /** 描述是谁写的。 */
   manual: boolean
   label: string
   tone: Tone
-  hint: string
 }
 
 /**
@@ -243,19 +230,9 @@ export function isManual(value: unknown): boolean {
 
 export function descriptionOwner(item: { manual?: unknown }): DescriptionOwner {
   if (isManual(item?.manual)) {
-    return {
-      manual: true,
-      label: '人工写的',
-      tone: 'accent',
-      hint: '这句是你手写的：自动描述不会覆盖它，「交回自动描述」会把它退回去',
-    }
+    return { manual: true, label: '人工写的', tone: 'accent' }
   }
-  return {
-    manual: false,
-    label: '自动描述',
-    tone: 'neutral',
-    hint: '这句是视觉模型写的：你一改就变成「人工写的」，模型就不会再覆盖它',
-  }
+  return { manual: false, label: '自动描述', tone: 'neutral' }
 }
 
 /* ------------------------------------------------------ 写操作（请求体） */
@@ -317,34 +294,12 @@ export function updateNote(changed: unknown): string {
   const names: Record<string, string> = { description: '描述', name: '名字', disabled: '停用状态' }
   const list = Array.isArray(changed) ? changed.map((key) => names[String(key)] || String(key)) : []
   if (!list.length) return '已保存'
-  return `已保存（${list.join('、')}）：她下次挑素材时看到的就是这一份`
+  return `已保存（${list.join('、')}）`
 }
 
-/** 这条素材在界面上的称呼（描述 → 名字 → assetId）。 */
-export function stickerTitle(item: StickerItem): string {
-  return clean(item?.description) || clean(item?.name) || clean(item?.assetId) || '这条素材'
-}
-
-/**
- * 两段删除的警告文案：默认那一段要说得出"还能恢复"，`purge` 那一段必须写明
- * **不可恢复**。这句话挂在界面上（不是浏览器原生确认框——插件页跑在
- * `sandbox` 里，没带 `allow-modals` 时宿主会静默忽略 confirm，按钮看起来点了没反应）。
- */
-export function deleteWarning(item: StickerItem, purge: boolean): string {
-  if (purge) {
-    return `彻底删掉「${stickerTitle(item)}」？磁盘上的图片会被真删掉，不可恢复；`
-      + '库里只留一条「这里曾经有」的记录，想反悔只能重新拿到那张图再发一次。'
-  }
-  return `把「${stickerTitle(item)}」标记为移除？文件和描述都还留着，只是不再进入她的素材目录；`
-    + '之后点「重新扫描」就能把它找回来（可恢复）。'
-}
-
-/** 删除完成后的提示：`purged` 决定这是不是一句"还能恢复"。 */
+/** 删除完成后的提示（行内只有"真删文件"一种删除，短说即可）。 */
 export function deleteDoneNote(result: StickerDeleteResult): string {
-  if (result?.purged) {
-    return '已彻底删除：磁盘上的文件删掉了（不可恢复），库里留了一条记录'
-  }
-  return '已移除：文件和描述都还留着，重新扫描就能找回来（可恢复）'
+  return result?.purged ? '已删除' : '已删除（文件保留）'
 }
 
 /** 重扫结果：说清"跑完了、库里现在多少、新增多少"。 */
@@ -385,7 +340,7 @@ export function mergeStickerItems(
 export function staleOverridesNote(pending: number): string {
   const total = count(pending)
   if (!total) return ''
-  return `刚就地改了 ${total} 条：上面的合计与各状态数量还是刷新前的数字，点「刷新」重新统计`
+  return `合计待刷新（刚改了 ${total} 条）`
 }
 
 /* ------------------------------------------------------------ 空态与缩略图 */
@@ -398,16 +353,15 @@ export function emptyHint(input: {
   total: number
 }): string {
   if (!input.enabled) {
-    return '本地表情包库没启用：去「配置」里打开「本地表情包 → 启用本地表情包库」，'
-      + '自动收藏与重新扫描才会动。'
+    return '本地表情包库未启用，去「配置」里打开它。'
   }
   if (input.hasFilters) {
-    return '没有符合这些筛选条件的素材。换个条件，或点「重置筛选」看全部。'
+    return '没有符合条件的素材，试试「重置筛选」。'
   }
   if (count(input.total) === 0 && !input.autoCollect) {
-    return '库里还没有素材，而且自动收藏是关着的：只有你放进表情库目录的文件会被扫进来。'
+    return '库里还没有素材（自动收藏已关闭）。'
   }
-  return '库里还没有素材：她收到别人发的表情包之后，点「重新扫描」把它们收进来。'
+  return '库里还没有素材，点「重新扫描」找找。'
 }
 
 /**

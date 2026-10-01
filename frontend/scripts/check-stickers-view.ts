@@ -6,14 +6,19 @@
  * 长列表只看得到 60 条却不说还有多少、就地更新之后合计数字悄悄变成错的。
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
-  DEFAULT_PAGE_SIZE, DESCRIPTION_LIMIT, EMPTY_FILTERS, MARK_DELETE_LABEL, NAME_LIMIT,
-  PAGE_SIZE_MAX, PURGE_DELETE_LABEL, activeFilterCount, deleteDoneNote, deletePayload,
-  deleteWarning, descriptionOwner, disabledPayload, emptyHint, fileLabel, isManual, kindLabel,
+  DEFAULT_PAGE_SIZE, DELETE_CONFIRM_LABEL, DELETE_LABEL, DESCRIPTION_LIMIT, DISABLE_LABEL,
+  EMPTY_FILTERS, ENABLE_LABEL, NAME_LIMIT, PAGE_SIZE_MAX, activeFilterCount, deleteDoneNote,
+  deletePayload, descriptionOwner, disabledPayload, emptyHint, fileLabel, isManual, kindLabel,
   mergeStickerItems, pageOffset, pageSize, pageWindow, rescanNote, restorePayload,
-  resultSummary, saveBlocker, sourceLabel, staleOverridesNote, statusHint, statusLabel,
-  statusTone, stickerParams, stickerTitle, thumbnailEndpoint, updateNote, updatePayload,
+  resultSummary, saveBlocker, sourceLabel, staleOverridesNote, statusLabel,
+  statusTone, stickerParams, thumbnailEndpoint, updateNote, updatePayload,
 } from '../src/stickers-view.ts'
+
+const here = dirname(fileURLToPath(import.meta.url))
 import type { StickerItem } from '../src/types.ts'
 
 function item(patch: Partial<StickerItem> = {}): StickerItem {
@@ -102,10 +107,10 @@ assert.equal(pageWindow(-4, 60, 10).start, 0)
 const summary = resultSummary({ total: 137, shown: 60, limit: 60, offset: 60, truncated: false })
 assert.match(summary, /共 137 条/)
 assert.match(summary, /本页 60 条（第 61–120 条）/, '只说"共 137 条"会让用户以为这一页就是全部')
-assert.doesNotMatch(summary, /最近的一批/)
+assert.doesNotMatch(summary, /只统计了最近一批/)
 const truncated = resultSummary({ total: 137, shown: 60, limit: 60, offset: 0, truncated: true })
 assert.match(truncated, /共 137 条/)
-assert.match(truncated, /更早的没算进来/, 'truncated 必须让用户看见，别以为库里就这么多')
+assert.match(truncated, /只统计了最近一批/, 'truncated 必须让用户看见，别以为库里就这么多（一句话就够）')
 assert.equal(
   resultSummary({ total: 0, shown: 0, limit: 60, offset: 0, truncated: false }),
   '共 0 条 · 本页 0 条',
@@ -115,7 +120,7 @@ assert.equal(
 
 assert.equal(statusLabel('active'), '在用')
 assert.equal(statusLabel('pending'), '待自动描述')
-assert.equal(statusLabel('missing'), '已移除')
+assert.equal(statusLabel('missing'), '缺失', 'missing 用中性词（"移除"已经不是用户的动作了）')
 assert.equal(statusLabel('disabled'), '已停用')
 assert.equal(statusLabel('weird'), 'weird', '不认识的状态照原样显示，不要编一个')
 assert.equal(statusLabel(''), '未知状态')
@@ -124,10 +129,6 @@ assert.equal(statusTone('pending'), 'warn')
 assert.equal(statusTone('missing'), 'danger')
 assert.equal(statusTone('disabled'), 'neutral')
 assert.equal(statusTone('weird'), 'neutral')
-// 四种状态的悬停说明必须各不相同（"待描述"和"已移除"混了就等于没说）。
-const hints = ['active', 'pending', 'missing', 'disabled'].map((value) => statusHint(value))
-assert.equal(new Set(hints).size, 4)
-assert.match(statusHint('missing'), /重扫/, '移除可恢复这条要写在说明里')
 assert.equal(kindLabel('image'), '静止图')
 assert.equal(kindLabel('animated'), '动图')
 assert.equal(kindLabel(''), '未知形式')
@@ -144,8 +145,6 @@ assert.equal(manual.label, '人工写的')
 assert.equal(auto.label, '自动描述')
 assert.notEqual(manual.label, auto.label, '两种描述必须在界面上分得开')
 assert.notEqual(manual.tone, auto.tone, '两种描述的颜色也要分得开')
-assert.match(manual.hint, /交回自动描述/, '人工写的那条要指出去哪退回')
-assert.match(auto.hint, /改/, '自动描述要说明改了之后就归你')
 // 后端只回 SQLite 的 1/0 时不能被判成"自动"（`is True` 的老病）。
 assert.equal(descriptionOwner({ manual: 1 }).manual, true)
 assert.equal(isManual(1), true)
@@ -209,37 +208,23 @@ assert.deepEqual(restorePayload({ ...item(), manual: 1 as unknown as boolean }),
 
 /* ---------------------------------------------------- 删除的两段语义 */
 
-assert.equal(MARK_DELETE_LABEL, '移除（可恢复）')
-assert.equal(PURGE_DELETE_LABEL, '彻底删除（不可恢复）')
-assert.deepEqual(deletePayload(item(), false), { assetId: 'sticker-1a2b3c4d', purge: false })
+// 行内两个动作：动作词本身就是文案（不长、不解释）
+assert.equal(DELETE_LABEL, '删除')
+assert.equal(DELETE_CONFIRM_LABEL, '确认删除')
+assert.equal(DISABLE_LABEL, '停用')
+assert.equal(ENABLE_LABEL, '启用')
 assert.deepEqual(deletePayload(item(), true), { assetId: 'sticker-1a2b3c4d', purge: true })
-// 默认那一段（`purge` 不给）绝不能变成真删。
+assert.deepEqual(deletePayload(item(), false), { assetId: 'sticker-1a2b3c4d', purge: false })
+// `purge` 不给时绝不能变成真删（后端那条只标记的路还要能单独调用）
 assert.equal(deletePayload(item(), undefined as unknown as boolean).purge, false)
-
-const markWarning = deleteWarning(item(), false)
-const purgeWarning = deleteWarning(item(), true)
-assert.match(markWarning, /可恢复/, '默认那一步要能看懂"还能恢复"')
-assert.match(markWarning, /重新扫描/)
-assert.doesNotMatch(markWarning, /不可恢复/)
-assert.match(purgeWarning, /不可恢复/, '真删文件必须写明不可恢复')
-assert.match(purgeWarning, /真删掉/)
-assert.notEqual(markWarning, purgeWarning, '两段删除不能是同一句文案')
-// 没有描述/名字时也要说得出是哪一条。
-assert.match(deleteWarning(item({ description: '', name: '', assetId: 'sticker-9' }), true), /sticker-9/)
-assert.equal(stickerTitle(item({ description: '', name: '小猫咪' })), '小猫咪')
-
-assert.match(deleteDoneNote({ assetId: 's', purged: false, deletedFile: false, file: '', changed: ['deleted'] }), /可恢复/)
-assert.match(deleteDoneNote({ assetId: 's', purged: true, deletedFile: true, file: '', changed: ['deleted'] }), /不可恢复/)
-assert.doesNotMatch(
-  deleteDoneNote({ assetId: 's', purged: false, deletedFile: false, file: '', changed: [] }),
-  /不可恢复/,
-)
+assert.equal(deleteDoneNote({ assetId: 's', purged: true, deletedFile: true, file: '', changed: ['deleted'] }), '已删除')
+assert.equal(deleteDoneNote({ assetId: 's', purged: false, deletedFile: false, file: '', changed: [] }), '已删除（文件保留）')
 
 // 重扫结果 / 保存提示。
 assert.equal(rescanNote({ scanned: true, assets: 42, added: 3 }), '扫描完成：库里现在 42 条，新增 3 条')
 assert.equal(rescanNote({ scanned: true, assets: 42, added: 0 }), '扫描完成：库里现在 42 条，没有发现新素材')
-assert.match(updateNote(['description']), /描述/)
-assert.match(updateNote(['description', 'disabled']), /描述、停用状态/)
+assert.equal(updateNote(['description']), '已保存（描述）')
+assert.equal(updateNote(['description', 'disabled']), '已保存（描述、停用状态）')
 assert.equal(updateNote([]), '已保存')
 
 /* ------------------------------------------------------------ 就地更新 */
@@ -260,6 +245,7 @@ assert.equal(mergeStickerItems(rows, {})[0].description, '一只挥手的猫')
 assert.equal(staleOverridesNote(0), '')
 assert.match(staleOverridesNote(2), /刷新/)
 assert.match(staleOverridesNote(2), /2 条/)
+assert.ok(staleOverridesNote(2).length < 24, '这是状态行，不是句子')
 
 /* ------------------------------------------------------------ 空态 */
 
@@ -271,6 +257,7 @@ assert.match(off, /配置/)
 assert.match(filtered, /筛选/)
 assert.match(nothing, /重新扫描/)
 assert.equal(new Set([off, filtered, nothing, noAuto]).size, 4, '四种空态不能是同一句话')
+assert.ok([off, filtered, nothing, noAuto].every((text) => text.length < 26), '空态也给短句')
 // 库里明明有（被筛掉了），不能说是空的。
 assert.match(emptyHint({ enabled: true, autoCollect: true, hasFilters: true, total: 9 }), /筛选/)
 
@@ -315,4 +302,31 @@ assert.equal(endpointUrl('  '), '')
 ;(globalThis as { window?: unknown }).window = {}
 assert.equal(endpointUrl(thumbnailEndpoint(item())), '', '拿不到插件名时回空串')
 
-console.log('stickers-view ok')
+/* --------------------------------------- 这一页要像工具，不像说明书（用户点名） */
+
+// 用户原话："这整个都是没必要的描述" —— 整段解释、成对的"可恢复 / 不可恢复"、把内部状态讲给用户听，
+// 一律不许回到这一页。这里直接扫源码，比断言某个渲染结果更不容易漏。
+const panelSource = readFileSync(join(here, '..', 'src', 'panels', 'Stickers.tsx'), 'utf8')
+const viewSource = readFileSync(join(here, '..', 'src', 'stickers-view.ts'), 'utf8')
+const FORBIDDEN = [
+  '这一页在改什么',   // 那块整段说明的面板
+  '彻底删除',         // 动作就叫「删除」
+  '不可恢复',         // 不解释为什么不可逆
+  '可恢复',           // 更没有"两段删除"这回事了
+  '移除（',           // 「移除（可恢复）」这个按钮不许回来
+  '已移除',           // 内部状态改中性词「缺失」
+  '不参与挑选',       // 状态徽章只写状态词
+  '素材目录：',       // 目录路径不再摆给用户看
+  '她下次挑素材时看到的就是这一份', // 保存提示不写小作文
+]
+for (const word of FORBIDDEN) {
+  assert.ok(!panelSource.includes(word), `面板里不许再出现「${word}」`)
+  assert.ok(!viewSource.includes(word), `文案模块里不许再出现「${word}」`)
+}
+// 也不许再有一个"说明"性质的面板（图标 info / 标题像说明书）。
+assert.ok(!/<Panel[^>]*icon="info"/.test(panelSource), '面板里不许再挂说明性质的 Panel')
+assert.ok(!/这一页|说明/.test(panelSource.match(/<Panel[\s\S]{0,80}?title=\{?[^}]*\}?/) ?? ''), 'Panel 标题不许写成说明书')
+// 两个动作的词必须在（动作就是这两个词，不要长句）。
+assert.ok(panelSource.includes('DELETE_LABEL') && panelSource.includes('DISABLE_LABEL') && panelSource.includes('ENABLE_LABEL'))
+
+console.log('stickers-view ok（文案只留状态词与动作词，无说明书段落）')
