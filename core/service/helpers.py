@@ -65,6 +65,8 @@ __all__ = [
     'normalize_media_segments',
     'describe_image_media',
     'describe_card_media',
+    'media_kind_label',
+    'card_media_label',
     'guess_audio_format',
     # ---- 表情 / 表态 ----
     'calibrated_native_face_willingness',
@@ -596,29 +598,47 @@ def _media_attr(attributes: Any, key: str) -> str:
 
 
 def describe_image_media(attributes: Any) -> str:
-    """`<img>` → `[图片]` / `[表情包]` / `[动画表情]` / `[QQ 商城表情]`。"""
-    kind = _media_attr(attributes, 'kind').lower()
-    summary = _media_attr(attributes, 'summary')
+    """`<img>` → `[图片]` / `[表情包]` / `[动画表情]` / `[QQ 商城表情]`（文本入口）。"""
+    return media_kind_label(_media_attr(attributes, 'kind'), _media_attr(attributes, 'summary'))
+
+
+def media_kind_label(kind: Any, summary: Any) -> str:
+    """媒体种类 + 平台原文 → 给人/模型看的标签（**唯一判据，两个入口共用**）。
+
+    入口一：`describe_image_media()`（文本里的 `<img kind=… summary=…>`，只用来出标签）；
+    入口二：`chunk3` 读**结构化媒体表**（`session.media`，种类与来源都在里面，
+    §46）。标签必须逐字一致，所以两处都走这一个函数。
+    """
+    kind_text = _str(kind).strip().lower()
+    summary_text = _str(summary).strip()
     # 平台给的 summary 比我们推测的 kind 更具体：`[动画表情]` 说明它还会动。
-    if '动画' in summary:
+    if '动画' in summary_text:
         return '[动画表情]'
-    if kind in IMAGE_MEDIA_KIND_LABELS:
-        return IMAGE_MEDIA_KIND_LABELS[kind]
-    if '表情' in summary:
+    if kind_text in IMAGE_MEDIA_KIND_LABELS:
+        return IMAGE_MEDIA_KIND_LABELS[kind_text]
+    if '表情' in summary_text:
         return '[表情包]'
     return '[图片]'
 
 
 def describe_card_media(attributes: Any) -> str:
-    """`<card>`（QQ 小程序 / 分享卡片）→ `[QQ小程序：标题]` / `[分享卡片：标题]`。
+    """`<card>`（QQ 小程序 / 分享卡片）→ `[QQ小程序：标题]` / `[分享卡片：标题]`（文本入口）。
 
     卡片必须带上**是什么**：只有 `<card/>` 时模型只能含糊成"他发了点什么"。
     """
-    app = _media_attr(attributes, 'app')
-    title = _media_attr(attributes, 'title') or _media_attr(attributes, 'prompt')
-    mini = app.startswith('com.tencent.miniapp') or app.startswith('110')
-    if title:
-        return ('[QQ小程序：%s]' if mini else '[分享卡片：%s]') % title[:40]
+    return card_media_label(
+        _media_attr(attributes, 'app'),
+        _media_attr(attributes, 'title') or _media_attr(attributes, 'prompt'),
+    )
+
+
+def card_media_label(app: Any, title: Any) -> str:
+    """卡片属性 → 标签（**唯一判据，两个入口共用**，同 `media_kind_label`）。"""
+    app_text = _str(app).strip()
+    title_text = _str(title).strip()
+    mini = app_text.startswith('com.tencent.miniapp') or app_text.startswith('110')
+    if title_text:
+        return ('[QQ小程序：%s]' if mini else '[分享卡片：%s]') % title_text[:40]
     return '[QQ小程序]' if mini else '[分享卡片]'
 
 

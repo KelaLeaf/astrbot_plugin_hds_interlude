@@ -1640,6 +1640,23 @@ class AutomaticStickerCollectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(host.transport.fetched, [])
             self.assertEqual(await host.db_get('interlude_sticker', {}), [])
 
+    async def test_text_sources_are_never_fetched_even_with_a_sticker_kind(self):
+        """§46.8：`text:`（正文坐标）在采集路径上同样永不取回 —— 连种类对也不下载。
+
+        生产上媒体表是适配器写的、不会出现 `text:`；这条是**护栏**：哪天有人把正文里的
+        坐标接回采集路径，这里会直接红（不下载、不读盘、零入库）。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            source = 'text:https://cdn.example.com/a.png'
+            host.transport.payloads[source] = _png()
+            self.assertEqual(
+                await host.collect_incoming_stickers([{'source': source, 'kind': 'sticker'}], [source]),
+                [],
+            )
+            self.assertEqual(host.transport.fetched, [])
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+
     async def test_bytes_that_are_not_images_are_skipped(self):
         """种类对但字节不是图片（HTML 错误页 / 纯文本 / 空）→ 零入库 + 一条 warn。"""
         with tempfile.TemporaryDirectory() as tmp:

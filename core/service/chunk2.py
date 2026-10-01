@@ -259,9 +259,9 @@ def _media_sources(media: Any) -> list[str]:
     """`media` 里**带来源**的那几条 → 去重后的来源表（顺序保持）。
 
     群聊的收藏钩子用它当 `collect_incoming_stickers(media, sources)` 的来源表：
-    `media` 与 `image_sources` 本来就是同一条链路（`_fallback_extract_session_media`
-    与 `_fallback_extract_session_image_sources` 共用同一套来源归一化），再抽一次
-    来源只会多一处对齐点。没有来源的条目（小程序卡片）本来也收不了。
+    `media` 与 `image_sources` 本来就是同一条链路（适配层写下的结构化媒体表里
+    `source` 与 `extract_session_image_sources` 读出来的那个字符串逐字一致，§46），
+    再抽一次来源只会多一处对齐点。没有来源的条目（小程序卡片）本来也收不了。
     """
     sources: list[str] = []
     for item in (media or []):
@@ -1619,8 +1619,9 @@ class ServiceChunk2(ServiceBase):
         群批次的 `turn['messages']` 会在 `flush_group_turn` 里被
         `del turn['messages'][:]` 清空，回读等于跟刷出抢时序（刷出先跑就静默丢收藏）。
         `media` 就是**同一次解析**的结果——群与私聊共用同一条
-        `extract_session_media`（`session.content` 的 `<img kind=…>` → `[{source,kind,…}]`），
-        判据仍然只有 `helpers.collectible_sticker_kind()` 一处，不从 `[表情包]` 文本反推。
+        `extract_session_media`（适配层写在 `SessionView.media` 上的结构化媒体表 →
+        `[{source,kind,…}]`，§46），判据仍然只有 `helpers.collectible_sticker_kind()`
+        一处，**不从 `[表情包]` 文本也不从 `<img>` 文本反推**。
 
         纯文字 / 只有普通照片的群消息**不建任务**（同私聊：旁路也不该按消息量线性增加调度）；
         `auto_collect_guess` 打开时普通照片也算"值得建任务"（第二层判据只对 `kind == 'image'`
@@ -1714,8 +1715,9 @@ class ServiceChunk2(ServiceBase):
 
         1. **种类必须是观测到的**：只有 `sticker` / `animated` / `market` 才考虑收藏。
            种类来自适配层从 OneBot 原始段捞出来的 `sub_type` / `summary`（见
-           `astrbot_bridge.raw_media_hints`），经 `extract_session_media` 成了
-           每条媒体的 `kind`。**缺失 / 未知 / `image` / `card` 一律不收**，记 debug。
+           `astrbot_bridge.raw_media_hints`），**结构化**地随 `SessionView.media`
+           下来，经 `extract_session_media` 成了每条媒体的 `kind`（§46；core **不读**
+           正文里的 `<img>` 文本）。**缺失 / 未知 / `image` / `card` 一律不收**，记 debug。
            第一层认了的种类**直接收，永远不走模型**（行为与 v1.8.0 逐字一致）。
         2. **字节要真的验过是图片**：魔数嗅探（png/jpg/gif/webp）不过就跳过 + debug。
         3. **上限**：超过 `max_file_size_mb` 的字节在 `store_collected_sticker` 里被挡掉
@@ -2091,9 +2093,13 @@ class ServiceChunk2(ServiceBase):
         读本地文件的口子**只对适配器给出来的来源开放**（`onebot-file:` / `file://`），
         与 `chunk3.fetch_native_image` 的信任边界同源；`onebot-url:` / `http(s)` 走
         `Transport.fetch_image`（`ctx.http_get` 是它的回退，由 `chunk3` 提供）。
+        `text:`（正文里读出来的坐标，§46.8）一律不认：既不下载也不读盘。
         """
         value = source.strip()
         if not value:
+            return None
+        if value.startswith('text:') or value == 'text:':
+            # 正文坐标的惰性前缀（与 `chunk3.TEXT_SOURCE_PREFIX` 同一个约定）。
             return None
         if value.startswith('data:image/'):
             match = re.match(r'^data:(image/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$', value, re.IGNORECASE)

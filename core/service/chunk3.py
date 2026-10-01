@@ -360,27 +360,67 @@ def _local_image_path(value: Any) -> str:
     return text.strip()
 
 
-def _fallback_extract_session_image_sources(session: Any) -> list[str]:
-    """上游 `extractSessionImageSources`（`src/service.ts:7036`）逐字移植。
+#: **文本来源的惰性前缀**（受控偏离 §46.8）。
+#:
+#: `session.content` 是用户可写的字符串：谁都能在里面手打 `<img src="…"/>` 或
+#: `[CQ:image,url=…]`。上游把 `[CQ:image,…]` 的 url 记成 `onebot-url:…` —— 那是
+#: "适配器提供"的坐标，取回时**跳过主机白名单**；于是"原生视觉"能被一段正文指向
+#: 任意地址。这里把所有**从正文读出来**的坐标一律标成 `text:`：
+#:
+#: * 条目照常出现（`imageCount`、附件条目、`[图片]` 那份叙事文本都不变）；
+#: * `fetch_native_image()` 见到它直接回 `None` —— **永不取回**；
+#: * 它也没有本地读文件的口子（`file=` token 同样惰性化）。
+TEXT_SOURCE_PREFIX = 'text:'
 
-    只解析这条消息的原始内容（`session.elements` 归适配器所有，可能被别的
-    中间件跨回合复用，否则旧图片元素会被误挂到后续纯文本回合上）。
+#: 「这个宿主没有结构化媒体观测通道」这条能力缺失告警的最短间隔（毫秒，按会话节流）。
+#: 与 `STICKER_COLLECT_WARN_INTERVAL_MS` / `note_access_skip` 同一条纪律：能力缺失必须
+#: 让人看见，但同一条原因不能刷屏（一条图片消息每分钟能来十几条）。
+MEDIA_OBSERVABILITY_WARN_INTERVAL_MS = 10 * 60 * 1000
+
+
+def _fallback_extract_session_image_sources(session: Any) -> list[str]:
+    """上游 `extractSessionImageSources`（`src/service.ts:7036`）+ **文本来源惰性化**。
+
+    这一份只用于**没有结构化媒体观测通道**的会话（`SessionView.media is None`：
+    老宿主 / 只给了 `message_str` / 自己搓 `SessionView` 的调用方）。有结构化媒体表时
+    走 `_structured_image_sources()`，**绝不看文本**（§46.8）。
+
+    与上游的两处受控偏离：
+
+    * 正文里读出来的 http(s) 坐标一律加 `text:`（上游是裸 URL；`[CQ:image,…]` 更是
+      `onebot-url:` —— 后者正是"手打一个 CQ 码就能让她下载任意地址"的入口）；
+    * 正文里的 `file=` token 同样惰性化（上游会去读本地文件）。
+
+    **适配器直给的元素**（`session.elements`）**不变**：那一份仍然记成 `onebot-file:`，
+    仍然允许读本地文件（可信坐标），与正文无关。只解析这条消息的原始内容
+    （`session.elements` 归适配器所有，可能被别的中间件跨回合复用，否则旧图片元素
+    会被误挂到后续纯文本回合上）。
     """
     raw = _text(_member(session, 'content'))
     sources: list[str] = []
 
     def add(value: Any, kind: str = 'url') -> None:
         source = _text(value).strip()
-        if not source or source in sources:
-            return
-        if len(source) > 8 * 1024 * 1024:
+        if not source or len(source) > 8 * 1024 * 1024:
             return
         if re.match(r'^https?://', source, re.IGNORECASE):
-            sources.append('onebot-url:%s' % source if kind == 'adapter-url' else source)
+            # 上游这里是裸 URL / `onebot-url:`；本移植版一律惰性（§46.8）。
+            entry = '%s%s' % (TEXT_SOURCE_PREFIX, source)
         elif re.match(r'^data:image/', source, re.IGNORECASE):
-            sources.append(source)
+            # 内联图片就地解码、没有取回动作，照上游保留。
+            entry = source
+        elif kind == 'element-file':
+            # 适配器直给的本地路径：唯一允许读本地文件的坐标。
+            entry = 'onebot-file:%s' % source
         elif kind == 'file':
-            sources.append('onebot-file:%s' % source)
+            # 来自正文的 `file=` token：惰性（上游会去读本地文件，那等于给正文开一个
+            # 本地读文件的口子）。
+            entry = '%s%s' % (TEXT_SOURCE_PREFIX, source)
+        else:
+            return
+        # 去重按**最终坐标**（上游按原文去重，带前缀的那几种会重复记账）。
+        if entry not in sources:
+            sources.append(entry)
 
     def image_src(element: Any) -> Any:
         if not is_record(element):
@@ -403,7 +443,7 @@ def _fallback_extract_session_image_sources(session: Any) -> list[str]:
         for element in trusted:
             src = image_src(element)
             if src and not re.match(r'^(?:https?://|data:image/)', _text(src), re.IGNORECASE):
-                add(_local_image_path(src), 'file')
+                add(_local_image_path(src), 'element-file')
 
     parse = _helper('_parse_mini_xml_elements')
     visit_elements = _helper('_visit_elements')
@@ -437,83 +477,110 @@ def _fallback_extract_session_image_sources(session: Any) -> list[str]:
     return sources
 
 
-def _fallback_extract_session_media(session: Any) -> list[dict[str, Any]]:
-    """入站媒体（图片 / QQ 小程序卡片）→ `[{source, kind, summary, label}]`。
+def _structured_image_sources(entries: Any) -> list[str]:
+    """结构化媒体表 → 视觉来源表（`[{'source',…}]` → `[str]`）。
 
-    与 `_fallback_extract_session_image_sources` **同源**：`source` 用同一套归一化
-    （`onebot-url:` / `onebot-file:` / `data:image/` / 本地 `file://`），所以调用方可以
-    直接拿图片来源去这张表里对齐种类，不依赖遍历顺序。
+    与 `_structured_session_media()` 是**同一份数据**（`SessionView.media`）：
+    图片来源就是媒体来源，payload 的 `attachments` 才能按 `source` 对齐种类（§29/§45）。
 
-    `kind` / `summary` 来自适配层从 OneBot 原始段捞回来的 `<img kind=… summary=…>`；
-    取不到就是普通图片（`[图片]`）。卡片没有可下载来源，单独按顺序列出。
+    `file://…`（适配器把图落到本地）归一成 `onebot-file:…`，与上游从 `session.elements`
+    认本地路径的那套坐标**同形** —— 那是本移植版里唯一允许读本地文件的坐标。
+    卡片（`source` 为空）不产生来源。
     """
-    raw = _text(_member(session, 'content'))
+    sources: list[str] = []
+    for entry in entries or []:
+        if not is_record(entry):
+            continue
+        source = _text(pick(entry, 'source')).strip()
+        if not source or source in sources:
+            continue
+        source_kind = _text(pick(entry, 'source_kind')).strip().lower()
+        if source.startswith('onebot-file:'):
+            sources.append(source)
+        elif source_kind == 'path' or re.match(r'^file://', source, re.IGNORECASE):
+            sources.append('onebot-file:%s' % _local_image_path(source))
+        elif (
+            re.match(r'^https?://', source, re.IGNORECASE)
+            or re.match(r'^data:image/', source, re.IGNORECASE)
+            or source_kind in ('url', 'data', 'file')
+        ):
+            # `source_kind == 'file'` 但没带前缀（桌面桥的自造坐标）：补上与上游同形的前缀，
+            # 否则它既取不回、也和媒体表对不上。
+            sources.append(
+                'onebot-file:%s' % _local_image_path(source) if source_kind == 'file' else source
+            )
+        elif re.match(r'^(?:[A-Za-z]:[\\/]|/)', source):
+            # 没标注种类的绝对路径（手搓媒体条目）：当适配器给的本地坐标处理。
+            sources.append('onebot-file:%s' % _local_image_path(source))
+    return sources
+
+
+def _structured_session_media(session: Any) -> list[dict[str, Any]]:
+    """读适配层写下来的**结构化媒体表**（`session.media`）→ `[{source,kind,summary,label}]`。
+
+    为什么必须结构化（`docs/PORTING_NOTES.md` §46）：这条链路上的判据是"这张图是不是
+    表情包"，而旧的实现是从 `session.content` 的 `<img kind=…>` 文本里正则反解析的。
+    正文是**用户可写**的——谁都能在消息里手打一个
+    `<img src="http://任意地址" kind="sticker"/>`，于是"收藏表情包"会真的去下载那个
+    地址（SSRF-lite）并往库里塞垃圾。判据只能来自适配器**观测到的原始段**。
+
+    入口与形状：
+
+    * 产出口：`astrbot_bridge.serialize_message_chain(..., media=[…])`（图片的
+      `kind` / `summary` 来自 OneBot 原始段的 `sub_type` / `summary`，卡片来自
+      `Json` 组件），随 `SessionView.media` 一起下来；
+    * 每项：`kind`（`image` / `sticker` / `animated` / `market` / `card`）、
+      `source`（归一化来源；视觉来源表就是它的规范化形式，见
+      `_structured_image_sources`）、`summary`（平台原文）、`raw`（原始判据，
+      core 侧不用，只做透传的余量）；
+    * `label` 在这里由 `helpers.media_kind_label` / `helpers.card_media_label`
+      算出来 —— 文案只有一处（见 §46）。
+
+    ⚠️ **种类这一半没有文本降级**：`media` 不是 list（`None` / 缺失：老宿主、
+    `message_str` 兜底、手搓 `SessionView`）就回空表 —— 不收藏、payload 里没有
+    attachments、也没有媒体事实。**绝不**回退去解析文本。（"来源"那一半的降级见
+    `_extract_session_image_sources`：文本坐标带 `text:` 惰性前缀，永不取回。）
+    """
+    entries = pick(session, 'media')
+    if not isinstance(entries, list):
+        return []
+    label_of_image = _helper('media_kind_label')
+    label_of_card = _helper('card_media_label')
     media: list[dict[str, Any]] = []
     seen: set[str] = set()
-    describe_image = _helper('describe_image_media')
-    describe_card = _helper('describe_card_media')
-
-    def add(source: Any, attrs: str = '') -> None:
-        value = _text(source).strip()
-        if not value or value in seen:
-            return
-        seen.add(value)
-        kind = 'image'
-        summary = ''
-        found = re.search(r'kind=["\']([^"\']*)["\']', attrs, re.IGNORECASE) if attrs else None
-        if found:
-            kind = found.group(1).strip().lower() or 'image'
-        found = re.search(r'summary=["\']([^"\']*)["\']', attrs, re.IGNORECASE) if attrs else None
-        if found:
-            summary = found.group(1).strip()
-        label = describe_image(attrs) if callable(describe_image) else '[图片]'
-        media.append({'source': value, 'kind': kind, 'summary': summary, 'label': label})
-
-    # 图片：只解析这条消息的内容（`session.elements` 归适配器所有，可能被跨回合复用）
-    for match in re.finditer(r'<(?:img|image)\b([^>]*?)/?>', raw, re.IGNORECASE):
-        attrs = match.group(1)
-        source = ''
-        for key in ('src', 'url'):
-            found = re.search(r'%s=["\']([^"\']*)["\']' % key, attrs, re.IGNORECASE)
-            if found and found.group(1).strip():
-                source = found.group(1).strip()
-                break
-        if not source:
-            found = re.search(r'file=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
-            if found:
-                source = 'onebot-file:%s' % found.group(1).strip()
-        add(source, attrs)
-    # 适配器直给的本地图片（与 `extract_session_image_sources` 的信任边界一致：
-    # 只认适配器元素，绝不给正文里手写的路径开本地读文件的口子）。
-    trusted = _member(session, 'elements')
-    if isinstance(trusted, list):
-        for element in trusted:
-            if not is_record(element) or _text(element.get('type')).lower() not in ('img', 'image'):
-                continue
-            attrs = element.get('attrs') if is_record(element.get('attrs')) else {}
-            data = element.get('data') if is_record(element.get('data')) else {}
-            merged = {**data, **attrs}
-            source = _text(merged.get('src') or merged.get('url'))
-            if source and not re.match(r'^(?:https?://|data:image/)', source, re.IGNORECASE):
-                add(_local_image_path(source), _attrs_text(merged))
-
-    # 小程序 / 分享卡片：没有可下载来源，按出现顺序列出，供文字与 payload 使用。
-    for match in re.finditer(r'<card\b([^>]*?)/?>', raw, re.IGNORECASE):
-        label = describe_card(match.group(1)) if callable(describe_card) else '[分享卡片]'
-        media.append({'source': '', 'kind': 'card', 'summary': '', 'label': label})
+    for entry in entries:
+        if not is_record(entry):
+            continue
+        kind = _text(pick(entry, 'kind')).strip().lower()
+        if kind == 'card':
+            # 卡片没有可下载来源：只留一条"他转了个什么"，给 payload 与叙事用。
+            raw = pick(entry, 'raw')
+            attributes = raw if is_record(raw) else {}
+            label = (
+                label_of_card(attributes.get('app'), attributes.get('title') or attributes.get('prompt'))
+                if callable(label_of_card) else '[分享卡片]'
+            )
+            media.append({'source': '', 'kind': 'card', 'summary': '', 'label': label})
+            continue
+        source = _text(pick(entry, 'source')).strip()
+        if not source or source in seen:
+            continue
+        seen.add(source)
+        summary = _text(pick(entry, 'summary')).strip()
+        label = (
+            label_of_image(kind or 'image', summary) if callable(label_of_image) else '[图片]'
+        )
+        media.append({'source': source, 'kind': kind or 'image', 'summary': summary, 'label': label})
     return media
 
 
-def _attrs_text(attrs: Any) -> str:
-    """把属性字典还原成 `key="value"` 串（标签解析只认字符串，统一从这里过一道）。"""
-    if not is_record(attrs):
-        return ''
-    return ' '.join('%s="%s"' % (key, value) for key, value in attrs.items() if value not in (None, ''))
-
-
 def _extract_session_media(session: Any) -> list[dict[str, Any]]:
-    """`extract_session_media`：优先 helpers.py 的移植版，缺失走本模块回退。"""
-    return (_helper('extract_session_media') or _fallback_extract_session_media)(session)
+    """入站媒体 → `[{source, kind, summary, label}]`；**唯一入口**，只读结构化数据。
+
+    旧实现（从 `session.content` 里的 `<img kind=…>` 文本反解析）已经**整段删除**，
+    别接回来：那条路把用户手打的文本当判据（§46）。
+    """
+    return _structured_session_media(session)
 
 
 def _format_buffered_user_messages(messages: list[Any]) -> str:
@@ -521,9 +588,64 @@ def _format_buffered_user_messages(messages: list[Any]) -> str:
     return (_helper('format_buffered_user_messages') or _fallback_format_buffered_user_messages)(messages)
 
 
+#: 没有观测通道时，正文里"有图"的可见痕迹：坐标之外的第二种判据。
+#: 有些宿主只给 `message_str`，而它把图片渲染成 `[图片]` / `[动画表情]` 这种占位。
+#: ⚠️ 用户自己也能打出这几个字 —— 在没有观测通道的宿主上我们分不清，而"看不见图"
+#: 这件事必须至少说一次（节流 10 分钟一条），所以这里刻意宁可多报一次。
+_MEDIA_PLACEHOLDER_RE = re.compile(r'\[\s*(?:图片|表情包|动画表情|QQ\s*商城表情|视频)\s*\]')
+
+
+def _note_missing_media_observability(service: Any, session: Any, sources: Any) -> None:
+    """`media is None`（没有观测通道）而这条消息确实有图 → 一条**节流 warn**（§46.9.2）。
+
+    判据（`media is None` 先短路，所以 `[]` 场景永远不会走到下面）：
+
+    * `pick(session, 'media') is None`：适配层根本没交结构化媒体表（老宿主 / 只给
+      `message_str` / 手搓 `SessionView`）——`[]` **不算**（那是"观测到零媒体"）；
+    * 且"确实有图"命中二者之一：
+      1. `sources` 非空（正文里解析出了图片坐标，`currentEvent.imageCount` 就是它）；
+      2. 正文里有 `[图片]` / `[动画表情]` 这类**占位文本**（宿主把图渲染成了文字，
+         连坐标都没有）。
+
+    为什么必须可见（坑 25）：这种宿主拿不到原生图片输入 —— 图片只会以 `[图片]` 文本
+    告知模型、**永不取回**（§46.7）。用户看不到就会以为"她瞎了"。
+    节流照 `note_access_skip`（键里带会话坐标与原因，同一条原因 10 分钟一条）。
+    """
+    if pick(session, 'media') is not None:
+        return
+    if not sources and not _MEDIA_PLACEHOLDER_RE.search(_text(_member(session, 'content'))):
+        return
+    note = getattr(service, 'note_access_skip', None)
+    if not callable(note):
+        return
+    platform = _text(_member(session, 'platform')) or '?'
+    self_id = _text(_member(session, 'selfId', 'self_id')) or '?'
+    scope = (
+        _text(_member(session, 'channelId', 'channel_id'))
+        or _text(_member(session, 'userId', 'user_id'))
+        or '?'
+    )
+    note(
+        'media-observability|%s|%s|%s' % (platform, self_id, scope),
+        MEDIA_OBSERVABILITY_WARN_INTERVAL_MS,
+        '当前平台没有提供结构化媒体（只能拿到文本），原生图片输入不可用：'
+        '图片只会以 [图片] 文本告知模型，不会被取回。若是 OneBot 适配器，请检查适配器版本。',
+    )
+
+
 def _extract_session_image_sources(session: Any) -> list[str]:
-    """`extract_session_image_sources`：优先 helpers.py 的移植版。"""
-    return (_helper('extract_session_image_sources') or _fallback_extract_session_image_sources)(session)
+    """入站图片来源（视觉路径 `sources`）：**结构化优先**，只在没有观测通道时回退文本。
+
+    * `SessionView.media` 是 list（含空表）→ 只读结构化那份（`_structured_image_sources`），
+      **绝不看文本**：正文里手打的 `<img src=…>` / `[CQ:image,…]` 一条都不进来源表；
+    * `media` 是 `None` / 缺失 / 不是 list（老宿主、只给 `message_str`、手搓 `SessionView`
+      的调用方）→ 上游那套文本抽取，但**所有文本坐标带 `text:` 惰性前缀**（永不取回）。
+      见 `docs/PORTING_NOTES.md` §46.8。
+    """
+    entries = pick(session, 'media')
+    if isinstance(entries, list):
+        return _structured_image_sources(entries)
+    return _fallback_extract_session_image_sources(session)
 
 
 # =========================================================================== #
@@ -1013,10 +1135,14 @@ class ServiceChunk3(ServiceBase):
 
         附件本身走原生多模态通道；普通文本里**不留**图片占位符：抓取失败/被过滤
         必须表现为「没有视觉输入」，而不是邀请模型编一个。
+
+        本移植版追加一件事：**没有观测通道**（`session.media is None`）而这条消息
+        确实有图片时，打一条节流 warn（能力缺失，§46.9 / 坑 25）。
         """
         raw = _text(_member(session, 'content'))
         sources = _extract_session_image_sources(session)
         media = _extract_session_media(session)
+        _note_missing_media_observability(self, session, sources)
         text = normalize_qq_native_face_segments(raw)
         describe_card = _helper('describe_card_media')
         if callable(describe_card):
@@ -1159,8 +1285,14 @@ class ServiceChunk3(ServiceBase):
 
         只有 QQ/OneBot 的 CDN 主机在原生视觉路径里被取回，避免任意用户 URL
         变成内网抓取代理；适配器直接给的 URL（`adapterProvided`）例外。
+
+        ⚠️ `text:` 前缀（正文里读出来的坐标）**永不取回**：它既不算适配器提供，
+        也不认主机白名单 —— 否则手打一句 `[CQ:image,url=…]` 就能让她下载任意地址
+        （受控偏离 §46.8）。
         """
         value = _text(source).strip()
+        if value.startswith(TEXT_SOURCE_PREFIX):
+            return None
         if value.startswith('onebot-url:'):
             return await self.fetch_native_image(value[len('onebot-url:'):], bot, True)
         if value.startswith('onebot-file:'):

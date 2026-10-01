@@ -310,6 +310,10 @@ def desktop_session(
     `channelId` 群聊取 `event.channelId`，私聊取 `event.channelId ||
     'private:' + event.senderId`；正文是 `event.content` 拼上每个
     `imageSources` 的 `<img src="...">`（空串被丢掉，与 JS `.filter(Boolean)` 一致）。
+
+    **结构化媒体表**（§46）也从 `imageSources` 造：桌面协议里没有种类字段，所以
+    一律是 `image`（普通图片，不可收藏）。正文里手打的 `<img kind=…>` 不算数 ——
+    core 只读这份。
     """
     record = event if isinstance(event, dict) else {}
     kind = pick(record, 'kind')
@@ -325,6 +329,15 @@ def desktop_session(
     pieces = [_js_string(pick(record, 'content') or '')]
     pieces.extend('<img src="%s">' % escape_attribute(source) for source in image_sources)
     content = ''.join(piece for piece in pieces if piece)
+    media = [
+        {
+            'kind': 'image', 'source': str(source),
+            # 桌面协议只给坐标：http(s)/data 算 url，其余当本地文件。
+            'source_kind': 'url' if re.match(r'^(?:https?|data):', str(source), re.IGNORECASE) else 'file',
+            'summary': '', 'raw': {},
+        }
+        for source in image_sources if str(source).strip()
+    ]
     raw_message_id = pick(record, 'rawMessageId', 'raw_message_id')
     delivery_payload = {
         'accountKey': pick(record, 'accountKey', 'account_key'),
@@ -345,6 +358,7 @@ def desktop_session(
         guild_id=(channel_id or '') if kind == 'group' else '',
         is_direct=kind == 'private',
         content=content,
+        media=media,
         quote=pick(record, 'quote'),
         message_id=raw_message_id,
         username=pick(record, 'senderName', 'sender_name') or sender_id,

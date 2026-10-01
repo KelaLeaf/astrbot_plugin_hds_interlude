@@ -93,7 +93,7 @@ from .helpers import (
 # 群音频的批次预算（上游 2197-2215）住在 chunk3：那里有 `audioConfig` 的解析与
 # `load_native_audio`。chunk3 **不** import chunk1，所以这条模块级依赖不成环。
 # `_extract_session_media` 同源：群聊入站的自动收藏要**与私聊同一份**结构化媒体表
-# （`<img kind=…>` → `[{source, kind, summary, label}]`），不能另外推一份（见 §45.6）。
+# （`SessionView.media` → `[{source, kind, summary, label}]`），不能另外推一份（见 §45.6/§46）。
 from .chunk3 import _extract_session_media, _load_group_batch_audio
 
 __all__ = ['ServiceChunk1']
@@ -1074,9 +1074,10 @@ class ServiceChunk1(ServiceBase):
         # 自动收藏入站表情包（群聊覆盖，受控偏离 §45.6）：种类必须在**文本化之前**拿到。
         # `describe_group_attachments` 会把 `<img kind=…>` 翻成 `[表情包]` / `[动画表情]`
         # 文本，从那种文本反推种类就是"两种拼写、两处判据"的老病（坑 46）。
-        # 这里用的是与私聊**同一条** `extract_session_media`：同一个适配层标记
-        # （`raw_media_hints` → `<img kind=…>`）、同一个 `kind`，判据仍然只有
-        # `helpers.collectible_sticker_kind()` 一处。
+        # 这里用的是与私聊**同一条** `extract_session_media`：同一份**结构化媒体表**
+        # （适配层从观测到的 OneBot 原始段写下的 `SessionView.media`，§46）、同一个
+        # `kind`，判据仍然只有 `helpers.collectible_sticker_kind()` 一处 ——
+        # **不读正文里的任何 `<img>` 文本**（用户手打的标签不算数）。
         group_media = _extract_session_media(session)
         message_content = describe_group_attachments(_session_read(session, 'content'))
 

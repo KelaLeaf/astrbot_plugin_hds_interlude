@@ -1216,47 +1216,88 @@ class LocalImageSourceTests(unittest.TestCase):
         self.assertEqual(self._sources('<img src="/etc/passwd"/>', []), [])
         self.assertEqual(self._sources('<img src="file:///etc/passwd"/>', []), [])
 
-    def test_http_sources_still_work_in_both_paths(self):
+    def test_http_sources_are_recorded_but_inert(self):
+        """正文里的 http 来源仍被记下（`imageCount` / 附件条目照旧），但带 `text:` 惰性前缀。
+
+        受控偏离 §46.8：上游这里给的是**裸 URL**（`[CQ:image,…]` 更是 `onebot-url:`，
+        取回时跳过主机白名单）—— 那正是"手打的正文能让她下载任意地址"的入口。
+        条目还在，只是永不取回（`fetch_native_image()` 见到 `text:` 直接回 None）。
+        """
         url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=x'
-        self.assertEqual(self._sources('<img src="%s"/>' % url, []), [url])
+        self.assertEqual(self._sources('<img src="%s"/>' % url, []), ['text:%s' % url])
         self.assertEqual(
             self._sources('<img src="%s"/>' % url,
                           [{'type': 'img', 'attrs': {'src': url}, 'children': []}]),
-            [url],
+            ['text:%s' % url],
+        )
+
+    def test_text_file_tokens_are_inert_while_adapter_elements_stay_trusted(self):
+        """正文里的 `file=` token 惰性化；`session.elements`（适配器直给）仍是可信坐标。"""
+        content = '<img src="file:///tmp/a.png"/><img file="/tmp/b.png"/>'
+        elements = [{'type': 'img', 'attrs': {'src': 'file:///tmp/a.png'}, 'children': []}]
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='2', content=content, elements=elements,
+        )
+        self.assertEqual(
+            chunk3._fallback_extract_session_image_sources(session),
+            ['onebot-file:/tmp/a.png', 'text:/tmp/b.png'],
         )
 
 
 class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
 
     def test_describe_vision_event_strips_attachment_markup_and_keeps_sources(self) -> None:
+        """正文里的来源照旧进 `sources`（`imageCount` 与附件条目不变），但带 `text:` 惰性前缀。"""
         host = FakeService()
         event = ServiceChunk3.describe_vision_event(host, {
             'content': '看这个<img src="https://gchat.qpic.cn/a.png"/>好看吗[CQ:record,file=v.silk]',
         })
         self.assertEqual(event['content'], '看这个好看吗')
-        self.assertEqual(event['sources'], ['https://gchat.qpic.cn/a.png'])
+        self.assertEqual(event['sources'], ['text:https://gchat.qpic.cn/a.png'])
 
     def test_describe_vision_event_keeps_image_only_input_wordless(self) -> None:
         """上游注释：抓取失败/被过滤必须表现为「没有视觉输入」，不邀请模型编造。"""
         host = FakeService()
         event = ServiceChunk3.describe_vision_event(host, {'content': '<img src="https://gchat.qpic.cn/a.png"/>'})
         self.assertEqual(event['content'], '')
-        self.assertEqual(event['sources'], ['https://gchat.qpic.cn/a.png'])
+        self.assertEqual(event['sources'], ['text:https://gchat.qpic.cn/a.png'])
 
-    def test_extract_session_image_sources_prefers_cdn_url_then_file_token(self) -> None:
-        host = FakeService()
+    def test_extract_session_image_sources_structured_first_then_inert_text(self) -> None:
+        """§46.8：表在 → **只读结构化**；表不在（`None`/缺失）→ 文本降级但全部惰性。"""
+        # 表在：正文里的三种写法**一条都不进来源表**（种类与来源都只认观测到的那份）。
+        structured = SessionView(
+            platform='onebot', self_id='1', user_id='2',
+            content=('<img src="https://gchat.qpic.cn/real.png"/>'
+                     '<img src="https://gchat.qpic.cn/typed.png"/>'
+                     '[CQ:image,url=https://gchat.qpic.cn/cq.png]'),
+            media=[{'kind': 'image', 'source': 'https://gchat.qpic.cn/real.png',
+                    'source_kind': 'url', 'summary': '', 'raw': {}}],
+        )
+        self.assertEqual(
+            chunk3._extract_session_image_sources(structured),
+            ['https://gchat.qpic.cn/real.png'],
+        )
+        # 空表也算"表在"：观测到零媒体 → 不回退文本。
+        self.assertEqual(
+            chunk3._extract_session_image_sources(
+                SessionView(content='<img src="https://x/b.png"/>', media=[]),
+            ),
+            [],
+        )
+
+        # 没有观测通道（老宿主 / 手搓 session）→ 上游那套文本抽取，坐标一律 `text:`。
         self.assertEqual(
             # 上游 `add(fields.url || fields.cache_url, 'adapter-url')` → 带 onebot-url: 前缀
             chunk3._extract_session_image_sources({'content': '[CQ:image,file=a.jpg,url=https://x/a.jpg]'}),
-            ['onebot-url:https://x/a.jpg'],
+            ['text:https://x/a.jpg'],
         )
         self.assertEqual(
             chunk3._extract_session_image_sources({'content': '[CQ:image,file=abc.jpg]'}),
-            ['onebot-file:abc.jpg'],
+            ['text:abc.jpg'],
         )
         self.assertEqual(
             chunk3._extract_session_image_sources({'content': '<img src="https://x/b.png"/><img src="https://x/b.png"/>'}),
-            ['https://x/b.png'],
+            ['text:https://x/b.png'],
         )
         self.assertEqual(chunk3._extract_session_image_sources({'content': '普通文字'}), [])
 
@@ -1298,6 +1339,43 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
             host, 'onebot-url:https://example.com/a.png',
         )
         self.assertEqual(adapter['mime_type'], 'image/png')
+
+    async def test_text_sources_are_never_fetched_even_on_trusted_hosts(self) -> None:
+        """红线（§46.8）：`text:`（正文里读出来的坐标）**永不取回**，连主机白名单都不认。
+
+        这条钉的是"来源"这一半的洞：从前正文里的 `[CQ:image,url=…]` 会被记成
+        `onebot-url:`（= 适配器提供，取回时跳过白名单），手打一句就能让她下载任意地址；
+        裸 URL 也会因为 QQ CDN 白名单被取回。
+        """
+        seen: list[str] = []
+        png = _png_bytes()
+        host = _MediaHost(config={'model': {'vision': {'enabled': True}}})
+
+        async def fetch(url: str) -> bytes:
+            seen.append(url)
+            return png
+
+        host.transport = FakeTransport(fetch_image=fetch)
+        for source in (
+            'text:https://gchat.qpic.cn/a.png',       # 可信主机也不认
+            'text:https://multimedia.nt.qq.com.cn/b.png',
+            'text:https://example.com/c.png',
+            'text:/tmp/secret.png',                   # 也没有本地读文件的口子
+        ):
+            with self.subTest(source=source):
+                self.assertIsNone(await ServiceChunk3.fetch_native_image(host, source))
+        self.assertEqual(seen, [], '正文里的坐标一次都不许取回')
+
+        # 正向对照：适配器观测到的同一批坐标照旧取回（白名单 / 适配器标记不变）。
+        self.assertEqual(
+            (await ServiceChunk3.fetch_native_image(host, 'https://gchat.qpic.cn/a.png'))['mime_type'],
+            'image/png',
+        )
+        self.assertEqual(
+            (await ServiceChunk3.fetch_native_image(host, 'onebot-url:https://example.com/a.png'))['mime_type'],
+            'image/png',
+        )
+        self.assertEqual(seen, ['https://gchat.qpic.cn/a.png', 'https://example.com/a.png'])
 
     async def test_fetch_native_image_decodes_data_uris_and_rejects_non_images(self) -> None:
         host = _MediaHost(config={'model': {'vision': {'enabled': True}}})
@@ -1387,18 +1465,49 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await ServiceChunk3.describe_current_images(host, {'id': 's'}, [{'id': 'i'}], '看看'))
         self.assertTrue(any('侧端识图跳过' in str(entry) for entry in host.logs))
 
-    def test_extract_session_media_reads_kind_and_cards(self) -> None:
-        """媒体种类必须和图片来源对齐，并带上卡片（受控偏离 §29）。"""
+    def test_extract_session_media_reads_the_structured_table_only(self) -> None:
+        """媒体种类必须和图片来源对齐，并带上卡片（受控偏离 §29）。
+
+        输入是适配层写下的**结构化媒体表**（`SessionView.media`，§46）：
+        `kind`/`summary` 来自 OneBot 原始段，`raw` 是原始判据，卡片没有来源。
+        """
         media = chunk3._extract_session_media({
+            'media': [
+                {'kind': 'sticker', 'source': 'https://x/a.png', 'source_kind': 'url',
+                 'summary': '[动画表情]', 'raw': {'sub_type': '1'}},
+                {'kind': 'card', 'source': '', 'source_kind': '', 'summary': '',
+                 'raw': {'app': 'com.tencent.miniapp', 'title': '宝箱'}},
+            ],
             'content': '<img src="https://x/a.png" kind="sticker" summary="[动画表情]"/>'
                        '<card app="com.tencent.miniapp" title="宝箱"/>',
-            'elements': [],
         })
         self.assertEqual(media[0]['source'], 'https://x/a.png')
         self.assertEqual(media[0]['kind'], 'sticker')
         self.assertEqual(media[0]['label'], '[动画表情]')
         self.assertEqual(media[1]['kind'], 'card')
         self.assertEqual(media[1]['label'], '[QQ小程序：宝箱]')
+
+    def test_extract_session_media_never_reads_the_message_text(self) -> None:
+        """红线（§46）：正文里手打的 `<img … kind="sticker"/>` **一个都不算数**。
+
+        内容与上一条**逐字相同**，区别只在没有结构化媒体表。判据曾经是从这段文本里
+        正则抠出来的 —— 那样谁都能手打一个 `<img src="http://任意地址" kind="sticker"/>`
+        冒充表情包（会真的去下载那个地址）。取不到结构化数据必须回**空表**，
+        绝不回退解析文本。
+        """
+        content = ('<img src="https://evil.example/x.png" kind="sticker"/>'
+                   '<img src="https://evil.example/x.png" kind="animated"/>'
+                   '<card app="com.tencent.miniapp" title="宝箱"/>')
+        for session in (
+            {'content': content, 'elements': []},
+            {'content': content},
+            SessionView(platform='onebot', self_id='1', user_id='2', content=content),
+            # 老宿主 / 结构缺失：`media` 不是列表也一律按"没有"处理。
+            {'content': content, 'media': None},
+            {'content': content, 'media': 'sticker'},
+        ):
+            with self.subTest(session=session):
+                self.assertEqual(chunk3._extract_session_media(session), [])
 
     def test_vision_event_keeps_cards_as_text(self) -> None:
         """卡片是可读内容，留成标签；图片标记照旧拿掉（上游语义）。"""
@@ -1411,7 +1520,7 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('[图片]', event['content'])
         self.assertNotIn('<card', event['content'])
         self.assertIn('[QQ小程序：宝箱]', event['content'])
-        self.assertEqual(event['sources'], ['https://x/a.png'])
+        self.assertEqual(event['sources'], ['text:https://x/a.png'])
 
     async def test_describe_current_images_returns_observations(self) -> None:
         host = _MediaHost(config={'model': {'vision': {'detail': 'low'}}})

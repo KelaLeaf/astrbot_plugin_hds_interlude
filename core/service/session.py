@@ -40,6 +40,7 @@ SESSION_VIEW_KEYS = {
     'isDirect': 'is_direct', 'is_direct': 'is_direct',
     'content': 'content',
     'elements': 'elements',
+    'media': 'media',
     'quote': 'quote',
     'messageId': 'message_id', 'message_id': 'message_id',
     'username': 'username',
@@ -93,6 +94,25 @@ class SessionView:
     # 这里保留占位以兼容 `session.bot.selfId` 这类读取（`canHandleSession`
     # 只用 session.selfId，故默认 None 是安全的）。
     bot: Any = None
+    # **结构化媒体表**（本移植版新增，`docs/PORTING_NOTES.md` §46）：适配器从
+    # **观测到的原始段 / 组件**里写下来的
+    # `[{'kind', 'source', 'source_kind', 'summary', 'raw'}, …]`。
+    #
+    # 为什么要有它：种类（照片 / 表情包 / 动图 / 商城表情 / 卡片）与来源过去是 core 从
+    # `content` 的 `<img kind=…>` **文本**里反解析出来的 —— 而正文是用户可写的，
+    # 谁都能手打一个 `<img src="http://任意地址" kind="sticker"/>` 冒充表情包
+    # （会真的去下载、往库里塞垃圾）。现在 core 只读这一份。
+    #
+    # 三种取值（§46.5 / §46.8）：
+    #
+    # * 有内容 → 种类与来源都只从这里来；
+    # * `[]` → **观测到零媒体**（适配器交上来了，这条消息里没有图片 / 卡片）；
+    # * `None` / 缺失 → 适配器**根本没有观测通道**（老宿主 / 自己搓 `SessionView` 的
+    #   调用方）→ 只有"来源"那一半允许回退到上游的文本抽取，而文本坐标一律带 `text:`
+    #   惰性前缀（**永不取回**）；"种类"那一半没有回退，一律空表。
+    #
+    # 字段放末尾：位置参数构造的调用方不受影响。
+    media: Optional[list[dict[str, Any]]] = None
 
     # ---- Koishi `Session` 上 service 层用到的读取入口 ----
 

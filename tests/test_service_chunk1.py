@@ -1299,6 +1299,38 @@ ANIMATED_TAG = (
 UNKNOWN_KIND_TAG = '<img src="https://cdn.example.com/wat.png" kind="wat"/>'
 
 
+def image_media(source: str, kind: str = 'image', summary: str = '', raw: Any = None) -> dict[str, Any]:
+    """适配层为一张图写下的**结构化媒体条目**（`SessionView.media` 的一项）。
+
+    形状与 `astrbot_bridge.serialize_message_chain(..., media=[…])` 写下的逐字一致
+    （夹具不造生产没有的东西；形状由 `test_astrbot_bridge.IncomingMediaKindTests` 钉住）。
+    """
+    return {
+        'kind': kind, 'source': source, 'source_kind': 'url', 'summary': summary,
+        'raw': dict(raw or {}),
+    }
+
+
+def card_media(app: str, title: str = '') -> dict[str, Any]:
+    """适配层为一张分享卡片写下的结构化条目（卡片没有可下载来源）。"""
+    return {
+        'kind': 'card', 'source': '', 'source_kind': '', 'summary': '',
+        'raw': {'app': app, 'title': title},
+    }
+
+
+#: **真实**表情包在会话里长这样：正文标记（给人/模型看的文本）与结构化条目
+#: （唯一判据）**成对出现**——两者都是适配层同一次序列化写出来的。
+#: 手打的正文只有前者，那正是 §46 的红线用例（`..._hand_typed_...`）。
+PHOTO_MEDIA = image_media('https://cdn.example.com/photo.png')
+STICKER_MEDIA = image_media('https://cdn.example.com/sticker.png', 'sticker', raw={'sub_type': '1'})
+ANIMATED_MEDIA = image_media(
+    'https://cdn.example.com/animated.gif', 'animated', '[动画表情]',
+    raw={'sub_type': '0', 'summary': '[动画表情]'},
+)
+UNKNOWN_KIND_MEDIA = image_media('https://cdn.example.com/wat.png', 'wat')
+
+
 class _GroupByteTransport:
     """只实现 `fetch_image` 的传输桩：按 URL 回字节，并记下被请求过哪些 URL。
 
@@ -1380,13 +1412,16 @@ class GroupStickerCollectionTests(ServiceHarness):
 
     @needs('receive_group', 'collect_incoming_stickers')
     async def test_group_stickers_are_collected_from_the_structured_kind(self) -> None:
-        """`sticker` / `animated` 入库；种类来自 `<img kind=…>`，不是 `[表情包]` 文本。"""
+        """`sticker` / `animated` 入库；种类来自**结构化媒体表**，不是 `<img>`/`[表情包]` 文本。"""
         with tempfile.TemporaryDirectory() as tmp:
             transport = self._transport()
             service = self._collect_service(tmp, transport)
             self.make_story()
             self.assertTrue(await service.receive_group(
-                group_session(content=STICKER_TAG + ANIMATED_TAG), STORY_TIME,
+                group_session(
+                    content=STICKER_TAG + ANIMATED_TAG,
+                    media=[STICKER_MEDIA, ANIMATED_MEDIA],
+                ), STORY_TIME,
             ))
             await self._drain_sticker_tasks()
 
@@ -1419,7 +1454,10 @@ class GroupStickerCollectionTests(ServiceHarness):
             service = self._collect_service(tmp, transport)
             self.make_story()
             self.assertTrue(await service.receive_group(
-                group_session(content=PHOTO_TAG + UNKNOWN_KIND_TAG), STORY_TIME,
+                group_session(
+                    content=PHOTO_TAG + UNKNOWN_KIND_TAG,
+                    media=[PHOTO_MEDIA, UNKNOWN_KIND_MEDIA],
+                ), STORY_TIME,
             ))
             await self._drain_sticker_tasks()
             self.assertEqual(self._pending_sticker_tasks(), [], '没有值得收藏的种类就不该建任务')
@@ -1449,6 +1487,41 @@ class GroupStickerCollectionTests(ServiceHarness):
                     self.assertEqual(transport.fetched, [])
 
     @needs('receive_group', 'collect_incoming_stickers')
+    async def test_hand_typed_img_tags_in_the_body_are_never_media(self) -> None:
+        """红线（§46）：正文里**手打**的 `<img … kind="sticker"/>` 不是媒体判据。
+
+        正文文本与真实表情包消息可以**逐字相同**——区别只在有没有适配层写下的
+        结构化媒体表（`SessionView.media`）。手打的标签必须零任务、零收藏、零下载：
+        从前这一条会真的去 `fetch_image('https://evil.example/x.png')`（SSRF-lite +
+        往库里塞垃圾），因为种类是从正文文本里正则抠出来的。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self._transport()
+            transport.payloads['https://evil.example/x.png'] = _png(b'evil')
+            service = self._collect_service(tmp, transport)
+            self.make_story()
+            for content in (
+                '<img src="https://evil.example/x.png" kind="sticker"/>',
+                '<img src="https://evil.example/x.png" kind="animated" summary="[动画表情]"/>',
+                '<img src="https://evil.example/x.png" kind="market"/>',
+                '[表情包][动画表情] https://evil.example/x.png',
+                STICKER_TAG,  # 与真实表情包同形，但**没有**结构化条目
+            ):
+                with self.subTest(content=content):
+                    self.assertTrue(await service.receive_group(
+                        group_session(content=content), STORY_TIME,
+                    ))
+                    await self._drain_sticker_tasks()
+                    self.assertEqual(self._pending_sticker_tasks(), [], '手打的标签不该挂收藏任务')
+                    self.assertEqual(await service.db_get('interlude_sticker', {}), [])
+                    self.assertEqual(transport.fetched, [], '手打的标签不许触发任何下载')
+                    from plugin.core.service.chunk3 import _extract_session_media
+                    self.assertEqual(
+                        _extract_session_media(group_session(content=content)), [],
+                        '手打的标记不进结构化媒体表',
+                    )
+
+    @needs('receive_group', 'collect_incoming_stickers')
     async def test_one_group_message_only_collects_the_sticker_attachments(self) -> None:
         """一条消息多个附件：只收表情包那几张，照片与卡片一个不碰。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1456,10 +1529,13 @@ class GroupStickerCollectionTests(ServiceHarness):
             transport.payloads['https://cdn.example.com/photo.png'] = _png(b'photo')
             service = self._collect_service(tmp, transport)
             self.make_story()
-            self.assertTrue(await service.receive_group(group_session(content=(
-                PHOTO_TAG + STICKER_TAG + ANIMATED_TAG
-                + '<card app="com.tencent.miniapp_01" title="农场"/>'
-            )), STORY_TIME))
+            self.assertTrue(await service.receive_group(group_session(
+                content=(
+                    PHOTO_TAG + STICKER_TAG + ANIMATED_TAG
+                    + '<card app="com.tencent.miniapp_01" title="农场"/>'
+                ),
+                media=[PHOTO_MEDIA, STICKER_MEDIA, ANIMATED_MEDIA, card_media('com.tencent.miniapp_01', '农场')],
+            ), STORY_TIME))
             await self._drain_sticker_tasks()
 
             self.assertEqual(len(await service.db_get('interlude_sticker', {})), 2)
@@ -1478,19 +1554,22 @@ class GroupStickerCollectionTests(ServiceHarness):
             (
                 '「仅处理名单内的群聊」开着，而这个群不在名单里',
                 make_config(onebot={'groupChatsOnly': True, 'groupChats': [group_rule_stub()]}),
-                group_session(channel_id='77', guild_id='77', content=sticker_content),
+                group_session(
+                    channel_id='77', guild_id='77', content=sticker_content,
+                    media=[STICKER_MEDIA],
+                ),
             ),
             (
                 '名单里的群写了 enabled=false',
                 make_config(onebot={
                     'groupChatsOnly': True, 'groupChats': [group_rule_stub(enabled=False)],
                 }),
-                group_session(content=sticker_content),
+                group_session(content=sticker_content, media=[STICKER_MEDIA]),
             ),
             (
                 'mention-only 且这条没 @ 机器人',
                 onebot_config(onebot={'groupChats': [group_rule_stub(responseMode='mention-only')]}),
-                group_session(content=sticker_content),
+                group_session(content=sticker_content, media=[STICKER_MEDIA]),
             ),
         ]
         self.make_story()
@@ -1518,7 +1597,7 @@ class GroupStickerCollectionTests(ServiceHarness):
                 transport = self._transport()
                 service = self._collect_service(tmp, transport, **stickers)
                 self.assertTrue(await service.receive_group(
-                    group_session(content=STICKER_TAG), STORY_TIME,
+                    group_session(content=STICKER_TAG, media=[STICKER_MEDIA]), STORY_TIME,
                 ))
                 await self._drain_sticker_tasks()
                 self.assertEqual(await service.db_get('interlude_sticker', {}), [])
@@ -1543,7 +1622,9 @@ class GroupStickerCollectionTests(ServiceHarness):
 
             service.image_bytes_to_native = image_bytes_to_native
             self.make_story()
-            self.assertTrue(await service.receive_group(group_session(content=PHOTO_TAG), STORY_TIME))
+            self.assertTrue(await service.receive_group(
+                group_session(content=PHOTO_TAG, media=[PHOTO_MEDIA]), STORY_TIME,
+            ))
             await self._drain_sticker_tasks()
 
             self.assertEqual(len(describer.guessed), 1, '群里的普通图片也该被问一次')
@@ -1564,7 +1645,9 @@ class GroupStickerCollectionTests(ServiceHarness):
             describer = _GroupGuessingDescriber()
             service.sticker_describer = describer
             self.make_story()
-            self.assertTrue(await service.receive_group(group_session(content=PHOTO_TAG), STORY_TIME))
+            self.assertTrue(await service.receive_group(
+                group_session(content=PHOTO_TAG, media=[PHOTO_MEDIA]), STORY_TIME,
+            ))
             await self._drain_sticker_tasks()
             self.assertEqual(self._pending_sticker_tasks(), [])
             self.assertEqual(describer.guessed, [])
@@ -1750,11 +1833,354 @@ class ReceiveTests(ServiceHarness):
         self.assertIn('当前事件包含图片附件', self.sink.text())
         self.assertIn('当前事件包含语音附件', self.sink.text())
 
+    # ------------------------------------------------------------------ #
+    # 私聊入站的媒体判据（§46 红线；群聊那半边见 GroupStickerCollectionTests）
+    # ------------------------------------------------------------------ #
+
+    def _sticker_service(self, tmp: str, transport: Any) -> Any:
+        """开着自动收藏的私聊宿主（`receive()` 就是私聊的入站入口）。"""
+        os.makedirs(os.path.join(tmp, 'stickers'), exist_ok=True)
+        service = self.make_service(
+            {
+                **self._config(),
+                'stickers': {'enabled': True, 'directory': 'stickers'},
+            },
+            transport=transport,
+        )
+        # 库里开着时 `__init__` 会顺手挂一个目录扫描任务，与"还挂着哪些收藏任务"的
+        # 断言相互干扰；收藏钩子不依赖后台调度（同群聊夹具）。
+        service.background_started = True
+        service.ctx.base_dir = tmp
+        return service
+
+    @staticmethod
+    def _pending_sticker_tasks() -> list[Any]:
+        """还挂着的收藏旁路任务（与群聊夹具同一套判据）。"""
+        current = asyncio.current_task()
+        found: list[Any] = []
+        for task in asyncio.all_tasks():
+            if task is current:
+                continue
+            coro = task.get_coro() if hasattr(task, 'get_coro') else None
+            if 'sticker' in str(getattr(coro, '__qualname__', '')).lower():
+                found.append(task)
+        return found
+
+    async def _drain_sticker_tasks(self) -> None:
+        for _ in range(500):
+            if not self._pending_sticker_tasks():
+                return
+            await asyncio.sleep(0)
+        self.fail('收藏任务没有在预期时间内结束')
+
+    @needs('receive', 'describe_vision_event', 'collect_incoming_stickers')
+    async def test_real_private_sticker_is_collected_end_to_end(self) -> None:
+        """真实表情包（结构化媒体表里 `kind=sticker`）在私聊照样入库。
+
+        正对着下面那条红线：从 `receive()` 入口一路走到 `interlude_sticker` 落库，
+        证明"只读结构化数据"之后**没有把真表情包一起误杀**。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = _GroupByteTransport({
+                'https://cdn.example.com/sticker.png': _png(b'sticker'),
+            })
+            service = self._sticker_service(tmp, transport)
+            self.make_story()
+            participant = {'id': 'onebot:1:2', 'status': 'active', 'personId': '2'}
+            self._stub_private_dependencies(service, participant)
+            service.signal_incoming_interruption = lambda _story, _participant: None
+
+            self.assertTrue(await service.receive(
+                self._session(content=STICKER_TAG, media=[STICKER_MEDIA]), STORY_TIME,
+            ))
+            await self._drain_sticker_tasks()
+
+            rows = await service.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 1, '私聊里观测到表情包就该入库')
+            self.assertEqual(rows[0]['group'], 'collected')
+            self.assertEqual(transport.fetched, ['https://cdn.example.com/sticker.png'])
+
+    @needs('receive', 'describe_vision_event', 'collect_incoming_stickers')
+    async def test_local_file_sticker_is_collected_from_the_same_coordinate(self) -> None:
+        """§46.9 修正：宿主把别人发的表情落成本地文件时，私聊也必须收到。
+
+        媒体坐标与图片来源现在是**同一个字面量** `onebot-file:<路径>`。从前媒体侧写
+        `file://…`、来源侧写 `onebot-file:…`，按 `source` 对齐种类时对不上 →
+        私聊永远收不到这类表情包（宿主落本地恰恰是最常见的一类）；群聊因为走
+        `_media_sources(media)` 才侥幸对得上。
+
+        ⚠️ 会话**由适配层写出来**（`astrbot_bridge.session_view` + `Image(path=…)`），
+        不是手拼的字面量 —— 否则把媒体坐标改回 `file://…` 这条用例不会红
+        （夹具必须用生产写入方的写法，坑 39/46）。
+        """
+        from plugin.tests.test_astrbot_bridge import IncomingMediaKindTests  # noqa: F401 - 装 astrbot 桩
+        from plugin.adapters import astrbot_bridge as bridge
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = (
+                ('image（sub_type=0，实拍照片）', 'image', 0, 0),
+                ('sticker（sub_type=1，收藏表情）', 'sticker', 1, 1),
+                ('market（sub_type=4，商城表情）', 'market', 4, 2),
+            )
+            self.make_story()
+            for label, kind, sub_type, expected_total in cases:
+                with self.subTest(label):
+                    local = os.path.join(tmp, '%s.png' % kind)
+                    with open(local, 'wb') as handle:
+                        handle.write(_png(('local-%s' % kind).encode()))
+                    coordinate = 'onebot-file:%s' % local
+                    event = IncomingMediaKindTests._event(
+                        [{'type': 'image', 'data': {'file': '%s.png' % kind, 'sub_type': sub_type}}],
+                        components=[bridge.Image(path=local)],
+                    )
+                    # 让适配层写出来的会话落在夹具的剧本/参与者坐标上（id 与 `_session` 一致）。
+                    event.get_self_id = lambda: '1'
+                    event.get_sender_id = lambda: '2'
+                    session = bridge.session_view(event)
+                    # 正文标签仍是 `<img src="file://…"/>`（给人看的文本不变；真实种类由
+                    # 链接上的原始段给出时，照旧写成 `kind="…"` —— 那是本来就该有的）。
+                    self.assertEqual(
+                        session.content,
+                        '<img src="file://%s"%s/>' % (
+                            local, '' if kind == 'image' else ' kind="%s"' % kind,
+                        ),
+                    )
+                    self.assertEqual(
+                        [item['source'] for item in session.media], [coordinate],
+                        '适配层写下的媒体坐标就是图片来源那个字面量',
+                    )
+                    self.assertEqual(
+                        [item['kind'] for item in session.media], [kind],
+                        '组件没有 url/file 时，靠"这条消息只有一个图段"仍要认出种类（§46.9）',
+                    )
+
+                    transport = _GroupByteTransport({})
+                    service = self._sticker_service(tmp, transport)
+                    participant = {'id': 'onebot:1:2', 'status': 'active', 'personId': '2'}
+                    self._stub_private_dependencies(service, participant)
+                    service.signal_incoming_interruption = lambda _story, _participant: None
+
+                    vision = service.describe_vision_event(session)
+                    self.assertEqual(vision['sources'], [coordinate], '两边必须逐字相等')
+                    self.assertTrue(await service.receive(session, STORY_TIME))
+                    await self._drain_sticker_tasks()
+
+                    rows = await service.db_get('interlude_sticker', {})
+                    self.assertEqual(len(rows), expected_total, '只有表情包该入库')
+                    self.assertEqual(transport.fetched, [], '本地文件不该走网络')
+
+    @needs('receive', 'describe_vision_event', 'collect_incoming_stickers')
+    async def test_hand_typed_img_tags_in_a_private_message_are_never_media(self) -> None:
+        """红线（§46）：私聊正文里手打的 `<img … kind="sticker"/>` 零收藏、零下载。
+
+        与群聊那条**同一条红线**（同一份结构化媒体表、同一个判据）：从前这里会真的
+        去 `fetch_image('https://evil.example/x.png')`，并把内容塞进表情库。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = _GroupByteTransport({'https://evil.example/x.png': _png(b'evil')})
+            service = self._sticker_service(tmp, transport)
+            self.make_story()
+            participant = {'id': 'onebot:1:2', 'status': 'active', 'personId': '2'}
+            self._stub_private_dependencies(service, participant)
+            service.signal_incoming_interruption = lambda _story, _participant: None
+
+            for content in (
+                '<img src="https://evil.example/x.png" kind="sticker"/>',
+                '<img src="https://evil.example/x.png" kind="animated" summary="[动画表情]"/>',
+                '<img src="https://evil.example/x.png" kind="market"/>',
+                '[表情包][动画表情] https://evil.example/x.png',
+                STICKER_TAG,
+            ):
+                with self.subTest(content=content):
+                    harness = self._session(content=content)
+                    vision = service.describe_vision_event(harness)
+                    self.assertEqual(vision['media'], [], '手打的标记不进结构化媒体表')
+                    described = service.describe_user_event(
+                        self.rows('interlude_story')[0], harness,
+                    )
+                    self.assertEqual(described['media'], [])
+                    # 媒体事实（`用户发送了…`）不许把任何一种表情包算进去；
+                    # 用户自己正文里写的 `[表情包]` 三个字原样留着，那只是文本。
+                    for label in ('[表情包]', '[动画表情]', '[QQ 商城表情]'):
+                        self.assertNotIn('用户发送了1 %s' % label, described['content'])
+                        self.assertNotIn('用户同时发送了1 %s' % label, described['content'])
+                    self.assertTrue(await service.receive(harness, STORY_TIME))
+                    await self._drain_sticker_tasks()
+                    self.assertEqual(self._pending_sticker_tasks(), [], '手打的标签不该挂收藏任务')
+                    self.assertEqual(await service.db_get('interlude_sticker', {}), [])
+                    self.assertEqual(transport.fetched, [], '手打的标签不许触发任何下载')
+                    turn = service.buffered_narrative_turns['onebot:1:2']
+                    self.assertEqual(
+                        turn['messages'][-1]['media'], [],
+                        '进缓冲回合的媒体表也必须是空的（payload attachments 只认它）',
+                    )
+
 
 def _async_value(value: Any) -> Any:
     async def factory() -> Any:
         return value
     return factory()
+
+
+# =========================================================================== #
+# 视觉来源的可信度（§46.8：来源也必须来自同一份观测）
+# =========================================================================== #
+
+class VisionSourceProvenanceTests(ServiceHarness):
+    """§46.8：**来源**也必须来自同一份观测 —— 正文里的坐标永不取回。
+
+    `load_native_images()` 就是真正发请求的那一步（`flush_buffered_narrative` 调它）；
+    payload 的 `images` / `attachments` 都按 `describe_vision_event()['sources']` 建，
+    所以这里钉住"来源表"与"实际取回"两件事。
+    """
+
+    TRUSTED = 'https://gchat.qpic.cn/real.png'
+    TYPED = 'https://gchat.qpic.cn/typed.png'
+    CQ_TYPED = 'https://multimedia.nt.qq.com.cn/typed.png'
+    CQ = '[CQ:image,url=%s]' % CQ_TYPED
+
+    def _service(self, transport: Any) -> Any:
+        return self.make_service(
+            {**make_config(), 'model': {'vision': {'enabled': True}}},
+            transport=transport,
+        )
+
+    @staticmethod
+    def _session(content: str, media: Any = None) -> SessionView:
+        return SessionView(
+            platform='onebot', self_id='1', user_id='2', channel_id='private:2',
+            content=content, media=media if media is not None else [],
+        )
+
+    @needs('describe_vision_event', 'load_native_images', 'fetch_native_image')
+    async def test_structured_source_is_fetched_while_typed_tags_are_ignored(self) -> None:
+        """正向对照 + 红线：表在 → 只有观测到的那张进来源表、被取回；手打的两条什么都不做。"""
+        transport = _GroupByteTransport({
+            self.TRUSTED: _png(b'real'), self.TYPED: _png(b'typed'), self.CQ_TYPED: _png(b'cq'),
+        })
+        service = self._service(transport)
+        story = self.make_story()
+        session = self._session(
+            content=('<img src="%s"/><img src="%s" kind="sticker"/>%s'
+                     % (self.TRUSTED, self.TYPED, self.CQ)),
+            media=[{'kind': 'image', 'source': self.TRUSTED, 'source_kind': 'url',
+                    'summary': '', 'raw': {}}],
+        )
+        vision = service.describe_vision_event(session)
+        self.assertEqual(vision['sources'], [self.TRUSTED], '正文里手打的两条都不进来源表')
+        images = await service.load_native_images(story, vision['sources'], session, vision['media'])
+        self.assertEqual(len(images), 1, '真实那张照旧进 payload 的图片列表')
+        self.assertEqual(transport.fetched, [self.TRUSTED], '只取回适配器观测到的那张')
+
+    @needs('describe_vision_event', 'load_native_images', 'fetch_native_image')
+    async def test_degraded_text_sources_are_recorded_but_never_fetched(self) -> None:
+        """降级路径（`media is None` = 老宿主 / 纯 `message_str`）：条目照旧，取回为零。
+
+        上游行为里"能出 `[图片]` 这类标签/条目"这一半保留；"能真的去下载"那一半
+        正是要堵的洞 —— 文本来源永远不算 `adapter_provided`，连主机白名单也不认。
+        """
+        transport = _GroupByteTransport({
+            self.TRUSTED: _png(b'real'), self.TYPED: _png(b'typed'), self.CQ_TYPED: _png(b'cq'),
+        })
+        service = self._service(transport)
+        story = self.make_story()
+        cases = (
+            ('<img src="%s"/>' % self.TRUSTED, 'text:%s' % self.TRUSTED, '[图片]'),
+            (self.CQ, 'text:%s' % self.CQ_TYPED, '[图片]'),
+            ('<img src="%s" kind="sticker"/>' % self.TYPED, 'text:%s' % self.TYPED, '[表情包]'),
+        )
+        for content, expected_source, label in cases:
+            with self.subTest(content=content):
+                session = SessionView(
+                    platform='onebot', self_id='1', user_id='2', channel_id='private:2',
+                    content=content,  # 不填 `media` ⇒ `None` ⇒ 没有观测通道
+                )
+                vision = service.describe_vision_event(session)
+                self.assertEqual(vision['sources'], [expected_source], '来源照旧记条目，但带 text: 前缀')
+                self.assertEqual(vision['media'], [], '种类那一半没有回退：永远空表')
+                # `adapter_provided=True` 也救不了它 —— 文本来源永远不算适配器提供。
+                self.assertIsNone(await service.fetch_native_image(expected_source, None, True))
+                self.assertEqual(
+                    await service.load_native_images(story, vision['sources'], session, vision['media']),
+                    [],
+                )
+                self.assertEqual(transport.fetched, [], '正文里的坐标一次都不许取回')
+                from plugin.core.service.helpers import describe_group_attachments
+                self.assertIn(label, describe_group_attachments(content), '上游的文本标签照旧')
+
+    # ---- §46.9：没有观测通道这件事必须可见（坑 25），但按会话节流 ----
+
+    def _media_warns(self) -> list[tuple[str, str]]:
+        """日志里"没有结构化媒体"这条 warn（级别, 正文）。"""
+        return [
+            (level, text) for level, text in self.sink.records if '结构化媒体' in text
+        ]
+
+    @needs('describe_vision_event')
+    async def test_missing_observation_channel_with_images_warns_once_per_session(self) -> None:
+        """`media is None` + 有图 → **恰好一条 warn**；同会话再调不再刷，换会话各一条。"""
+        service = self._service(_GroupByteTransport({}))
+        first = SessionView(
+            platform='onebot', self_id='1', user_id='2', channel_id='private:2',
+            content='<img src="%s"/>' % self.TRUSTED,
+        )
+        # 生产上一条消息会调两次（`receive` 一次 + `describe_user_event` 一次），所以这里多调几次。
+        for _ in range(4):
+            service.describe_vision_event(first)
+        self.assertEqual([level for level, _ in self._media_warns()], ['warn'], '按纪律必须是 warn')
+
+        second = SessionView(
+            platform='onebot', self_id='1', user_id='3', channel_id='private:3',
+            content='<img src="%s"/>' % self.TRUSTED,
+        )
+        service.describe_vision_event(second)
+        self.assertEqual(len(self._media_warns()), 2, '节流按会话：另一个会话各一条')
+
+    @needs('describe_vision_event')
+    async def test_missing_observation_channel_without_images_stays_silent(self) -> None:
+        """`media is None` + 纯文本（常态）→ 零 warn。"""
+        service = self._service(_GroupByteTransport({}))
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='2', channel_id='private:2',
+            content='只有文字，没有图。',
+        )
+        for _ in range(3):
+            service.describe_vision_event(session)
+        self.assertEqual(self._media_warns(), [])
+
+    @needs('describe_vision_event')
+    async def test_missing_observation_channel_warns_on_placeholder_text_too(self) -> None:
+        """宿主把图渲染成 `[图片]` / `[动画表情]` 占位（连坐标都没有）时也要打一条。
+
+        这是"有图但没有任何坐标"的第二条判据；用户自己打这几个字会多报一次 ——
+        在没有观测通道的宿主上分不清，而能力缺失宁可多报（节流 10 分钟一条）。
+        """
+        service = self._service(_GroupByteTransport({}))
+        for content in ('[图片]', '看这个[动画表情]', '[表情包][动画表情]'):
+            with self.subTest(content=content):
+                self.sink.records.clear()
+                # 每个子用例一个**新宿主**（节流表在 service 上，复用会让后两个被节流掉）。
+                service = self._service(_GroupByteTransport({}))
+                session = SessionView(
+                    platform='onebot', self_id='1', user_id='2', channel_id='private:2',
+                    content=content,
+                )
+                for _ in range(3):
+                    service.describe_vision_event(session)
+                self.assertEqual(len(self._media_warns()), 1, content)
+
+    @needs('describe_vision_event')
+    async def test_empty_media_table_never_warns_even_with_image_text(self) -> None:
+        """`media == []`（有观测通道、确实没图）→ 零 warn —— 这条最容易写错。"""
+        service = self._service(_GroupByteTransport({}))
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='2', channel_id='private:2',
+            content='<img src="%s" kind="sticker"/>%s' % (self.TYPED, self.CQ),
+            media=[],  # 观测到零媒体：正文里的坐标一条都不算数
+        )
+        for _ in range(3):
+            service.describe_vision_event(session)
+        self.assertEqual(self._media_warns(), [])
 
 
 # =========================================================================== #

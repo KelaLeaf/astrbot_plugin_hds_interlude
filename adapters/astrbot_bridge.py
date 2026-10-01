@@ -359,23 +359,28 @@ def raw_media_hints(event: Any) -> dict[str, Any]:
       长得一模一样；
     * `mface`（QQ 商城表情）被适配器 `continue` 掉，**整段消失**，连占位都没有。
 
-    返回：`images`（按 `file`/`url` 索引的 kind+summary）、`faces`（表情 id → 文本）、
-    `extras`（结构化链里不存在的段的元素定义，按原文顺序）、`forwards`（合并转发的
-    资源 id 列表）。
+    返回：`images`（按 `file`/`url` 索引的 kind+summary+原始段 data）、
+    `image_order`（图片段按出现顺序的同一批条目 —— 组件与段**链接不上**时的位置兜底，
+    见 `serialize_message_chain`，§46.9）、`faces`（表情 id → 文本）、
+    `extras`（结构化链里不存在的段的元素定义，按原文顺序）、
+    `forwards`（合并转发的资源 id 列表）。
 
     **`forwards` 为什么必须回原始段取**：AstrBot 的 `Forward` 组件只有 `id`，而
     `get_message_str()` 把它渲染成 `[转发消息]`（**不带 id**）——只按消息文本抠 id 的话
     永远读不到正文。`message_obj.raw_message` 里的 `{'type': 'forward', 'data': {'id': …}}`
     是唯一还带 id 的地方（和图片的 `sub_type` 是同一条路子）。
     """
-    hints: dict[str, Any] = {'images': {}, 'faces': {}, 'extras': [], 'forwards': []}
+    hints: dict[str, Any] = {
+        'images': {}, 'image_order': [], 'faces': {}, 'extras': [], 'forwards': [],
+    }
     for segment in _raw_segments(event):
         kind = _text(segment.get('type')).lower()
         data = segment.get('data')
         payload = data if isinstance(data, dict) else {}
         if kind == 'image':
             media_kind, summary = _image_media_kind(payload)
-            entry = {'kind': media_kind, 'summary': summary}
+            entry = {'kind': media_kind, 'summary': summary, 'raw': dict(payload)}
+            hints['image_order'].append(entry)
             for key in ('file', 'url'):
                 value = _text(payload.get(key))
                 if value:
@@ -465,9 +470,88 @@ def _json_card_attrs(component: Any) -> dict[str, str]:
     return attrs
 
 
+def _observed_image_data(component: Any) -> dict[str, Any]:
+    """一张图**观测到的原始判据**（原始段 data，加上组件上还留着的种类字段）。
+
+    进 `session.media[].raw`。留它是为了"以后要加判据时不必回消息文本里找"——
+    文本是用户可写的，判据只能来自适配器看见的段。
+    """
+    observed: dict[str, Any] = {}
+    payload = _attr(component, 'data')
+    if isinstance(payload, dict):
+        observed.update(payload)
+    for key in ('sub_type', 'subType', 'summary', 'file', 'url'):
+        value = _attr(component, key)
+        if value in (None, '') or key in observed:
+            continue
+        observed[key] = value
+    return observed
+
+
+def _media_source_from_attrs(attrs: Any, path: Any = None) -> str:
+    """从**刚写出来的** `<img>` 属性里取来源（媒体条目的 `source`）。
+
+    优先级与 `core/service/chunk3._fallback_extract_session_image_sources`
+    从标签里读出来的那一套一致（`src` → `url` → `onebot-file:`）。
+
+    **本地落盘图（`Image(path=…)`）归一成 `onebot-file:<路径>`**（§46.9）：core 的
+    图片来源（`chunk3._structured_image_sources`）把本地路径读成 `onebot-file:…`，
+    媒体这一侧必须写**同一个字面量**，否则"按 `source` 对齐种类"对不上 ——
+    宿主把别人发来的收藏表情落成本地文件时，私聊就永远收不到它（§46.9 修正）。
+    """
+    if not isinstance(attrs, dict):
+        return ''
+    src = _text(attrs.get('src')).strip()
+    url = _text(attrs.get('url')).strip()
+    file_value = _text(attrs.get('file')).strip()
+    if src:
+        if src.lower().startswith('file://'):
+            local = os.path.abspath(_text(path)) if path else unquote(urlparse(src).path)
+            return ('onebot-file:%s' % local) if local else ''
+        return src
+    if url:
+        return url
+    return 'onebot-file:%s' % file_value if file_value else ''
+
+
+def _media_source_kind(source: str) -> str:
+    """来源坐标属于哪一类（`url` / `file` / `path` / `data`）——给人看的判据。"""
+    if source.startswith('onebot-file:'):
+        return 'file'
+    lowered = source.lower()
+    if lowered.startswith('data:'):
+        return 'data'
+    if lowered.startswith('file://'):
+        return 'path'
+    return 'url'
+
+
+
+def _sole_image_hint(chain: list[Any], hints: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """「只有一个图段、也只有一个图片组件」时那个原始段条目（否则 `None`）。
+
+    为什么需要它（§46.9）：组件与原始段是靠 `file` / `url` 字符串链接的，而宿主把图片
+    **落到本地**时组件可能两者都没有（只有 `path`）—— 链接断了，`kind` 就丢，收藏表情
+    会被当成普通照片（私聊永远收不到）。"整条消息只有一个图段"是唯一不需要**排序假设**
+    的情形（与 `extras` 那条注释同一条理由：只有一个时位置本来就是对的）。
+
+    段数或组件数不是 1 时一律回 `None`：适配器丢段 / 补段时位置就不可信，**不猜**。
+    """
+    if not isinstance(hints, dict):
+        return None
+    order = hints.get('image_order')
+    if not isinstance(order, list) or len(order) != 1:
+        return None
+    if sum(1 for component in chain if _component_kind(component) in ('image', 'img')) != 1:
+        return None
+    return order[0] if isinstance(order[0], dict) else None
+
+
 def serialize_component(
     component: Any,
     hints: Optional[dict[str, Any]] = None,
+    media: Optional[list[dict[str, Any]]] = None,
+    sole_image: Optional[dict[str, Any]] = None,
 ) -> tuple[str, Optional[dict[str, Any]], Optional[dict[str, Any]]]:
     """把一个 AstrBot 组件翻成 `(content 片段, element, quote)`。
 
@@ -475,6 +559,14 @@ def serialize_component(
     `quote` 只在 `Reply` 组件上产生（上游 `session.quote`）。
     返回的 `content` 片段与上游 Koishi 的序列化形式一致：文本原样，元素写成
     自闭合标签，`core/service/helpers.py` 的 `_parse_mini_xml_elements` 直接可读。
+
+    `media` 非 `None` 时，图片 / 卡片会往这个列表里追加**结构化媒体条目**
+    （见 `serialize_message_chain`）：种类与来源只在这里判定一次，core 不再回读
+    `<img>` 文本（`docs/PORTING_NOTES.md` §46）。
+
+    `sole_image` 是"这条消息只有一个图段、也只有一个图片组件"时那个原始段条目
+    （由 `serialize_message_chain` 判定）：组件按 `file`/`url` **链接不上**时（宿主把图
+    落到本地、组件没有 url/file token）用它兜底，否则种类会丢（§46.9）。
     """
     kind = _component_kind(component)
 
@@ -500,18 +592,39 @@ def serialize_component(
             'sub_type': _attr(component, 'sub_type', 'subType'),
             'summary': _attr(component, 'summary'),
         })
+        observed = _observed_image_data(component)
         lookup = hints.get('images') if isinstance(hints, dict) else None
+        linked = False
         if isinstance(lookup, dict):
             for key in ('file:%s' % _text(file_value), 'url:%s' % url):
                 found = lookup.get(key)
                 if isinstance(found, dict):
                     media_kind = _text(found.get('kind')) or media_kind
                     summary = _text(found.get('summary')) or summary
+                    if isinstance(found.get('raw'), dict):
+                        observed = dict(found['raw'])
+                    linked = True
                     break
+        if not linked and isinstance(sole_image, dict):
+            # 链接不上但这条消息只有一个图段 ⇒ 那就是它（不需要排序假设；§46.9）。
+            media_kind = _text(sole_image.get('kind')) or media_kind
+            summary = _text(sole_image.get('summary')) or summary
+            if isinstance(sole_image.get('raw'), dict):
+                observed = dict(sole_image['raw'])
         if media_kind and media_kind != 'image':
             attrs['kind'] = media_kind
         if summary:
             attrs['summary'] = summary
+        if media is not None:
+            source = _media_source_from_attrs(attrs, path)
+            if source:
+                media.append({
+                    'kind': media_kind or 'image',
+                    'source': source,
+                    'source_kind': _media_source_kind(source),
+                    'summary': summary,
+                    'raw': observed,
+                })
         tag = ' '.join('%s="%s"' % (key, _escape_attr(value)) for key, value in attrs.items() if value != '')
         return ('<img %s/>' % tag) if tag else '<img/>', {'type': 'img', 'attrs': attrs, 'children': []}, None
 
@@ -567,6 +680,16 @@ def serialize_component(
 
     if kind == 'json':
         attrs = _json_card_attrs(component)
+        if media is not None:
+            # 卡片没有可下载来源，但也**只有适配器看得见**：正文里手打的 `<card …/>`
+            # 不再是媒体条目（与 `<img>` 同一条纪律）。
+            media.append({
+                'kind': 'card',
+                'source': '',
+                'source_kind': '',
+                'summary': '',
+                'raw': dict(attrs),
+            })
         tag = ' '.join('%s="%s"' % (key, _escape_attr(value)) for key, value in attrs.items() if value != '')
         return ('<card %s/>' % tag) if tag else '<card/>', {'type': 'card', 'attrs': attrs, 'children': []}, None
 
@@ -636,20 +759,34 @@ def serialize_component(
 def serialize_message_chain(
     chain: Iterable[Any],
     hints: Optional[dict[str, Any]] = None,
+    media: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str, list[dict[str, Any]], Optional[dict[str, Any]]]:
     """把整条 AstrBot 消息链翻成 `(content, elements, quote)`。
 
     `content` 是上游 `session.content` 的等价物——`core/service/helpers.py` 会按
     Koishi 的 mini-xml 语法重新解析它（图片 / 语音 / 文件事实、`<at>` 提及检测），
     所以文本必须原样保留、元素必须写成自闭合标签。
+
+    `media` 非 `None` 时**顺带**收一份结构化媒体表（`session_view` 就是这么用的）：
+
+    ``[{'kind', 'source', 'source_kind', 'summary', 'raw'}, …]``
+
+    * `kind`：观测到的种类（`image` / `sticker` / `animated` / `market` / `card`），
+      来自 OneBot 原始段的 `sub_type` / `summary`（§29）；
+    * `source`：归一化来源，与 `extract_session_image_sources` 从标签里读出来的
+      那个字符串逐字一致（"按来源对齐种类"靠它）；卡片为空串；
+    * `raw`：这条媒体**观测到的原始判据**（原始段 data / 卡片属性）。
+
+    ⚠️ 纪律：core 只认这一份，**绝不**再从 `content` 的 `<img kind=…>` 反解析
+    （那等于把"用户手打的文本"当判据，`docs/PORTING_NOTES.md` §46）。
     """
     parts: list[str] = []
     elements: list[dict[str, Any]] = []
     quote: Optional[dict[str, Any]] = None
-    for component in chain or []:
-        if component is None:
-            continue
-        fragment, element, quoted = serialize_component(component, hints)
+    items = [component for component in (chain or []) if component is not None]
+    sole_image = _sole_image_hint(items, hints)
+    for component in items:
+        fragment, element, quoted = serialize_component(component, hints, media, sole_image)
         if fragment:
             parts.append(fragment)
         if element is not None:
@@ -797,6 +934,7 @@ def session_view(
     | `isDirect` | 私聊判定 |
     | `content` | `serialize_message_chain()`（Koishi mini-xml 形式）+ `forward_read` 的正文 |
     | `elements` | 同上，结构化段列表 |
+    | `media` | 同上，结构化媒体表（种类 / 来源 / 摘要 / 原始判据；§46）；只有 `message_str` 兜底时交 `None` |
     | `quote` | `Reply` 组件（上游 `session.quote`） |
     | `messageId` | `event.message_obj.message_id` |
     | `username` | `event.get_sender_name()` |
@@ -809,18 +947,24 @@ def session_view(
     resolved = endpoint if endpoint is not None else endpoint_for_event(event)
     hints = raw_media_hints(event)
     chain = _call(event, 'get_messages', []) or []
-    content, elements, quote = serialize_message_chain(chain, hints)
+    # 结构化媒体表：**只在这里**（同一条序列化走查里）产生 —— 种类来自原始段的
+    # `sub_type` / `summary`，来源来自适配器组件（`docs/PORTING_NOTES.md` §46）。
+    # `None` 只表示"这个宿主根本没有观测通道"（见下面的 `message_str` 兜底）。
+    media: Optional[list[dict[str, Any]]] = []
+    content, elements, quote = serialize_message_chain(chain, hints, media)
     used_raw_chain = False
     if not content and not elements:
         # 结构化链是空的：退回适配器的原始段（见 `_raw_segment_chain`）。
         raw_chain = _raw_segment_chain(event)
         if raw_chain:
-            content, elements, quote = serialize_message_chain(raw_chain)
+            media = []  # 前面那份属于空链，作废重来（不许把两份拼起来）
+            content, elements, quote = serialize_message_chain(raw_chain, None, media)
             used_raw_chain = True
     if not used_raw_chain and hints.get('extras'):
         # 结构化链**存在但缺段**：适配器 `continue` 掉的段（QQ 商城表情）只能在这里补。
         # 顺序上它们落在文末——混合消息里位置会略偏，但"她确实收到一个商城表情"
         # 这条事实比顺序精确更重要（整条消息只有一个表情时位置本来就是对的）。
+        # 这些补齐段都不是图片，因此不产生媒体条目（`mface` 是另一种东西）。
         for extra in hints['extras']:
             fragment, element, _quoted = serialize_component(_RawSegment(extra['type'], extra['attrs']))
             if fragment:
@@ -828,7 +972,10 @@ def session_view(
             if element is not None:
                 elements.append(element)
     if not content:
-        # 有些适配器只填 `message_str`（纯文本）而没有结构化段。
+        # 有些适配器只填 `message_str`（纯文本）而没有结构化段：**没有观测通道**。
+        # 媒体表交 `None`：core 只对"来源"那一半回退到文本抽取，而文本坐标一律
+        # `text:` 惰性前缀（永不取回）；"种类"那一半没有回退（§46.8）。
+        media = None
         content = _text(_call(event, 'get_message_str', ''))
         if content and not elements:
             elements = [{'type': 'text', 'attrs': {'content': content}, 'children': []}]
@@ -847,6 +994,7 @@ def session_view(
         is_direct=not resolved.is_group,
         content=content,
         elements=elements,
+        media=media,
         quote=quote,
         message_id=resolved.message_id or None,
         username=_text(_call(event, 'get_sender_name', '')),

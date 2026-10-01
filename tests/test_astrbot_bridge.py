@@ -689,6 +689,149 @@ class IncomingMediaKindTests(unittest.TestCase):
         hints = bridge_module.raw_media_hints(event)
         self.assertEqual(hints['images']['file:a.jpg']['kind'], 'market')
         self.assertEqual(hints['images']['url:https://x/a.jpg']['kind'], 'market')
+        # 结构化媒体表要用的**原始判据**也一并带出来（`session.media[].raw`）。
+        self.assertEqual(hints['images']['file:a.jpg']['raw']['sub_type'], '4')
+
+    # ---- 结构化媒体表（§46）：core 只读这一份，判据不许再从正文文本里来 ----
+
+    def test_structured_media_carries_kind_source_and_raw_criteria(self):
+        """一条真实表情包：种类 / 来源 / 原始判据都在结构化表里（core 的唯一切入点）。"""
+        event = self._event([{'type': 'image', 'data': {
+            'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': 1, 'summary': '[动画表情]',
+        }}], components=[bridge_module.Image(file='a.jpg', url='https://x/a.jpg')])
+        self.assertEqual(bridge_module.session_view(event).media, [{
+            'kind': 'sticker',
+            'source': 'https://x/a.jpg',
+            'source_kind': 'url',
+            'summary': '[动画表情]',
+            'raw': {'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': 1, 'summary': '[动画表情]'},
+        }])
+
+    def test_structured_media_covers_photos_local_paths_and_cards(self):
+        from plugin.core.service.chunk3 import _extract_session_image_sources
+        photo = self._event([{'type': 'image', 'data': {
+            'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': 0,
+        }}], components=[bridge_module.Image(file='a.jpg', url='https://x/a.jpg')])
+        self.assertEqual(bridge_module.session_view(photo).media[0]['kind'], 'image')
+
+        local = self._event([{'type': 'image', 'data': {'file': 'b.jpg'}}],
+                            components=[bridge_module.Image(path='/tmp/b.jpg')])
+        media = bridge_module.session_view(local).media
+        # 本地落盘图与**图片来源**归一成同一个字面量（§46.9）：`file://…` → `onebot-file:…`。
+        self.assertEqual(media[0]['source'], 'onebot-file:/tmp/b.jpg')
+        self.assertEqual(media[0]['source_kind'], 'file')
+        self.assertEqual(
+            _extract_session_image_sources(bridge_module.session_view(local)),
+            ['onebot-file:/tmp/b.jpg'],
+            '两边必须逐字相等，否则私聊按 source 对齐种类时对不上',
+        )
+
+        payload = {'app': 'com.tencent.miniapp_01', 'meta': {'detail_1': {'title': 'QQ经典农场'}}}
+        card = types.SimpleNamespace(data=payload)
+        card._hdsi_kind = 'json'
+        carded = self._event([{'type': 'json', 'data': payload}], components=[card])
+        self.assertEqual(bridge_module.session_view(carded).media, [{
+            'kind': 'card', 'source': '', 'source_kind': '', 'summary': '',
+            'raw': {'app': 'com.tencent.miniapp_01', 'title': 'QQ经典农场'},
+        }])
+
+    def test_hand_typed_img_tags_in_the_body_produce_no_media(self):
+        """红线（§46）：正文里手打的 `<img kind=…>` / `<card …/>` **不产生媒体条目**。
+
+        这一段文本从前会被 core 正则解析成"种类 = sticker"，于是自动收藏会真的去
+        下载那个地址（SSRF-lite）。适配层现在只看**组件与原始段**，不看正文。
+        """
+        text = ('<img src="https://evil.example/x.png" kind="sticker"/>'
+                '<img src="https://evil.example/x.png" kind="animated"/>'
+                '<card app="com.tencent.miniapp" title="宝箱"/>')
+        event = self._event([{'type': 'text', 'data': {'text': text}}],
+                            components=[bridge_module.Plain(text)])
+        view = bridge_module.session_view(event)
+        self.assertEqual(view.media, [])
+        self.assertIn('kind="sticker"', view.content)  # 正文原样保留（那是给人看的文本）
+
+    def test_structured_media_sources_align_with_image_sources(self):
+        """对齐契约：`media[].source` 必须与 `extract_session_image_sources()` 逐字一致。
+
+        payload 里的 `attachments` 与 `load_native_images()` 都是"拿图片来源去媒体表里
+        对齐种类"（§29/§45）—— 两个字符串只要差一个字符，表情包就会被当成普通图片。
+        这条把契约钉在适配层这一侧（`media` 与内容标签同一次走查里写出来）。
+        """
+        from plugin.core.service.chunk3 import _extract_session_image_sources
+
+        url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=x'
+        event = self._event([{'type': 'image', 'data': {
+            'file': 'a.jpg', 'url': url, 'sub_type': 1,
+        }}], components=[bridge_module.Image(file='a.jpg', url=url)])
+        view = bridge_module.session_view(event)
+        self.assertEqual(_extract_session_image_sources(view), [url])
+        self.assertEqual([item['source'] for item in view.media], [url])
+
+        file_only = self._event([{'type': 'image', 'data': {'file': 'a.jpg'}}],
+                                components=[bridge_module.Image(file='a.jpg')])
+        view = bridge_module.session_view(file_only)
+        self.assertEqual(_extract_session_image_sources(view), ['onebot-file:a.jpg'])
+        self.assertEqual([item['source'] for item in view.media], ['onebot-file:a.jpg'])
+
+    def test_pure_text_chain_hands_over_an_empty_media_table(self):
+        """结构化链在（哪怕是纯文本）→ `media == []`：**观测到零媒体**，core 不回退文本。"""
+        text = '<img src="https://evil.example/x.png" kind="sticker"/>'
+        event = self._event([{'type': 'text', 'data': {'text': text}}],
+                            components=[bridge_module.Plain(text)])
+        view = bridge_module.session_view(event)
+        self.assertEqual(view.media, [])
+
+    def test_plain_text_only_host_hands_over_no_media_table(self):
+        """只有 `message_str` 的宿主：`media=None` = 没有观测通道（core 的文本降级入口）。"""
+        event = self._event([], components=[])
+        event.get_message_str = lambda: '看这个<img src="https://x/a.png"/>'
+        view = bridge_module.session_view(event)
+        self.assertIsNone(view.media)
+        self.assertIn('<img', view.content)
+
+    def test_path_only_component_with_a_single_image_segment_keeps_its_kind(self):
+        """§46.9：宿主把图落到本地（组件没有 url/file）时，只有一个图段 ⇒ 那就是它。
+
+        从前组件与原始段只靠 `file`/`url` 字符串链接，路径型组件两者都没有 → 链接断 →
+        `kind` 丢 → 收藏表情在私聊被当成普通照片（永远收不到）。
+        """
+        event = self._event(
+            [{'type': 'image', 'data': {'file': 's.png', 'sub_type': 1, 'summary': '[动画表情]'}}],
+            components=[bridge_module.Image(path='/tmp/s.png')],
+        )
+        view = bridge_module.session_view(event)
+        self.assertEqual([item['kind'] for item in view.media], ['sticker'])
+        self.assertEqual(view.media[0]['raw']['sub_type'], 1)
+        self.assertIn('kind="sticker"', view.content)
+        self.assertIn('summary="[动画表情]"', view.content)
+
+    def test_two_image_segments_are_never_matched_by_position(self):
+        """两个图段、组件又都链接不上 → **不猜**：种类退回普通图片（不给位置配对）。"""
+        event = self._event(
+            [
+                {'type': 'image', 'data': {'file': 'a.png', 'sub_type': 1}},
+                {'type': 'image', 'data': {'file': 'b.png', 'sub_type': 0}},
+            ],
+            components=[
+                bridge_module.Image(path='/tmp/a.png'),
+                bridge_module.Image(path='/tmp/b.png'),
+            ],
+        )
+        view = bridge_module.session_view(event)
+        self.assertEqual([item['kind'] for item in view.media], ['image', 'image'])
+        self.assertNotIn('kind=', view.content)
+
+    def test_structured_media_survives_the_raw_segment_fallback(self):
+        """结构化链为空、退回原始段时，媒体表照样产生（且种类来自原始段的 sub_type）。"""
+        event = self._event([{'type': 'image', 'data': {
+            'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': 1,
+        }}], components=[])
+        view = bridge_module.session_view(event)
+        self.assertIn('kind="sticker"', view.content)
+        self.assertEqual(view.media, [{
+            'kind': 'sticker', 'source': 'https://x/a.jpg', 'source_kind': 'url',
+            'summary': '', 'raw': {'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': 1},
+        }])
 
 
 class DeliveryCoordinateTests(unittest.TestCase):
