@@ -1055,9 +1055,13 @@ class VoiceAndInputStatusTests(PlatformTransportTestCase):
         self.assertEqual(voices[0]['id'], 'edge-tts')
         self.assertEqual(voices[0]['voice'], 'zh-CN-XiaoxiaoNeural')
 
+    @staticmethod
+    def _private_target(user_id: str = '1000008890') -> dict:
+        return {'platform': 'onebot', 'self_id': '100001357', 'user_id': user_id,
+                'group_id': '', 'channel_id': user_id, 'is_group': False}
+
     def test_set_input_status_on_and_off(self):
-        target = {'platform': 'onebot', 'self_id': '100001357', 'user_id': '1000008890',
-                  'group_id': '', 'channel_id': '1000008890', 'is_group': False}
+        target = self._private_target()
         result = asyncio.run(self.transport.set_input_status(target, True))
         self.assertTrue(result['ok'], result)
         self.assertEqual(
@@ -1076,14 +1080,67 @@ class VoiceAndInputStatusTests(PlatformTransportTestCase):
         self.assertIn('user_id', result['error'])
         self.assertEqual(self.client.calls, [])
 
-    def test_set_input_status_failure_does_not_raise(self):
-        """群聊不一定支持输入状态：失败就是 ok=False + 一条 warn。"""
-        target = {'platform': 'onebot', 'self_id': '100001357', 'user_id': '2', 'is_group': True}
-        self.client.default_frame = {'status': 'failed', 'retcode': 1400, 'message': '群聊不支持'}
-        result = asyncio.run(self.transport.set_input_status(target, True))
+    def test_group_targets_never_reach_the_platform_and_never_warn(self):
+        """**新用例（用户点名）**：群聊不点亮、不熄灭、不调用、不告警。"""
+        for typing in (True, False):
+            with self.subTest(typing=typing):
+                self.client.calls.clear()
+                self.logs.clear()
+                result = asyncio.run(self.transport.set_input_status(
+                    {'platform': 'onebot', 'self_id': '1', 'user_id': '2',
+                     'group_id': '7788', 'is_group': True},
+                    typing,
+                ))
+                self.assertFalse(result['ok'])
+                self.assertEqual(self.client.calls, [], '群聊一个平台调用都不许发')
+                self.assertEqual(self.warnings(), [], '群聊不许告警')
+
+    def test_a_missing_receipt_is_a_success_not_a_failure(self):
+        """**新用例（用户点名）**：`set_input_status` 是即发即忘的接口，NapCat 不保证
+        返回 dict。没有 dict 回执**当成功**，而且不许再打那两条 warn。"""
+        for frame in (None, {}, 'ok', 0):
+            with self.subTest(frame=frame):
+                self.client.calls.clear()
+                self.logs.clear()
+                self.client.default_frame = frame
+                result = asyncio.run(self.transport.set_input_status(self._private_target(), True))
+                self.assertTrue(result['ok'], '没有回执不是失败：%r' % (frame,))
+                self.assertEqual(self.warnings(), [], '即发即忘的接口不该为回执形状告警')
+                self.assertEqual(self.client.actions, ['set_input_status'])
+        self.client.default_frame = {'status': 'ok', 'retcode': 0, 'data': {}}
+
+    def test_a_platform_verdict_of_failure_is_still_a_failure_but_stays_quiet(self):
+        """真实失败**不许被吞**（ok=False，平台原话原样回给调用方），而传输层这一路
+        **一条日志都不打**——降噪与"确实不支持"的那条 warn 由 core 按会话节流后打。"""
+        self.client.default_frame = {'status': 'failed', 'retcode': 1400, 'message': '假的拒绝'}
+        before = len(self.logs)
+        result = asyncio.run(self.transport.set_input_status(self._private_target(), True))
         self.assertFalse(result['ok'])
-        self.assertIn('群聊不支持', result['error'])
-        self.assertWarned('输入状态设置失败')
+        self.assertIn('假的拒绝', result['error'])
+        self.assertEqual(result.get('retcode'), 1400)
+        self.assertEqual(self.warnings(), [], '真实失败在传输层也不打 warn')
+        self.assertEqual(self.logs[before:], [], '传输层对输入状态完全静音（core 负责记一条）')
+        self.client.default_frame = {'status': 'ok', 'retcode': 0, 'data': {}}
+
+    def test_a_transport_exception_still_returns_a_failure(self):
+        self.client.raise_error = RuntimeError('连接断了')
+        result = asyncio.run(self.transport.set_input_status(self._private_target(), True))
+        self.assertFalse(result['ok'])
+        self.assertIn('连接断了', result['error'])
+        self.assertEqual(self.warnings(), [])
+        self.client.raise_error = None
+
+    def test_no_input_status_log_line_is_labelled_as_a_group_chat(self):
+        """**新用例（用户点名）**：私聊里的输入状态日志不许出现 `[群聊]` 标签——
+        哪怕平台给的错误文案里就写着"群聊"两个字。真正的标签由 core 按真实会话
+        类型给（`test_platform_dispatch` 钉住那条），传输层这一路一声不吭。"""
+        self.client.default_frame = {'status': 'failed', 'retcode': 1400, 'message': '群聊不支持'}
+        result = asyncio.run(self.transport.set_input_status(self._private_target(), True))
+        self.assertFalse(result['ok'], '真实失败不许被吞')
+        self.assertIn('群聊不支持', result['error'], '平台原话原样回给调用方')
+        rendered = '\n'.join(text for _level, text in self.logs)
+        self.assertNotIn('[群聊]', rendered)
+        self.client.default_frame = {'status': 'ok', 'retcode': 0, 'data': {}}
 
 
 # =========================================================================== #

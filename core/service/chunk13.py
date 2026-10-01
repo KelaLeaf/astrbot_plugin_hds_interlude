@@ -87,7 +87,7 @@ QZONE_AUTO_FEED_NOTE_INTERVAL_MS = 60 * 60 * 1000
 QZONE_POST_SUMMARY_CHARS = 120
 #: 改可见范围前回看多少条说说找"当前正文"（`emotion_cgi_update` 会按整条重建）。
 QZONE_VISIBILITY_LOOKUP_COUNT = 30
-#: 改带图说说的可见范围时，最多肯**重新上传**几张图（v1.7.8）。
+#: 改带图说说的可见范围时，最多肯**重新上传**几张图（v1.7.7）。
 #:
 #: 一条说说的相册上限就是 9 张；超过这个数不可能来自一条正常说说（列表被拼坏 /
 #: 字段被污染），此时**明确拒绝**而不是"只传前 9 张"——静默少传一张就是丢内容。
@@ -174,6 +174,28 @@ def _target_uin_param(value: Any) -> Any:
     if not math.isfinite(number) or number != int(number):
         return None
     return int(number)
+
+
+def _qzone_feed_row(raw: Any) -> dict[str, Any]:
+    """把动态行补成"归一化层认识"的形状：只做**时间字段的搬运**。
+
+    两条读通道的时间字段名不一样：SnowLuma 的 `get_qzone_feeds` 回 `time`（秒），
+    NapCat WS 方案（QZone CGI）回 `abstime`（秒，`feedstime` 是人读格式）。
+    而 `normalize_qzone_feed_entry` / `fresh_qzone_feeds` / `qzone_feed_candidates`
+    只认 `time`——不补这一下，CGI 通道回来的每条动态都会被当成 1970 年、被新鲜度
+    过滤整批丢掉（"看着在轮询、其实一条都不进剧本"）。
+
+    **只动这一个键**：协议层（`core/qzone_cgi.py`）的解析结果一个字不改。
+    """
+    row = dict(raw) if isinstance(raw, Mapping) else {}
+    if 'time' in row:
+        return row
+    for source in ('abstime', 'feedstime'):
+        stamp = row.get(source)
+        if stamp not in (None, ''):
+            row['time'] = stamp
+            break
+    return row
 
 
 def _js_round(value: float) -> int:
@@ -594,7 +616,7 @@ class ServiceChunk13(ServiceBase):
         对空正文直接抛错）。所以：
 
         1. 用 `moods`（说说列表）按 `tid` 找回当前正文；
-        2. **带配图的说说先把原图重新上传一遍**（v1.7.8）：图片不在正文里，而在上传时由服务端
+        2. **带配图的说说先把原图重新上传一遍**（v1.7.7）：图片不在正文里，而在上传时由服务端
            生成的 `richval`（`albumid` / `lloc` / `sloc` / …）里，说说列表只回图片 URL，拿不回
            那串原文——所以走"下载原图 → 重新上传 → 用新回执拼 `richval` → 带着它 update"
            这条路。代价是**图片在腾讯侧变成新上传的副本**（地址与相册记录都换了，点赞 / 评论 /
@@ -728,7 +750,7 @@ class ServiceChunk13(ServiceBase):
     async def _qzone_reupload_images(
         self, request: Any, auth: Any, pics: Sequence[Any],
     ) -> tuple[str, str, str]:
-        """把这条说说原来的配图**重新上传**一遍，拼出新的 `richval` / `pic_bo`（v1.7.8）。
+        """把这条说说原来的配图**重新上传**一遍，拼出新的 `richval` / `pic_bo`（v1.7.7）。
 
         为什么非要重传：`emotion_cgi_update` 按整条重建，而图片不在正文里——它在**上传时**
         由服务端生成的 `richval`（`albumid` / `lloc` / `sloc` / …）里，说说列表只回图片 URL，
@@ -888,13 +910,20 @@ class ServiceChunk13(ServiceBase):
                 return
             now = self.now()
             try:
-                raw = _mapping(await call_qzone_action(call, 'get_qzone_feeds', {
+                # **只读动作一律走 `_qzone_run_action`**：NapCat WS 方案（get_cookies +
+                # QZone CGI）优先，拿不到 cookie 才回落 SnowLuma 扩展动作。
+                # 早先这里直接 `call_qzone_action`，等于把 `get_qzone_feeds` 当成
+                # NapCat 的**原生动作**打过去——NapCat 根本没有这条 API，于是每轮都
+                # 以 `retcode 1404 不支持的Api get_qzone_feeds` 失败（用户贴日志点名）。
+                # 两个通道认的参数名不同：CGI 认 `page`、SnowLuma 认 `page_num`，都带上。
+                raw = _mapping(await self._qzone_run_action(call, 'get_qzone_feeds', {
+                    'page': QZONE_FEED_PAGE_NUM,
                     'page_num': QZONE_FEED_PAGE_NUM,
                     'count': QZONE_FEED_PAGE_SIZE,
-                }))
+                }, 'feed'))
                 feeds = [
                     entry for entry in (
-                        normalize_qzone_feed_entry(item, now)
+                        normalize_qzone_feed_entry(_qzone_feed_row(item), now)
                         for item in _rows(pick(raw, 'feeds'))
                     ) if entry
                 ]
@@ -914,14 +943,21 @@ class ServiceChunk13(ServiceBase):
             for feed in qzone_feed_candidates(feeds, seen_keys, runtime, now):
                 content = ''
                 try:
-                    list_raw = _mapping(await call_qzone_action(call, 'get_qzone_msg_list', {
-                        'target_uin': _target_uin_param(pick(feed, 'uin')),
+                    # 同一条口径：正文对齐也走 CGI 优先的读通道（NapCat 没有
+                    # `get_qzone_msg_list` 这条原生动作）。参数名两个通道各取所需：
+                    # CGI 认 `targetUin` + `count`，SnowLuma 认 `target_uin` + `num`。
+                    target_uin = _target_uin_param(pick(feed, 'uin'))
+                    list_raw = _mapping(await self._qzone_run_action(call, 'get_qzone_msg_list', {
+                        'target_uin': target_uin,
+                        'targetUin': target_uin,
                         'num': QZONE_FEED_MSG_NUM,
-                    }))
+                        'count': QZONE_FEED_MSG_NUM,
+                    }, 'moods'))
                     entries = [
                         entry for entry in (
                             normalize_qzone_msg_entry(item)
-                            for item in _rows(pick(list_raw, 'msglist'))
+                            # CGI 通道把说说列表放在 `posts` 里，SnowLuma 放在 `msglist`。
+                            for item in _rows(pick(list_raw, 'msglist', 'posts'))
                         ) if entry
                     ]
                     content = match_qzone_feed_content(entries, feed)

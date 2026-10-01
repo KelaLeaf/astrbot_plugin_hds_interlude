@@ -41,6 +41,9 @@ class _Host(ServiceChunk12):
         self.intents: list[dict] = []
         self.commands: list[dict] = []
         self.reports: list[tuple[str, str]] = []
+        #: 排出去的定时器 `(callback, delay_ms, args)`——测试里手动触发（分段气泡的
+        #: "到点才点亮"就是靠它）。
+        self.timers: list[tuple] = []
         self._next_id = 0
         self._random = 0.5
         self._now = ANCHOR
@@ -56,12 +59,36 @@ class _Host(ServiceChunk12):
 
             @staticmethod
             def set_timeout(callback, delay_ms, *args):
+                host.timers.append((callback, delay_ms, args))
                 return None
 
         return _Ctx()
 
+    def fire_timers(self, callback_name: str = '') -> None:
+        """触发已排的定时器（可选只挑某个回调名），模拟宿主到点回调。"""
+        pending, self.timers = self.timers, []
+        for callback, _delay, args in pending:
+            if callback_name and getattr(callback, '__name__', '') != callback_name:
+                self.timers.append((callback, _delay, args))
+                continue
+            callback(*args)
+
     def now(self):
         return self._now
+
+    def now_ms(self):
+        return self._now.timestamp() * 1000
+
+    def note_access_skip(self, key, interval_ms, message, *args, category=''):
+        """`ServiceBase.note_access_skip` 的最小等价物（"一次性信息按会话节流"）。"""
+        self.access_notes = getattr(self, 'access_notes', {})
+        now = self.now_ms()
+        last = self.access_notes.get(key)
+        if last is not None and now - last < interval_ms:
+            return False
+        self.access_notes[key] = now
+        self.report_standalone('warn', message, *args, category=category)
+        return True
 
     def random(self):
         return self._random
@@ -69,8 +96,11 @@ class _Host(ServiceChunk12):
     def section(self, name):
         return self.config.get(name) or {}
 
-    def report_standalone(self, level, message, *args):
+    def report_standalone(self, level, message, *args, category=""):
         self.reports.append((level, message % args if args else message))
+        #: 每条日志的标签（真实会话类型决定的那个）——钉"私聊不许标成 [群聊]"。
+        self.categories = getattr(self, 'categories', [])
+        self.categories.append(category)
 
     def typing_delay_milliseconds(self, content):
         return 1200
@@ -117,7 +147,7 @@ class _Transport:
 
     async def set_input_status(self, target, typing):
         self.status.append((dict(target), typing))
-        return {'ok': self.ok}
+        return {'ok': self.ok, 'error': '' if self.ok else 'platform-error'}
 
 
 STORY = {'id': 's1'}
@@ -562,6 +592,154 @@ class TypingIndicatorTests(unittest.IsolatedAsyncioTestCase):
         await host.end_typing({'userId': '1'})
         self.assertEqual(host._typing_lit(), {})
         self.assertEqual([typing for _t, typing in transport.status], [True, False])
+
+    # ------------------------------------------------------------------ #
+    # 逐条气泡：只对私聊、两条 = 两次亮灭、到点才亮
+    # ------------------------------------------------------------------ #
+
+    async def test_two_bubbles_light_and_darken_twice_never_merged(self):
+        """**新用例（用户点名）**：每条气泡自己的等待窗口里亮一次、发出即熄灭。
+        两条气泡 = 两次亮灭，绝不合并成一次长亮。"""
+        transport = _Transport()
+        host = self._host(transport, {'input_status': {
+            'enabled': True, 'min_visible_ms': 0, 'beat_chance': 0,
+        }})
+        host.typing_delay_milliseconds = lambda content: 20  # type: ignore[assignment]
+        session = {'userId': '1', 'groupId': ''}
+        # 调用点的语义：每条气泡发出**之前**调一次，它自己负责亮→等→灭。
+        await host.typing_indicator(session, '第一条')
+        await host.typing_indicator(session, '第二条')
+        self.assertEqual(
+            [typing for _t, typing in transport.status],
+            [True, False, True, False],
+            '两条气泡必须各自亮灭一次，不许合并',
+        )
+        self.assertEqual(len(transport.status), 4)
+
+    async def test_a_too_short_bubble_sends_no_input_status_at_all(self):
+        """短于 `min_visible_ms` 的气泡**一条输入状态都不发**——连"停止输入"也不发。
+        否则 `min_visible_ms` 的说明（"短于此时长就不发送，避免闪一下"）就是假的，
+        而且每条短回复都会多一次多余的平台调用。"""
+        transport = _Transport()
+        host = self._host(transport, {'input_status': {
+            'enabled': True, 'min_visible_ms': 5000, 'beat_chance': 0,
+        }})
+        host.typing_delay_milliseconds = lambda content: 200  # type: ignore[assignment]
+        session = {'userId': '1', 'groupId': ''}
+        self.assertEqual(await host.typing_indicator(session, '在', darken=False), 0)
+        await host.end_typing(session)
+        self.assertEqual(transport.status, [])
+
+    async def test_group_sessions_never_light_never_warn(self):
+        """**新用例（用户点名）**：群聊不点亮、不熄灭、不调用、不告警。"""
+        for session in (
+            {'userId': '1', 'groupId': '7788'},
+            {'userId': '1', 'groupId': 7788},
+            {'userId': '1', 'groupId': '7788', 'is_group': True},
+        ):
+            with self.subTest(session=session):
+                transport = _Transport()
+                host = self._host(transport, {'input_status': {
+                    'enabled': True, 'min_visible_ms': 0,
+                }})
+                host.typing_delay_milliseconds = lambda content: 20  # type: ignore[assignment]
+                self.assertEqual(await host.typing_indicator(session, '你好'), 0)
+                self.assertFalse(await host.begin_typing(session, 500))
+                await host.end_typing(session)
+                self.assertEqual(transport.status, [], '群聊一个平台调用都不许发')
+                self.assertEqual(host.reports, [], '群聊不许告警')
+
+    def test_group_detection_treats_the_onebot_group_id_zero_as_private(self):
+        """OneBot 私聊会把 `group_id` 填成 `0` / `'0'`——那是**私聊**，不是群聊
+        （用户贴的日志正是 `group_id: 0`）。"""
+        is_group = _Host.typing_target_is_group
+        for target in (
+            {'group_id': 0}, {'group_id': '0'}, {'group_id': ''}, {'group_id': None},
+            {'user_id': '1'}, {'user_id': '1', 'is_group': False},
+        ):
+            with self.subTest(target=target):
+                self.assertFalse(is_group(target))
+        for target in (
+            {'group_id': 7788}, {'group_id': '7788'}, {'is_group': True},
+            {'group_id': '7788', 'is_group': False},
+        ):
+            with self.subTest(target=target):
+                self.assertTrue(is_group(target))
+
+    async def test_a_group_id_zero_session_still_lights(self):
+        """用户日志里的形状：`group_id: 0` 的私聊**照样**点亮。"""
+        transport = _Transport()
+        host = self._host(transport, {'input_status': {
+            'enabled': True, 'min_visible_ms': 0, 'beat_chance': 0,
+        }})
+        host.typing_delay_milliseconds = lambda content: 20  # type: ignore[assignment]
+        waited = await host.typing_indicator({'userId': '1000008890', 'groupId': 0}, '你好')
+        self.assertGreater(waited, 0)
+        self.assertEqual([typing for _t, typing in transport.status], [True, False])
+
+    async def test_a_split_bubble_lights_only_when_its_own_window_starts(self):
+        """分段气泡：第 1 条（窗口从 0 开始）立刻点亮；第 N 条**到点才点亮**，
+        不在排期那一刻把所有分段一次点亮（用户点名的旧行为）。"""
+        transport = _Transport()
+        host = self._host(transport, {'input_status': {
+            'enabled': True, 'min_visible_ms': 0, 'beat_chance': 0,
+        }})
+        session = {'userId': '1', 'groupId': ''}
+        self.assertTrue(await host.begin_typing(session, 900, delay_ms=0))
+        self.assertEqual([typing for _t, typing in transport.status], [True])
+
+        self.assertTrue(await host.begin_typing(session, 900, delay_ms=900))
+        self.assertEqual(
+            [typing for _t, typing in transport.status], [True],
+            '窗口还没开始：这条气泡此刻不许点亮',
+        )
+        delayed = [item for item in host.timers if getattr(item[0], '__name__', '') == '_typing_light_later']
+        self.assertEqual(len(delayed), 1, '正好排了一条"到点才点亮"')
+        self.assertEqual(delayed[0][1], 900)
+        host.fire_timers('_typing_light_later')
+        await asyncio.sleep(0.01)  # 让回调里 ensure_future 起来的点亮任务跑完
+        self.assertEqual(
+            [typing for _t, typing in transport.status], [True, True],
+            '第 2 条气泡的窗口开始时才点亮',
+        )
+
+    async def test_a_real_failure_is_a_debug_line_and_an_unsupported_platform_warns_once_per_session(self):
+        """**新用例（用户点名）**：真实失败只留一条 debug（原文不丢）；只有"确实不支持"
+        才 warn，而且**按会话节流**。"""
+        # ① 真实失败：debug + 原文
+        transport = _Transport(ok=False)
+        host = self._host(transport, {'input_status': {'enabled': True, 'min_visible_ms': 0}})
+        host.typing_delay_milliseconds = lambda content: 20  # type: ignore[assignment]
+        await host.typing_indicator({'userId': '1'}, '你好')
+        self.assertEqual([level for level, _t in host.reports], ['debug'])
+        self.assertIn('platform-error', host.reports[0][1])
+        self.assertNotIn('warn', [level for level, _t in host.reports])
+        self.assertEqual(host.categories, ['[系统]'],
+                         '私聊的日志标签按真实会话类型给，不跟着平台文案走')
+
+        # ② "确实不支持"：warn 一条，重复调用不再打（按会话节流）
+        class _Unsupported:
+            async def set_input_status(self, target, typing):
+                return {'ok': False, 'unsupported': True, 'error': '当前平台没有这条能力'}
+
+        host = self._host(_Unsupported(), {'input_status': {'enabled': True, 'min_visible_ms': 0}})
+        host.typing_delay_milliseconds = lambda content: 20  # type: ignore[assignment]
+        await host.typing_indicator({'userId': '1', 'self_id': 'bot'}, '你好')
+        await host.typing_indicator({'userId': '1', 'self_id': 'bot'}, '又一条')
+        warned = [item for item in host.reports if item[0] == 'warn']
+        self.assertEqual(len(warned), 1, '不支持是一次性信息，按会话节流后只打一条')
+        self.assertIn('不支持', warned[0][1])
+        self.assertEqual(host.categories, ['[系统]'], '节流后的 warn 也按真实会话类型打标签')
+
+    async def test_real_failures_are_not_swallowed_even_though_they_are_quiet(self):
+        """降噪不等于吞错：平台的明确拒绝照样返回 ok=False，并且原文进 debug 日志。"""
+        class _Rejecting:
+            async def set_input_status(self, target, typing):
+                return {'ok': False, 'retcode': 1400, 'error': 'set_input_status 失败：假的拒绝'}
+
+        host = self._host(_Rejecting(), {'input_status': {'enabled': True, 'min_visible_ms': 0}})
+        self.assertFalse(await host._set_input_status({'user_id': '1'}, True))
+        self.assertTrue(any('假的拒绝' in text for _level, text in host.reports))
 
 
 class CronTests(unittest.TestCase):

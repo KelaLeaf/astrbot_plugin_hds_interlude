@@ -936,6 +936,11 @@ class ServiceChunk4(ServiceBase):
             if automatic_delivery:
                 await self.record_automatic_delivery(story['id'], participant['id'], automatic_delivery, now)
             await self.record_character_message(participant, now)
+            # 本移植版：这条分段气泡已经投出去了，熄灭"正在输入"（下一条有自己的窗口，
+            # 由 `confirm_outgoing_deliveries` 按 `notBefore` 到点才点亮）。
+            ender = getattr(self, 'end_typing', None)
+            if callable(ender):
+                await ender(participant)
             await self.db_set('interlude_intent', {'id': intent['id']}, {'status': 'completed', 'updatedAt': now})
         if split_handled:
             await self.schedule_next_split_wake(story['id'])

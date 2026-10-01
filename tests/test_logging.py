@@ -179,6 +179,34 @@ class PhaseLabelTests(unittest.TestCase):
         self.assertEqual(phase_label(None), "系统")
 
 
+class LogCategoryTests(unittest.TestCase):
+    """标签口径：默认按文案推断；调用方知道**真实会话类型**时以它为准。
+
+    用户 2026-09-28 贴的日志里，私聊的一条输入状态日志被标成了 `[群聊]`——只因为
+    平台错误文案里写着"群聊不支持"。`category` 就是给这种场景准备的确定口径。
+    """
+
+    def _render(self, **extra):
+        record = {
+            "level": "warn", "protagonist": "HDSI", "colors": False,
+            "message": "输入状态设置失败 错误=%s", "args": ["群聊不支持"],
+            "standalone": True,
+        }
+        record.update(extra)
+        return format_layered_log(record)
+
+    def test_prose_alone_still_drives_the_category_by_default(self):
+        self.assertIn("[群聊]", self._render())
+
+    def test_the_caller_can_pin_the_real_session_type(self):
+        self.assertIn("[系统]", self._render(category="[系统]"))
+        self.assertNotIn("[群聊]", self._render(category="[系统]"))
+        self.assertIn("[群聊]", self._render(category="[群聊]"))
+
+    def test_an_empty_category_falls_back_to_prose(self):
+        self.assertIn("[群聊]", self._render(category=""))
+
+
 class LogSinkTests(unittest.TestCase):
     """移植版新增：`ctx.logger` → 可注入 sink。"""
 

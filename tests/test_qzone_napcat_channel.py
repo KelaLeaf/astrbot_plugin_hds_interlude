@@ -453,6 +453,106 @@ class QzoneReadTests(unittest.IsolatedAsyncioTestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 2c. 自动浏览好友动态也必须走 CGI（v1.7.8 修误路由）
+# --------------------------------------------------------------------------- #
+
+
+def _fresh_feed_text(seconds_ago: int = 1200) -> str:
+    """一条"时间窗内"的好友动态（`abstime` 是 CGI 通道的时间字段，秒）。"""
+    return (
+        "{ver:1,key:'K1',appid:311,uin:10002,nickname:'\u67d0\u4eba',abstime:%d,"
+        "html:'<div>\u4eca\u5929\u5929\u6c14\u5f88\u597d</div>',}"
+        % int(NOW.timestamp() - seconds_ago)
+    )
+
+
+def _feed_sweep_http(method: str, url: str, headers: object, data: object) -> str:
+    """CGI 两个读接口的回包：动态页 + 说说列表（tid 与动态的 `key` 对齐）。"""
+    if 'emotion_cgi_msglist' in url:
+        return '_preloadCallback({"code":0,"msglist":[{"tid":"K1","content":"\u4eca\u5929\u5929\u6c14\u5f88\u597d"}]});'
+    return _fresh_feed_text()
+
+
+class FeedSweepChannelTests(unittest.IsolatedAsyncioTestCase):
+    """**新用例（用户点名）**：自动浏览好友动态走 **QZone CGI 读通道**。
+
+    日志里的铁证是：
+
+        OneBot 动作 get_qzone_feeds 传输异常（结果未知，请勿自动重试）：
+        <ActionFailed retcode: 1404, message: '不支持的Api get_qzone_feeds'>
+
+    NapCat **没有** `get_qzone_feeds` / `get_qzone_msg_list` 这两条原生动作（它只有
+    发 / 删说说），所以任何把 QQ 空间的**读**当平台动作派出去的地方都是误路由。
+    这条回归钉住：默认（有 NapCat WS 通道）路径下，这两个动作名**一个都不会出现**
+    在 OneBot 直通里。
+    """
+
+    def _sweep_host(self) -> _Host:
+        host = _Host(config=dict(BASE_CONFIG, auto_feed=True, daily_comment_cap=1))
+        host.transport = _NapcatTransport(_napcat_handler([]), http=_feed_sweep_http)
+        return host
+
+    async def test_the_sweep_reads_through_the_qzone_cgi_not_a_platform_action(self):
+        host = self._sweep_host()
+        await host.qzone_feed_sweep()
+
+        actions = host.actions_called()
+        self.assertNotIn('get_qzone_feeds', actions,
+                         'NapCat 没有这条动作，绝不许当平台动作发出去（1404 的来源）')
+        self.assertNotIn('get_qzone_msg_list', actions)
+        self.assertEqual(actions, ['get_cookies', 'get_login_info', 'get_cookies', 'get_login_info'])
+        urls = [call['url'] for call in host.transport.http_calls]
+        self.assertEqual(len(urls), 2, '一条动态 + 一次正文对齐，两条都走 CGI')
+        self.assertTrue(any('feeds3_html_more' in url for url in urls))
+        self.assertTrue(any('emotion_cgi_msglist_v6' in url for url in urls))
+        # 参数按 CGI 的口径发：`pagenum` / `count` / `num`（不是 SnowLuma 的 `page_num`）。
+        feed_call = host.transport.http_calls[0]
+        self.assertEqual(feed_call['data']['pagenum'], '1')
+        self.assertEqual(feed_call['data']['count'], '20')
+        self.assertEqual(host.transport.http_calls[1]['data']['num'], '5')
+        self.assertEqual(len(host.entries), 1)
+        self.assertEqual(host.entries[0]['content'], '[好友动态] 某人发布了说说：今天天气很好')
+
+    async def test_the_sweep_still_records_the_dedupe_ledger_over_the_cgi(self):
+        """换通道不许把去重账本弄丢：`feed-seen` 行照旧落，且 tid 就是动态的 `key`。"""
+        host = self._sweep_host()
+        await host.qzone_feed_sweep()
+        seen = [data for table, data in host.created
+                if table == 'interlude_qzone_post' and data.get('kind') == 'feed-seen']
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]['tid'], 'K1')
+
+    async def test_the_cgi_time_field_keeps_the_entry_inside_the_freshness_window(self):
+        """CGI 那条通道的时间字段叫 `abstime`（SnowLuma 叫 `time`）：归一化前必须补上，
+        否则每条动态都会被当成 1970 年、被新鲜度过滤整批丢掉（悄悄什么都不进剧本）。"""
+        host = self._sweep_host()
+        await host.qzone_feed_sweep()
+        self.assertEqual(len(host.entries), 1, '时间字段搬运没做对时这里会是 0')
+
+    async def test_without_any_cgi_channel_the_snowluma_fallback_is_the_only_path(self):
+        """两条通道的边界：**只有**传输层没有原始 HTTP 能力（纯 SnowLuma 环境）时，
+        读才回落成平台动作 `get_qzone_feeds`。默认（装了 NapCat）走不到这里。"""
+        host = _Host(config=dict(BASE_CONFIG, auto_feed=True, daily_comment_cap=1))
+        host.transport = _NapcatTransport(
+            lambda a, p: (
+                {'ok': True, 'error': '', 'data': {'feeds': [{
+                    'key': 'K1', 'uin': '10002', 'appid': 311,
+                    'time': NOW.timestamp() - 1200,
+                }]}}
+                if a == 'get_qzone_feeds'
+                else {'ok': True, 'error': '', 'data': {'msglist': []}}
+            ),
+            has_http=False,
+        )
+        await host.qzone_feed_sweep()
+        self.assertEqual(host.transport.http_calls, [])
+        self.assertEqual(
+            [name for name in host.actions_called() if name.startswith('get_qzone')],
+            ['get_qzone_feeds', 'get_qzone_msg_list'],
+        )
+
+
+# --------------------------------------------------------------------------- #
 # 2b. 改说说可见范围（v1.7.5）
 # --------------------------------------------------------------------------- #
 

@@ -167,7 +167,7 @@ class FakeService(ServiceChunk3):
     def report_operation(self, *args: Any) -> None:
         self.logs.append(('operation',) + args)
 
-    def report_standalone(self, level: str, message: str, *args: Any) -> None:
+    def report_standalone(self, level: str, message: str, *args: Any, **_kwargs: Any) -> None:
         self.logs.append(('standalone', level, message % args if args else message))
 
     def report_standalone_operation(self, *args: Any) -> None:
@@ -534,10 +534,13 @@ class _FlushHost(FakeService):
     async def send_outgoing_messages(
         self, story: Any, messages: Any, participant: Any, session: Any,
         should_cancel: Any = None, record_failures: bool = True, request_started_at: Any = None,
+        **kwargs: Any,
     ) -> list[Any]:
         self.calls['send_outgoing_messages'] = (messages, participant, session)
         # 上游 1.0.1-rc21：叙事请求发起时刻必须传到投递侧（首条打字时间下限的基准）。
         self.calls['request_started_at'] = request_started_at
+        # 逐条「正在输入」窗口只在"立即回复"这条路径打开（用户 2026-09-28 点名）。
+        self.calls['typing_window'] = kwargs.get('typing_window')
         return list(messages)
 
     async def confirm_outgoing_deliveries(self, story: Any, delivered: Any) -> None:

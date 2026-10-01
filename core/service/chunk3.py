@@ -1658,6 +1658,9 @@ class ServiceChunk3(ServiceBase):
                 delivered = await self.send_outgoing_messages(
                     snapshot['story'], result['messages'], snapshot['participant'], latest_session,
                     request_started_at=request_started_at,
+                    # 立即回复：逐条气泡在**发出之前**点亮「正在输入」并按它自己的打字
+                    # 时长等待，发出即熄灭（用户点名的语义；分段气泡另有自己的窗口）。
+                    typing_window=True,
                 )
                 await self.confirm_outgoing_deliveries(snapshot['story'], delivered)
                 channel_id = pick(snapshot['participant'], 'channelId', 'channel_id')

@@ -379,7 +379,13 @@ def _log_category(
     phase: Optional["NarrativePhase"] = None,
     standalone: bool = False,
     message: str = "",
+    category: Optional[str] = None,
 ) -> str:
+    # 调用方知道**真实会话类型**时以它为准：这个标签是纯文案推断出来的，谁在正文里
+    # 写了一句"群聊不支持"就会被错标成 `[群聊]`（私聊里也照标）。能给出确切口径的
+    # 调用方（如输入状态按会话坐标判定）就把 `category` 显式传下来。
+    if category:
+        return str(category)
     if action == "trigger" or action == "emotion" or _RE_CATEGORY_ALTER.search(message):
         return "[情绪追踪]"
     if action == "agency" or _RE_CATEGORY_AGENCY.search(message):
@@ -488,7 +494,8 @@ def format_layered_log(data: Dict[str, Any]) -> str:
 
     `data` 键与上游 `LayeredLogInput` 一一对应：
     `level` / `phase` / `protagonist` / `message` / `args` / `colors` /
-    `color_theme` / `kaomoji` / `standalone`。
+    `color_theme` / `kaomoji` / `standalone`。本移植版多一个可选键 `category`：
+    调用方知道真实会话类型时用它直接给标签（未给时照旧按文案推断）。
     """
     text = render_log_message(data.get("message", ""), data.get("args"))
     action = detect_log_action(text, data.get("level"))
@@ -497,7 +504,9 @@ def format_layered_log(data: Dict[str, Any]) -> str:
     standalone = data.get("standalone") is True
     root = _is_root_log(summary, action, data.get("level"), standalone)
     branch = "" if root else ("└─" if _is_final_branch(summary, action) else "├─")
-    category = _log_category(action, data.get("phase"), standalone, text)
+    category = _log_category(
+        action, data.get("phase"), standalone, text, data.get("category"),
+    )
     face = _SYMBOLS[action] if data.get("kaomoji") is False else _KAOMOJI[action]
     theme = data.get("color_theme")
     palette = _COLOR_PALETTES["dark" if theme is None else theme]

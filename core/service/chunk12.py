@@ -59,8 +59,8 @@ CORE_HANDLED_ACTIONS = frozenset({
     'schedule_command', 'list_scheduled_commands', 'cancel_scheduled_command',
     # QQ 空间的三条**写动作**必须走 chunk13 的 `qzone_execute`（限流门 → 审计行 →
     # 动作 → 剧本条目），直通传输层会绕过风控与账本（上游这三个动作在叙事路径上
-    # 也是走 `qzoneExecute`）。只读的 `list_qzone_posts` / 危险的 `delete_qzone_post`
-    # 上游没有对应服务成员，直通传输层。
+    # 也是走 `qzoneExecute`）。危险的 `delete_qzone_post` 上游没有对应服务成员，
+    # 仍直通传输层（它打的是 NapCat **真有**的 `delete_qzone_msg`，见坑 71）。
     'publish_qzone_post', 'comment_qzone_post', 'like_qzone_post', 'forward_qzone_post',
     # v1.7.5：改说说可见范围（`emotion_cgi_update`）同样是**本机办**的写动作——
     # 它要先读回正文、过限流门、落审计行；直通传输层会绕过这一切（而且平台根本没有
@@ -68,6 +68,11 @@ CORE_HANDLED_ACTIONS = frozenset({
     'set_qzone_visibility',
     # v1.7.1：读类也收进本机——NapCat WebSocket 方案（get_cookies + QZone CGI）
     # 要按账号端点解析、并且**不能**让只读动作去撞限流门。
+    #
+    # ⚠️ 这两条**必须**留在本表里（v1.7.8 复核）：NapCat 的公开动作表里**没有**
+    # `get_qzone_feeds` / `get_qzone_msg_list`（它只有发 / 删说说），一旦被当平台动作
+    # 派到传输层，就是 `retcode 1404 不支持的Api`（用户贴过日志）。`_PLATFORM_CALLS`
+    # 里那两条映射只是目录↔平台的双向对账与 SnowLuma 直通口，默认路径走不到。
     'list_qzone_posts', 'list_qzone_feeds',
 })
 
@@ -77,7 +82,8 @@ QZONE_ACTION_KINDS_BY_ID = {
     'comment_qzone_post': 'comment',
     'like_qzone_post': 'like',
     # v1.7.1：转发说说也是**写**动作（受限流门与账本管）。只读的
-    # `list_qzone_feeds` / `list_qzone_posts` 与危险的 `delete_qzone_post` 直通传输层。
+    # `list_qzone_feeds` / `list_qzone_posts` 不走这张表（它们由 `qzone_read` 走
+    # CGI 读通道，见 `_run_core_action`）。
     'forward_qzone_post': 'forward',
     # v1.7.5：改可见范围（配额按**发帖**那一档算，见 `core/qzone.evaluate_qzone_gate`）。
     'set_qzone_visibility': 'visibility',
@@ -85,6 +91,10 @@ QZONE_ACTION_KINDS_BY_ID = {
 
 #: 定时消息在 intent 表里的类型名（内部调度账，控制台「承诺与意图」面板会标成内部）。
 SCHEDULED_MESSAGE_INTENT = 'scheduled-message'
+
+#: 「这个平台/这个会话就是不支持输入状态」的说明**按会话**节流（10 分钟）。
+#: 一次性信息才值得 warn，而且不该每回合重打一遍（用户 2026-09-28 点名降噪）。
+INPUT_STATUS_UNSUPPORTED_NOTE_INTERVAL_MS = 10 * 60 * 1000
 
 
 class ServiceChunk12(ServiceBase):
@@ -434,6 +444,25 @@ class ServiceChunk12(ServiceBase):
     def typing_indicator_target(self, session: Any) -> dict[str, Any]:
         return self.action_target_from_participant(session)
 
+    @staticmethod
+    def typing_target_is_group(target: Any) -> bool:
+        """会话坐标是不是群聊——**输入状态只对私聊做**（用户点名）。
+
+        判定依据是坐标里的真实会话类型：显式 `is_group: True`，或者一个非空、
+        非 `'0'` 的 `group_id`。私聊在 OneBot 里会把 `group_id` 填成 `0` /
+        `'0'` / 干脆不带这个键，三种都算私聊。
+        """
+        if not isinstance(target, dict):
+            return False
+        if target.get('is_group') is True:
+            return True
+        group_id = str(target.get('group_id') or '').strip()
+        return group_id not in ('', '0')
+
+    def typing_is_group(self, session: Any) -> bool:
+        """本回合会话是不是群聊（`typing_indicator_target` 之上的判定口）。"""
+        return self.typing_target_is_group(self.typing_indicator_target(session))
+
     async def typing_indicator(
         self,
         session: Any,
@@ -441,23 +470,29 @@ class ServiceChunk12(ServiceBase):
         *,
         already_waited_ms: int = 0,
         extra_delay_ms: int = 0,
+        darken: bool = True,
     ) -> int:
-        """点亮"正在输入"→按打字时间等待→熄灭，返回实际等待的毫秒数。
+        """点亮"正在输入"→按**这条气泡的**打字时长等待→熄灭，返回实际等待的毫秒数。
 
-        **刻意不挂主叙事期间**（用户明确要求）：模型思考时对方不该看到"正在输入"——
-        那是她还没开始打字。这里只按"这条气泡的打字时间"点亮，**一条气泡一次点亮/熄灭**，
-        所以分气泡投递天然就是多次闪光。
+        **一次调用只服务一条气泡**（用户点名的语义）：调用方在每条气泡**发出之前**调它，
+        发出之后这条气泡的灯就已经灭了；下一条要重新调一次、按它自己的字数重新等。
+        绝不允许"点亮一次、跨越多条气泡"。
 
-        - `already_waited_ms`：本回合已经等过的时间（首条消息的打字下限），不重复等待；
+        - **只对私聊做**：群聊直接返回 0，一个平台调用都不发（用户点名）；
+        - **刻意不挂主叙事期间**（用户明确要求）：模型思考时对方不该看到"正在输入"——
+          那是她还没开始打字。这里只按"这条气泡的打字时间"点亮；
+        - `already_waited_ms`：本回合已经等过的时间，不重复等待；
         - 等待时间短于 `min_visible_ms` 时**直接不点亮**（一闪而过只会显得抽风，也不值得多等）；
         - 中途按 `beat_chance` 随机"停一下再接着打"（打字节拍）；
+        - `darken=False`：等完**先不熄灯**，交给调用方在**真正发出之后**调 `end_typing`
+          熄灭——"发出后立刻中断"这条语义要求熄灯落在投递之后，而不是之前；
         - **任何异常都不影响投递**：输入状态是锦上添花，不是投递的前置条件。
         """
         config = self.input_status_config()
         if config.get('enabled') is False:
             return 0
         target = self.typing_indicator_target(session)
-        if not target:
+        if not target or self.typing_target_is_group(target):
             return 0
         try:
             total = max(0, int(self.typing_delay_milliseconds(content or '')) - int(already_waited_ms))
@@ -470,7 +505,13 @@ class ServiceChunk12(ServiceBase):
             min_visible = 600
         if total < min_visible:
             return 0
-        lit = await self._set_input_status(target, True)
+        if darken:
+            lit = await self._set_input_status(target, True)
+        else:
+            # 交给调用方在**投递之后**熄灭：走 `_light_typing` 登记 + 挂兜底定时器，
+            # 这样 `end_typing` 知道确实点过灯（没点过就不发"停止输入"——
+            # 短于 `min_visible_ms` 的回复本来就不该发任何输入状态）。
+            lit = await self._light_typing(target, total)
         if not lit:
             return 0
         try:
@@ -488,21 +529,60 @@ class ServiceChunk12(ServiceBase):
         except Exception:  # noqa: BLE001 - 打断/取消都不该冒泡
             pass
         finally:
-            await self._set_input_status(target, False)
+            if darken:
+                await self._set_input_status(target, False)
         return total
 
-    async def begin_typing(self, session: Any, expected_ms: int = 0) -> bool:
+    async def begin_typing(self, session: Any, expected_ms: int = 0, *, delay_ms: int = 0) -> bool:
         """**非阻塞**点亮输入状态（分段气泡用）。
 
-        分段气泡的等待发生在 intent 调度那边（`notBefore`），所以这里不能 sleep——只点亮，
-        再由投递那一刻调 `end_typing` 熄灭。额外挂一个**兜底定时器**：万一投递路径异常，
-        输入状态也会在 `expected_ms + 30s` 后自动熄灭（对方那头永远停在"正在输入"最糟）。
+        分段气泡的等待发生在 intent 调度那边（`notBefore`），所以这里不能 sleep——
+        只负责"把灯点上"。**逐条气泡的边界**由 `delay_ms` 决定：
+
+        - `delay_ms <= 0`：这条气泡的等待窗口**现在**开始 → 立刻点亮；
+        - `delay_ms > 0`：这条气泡的窗口要等上一条发出去才开始 → **到点才点亮**。
+
+        这样每条气泡各自有一段属于自己的亮灯窗口（`[上一条发出, 这一条发出]`），
+        而不是排期那一刻把所有分段一次点亮、跨越多条气泡（用户点名的旧行为）。
+        熄灭仍由投递那一刻的 `end_typing` 负责；额外挂一个**兜底定时器**：万一投递
+        路径异常，输入状态也会在 `expected_ms + 30s` 后自动熄灭（对方那头永远停在
+        "正在输入"最糟）。群聊一律不点亮。
         """
         config = self.input_status_config()
         if config.get('enabled') is False:
             return False
         target = self.typing_indicator_target(session)
-        if not target:
+        if not target or self.typing_target_is_group(target):
+            return False
+        expected = max(0, int(expected_ms or 0))
+        delay = max(0, int(delay_ms or 0))
+        if delay > 0:
+            # 窗口还没开始：排一条定时器到点再亮。排期失败就当没点亮（绝不影响投递）。
+            try:
+                self.context.set_timeout(self._typing_light_later, delay, target, expected)
+            except Exception:  # noqa: BLE001 - 定时器只是锦上添花
+                return False
+            return True
+        return await self._light_typing(target, expected)
+
+    async def end_typing(self, session: Any) -> None:
+        """熄灭输入状态（一条气泡投递完成后调用；重复调用安全）。群聊直接返回。
+
+        **没点亮过就不发"停止输入"**：短于 `min_visible_ms` 的回复、开关关掉、平台不支持
+        这几种情况下我们本来就没发过"开始输入"，再补一条"停止"既是多余的平台调用，
+        也违背 `min_visible_ms` 的说明（"短于此时长就不发送，避免闪一下"）。
+        """
+        target = self.typing_indicator_target(session)
+        if not target or self.typing_target_is_group(target):
+            return
+        key = self._typing_key(target)
+        if self._typing_lit().pop(key, None) is None:
+            return
+        await self._set_input_status(target, False)
+
+    async def _light_typing(self, target: dict[str, Any], expected_ms: int = 0) -> bool:
+        """点亮 + 挂兜底定时器（`begin_typing` 与定时回调共用的一段）。"""
+        if self.typing_target_is_group(target):
             return False
         if not await self._set_input_status(target, True):
             return False
@@ -515,14 +595,12 @@ class ServiceChunk12(ServiceBase):
             pass
         return True
 
-    async def end_typing(self, session: Any) -> None:
-        """熄灭输入状态（分段气泡投递完成后调用；重复调用安全）。"""
-        target = self.typing_indicator_target(session)
-        if not target:
-            return
-        key = self._typing_key(target)
-        self._typing_lit().pop(key, None)
-        await self._set_input_status(target, False)
+    def _typing_light_later(self, target: dict[str, Any], expected_ms: int = 0) -> None:
+        """到点才点亮（由 `context.set_timeout` 调用；同步回调里起一个即发任务）。"""
+        try:
+            asyncio.ensure_future(self._light_typing(target, max(0, int(expected_ms or 0))))
+        except Exception:  # noqa: BLE001 - 事件循环已关就放弃
+            pass
 
     def _typing_lit(self) -> dict[str, dict[str, Any]]:
         store = getattr(self, '_typing_lit_store', None)
@@ -547,17 +625,66 @@ class ServiceChunk12(ServiceBase):
         except Exception:  # noqa: BLE001 - 事件循环已关就放弃
             pass
 
+    @staticmethod
+    def typing_error_means_unsupported(result: Any) -> bool:
+        """这次失败是不是"这个平台/会话根本不支持输入状态"。
+
+        适配层对"没有 OneBot 客户端 / 不是 OneBot 平台"显式标 `unsupported`；平台的
+        明确拒绝（retcode 1404 / 文案里写"不支持"）同样算。其余一律当**真实错误**——
+        真实错误绝不能因为"降噪"被吞掉（用户点名的红线）。
+        """
+        if not isinstance(result, dict):
+            return False
+        if result.get('unsupported') is True:
+            return True
+        if result.get('retcode') == 1404:
+            return True
+        return '不支持' in str(result.get('error') or '')
+
     async def _set_input_status(self, target: dict[str, Any], typing: bool) -> bool:
-        """点亮/熄灭输入状态。平台不支持、没有账号、调用失败一律静默返回 False。"""
+        """点亮/熄灭输入状态。群聊、平台不支持、调用失败一律返回 False。
+
+        口径（用户 2026-09-28 点名降噪）：
+
+        * **群聊直接不做**——不点亮、不熄灭、不调用、不告警；
+        * **失败只留一条 debug**（原文带上平台错误，绝不忍吞）；
+        * 只有"确实不支持"这种一次性信息才 warn，且**按会话节流** 10 分钟——
+          否则每个回合都会重打一遍同样的 warn。
+        """
+        if self.typing_target_is_group(target):
+            return False
         setter = getattr(getattr(self, 'transport', None), 'set_input_status', None)
         if not callable(setter):
             return False
+        # 标签按**真实会话类型**给（这里是私聊——群聊在上面就返回了），别让平台错误文案
+        # 里的"群聊"两个字把这条日志标成 `[群聊]`（用户贴日志点名）。
+        category = '[系统]'
         try:
             result = await setter(target, typing)
-        except Exception as error:  # noqa: BLE001
-            self.report_standalone('debug', '输入状态设置失败 typing=%s 错误=%s', typing, error)
+        except Exception as error:  # noqa: BLE001 - 输入状态绝不冒泡、绝不影响投递
+            self.report_standalone(
+                'debug', '输入状态设置失败 输入中=%s 错误=%s', typing, error, category=category,
+            )
             return False
-        return bool(result.get('ok')) if isinstance(result, dict) else bool(result)
+        ok = bool(result.get('ok')) if isinstance(result, dict) else bool(result)
+        if ok:
+            return True
+        error = str(result.get('error') or '') if isinstance(result, dict) else ''
+        if self.typing_error_means_unsupported(result):
+            self.note_access_skip(
+                'input-status-unsupported|%s|%s' % (
+                    target.get('platform') or '', target.get('self_id') or '',
+                ),
+                INPUT_STATUS_UNSUPPORTED_NOTE_INTERVAL_MS,
+                '当前会话不支持「正在输入」状态，已停止设置 输入中=%s 原因=%s',
+                typing, error or '平台没有这条能力',
+                category=category,
+            )
+        else:
+            self.report_standalone(
+                'debug', '输入状态设置失败 输入中=%s 错误=%s', typing, error, category=category,
+            )
+        return False
 
     # ------------------------------------------------------------------ #
     # 本机动作：定时消息 / 定时命令

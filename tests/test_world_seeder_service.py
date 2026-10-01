@@ -91,7 +91,7 @@ class _Host(ServiceChunk10):
     def report_operation(self, level: str, verbosity: str, story: Any, phase: str, message: str, *args: Any) -> None:
         self.reports.append((level, message % args if args else message))
 
-    def report_standalone(self, level: str, message: str, *args: Any) -> None:
+    def report_standalone(self, level: str, message: str, *args: Any, **_kwargs: Any) -> None:
         self.standalone.append((level, message % args if args else message))
 
     def can_handle_story(self, story: Any) -> bool:

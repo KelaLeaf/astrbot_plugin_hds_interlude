@@ -282,9 +282,13 @@ class ServiceChunk9(ServiceBase):
             output = '[%s] %s\n事件：%s%s' % (phase_label(phase), protagonist, rendered, story_detail)
         self.emit_log(level, output)
 
-    def report_standalone(self, level: str, message: str, *args: Any) -> None:
-        """上游 `reportStandalone(level, message, ...args)`（`:6757`）。"""
-        self.write_standalone(level, message, args)
+    def report_standalone(self, level: str, message: str, *args: Any, category: str = '') -> None:
+        """上游 `reportStandalone(level, message, ...args)`（`:6757`）。
+
+        `category` 是本移植版的可选扩展：知道**真实会话类型**的调用方用它直接给日志
+        标签，免得被正文里的"群聊"两个字带偏（见 `chunk12._set_input_status`）。
+        """
+        self.write_standalone(level, message, args, category=category)
 
     def report_token_usage(self, record: Any) -> None:
         """上游 `reportTokenUsage(record)`（`:6763`）。
@@ -343,8 +347,13 @@ class ServiceChunk9(ServiceBase):
             return
         self.write_standalone(level, message, args)
 
-    def write_standalone(self, level: str, message: str, args: Any = None) -> None:
-        """上游 `writeStandalone(level, message, args)`（`:6775`）逐条移植。"""
+    def write_standalone(
+        self, level: str, message: str, args: Any = None, category: str = '',
+    ) -> None:
+        """上游 `writeStandalone(level, message, args)`（`:6775`）逐条移植。
+
+        `category` 见 `report_standalone`（可选，不传就按文案推断标签）。
+        """
         if self.blind_mode_config.get('enabled'):
             if level in ('error', 'warn'):
                 self.blind_mode_health_issue = True
@@ -362,6 +371,7 @@ class ServiceChunk9(ServiceBase):
                 'colors': logging_config.get('colors') is not False,
                 'color_theme': logging_config.get('colorTheme') or 'dark',
                 'kaomoji': logging_config.get('kaomoji') is not False,
+                **({'category': category} if category else {}),
             })
         else:
             output = '[系统] %s' % render_log_message(message, args)

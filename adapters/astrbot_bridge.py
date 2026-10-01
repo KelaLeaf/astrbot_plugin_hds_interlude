@@ -1242,6 +1242,11 @@ _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
     # `get_cookies`）。这里显式标 `@unsupported`：万一它绕到传输层，
     # 会拿到 `unsupported-platform-action`，而不是往平台打一个不存在的动作名。
     'set_qzone_visibility': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    # v1.7.8 复核：下面两条**只是目录↔平台的双向对账 + SnowLuma 直通口**，
+    # **默认路径走不到**——`chunk12.CORE_HANDLED_ACTIONS` 把这两个目录动作收在本机，
+    # 由 `chunk13.qzone_read` 走 CGI 读通道（拿不到 cookie 才回落这里）。
+    # NapCat 没有这两个原生动作，所以任何"把它们当平台动作派出去"的路径都会拿到
+    # `retcode 1404 不支持的Api`（用户贴过日志）——别再让哪条新路径从这儿过。
     'list_qzone_feeds': ('get_qzone_feeds', {'count': 'num'}),
     # 指了归属 QQ = 看那个人的说说列表；没指 = 看好友动态（见 `_resolve_platform_call`）。
     'list_qzone_posts': ('get_qzone_msg_list', {'target_uin': 'target_uin', 'count': 'num'}),
@@ -1675,6 +1680,19 @@ def _frame_ok(frame: Any) -> bool:
     if not isinstance(frame, Mapping):
         return False
     return frame.get('status') == 'ok' or frame.get('retcode') == 0
+
+
+def _frame_has_verdict(frame: Any) -> bool:
+    """平台到底有没有就这条动作表态（`status` / `retcode` / `message` 任一有值）。
+
+    即发即忘的接口（`set_input_status`）用得到：NapCat 不保证给回执，"什么都没说"
+    不是失败，只有**明确说了** `status`/`retcode`/`message` 且不是成功帧才算失败。
+    """
+    if not isinstance(frame, Mapping):
+        return False
+    if frame.get('status') is not None or frame.get('retcode') is not None:
+        return True
+    return bool(frame.get('message') or frame.get('msg') or frame.get('wording'))
 
 
 def _frame_error_text(action_name: str, frame: Any) -> str:
@@ -2119,27 +2137,44 @@ class AstrbotTransport:
         """按会话坐标取 OneBot 客户端（拿不到返回 `None`，绝不抛）。"""
         return self.bridge.onebot_client(_clean(target.get('platform')), _clean(target.get('self_id')))
 
-    async def _call_onebot_on(self, client: Any, action: str, params: Any) -> dict[str, Any]:
-        """在对外的 `call_onebot` 与 `set_input_status` 之间复用的一段。"""
+    async def _call_onebot_on(
+        self, client: Any, action: str, params: Any, *, fire_and_forget: bool = False,
+    ) -> dict[str, Any]:
+        """在对外的 `call_onebot` 与 `set_input_status` 之间复用的一段。
+
+        `fire_and_forget=True`（`set_input_status` 这种**即发即忘**的接口）：
+        平台回了 non-dict / 空帧一律**当成功**——NapCat 不保证给回执，"没有回执"
+        不是失败；这一路**完全不打日志**（失败原因照样原样回给调用方）。降噪与
+        "确实不支持"的那一条 warn 由 `core` 侧按会话节流后打——那边知道真实会话
+        类型，标签才不会被平台文案里的"群聊"两个字带偏（用户贴日志点名）。
+        """
         name = _clean(action)
         if not name:
             return {'ok': False, 'error': 'OneBot 动作名为空', 'data': None}
         if client is None:
-            log_fallback(
-                'warn',
-                '没有可用的 OneBot 客户端，动作 %s 未执行'
-                '（平台不是 aiocqhttp/NapCat，或平台实例 / 机器人连接未就绪）',
-                name,
-            )
+            if not fire_and_forget:
+                log_fallback(
+                    'warn',
+                    '没有可用的 OneBot 客户端，动作 %s 未执行'
+                    '（平台不是 aiocqhttp/NapCat，或平台实例 / 机器人连接未就绪）',
+                    name,
+                )
             return {
                 'ok': False,
+                'unsupported': True,
                 'error': '当前平台实例没有可用的 OneBot 客户端（aiocqhttp/NapCat 才有），%s 未执行' % name,
                 'data': None,
             }
         call = getattr(client, 'call_action', None)
         if not callable(call):
-            log_fallback('warn', 'OneBot 客户端没有 call_action，动作 %s 未执行', name)
-            return {'ok': False, 'error': 'OneBot 客户端不支持 call_action，%s 未执行' % name, 'data': None}
+            if not fire_and_forget:
+                log_fallback('warn', 'OneBot 客户端没有 call_action，动作 %s 未执行', name)
+            return {
+                'ok': False,
+                'unsupported': True,
+                'error': 'OneBot 客户端不支持 call_action，%s 未执行' % name,
+                'data': None,
+            }
         payload = dict(params) if isinstance(params, Mapping) else {}
         try:
             frame = call(name, **payload)
@@ -2147,7 +2182,8 @@ class AstrbotTransport:
                 frame = await frame
         except Exception as error:  # noqa: BLE001 - 传输异常可能已在平台侧生效
             # 超时 / 断连时请求可能已经被服务端执行：**不能**让调用方自动重试。
-            log_fallback('warn', 'OneBot 动作 %s 传输异常（%s）：%s', name, _AMBIGUOUS_TAIL, error)
+            if not fire_and_forget:
+                log_fallback('warn', 'OneBot 动作 %s 传输异常（%s）：%s', name, _AMBIGUOUS_TAIL, error)
             return {
                 'ok': False,
                 'error': '%s 调用异常：%s；%s' % (name, error, _AMBIGUOUS_TAIL),
@@ -2156,8 +2192,19 @@ class AstrbotTransport:
             }
         if _frame_ok(frame):
             return {'ok': True, 'error': '', 'data': frame.get('data') if isinstance(frame, Mapping) else None}
+        if fire_and_forget and not _frame_has_verdict(frame):
+            # 即发即忘的接口：平台没给 dict 回执（`None` / 空帧 / 别的形状）——按成功记。
+            # NapCat 的 `set_input_status` 就是这样：早先判成"平台没有回执"失败，
+            # 于是每次点亮都打两条 warn（用户贴日志点名）。
+            return {
+                'ok': True, 'error': '',
+                'data': frame.get('data') if isinstance(frame, Mapping) else None,
+            }
         error_text = _frame_error_text(name, frame)
-        log_fallback('warn', 'OneBot 动作执行失败：%s', error_text)
+        if not fire_and_forget:
+            # 即发即忘的那一路不打这里：失败原因原样回给 core，由它按会话节流后记一条
+            # debug（那里才知道真实会话类型，标签不会跟着平台文案跑）。
+            log_fallback('warn', 'OneBot 动作执行失败：%s', error_text)
         result: dict[str, Any] = {'ok': False, 'error': error_text, 'data': None}
         if isinstance(frame, Mapping) and frame.get('retcode') is not None:
             result['retcode'] = frame.get('retcode')
@@ -2267,23 +2314,34 @@ class AstrbotTransport:
         return any(_text(item) == target for item in admins)
 
     async def set_input_status(self, target: dict[str, Any], typing: bool) -> dict[str, Any]:
-        """设置「正在输入」状态（NapCat `set_input_status`，`event_type` 1=开始 / 2=结束）。"""
+        """设置「正在输入」状态（NapCat `set_input_status`，`event_type` 1=开始 / 2=结束）。
+
+        三条口径（用户 2026-09-28 点名）：
+
+        * **只对私聊做**：群聊直接返回"不做"，一个平台调用都不发；
+        * **即发即忘**：NapCat 不保证回 dict 回执，"没有回执"**当成功**；只有
+          `status`/`retcode`/`message` 明确说失败才算失败；
+        * **降噪**：传输层这一路**不打任何日志**（失败原因原样回给调用方）；
+          "确实不支持"的一次性 warn 由 core 按会话节流后打
+          （`chunk12._set_input_status`）——那里才知道真实会话类型。
+        """
         coordinates = target if isinstance(target, Mapping) else {}
         user_id = _clean(pick(coordinates, 'userId', 'user_id'))
         if not user_id:
-            log_fallback('warn', '设置输入状态失败：会话坐标里没有 user_id')
+            log_fallback('debug', '设置输入状态已跳过：会话坐标里没有 user_id')
             return {'ok': False, 'error': '缺少 user_id，无法设置输入状态', 'data': None}
+        group_id = _clean(pick(coordinates, 'groupId', 'group_id'))
+        if coordinates.get('is_group') is True or (group_id and group_id != '0'):
+            # 输入状态只对私聊做：群聊不点亮、不熄灭、不调用、不告警。
+            return {'ok': False, 'error': 'group-typing-skipped', 'data': None}
         client = self._client_for(coordinates)
-        result = await self._call_onebot_on(
+        # 这一路**完全静音**：失败原因原样回给 core，由它记一条 debug / 一条按会话
+        # 节流的"不支持"warn——那边知道真实会话类型，标签不会被平台文案里的
+        # "群聊"两个字带偏（用户贴日志点名）。
+        return await self._call_onebot_on(
             client, 'set_input_status', {'user_id': user_id, 'event_type': 1 if typing else 2},
+            fire_and_forget=True,
         )
-        if not result.get('ok'):
-            # 群聊不一定支持输入状态：失败就是失败，但要说清是哪种情形。
-            log_fallback(
-                'warn', '输入状态设置失败（部分平台 / 群聊不支持） 目标=%s 输入中=%s 错误=%s',
-                user_id, bool(typing), result.get('error'),
-            )
-        return result
 
     async def _resolve_recall_message_id(
         self,

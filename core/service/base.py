@@ -306,10 +306,12 @@ merge_setting = _prefer_helper('merge_setting', _fallback_merge_setting)
 normalize_database_row = _prefer_helper('normalize_database_row', _fallback_normalize_database_row)
 
 
-def log_fallback(level: str, message: str, *args: Any) -> None:
+def log_fallback(level: str, message: str, *args: Any, category: str = '') -> None:
     """无实例上下文处的降级日志（`NullTransport` / 构造期错误）。
 
     不读配置、不看 blind mode，只保证一定落到 sink；日志本身绝不抛异常。
+    `category` 可选：调用方知道**真实会话类型**时用它直接给标签，避免被正文里的
+    "群聊"两个字带偏（`logging._log_category` 的文案推断是纯启发式）。
     """
     try:
         log_layered({
@@ -318,6 +320,7 @@ def log_fallback(level: str, message: str, *args: Any) -> None:
             'args': list(args),
             'standalone': True,
             'kaomoji': True,
+            **({'category': category} if category else {}),
         })
     except Exception:  # pragma: no cover
         return
@@ -1082,8 +1085,14 @@ class ServiceBase:
         except Exception:  # pragma: no cover
             log_fallback(level, output)
 
-    def write_standalone(self, level: str, message: str, args: Any) -> None:
-        """上游 `writeStandalone`（`src/service.ts:6778`）逐条移植。"""
+    def write_standalone(
+        self, level: str, message: str, args: Any, category: str = '',
+    ) -> None:
+        """上游 `writeStandalone`（`src/service.ts:6778`）逐条移植。
+
+        `category` 是可选扩展：知道真实会话类型的调用方直接给标签（见
+        `report_standalone` 的说明），不传时照旧按文案推断。
+        """
         # 上游 1.0.1-rc23：世界播种器。启用条件是**总开关 + 至少一条勾选「用于世界播种」
         # 的连接**（AND）。不满足时连定时器都不注册（零成本）；但启动时要说清原因——
         # 上游在这条路径上完全静默，用户会以为坏了（见 PORTING_NOTES §31）。
@@ -1117,6 +1126,7 @@ class ServiceBase:
                 'colors': logging_config.get('colors') is not False,
                 'color_theme': pick(logging_config, 'colorTheme', 'color_theme') or 'dark',
                 'kaomoji': logging_config.get('kaomoji') is not False,
+                **({'category': category} if category else {}),
             })
         else:
             output = '[系统] %s' % interlude_logging.render_log_message(message, args)
@@ -1158,9 +1168,13 @@ class ServiceBase:
             output = '[%s] %s\n事件：%s%s' % (phase_label(phase), protagonist, rendered, story_detail)
         self.emit_log(level, output)
 
-    def report_standalone(self, level: str, message: str, *args: Any) -> None:
-        """上游 `reportStandalone(level, message, ...args)`（`src/service.ts:6757`）。"""
-        self.write_standalone(level, message, args)
+    def report_standalone(self, level: str, message: str, *args: Any, category: str = '') -> None:
+        """上游 `reportStandalone(level, message, ...args)`（`src/service.ts:6757`）。
+
+        `category` 是本移植版的可选扩展：知道**真实会话类型**的调用方用它直接给日志
+        标签，免得被正文里的"群聊"两个字带偏（见 `chunk12._set_input_status`）。
+        """
+        self.write_standalone(level, message, args, category=category)
 
     def report_standalone_operation(self, verbosity: str, level: str, message: str, *args: Any) -> None:
         """上游 `reportStandaloneOperation(verbosity, level, message, ...args)`（`:6770`）。"""
@@ -2003,19 +2017,23 @@ class ServiceChunk0(ServiceBase):
             parts.append('名单外的群按默认群规则处理（不 @ 就不说话）')
         return notes + [('info', '接入与名单：%s' % '；'.join(parts))]
 
-    def note_access_skip(self, key: str, interval_ms: int, message: str, *args: Any) -> bool:
+    def note_access_skip(
+        self, key: str, interval_ms: int, message: str, *args: Any, category: str = '',
+    ) -> bool:
         """同一条"没动静"的原因在 `interval_ms` 内只打一次（返回这次是否打了）。
 
         为什么是节流而不是静默：群聊里一条拒绝原因每分钟能来十几条，直接打 warn 会把
         整个日志淹掉（坑 45 就是这个教训）；但"群聊完全没生效"这种状态必须至少说一次，
         否则用户只能靠猜。key 里带上原因本身，所以「换了原因」会立刻重新打一条。
+        `category` 可选：知道**真实会话类型**的调用方直接给日志标签（同
+        `report_standalone`），别让正文／平台文案里的字决定标签。
         """
         now = self.now_ms()
         last = self.access_notes.get(key)
         if last is not None and now - last < interval_ms:
             return False
         self.access_notes[key] = now
-        self.report_standalone('warn', message, *args)
+        self.report_standalone('warn', message, *args, category=category)
         return True
 
     def note_group_skip(self, session: Any, reason: str) -> bool:

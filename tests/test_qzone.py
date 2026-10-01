@@ -827,7 +827,7 @@ class _Host(ServiceChunk13):
     def report_operation(self, verbosity: str, level: str, story: Any, phase: str, message: str, *args: Any) -> None:
         self.reports.append((verbosity, level, phase, message % args if args else message))
 
-    def report_standalone(self, level: str, message: str, *args: Any) -> None:
+    def report_standalone(self, level: str, message: str, *args: Any, **_kwargs: Any) -> None:
         self.standalone.append((level, message % args if args else message))
 
     def note_access_skip(self, key: str, interval_ms: int, message: str, *args: Any) -> bool:
@@ -1236,7 +1236,13 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [action for action, _ in transport.calls], ['get_qzone_feeds', 'get_qzone_msg_list'],
         )
-        self.assertEqual(transport.calls[1][1], {'target_uin': 10002, 'num': 5})
+        # 这个桩没有 `request_text`（= 没有 NapCat WS 通道），所以走的是 SnowLuma 回退；
+        # 参数里不带下划线的那几个是给 CGI 通道准备的兄弟键（见 `_qzone_run_action`）。
+        self.assertEqual(transport.calls[0][1], {'page': 1, 'page_num': 1, 'count': 20})
+        self.assertEqual(
+            transport.calls[1][1],
+            {'target_uin': 10002, 'targetUin': 10002, 'num': 5, 'count': 5},
+        )
 
     async def test_content_mismatch_keeps_metadata_only(self):
         """正文只认 tid 精确命中：拉不到就只记"某人发了说说"。"""

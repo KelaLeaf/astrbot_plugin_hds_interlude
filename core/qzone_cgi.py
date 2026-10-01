@@ -54,7 +54,7 @@ ok = success_or_error(parse_jsonp(raw) if isinstance(raw, str) else raw)
   （`packages/napcat-test/qzone.test.ts`）钉着 `'10001|10002'` ——用 **`|`**；
 * 编辑请求要不要 `who`：参考实现的编辑构造器**没有** `who`（发布有），照它，不加。
 
-**第九、十条接口 `upload_image` / 带图的 `update`（v1.7.8 新增）**，同样出自上面那份
+**第九、十条接口 `upload_image` / 带图的 `update`（v1.7.7 新增）**，同样出自上面那份
 参考实现（`._ref/qzone_api-1.1.0`，**同一份**，逐字对照）：
 
 | 本模块 | 参考实现 | 用途 |
@@ -389,7 +389,7 @@ def build_update_visibility_request(
       空串直接**抛 `QZoneAuthError`**（它继承 `ValueError`，属于"取参错误"那一类），
       宁可让上层报错，也不要把用户的正文擦掉。
     * `richval` 是**带图说说**的富文本块（`build_image_richval` 的产物，来自把原图
-      **重新上传**拿到的新回执；v1.7.8）。给了它就照发布分支填 `richtype=1` /
+      **重新上传**拿到的新回执；v1.7.7）。给了它就照发布分支填 `richtype=1` /
       `subrichtype=1`——这两个槽位本来就在参考实现的编辑字段清单里（默认空串）。
       **留空时请求与 v1.7.5 逐字一致**（文本路径一个字节没动）。
       ⚠️ 调用方**必须**先确认"这条说说没有配图"或者"richval 是完整拼出来的"再调本函数：
@@ -441,7 +441,7 @@ def build_update_visibility_request(
 def build_upload_image_request(
     auth: Any, pic_base64: str, filename: str = "filename"
 ) -> QZoneRequest:
-    """上传一张图片到说说相册（`cgi_upload_image`，v1.7.8）。
+    """上传一张图片到说说相册（`cgi_upload_image`，v1.7.7）。
 
     字段与顺序**逐字**照抄参考实现
     `qzone_api/api/api_parms.py::build_upload_image_params`（含 `backUrls` 的两个备用

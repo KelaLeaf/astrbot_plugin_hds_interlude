@@ -1225,7 +1225,9 @@ class BufferTurnTests(unittest.IsolatedAsyncioTestCase):
         host.split_outgoing_message = lambda content: [content]
         drafts: list[Any] = []
 
-        async def send_outgoing_messages(story: Any, messages: Any, participant: Any, session: Any) -> list[Any]:
+        async def send_outgoing_messages(
+            story: Any, messages: Any, participant: Any, session: Any, **_kwargs: Any,
+        ) -> list[Any]:
             drafts.extend(messages)
             return [{'participant_id': 'p1', 'content': messages[0]['content']}]
 

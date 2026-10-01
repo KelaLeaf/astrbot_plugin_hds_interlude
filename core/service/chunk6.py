@@ -499,15 +499,19 @@ class ServiceChunk6(ServiceBase):
                         _record(pick(following, 'payload')).get('content'), max_characters,
                     )
                     if following_content:
+                        following_delay = self.typing_delay_milliseconds(following_content)
                         await self.db_set(
                             'interlude_intent', {'id': pick(following, 'id')},
                             {
-                                'notBefore': parse_dt(
-                                    dt_ms(now) + self.typing_delay_milliseconds(following_content),
-                                ),
+                                'notBefore': parse_dt(dt_ms(now) + following_delay),
                                 'updatedAt': now,
                             },
                         )
+                        # 这条被推后了：它的亮灯窗口从**现在**（上一条刚发出去）重新开始，
+                        # 到新的 `notBefore` 熄灭——逐条亮灭的边界不能让"积压"打破。
+                        starter = getattr(self, 'begin_typing', None)
+                        if callable(starter) and participant is not None:
+                            await starter(participant, following_delay)
             await self.schedule_next_split_wake(story_id)
 
         await self.serial(story_id, task)
@@ -905,6 +909,8 @@ class ServiceChunk6(ServiceBase):
         should_cancel: Optional[Callable[[Any], bool]] = None,
         record_failures: bool = True,
         request_started_at: Optional[datetime] = None,
+        *,
+        typing_window: bool = False,
     ) -> list[dict[str, Any]]:
         """上游 `sendOutgoingMessages(...)`（`:5107`）逐条移植。
 
@@ -915,6 +921,12 @@ class ServiceChunk6(ServiceBase):
         「她打字该花的时间」快时，首条消息补足等待再发；已经超过就立刻发。只对当前
         对话参与者的**首条**生效，整批至多一次；拆条后续分段、定时意图、跨参与者/跨群
         与推进回合都有各自的时间语义，不接管。
+
+        `typing_window`（本移植版，用户 2026-09-28 点名）：**逐条气泡**在**发出之前**
+        点亮「正在输入」→ 按这条气泡自己的打字时长等待 → 发出 → 立刻熄灭，下一条重新
+        点亮。默认关闭——只有"立即回复"那条路径打开它：分段气泡的亮灯窗口由
+        `confirm_outgoing_deliveries` 按 `notBefore` 排期（见 `begin_typing(delay_ms=…)`），
+        在这里再等一遍会把投递间隔翻倍。**不管开不开，投递的内容与顺序一个字都不变。**
         """
         delivered: list[dict[str, Any]] = []
         if not messages:
@@ -958,6 +970,7 @@ class ServiceChunk6(ServiceBase):
                         story, target_id, message, 'participant-not-allowed',
                     )
                 continue
+            hold = 0
             if (request_started_at is not None and current is not None
                     and message_participant_id == pick(current, 'id') and not typing_floor_applied):
                 # 上游 1.0.1-rc21：首条发言的打字时间下限。基准是叙事请求发起时刻，
@@ -971,28 +984,39 @@ class ServiceChunk6(ServiceBase):
                         'diagnostic', 'debug', story, 'user-message',
                         '首条消息按打字时间补足等待 参与者=%s 等待=%dms', target_id, hold,
                     )
-                    # 本移植版：这段等待**就是**"她在打字"的时间——点亮输入状态再等，
-                    # 对方这才看得见"正在输入…"（一条气泡一次点亮/熄灭）。
-                    indicator = getattr(self, 'typing_indicator', None)
-                    if callable(indicator):
-                        waited = await indicator(
-                            target, pick(message, 'content') or '', extra_delay_ms=hold,
-                        )
-                        typing_waited_ms = max(typing_waited_ms, waited)
-                    else:
-                        await asyncio.sleep(hold / 1000)
-                        typing_waited_ms = max(typing_waited_ms, hold)
             if should_cancel is not None and should_cancel(target):
                 self.report_operation(
                     'standard', 'info', story, 'user-message',
                     '新消息打断主角输入，停止发送后续分段 参与者=%s', target_id,
                 )
                 continue
+            content = message.get('content') if isinstance(message.get('content'), str) else ''
+            if typing_window:
+                # 逐条气泡：点亮 → 按**这条**气泡的打字时长等待 → （发出）→ 熄灭。
+                # 一次循环只管一条，所以第 N 条发出去之后灯就灭了；第 N+1 条重新点亮、
+                # 按它自己的字数重新等（用户点名的语义，不许合并成一次长亮）。
+                # 群聊在 `typing_indicator` 里就被挡掉：不点亮、不告警、不调用。
+                # `darken=False`：熄灯落在**投递之后**（下面的 `finally`），而不是之前。
+                waited = 0
+                indicator = getattr(self, 'typing_indicator', None)
+                if callable(indicator):
+                    waited = await indicator(target, content, darken=False)
+                if waited > 0:
+                    typing_waited_ms = max(typing_waited_ms, waited)
+                elif hold > 0:
+                    # 输入状态用不了（关掉 / 平台不支持 / 太短不值得亮）时，打字下限
+                    # 照旧生效：「首条不早于她的打字时长」是既有的投递语义，不能因为
+                    # 一个锦上添花的能力被丢掉。
+                    await asyncio.sleep(hold / 1000)
+                    typing_waited_ms = max(typing_waited_ms, hold)
+            elif hold > 0:
+                # 没开逐条亮灭的调用方：下限等待照旧（上游行为，一个字没改）。
+                await asyncio.sleep(hold / 1000)
+                typing_waited_ms = max(typing_waited_ms, hold)
             try:
                 self.report_operation(
                     'standard', 'info', story, 'intent-due', '消息投递开始 参与者=%s', target_id,
                 )
-                content = message.get('content') if isinstance(message.get('content'), str) else ''
                 literal_quote_message_id = await self.resolve_literal_quote_message_id(
                     pick(story, 'id'), target_id, content,
                 )
@@ -1112,6 +1136,13 @@ class ServiceChunk6(ServiceBase):
                     await self.record_outgoing_delivery_failure(
                         story, target_id, message, 'transport-error: %s' % error,
                     )
+            finally:
+                if typing_window:
+                    # 这条气泡发出去了（或明确失败）——**立刻**熄灭，绝不留到下一批 /
+                    # 下一条。失败也要熄：不能让对方永远看着"正在输入"。
+                    ender = getattr(self, 'end_typing', None)
+                    if callable(ender):
+                        await ender(target)
         return delivered
 
     # ------------------------------------------------------------------ #
@@ -1162,12 +1193,17 @@ class ServiceChunk6(ServiceBase):
                 later_segments = pick(message, 'laterSegments', 'later_segments') or []
                 later_voice = pick(message, 'laterSegmentsVoice', 'later_segments_voice') or []
                 for index, segment in enumerate(later_segments):
-                    delay += self.typing_delay_milliseconds(segment)
-                    # 本移植版：分段的等待 = 她在打这一条 → 非阻塞点亮输入状态，
-                    # 真正投递那一条时再熄灭（"分气泡投送就是多次点亮"）。
+                    segment_delay = self.typing_delay_milliseconds(segment)
+                    # 本移植版（用户 2026-09-28 点名）：每条分段气泡有**自己的**亮灯窗口
+                    # `[上一条发出去, 这一条发出去]`。所以第 1 条的窗口现在就开始（立刻点亮），
+                    # 第 N 条要等到第 N-1 条投递之后才点亮——而不是排期这一刻把所有分段一次
+                    # 点亮、跨越多条气泡。熄灭仍由投递那一刻的 `end_typing` 负责。
+                    # `notBefore` 的排期语义一个字没动（它管的是投递间隔，不是灯）。
+                    window_start = delay
+                    delay += segment_delay
                     starter = getattr(self, 'begin_typing', None)
                     if callable(starter):
-                        await starter(participant, self.typing_delay_milliseconds(segment))
+                        await starter(participant, segment_delay, delay_ms=window_start)
                     send_at = parse_dt(dt_ms(now) + delay)
                     payload: dict[str, Any] = {
                         'content': segment,

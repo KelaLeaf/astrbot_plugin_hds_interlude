@@ -188,7 +188,7 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
                 if row.get('id') == query.get('id'):
                     row.update(patch)
 
-        def report_standalone(self, level, message, *args):
+        def report_standalone(self, level, message, *args, **_kwargs):
             self.reports.append((level, message % args if args else message))
 
     async def test_a_record_creates_one_row_then_accumulates_into_it(self):

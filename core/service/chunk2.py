@@ -1073,7 +1073,7 @@ class ServiceChunk2(ServiceBase):
             'interaction': interaction,
             'user_initiated': True,
             **({'voice': True} if early['voice'] else {}),
-        }], participant, session)
+        }], participant, session, typing_window=True)
         if not delivered:
             return False
         confirmed = await self.confirm_outgoing_deliveries(story, delivered)
