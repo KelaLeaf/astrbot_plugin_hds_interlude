@@ -1129,6 +1129,71 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(silent.available())
         self.assertIsNone(await silent.describe_sticker('x', 'y', 'z', False))
 
+    async def test_guess_sticker_asks_the_stickers_route_for_strict_json(self):
+        """第二层判据（§45.7）：走**同一条** `stickers` 路由，问法要严格 JSON。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'is_sticker': True, 'kind': 'meme', 'confidence': 0.8, 'description': '一只猫',
+        }, ensure_ascii=False)}}]}])
+        config = make_config(providers=[make_provider(
+            use_for_main=False, use_for_stickers=True, model='vision-m',
+        )])
+        describer = create_sticker_describer(http, config)
+        self.assertTrue(describer.guess_sticker_available())
+        result = await describer.guess_sticker('data:image/png;base64,AAA', 'image/png', 'plain.png')
+        self.assertEqual(result['is_sticker'], True)
+        self.assertEqual(result['description'], '一只猫')
+
+        post = http.posts[0]
+        self.assertEqual(post['task'], 'stickers', '任务级路由必须报真实任务名')
+        body = post['body']
+        self.assertEqual(body['model'], 'vision-m')
+        self.assertEqual(body['max_tokens'], 256, '判定只要一句话，别按描述的口径给 768')
+        self.assertEqual(body['response_format'], {'type': 'json_object'})
+        system = body['messages'][0]['content']
+        for key in ('"is_sticker"', '"kind"', '"confidence"', '"description"'):
+            self.assertIn(key, system, '提示词要逐字要求这几个键')
+        self.assertIn('screenshot', system, '要明确"截图 / 实拍照片 = 不是表情包"')
+        self.assertIn('is_sticker=false', system, '拿不准要答 false')
+        self.assertIn('plain.png', body['messages'][1]['content'][0]['text'])
+        self.assertEqual(
+            body['messages'][1]['content'][1]['image_url'],
+            {'url': 'data:image/png;base64,AAA', 'detail': 'low'},
+        )
+
+    async def test_guess_sticker_falls_back_to_the_vision_route_but_never_to_the_main_model(self):
+        """没有 `stickers` 连接时回落 `vision`（并报 `vision` 的任务名）；主模型绝不顶替。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '{"is_sticker": false}'}}]}])
+        config = make_config(providers=[make_provider(
+            use_for_main=False, use_for_vision=True, model='sidecar-m',
+        )])
+        describer = create_sticker_describer(http, config)
+        # `available()` 仍是贴纸口径（没勾 stickers 就是 False）——两层口径刻意分开。
+        self.assertFalse(describer.available())
+        self.assertTrue(describer.guess_sticker_available())
+        result = await describer.guess_sticker('data:image/png;base64,AAA', 'image/png', 'x.png')
+        self.assertEqual(result, {'is_sticker': False})
+        self.assertEqual(http.posts[0]['task'], 'vision', '回落时要报 vision，否则指名的 Provider 会静默失效')
+        self.assertEqual(http.posts[0]['body']['model'], 'sidecar-m')
+
+        # 只配了主模型 → 判定没有路由，绝不偷偷花主叙事的钱。
+        only_main = create_sticker_describer(http, make_config())
+        self.assertFalse(only_main.guess_sticker_available())
+        self.assertIsNone(await only_main.guess_sticker('data:image/png;base64,AAA', 'image/png', 'x.png'))
+
+    async def test_guess_sticker_degrades_quietly_on_empty_or_broken_json(self):
+        """空回复 / JSON 坏 → `None`（core 侧按"不收"处理），不抛。"""
+        http = FakeHttpClient(responses=[
+            {'choices': [{'message': {'content': ''}}]},
+            {'choices': [{'message': {'content': '这不是 JSON'}}]},
+        ])
+        config = make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)])
+        describer = create_sticker_describer(http, config)
+        self.assertIsNone(await describer.guess_sticker('data:image/png;base64,AAA', 'image/png', 'a.png'))
+        self.assertIsNone(await describer.guess_sticker('data:image/png;base64,AAA', 'image/png', 'a.png'))
+        silent = create_sticker_describer(http, make_config())
+        self.assertFalse(silent.guess_sticker_available())
+        self.assertIsNone(await silent.guess_sticker('data:image/png;base64,AAA', 'image/png', 'a.png'))
+
     async def test_describe_images_uses_the_sidecar_contract_and_retries_once(self):
         http = FakeHttpClient(responses=[
             {'choices': [{'message': {'content': '   '}}]},

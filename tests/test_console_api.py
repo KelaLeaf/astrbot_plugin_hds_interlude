@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -20,17 +21,26 @@ from plugin.tests.test_astrbot_bridge import (
     TEST_DATA_DIR,
     FakeContext,
     _ProviderStub,
+    _install_web_request,
     _make_bridge,
+    _make_plugin,
     bridge_module,
 )
 from plugin.adapters import console_api as console_module
 from plugin.adapters.console_api import ConsoleApi, ConsoleError, CONSOLE_TASKS, mask_endpoint
 from plugin.core import platform_actions
 from plugin.core.database import Database
+from plugin.core.service.base import InterludeContext
+from plugin.core.service.chunk2 import ServiceChunk2
+from plugin.core.service.transport import NullTransport
 
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+#: 一张最小合法 PNG（魔数正确即可，内容不参与判据）。
+_PNG_BYTES = b'\x89PNG\r\n\x1a\n' + b'x' * 32
 
 
 class MaskEndpointTests(unittest.TestCase):
@@ -2484,3 +2494,545 @@ class WorksIntegrationTests(unittest.TestCase):
         self.assertEqual(payload['hint'], '')
         with self.assertRaises(ConsoleError):
             _run(self.api.work_detail('404'))
+
+
+# =========================================================================== #
+# 控制台「表情库」面板（v1.8.0）
+#
+# 这里跑的是**真实** `ServiceChunk2` + 真实内存库 + 真实临时目录：
+# 面板的全部价值是"读出来 / 写下去的确实是那件事"，桩掉服务层就什么都没验到。
+# 契约（端点 + 字段）冻结在 `docs/PORTING_NOTES.md` §45.3。
+# =========================================================================== #
+
+class _FilesystemStickerTransport(NullTransport):
+    """`NullTransport` + 真实的 `list_sticker_files`。
+
+    生产里这一步走适配器的同一个实现；`NullTransport` 的桩实现**故意回空**
+    （没有平台连接器时的降级），拿它跑扫描会把库里每一行都标成 missing。
+    """
+    from plugin.core.service.chunk2 import _list_sticker_files as _lister  # noqa: PLC0415
+
+    async def list_sticker_files(self, root: str) -> list:
+        return self._lister(root)
+
+
+class _StickerService(ServiceChunk2):
+    """只装配表情库需要的那几个字段的真实服务（绕开模型装配）。
+
+    `db` / `_db_write_lock` 与 `test_service_chunk2._host` 同一套：走**真实**的
+    `db_get` / `db_set` / `db_create`（含写队列），而不是把 CRUD 也桩掉。
+    """
+
+    def __init__(self, tmp: str, database: Any, directory: str = 'stickers') -> None:
+        self.ctx = InterludeContext(base_dir=tmp)
+        self.db = database
+        self._db_write_lock = asyncio.Lock()
+        self.config = {'stickers': {'enabled': True, 'directory': directory, 'catalogLimit': 40}}
+        self.transport = _FilesystemStickerTransport()
+        self.service_logger = None
+        self.cached_sticker_config = None
+        self.cached_audio_config = None
+        self.cached_blind_mode_config = None
+        self.embedder = None
+        self.sticker_catalog = []
+        self.sticker_by_id = {}
+        self.sticker_scan_running = False
+        self.sticker_describer = None
+        self._sticker_collect_warn_at = 0
+        self.reports: list[Any] = []
+        self.report = lambda *args, **kwargs: self.reports.append(args)
+        self.report_standalone = lambda *args, **kwargs: self.reports.append(args)
+        self.report_standalone_operation = lambda *args, **kwargs: self.reports.append(args)
+
+
+class ConsoleStickerLibraryTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = self._tmp.name
+        self.root = os.path.join(self.tmp, 'stickers')
+        os.makedirs(os.path.join(self.root, 'collected'))
+        self.bridge = _make_bridge({'stickers': {'enabled': True, 'directory': 'stickers'}})
+        self.database = Database(':memory:')
+        self.addCleanup(self.database.close)
+        self.database.register_tables()
+        self.bridge.db = self.database
+        self.service = _StickerService(self.tmp, self.database)
+        self.bridge.service = self.service
+        self.api = ConsoleApi(self.bridge)
+
+    # ---- 造数据 ----
+
+    def _row(self, asset_id, **patch):
+        base = {
+            'assetId': asset_id,
+            'filePath': '%s.png' % asset_id,
+            'group': 'collected',
+            'mimeType': 'image/png',
+            'animated': False,
+            'size': 40,
+            'hash': asset_id,
+            'description': '一只挥手的猫',
+            'aliases': ['打招呼'],
+            'status': 'active',
+            'embedding': [],
+            'name': '',
+            'source': 'auto' if asset_id.startswith('sticker-') else 'manual',
+            'uses': 0,
+            'descriptionManual': False,
+            # v1.8.0 第二层判据（§45.7）：默认不是"模型猜的"。
+            'guessed': False,
+            'createdAt': '2026-09-01T10:00:00.000Z',
+            'updatedAt': '2026-09-01T10:00:00.000Z',
+        }
+        base.update(patch)
+        return base
+
+    def _insert(self, asset_id, body: bytes = _PNG_BYTES, **patch):
+        with open(os.path.join(self.root, '%s.png' % asset_id), 'wb') as handle:
+            handle.write(body)
+        row = self._row(asset_id, **patch)
+        row['id'] = self.database.insert('interlude_sticker', row)
+        return row
+
+    # ---- 列表 ----
+
+    def test_empty_library_is_an_empty_shell_not_a_500(self):
+        payload = _run(self.api.stickers())
+        self.assertEqual(payload['items'], [])
+        self.assertEqual(payload['total'], 0)
+        self.assertFalse(payload['truncated'])
+        self.assertEqual(payload['counts'], {'total': 0, 'active': 0, 'pending': 0,
+                                             'missing': 0, 'disabled': 0})
+        self.assertTrue(payload['enabled'])
+        self.assertEqual(payload['root'], self.root)
+
+    def test_items_carry_the_frozen_contract_fields(self):
+        self._insert('sticker-abc-1')
+        payload = _run(self.api.stickers())
+        self.assertEqual(len(payload['items']), 1)
+        item = payload['items'][0]
+        for key in ('assetId', 'name', 'description', 'kind', 'source', 'addedAt',
+                    'uses', 'disabled', 'file', 'thumbnailUrl'):
+            self.assertIn(key, item, key)
+        self.assertEqual(item['assetId'], 'sticker-abc-1')
+        self.assertEqual(item['description'], '一只挥手的猫')
+        self.assertEqual(item['kind'], 'image')
+        self.assertEqual(item['source'], 'auto')
+        self.assertEqual(item['addedAt'], '2026-09-01T10:00:00+00:00',
+                         '时间列折成 ISO 文本（原始行回来的是 datetime）')
+        self.assertEqual(item['uses'], 0)
+        self.assertFalse(item['disabled'])
+        self.assertEqual(item['file'], 'sticker-abc-1.png')
+        self.assertEqual(
+            item['thumbnailUrl'], 'console/sticker-file?assetId=sticker-abc-1',
+        )
+
+    def test_gif_rows_report_the_animated_kind(self):
+        """`animated` 在原始行里是 SQLite 的 `1`，`is True` 会漏（实测踩到过）。"""
+        self._insert('sticker-gif-1', mimeType='image/gif', animated=True)
+        item = _run(self.api.stickers())['items'][0]
+        self.assertEqual(item['kind'], 'animated')
+        # `scan_sticker_library` 按扩展名建出来的行走的是 `mimeType` 这条路。
+        self._insert('sticker-gif-2', mimeType='image/gif', animated=False)
+        items = {entry['assetId']: entry for entry in _run(self.api.stickers())['items']}
+        self.assertEqual(items['sticker-gif-2']['kind'], 'animated')
+
+    def test_the_guessed_badge_is_exposed_as_an_extra_field(self):
+        """第二层判据（`§45.7`）：`guessed` 是**额外字段**（契约只有 auto / manual 两个 source）。
+
+        `source` 仍回 `auto`；"这一条是识图模型猜出来的"只能靠 `guessed` 暴露——
+        控制台**暂未显示**这个徽章，留给下一轮（`docs/PORTING_NOTES.md` §45.7）。
+        """
+        self._insert('sticker-guessed-1', guessed=True)
+        self._insert('sticker-plain-1', guessed=False)
+        items = {entry['assetId']: entry for entry in _run(self.api.stickers())['items']}
+        self.assertIn('guessed', items['sticker-guessed-1'], '额外字段也要在响应里')
+        self.assertTrue(items['sticker-guessed-1']['guessed'])
+        self.assertFalse(items['sticker-plain-1']['guessed'])
+        self.assertEqual(items['sticker-guessed-1']['source'], 'auto', 'source 不加第三个取值')
+        # 旧库补列前写入的行是 NULL，读取侧一律当 False（不是 None、不是报错）。
+        self.database.conn.execute(
+            "UPDATE interlude_sticker SET guessed = NULL WHERE assetId = 'sticker-guessed-1'",
+        )
+        self.database.conn.commit()
+        stale = {entry['assetId']: entry for entry in _run(self.api.stickers())['items']}
+        self.assertIs(stale['sticker-guessed-1']['guessed'], False)
+
+    def test_pagination_window_and_truncated_flag(self):
+        for index in range(5):
+            self._insert('sticker-%d' % index)
+        first = _run(self.api.stickers(limit=2, offset=0))
+        self.assertEqual(first['total'], 5)
+        self.assertEqual(len(first['items']), 2)
+        self.assertFalse(first['truncated'], '5 条远没到窗口上限')
+        second = _run(self.api.stickers(limit=2, offset=2))
+        self.assertEqual(len(second['items']), 2)
+        self.assertEqual(
+            [item['assetId'] for item in first['items']],
+            [item['assetId'] for item in first['items']],
+        )
+        self.assertEqual(
+            set(item['assetId'] for item in first['items'])
+            & set(item['assetId'] for item in second['items']),
+            set(), '两页不该重叠',
+        )
+
+    def test_filters_are_applied_server_side(self):
+        self._insert('sticker-a', description='一只猫')
+        self._insert('manual-b', description='一张狗', source='manual')
+        self._insert('sticker-c', description='', status='pending')
+        self._insert('sticker-d', description='被停用的', status='disabled')
+        self.assertEqual(_run(self.api.stickers(source='manual'))['total'], 1)
+        self.assertEqual(_run(self.api.stickers(status='pending'))['total'], 1)
+        self.assertEqual(_run(self.api.stickers(status='disabled'))['total'], 1)
+        self.assertEqual(_run(self.api.stickers(query='猫'))['total'], 1)
+        self.assertEqual(_run(self.api.stickers(query='sticker-'))['total'], 3)
+        counts = _run(self.api.stickers())['counts']
+        self.assertEqual(counts['total'], 4)
+        self.assertEqual(counts['active'], 2)
+        self.assertEqual(counts['disabled'], 1)
+
+    def test_source_falls_back_to_the_asset_id_namespace_for_old_rows(self):
+        """旧库没有 `source` 列时按 id 前缀判来源（不回填旧数据）。"""
+        row = self._row('sticker-legacy-1')
+        row['source'] = None
+        row['id'] = self.database.insert('interlude_sticker', row)
+        self.assertEqual(_run(self.api.stickers())['items'][0]['source'], 'auto')
+        row2 = self._row('manual-legacy-2')
+        row2['source'] = None
+        row2['id'] = self.database.insert('interlude_sticker', row2)
+        items = {item['assetId']: item for item in _run(self.api.stickers())['items']}
+        self.assertEqual(items['manual-legacy-2']['source'], 'manual')
+
+    # ---- 原图 ----
+
+    def test_file_endpoint_returns_a_path_inside_the_library(self):
+        self._insert('sticker-abc-1')
+        path = _run(self.api.sticker_file('sticker-abc-1'))
+        self.assertEqual(path, os.path.join(self.root, 'sticker-abc-1.png'))
+        self.assertTrue(os.path.isfile(path))
+
+    def test_file_endpoint_rejects_unknown_and_illegal_ids(self):
+        with self.assertRaises(ConsoleError):
+            _run(self.api.sticker_file(''))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.sticker_file('nope'))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.sticker_file('x' * 300))
+
+    def test_file_endpoint_refuses_to_escape_the_library(self):
+        """被改坏的 `filePath` 不许读出库外的文件（basename + 目录归属双保险）。"""
+        secret = os.path.join(self.tmp, 'secret.txt')
+        with open(secret, 'w', encoding='utf-8') as handle:
+            handle.write('top secret')
+        row = self._row('sticker-escape')
+        row['filePath'] = '../secret.txt'
+        self.database.insert('interlude_sticker', row)
+        with self.assertRaises(FileNotFoundError):
+            _run(self.api.sticker_file('sticker-escape'))
+
+    def test_file_endpoint_missing_file_is_a_404_shape(self):
+        self._insert('sticker-gone')
+        os.remove(os.path.join(self.root, 'sticker-gone.png'))
+        with self.assertRaises(FileNotFoundError):
+            _run(self.api.sticker_file('sticker-gone'))
+
+    # ---- 取图路由的两条分支（`inline=1` 的 JSON 信封 vs 缺省的图片字节） ----
+    #
+    # 这几条跑的是**真实** `main.page_console_sticker_file`（宿主响应桩），不是直接调
+    # `ConsoleApi`：两条分支的差别在**响应通道**上（JSON vs blob），只调 API 方法断言不到。
+    # 形状冻结在 `docs/PORTING_NOTES.md` §45.8，前端 `src/sticker-images.ts` 按它接。
+
+    def _page(self, **query):
+        """按查询参数跑一次 `page_console_sticker_file`（返回宿主响应桩）。"""
+        self.addCleanup(_install_web_request(query=query))
+        plugin = _make_plugin({})
+        plugin._console = self.api
+        return _run(plugin.page_console_sticker_file())
+
+    def test_inline_returns_a_base64_envelope_that_round_trips_the_file(self):
+        """`inline=1`：四字段信封 + `data` 解回**与原文件逐字节相同**的内容。"""
+        self._insert('sticker-abc-1')
+        response = self._page(assetId='sticker-abc-1', inline='1')
+        self.assertEqual(response.status_code, 200)
+        payload = response.payload
+        self.assertEqual(set(payload), {'assetId', 'mimeType', 'size', 'data'},
+                         '信封字段是冻结的（前端按这四个键解析）')
+        self.assertEqual(payload['assetId'], 'sticker-abc-1')
+        self.assertEqual(payload['mimeType'], 'image/png')
+        self.assertEqual(payload['size'], len(_PNG_BYTES))
+        self.assertFalse(payload['data'].startswith('data:'), '`data` 不含 data: 前缀')
+        with open(os.path.join(self.root, 'sticker-abc-1.png'), 'rb') as handle:
+            on_disk = handle.read()
+        self.assertEqual(base64.b64decode(payload['data']), on_disk, '必须逐字节相同')
+        self.assertEqual(payload['size'], len(on_disk))
+
+    def test_without_inline_the_response_is_still_the_raw_byte_stream(self):
+        """反向用例：缺省 / `inline=0` / `inline=` 一律**还是字节流**，不是 JSON 信封。"""
+        self._insert('sticker-abc-1')
+        expected = os.path.join(self.root, 'sticker-abc-1.png')
+        for query in ({'assetId': 'sticker-abc-1'}, {'assetId': 'sticker-abc-1', 'inline': '0'},
+                      {'assetId': 'sticker-abc-1', 'inline': ''}):
+            with self.subTest(query=query):
+                response = self._page(**query)
+                self.assertEqual(response.status_code, 200)
+                self.assertIsNone(response.payload, '老客户端拿到的不能是 JSON')
+                self.assertEqual(response.path, expected)
+                self.assertEqual(response.content_type, 'image/png', 'Content-Type 仍是图片')
+                self.assertEqual(response.filename, 'sticker-abc-1.png')
+                # `file_response` 是宿主侧的 blob 通道：body 就是这个路径的字节。
+                with open(response.path, 'rb') as handle:
+                    self.assertEqual(handle.read(), _PNG_BYTES)
+
+    def test_inline_keeps_the_same_400_and_404_wording(self):
+        """400 / 404 的措辞两条分支**逐字一致**（同一批校验、同一批 `except`）。"""
+        cases = (
+            ({'assetId': ''}, '缺少 assetId'),
+            ({'assetId': 'nope'}, '找不到这条素材：nope'),
+            ({'assetId': 'x' * 300}, 'assetId 过长'),
+        )
+        for params, message in cases:
+            with self.subTest(params=params):
+                plain = self._page(**params)
+                inline = self._page(inline='1', **params)
+                self.assertEqual(plain.status_code, 400, params)
+                self.assertEqual(inline.status_code, 400, params)
+                self.assertEqual(plain.payload['message'], message)
+                self.assertEqual(plain.payload['message'], inline.payload['message'])
+        self._insert('sticker-gone')
+        os.remove(os.path.join(self.root, 'sticker-gone.png'))
+        plain = self._page(assetId='sticker-gone')
+        inline = self._page(assetId='sticker-gone', inline='1')
+        self.assertEqual((plain.status_code, inline.status_code), (404, 404))
+        self.assertEqual(plain.payload['message'], inline.payload['message'])
+        self.assertEqual(plain.payload['message'], '表情包文件不存在（可能已被删除）')
+
+    def test_inline_refuses_huge_files_without_reading_them(self):
+        """超上限 → 400；**一个字节都不读进内存**（防轰炸：先判体积再读）。"""
+        path = os.path.join(self.root, 'sticker-huge.png')
+        with open(path, 'wb') as handle:
+            handle.write(_PNG_BYTES)
+            # 稀疏文件：体积够大但不真占盘（这里要的是 `getsize` 的值）。
+            handle.truncate(console_module.STICKER_INLINE_MAX_BYTES + 1)
+        self.database.insert('interlude_sticker', self._row('sticker-huge'))
+        opened: list[str] = []
+        real_open = open
+
+        def spy(file, *args, **kwargs):
+            opened.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch('builtins.open', spy):
+            response = self._page(assetId='sticker-huge', inline='1')
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn('data', response.payload, '拒绝时不许回任何内容')
+        self.assertIn('太大', response.payload['message'])
+        self.assertNotIn(path, opened, '先判体积：超限时不该打开文件')
+
+    def test_library_escape_and_unknown_ids_are_refused_on_both_branches(self):
+        """越界防护（被改坏的 `filePath`）两条分支都要挡住——库外文件一个字都不许回。"""
+        secret = os.path.join(self.tmp, 'secret.txt')
+        with open(secret, 'w', encoding='utf-8') as handle:
+            handle.write('top secret')
+        row = self._row('sticker-escape')
+        row['filePath'] = '../secret.txt'
+        self.database.insert('interlude_sticker', row)
+        plain = self._page(assetId='sticker-escape')
+        inline = self._page(assetId='sticker-escape', inline='1')
+        self.assertEqual((plain.status_code, inline.status_code), (404, 404))
+        self.assertEqual(plain.payload['message'], inline.payload['message'])
+        self.assertNotIn('data', plain.payload)
+        self.assertNotIn('data', inline.payload)
+        self.assertNotIn('top secret', json.dumps(inline.payload, ensure_ascii=False))
+        self.assertIsNone(inline.payload.get('path'), '信封里也不许泄露库外路径')
+
+    # ---- 改描述 / 名字 / 停用 ----
+
+    def test_description_edit_wins_over_the_automatic_one_and_enters_the_catalog(self):
+        """接线用例：改描述 → 写回 → **下一次 payload 里的目录文本真的变了**。"""
+        row = self._insert('sticker-abc-1', description='模型写的旧描述')
+        _run(self.service.refresh_sticker_catalog())
+        before = _run(self.service.sticker_catalog_for_session({'platform': 'onebot'}))
+        self.assertEqual([item['description'] for item in before], ['模型写的旧描述'])
+
+        payload = _run(self.api.update_sticker({
+            'assetId': 'sticker-abc-1', 'description': '她手写的：一只挥手的猫',
+        }))
+        self.assertEqual(payload['changed'], ['description'])
+        self.assertEqual(payload['item']['description'], '她手写的：一只挥手的猫')
+        self.assertTrue(payload['item']['manual'])
+
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['description'], '她手写的：一只挥手的猫')
+        self.assertTrue(stored['descriptionManual'], '手工标记必须落库（重扫据此跳过）')
+        self.assertEqual(stored['status'], 'active')
+
+        after = _run(self.service.sticker_catalog_for_session({'platform': 'onebot'}))
+        self.assertEqual([item['description'] for item in after], ['她手写的：一只挥手的猫'])
+        self.assertNotEqual(before, after, '目录文本必须随描述变化')
+
+    def test_manual_description_survives_a_full_rescan(self):
+        """手改 → 立刻重扫：描述不得被视觉模型顶掉（§45.2）。"""
+        self._insert('sticker-abc-1', description='模型写的')
+        _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'description': '人的描述'}))
+
+        async def _fake_describe(asset, payload, config=None):
+            raise AssertionError('手工描述的素材不该再被描述')
+
+        self.service.describe_sticker_asset = _fake_describe
+        _run(self.service.scan_sticker_library())
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['description'], '人的描述')
+        self.assertEqual(stored['status'], 'active')
+
+    def test_restore_hands_the_description_back_to_the_model(self):
+        self._insert('sticker-abc-1')
+        _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'description': '人的描述'}))
+        payload = _run(self.api.restore_sticker_description({'assetId': 'sticker-abc-1'}))
+        self.assertEqual(payload['changed'], ['description'])
+        self.assertFalse(payload['item']['manual'])
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['description'], '')
+        self.assertEqual(stored['status'], 'pending')
+
+    def test_name_edit_round_trips(self):
+        self._insert('sticker-abc-1')
+        payload = _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'name': '坏笑的猫'}))
+        self.assertEqual(payload['changed'], ['name'])
+        self.assertEqual(payload['item']['name'], '坏笑的猫')
+        self.assertEqual(
+            self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]['name'],
+            '坏笑的猫',
+        )
+
+    def test_disabled_toggles_out_of_the_model_catalog(self):
+        self._insert('sticker-abc-1')
+        _run(self.service.refresh_sticker_catalog())
+        self.assertEqual(len(self.service.sticker_catalog), 1)
+        payload = _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'disabled': True}))
+        self.assertTrue(payload['item']['disabled'])
+        self.assertEqual(
+            self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]['status'],
+            'disabled',
+        )
+        self.assertEqual(self.service.sticker_catalog, [], '停用后立刻退出模型目录')
+        _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'disabled': False}))
+        self.assertEqual(len(self.service.sticker_catalog), 1, '启用后回到目录（有描述 → active）')
+
+    def test_disabled_asset_is_not_resurrected_by_a_rescan(self):
+        """重扫不许把用户刻意停用的素材复活成 pending（那是"改了没反应"）。"""
+        self._insert('sticker-abc-1', description='')
+        _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'disabled': True}))
+        _run(self.service.scan_sticker_library())
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['status'], 'disabled')
+
+    def test_fields_outside_the_whitelist_are_rejected(self):
+        self._insert('sticker-abc-1')
+        for body in (
+            {'assetId': 'sticker-abc-1', 'status': 'active'},
+            {'assetId': 'sticker-abc-1', 'aliases': ['x']},
+            {'assetId': 'sticker-abc-1', 'hash': 'x'},
+            {'assetId': 'sticker-abc-1', 'filePath': '/etc/passwd'},
+            {'assetId': 'sticker-abc-1', 'description': 'x', 'embedding': [1.0]},
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(ConsoleError) as caught:
+                    _run(self.api.update_sticker(body))
+                self.assertIn('只能修改', str(caught.exception))
+        # 一个字段都没给也算错误（不是"什么都没改"的静默成功）。
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1'}))
+
+    def test_write_operations_reject_an_unknown_asset_id(self):
+        for coro in (
+            self.api.update_sticker({'assetId': 'nope', 'description': 'x'}),
+            self.api.delete_sticker({'assetId': 'nope'}),
+            self.api.restore_sticker_description({'assetId': 'nope'}),
+        ):
+            with self.assertRaises(ConsoleError):
+                _run(coro)
+        for body in ({}, {'assetId': ''}, {'assetId': None}):
+            with self.assertRaises(ConsoleError):
+                _run(self.api.update_sticker(body))
+
+    def test_invalid_values_are_rejected_before_writing(self):
+        self._insert('sticker-abc-1')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'description': 'x' * 5000}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'name': 'x' * 500}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'disabled': 'yes'}))
+        with self.assertRaises(ConsoleError):
+            _run(self.api.update_sticker({'assetId': 'sticker-abc-1', 'description': None}))
+        # 一次都没写下去。
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['description'], '一只挥手的猫')
+        self.assertFalse(stored['descriptionManual'])
+
+    # ---- 删除 ----
+
+    def test_delete_defaults_to_marking_only(self):
+        self._insert('sticker-abc-1')
+        payload = _run(self.api.delete_sticker({'assetId': 'sticker-abc-1'}))
+        self.assertFalse(payload['purged'])
+        self.assertFalse(payload['deletedFile'])
+        self.assertTrue(os.path.isfile(os.path.join(self.root, 'sticker-abc-1.png')),
+                        '默认不许删文件')
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})[0]
+        self.assertEqual(stored['status'], 'missing')
+        self.assertEqual(self.service.sticker_catalog, [])
+
+    def test_delete_with_purge_removes_the_file(self):
+        self._insert('sticker-abc-1')
+        path = os.path.join(self.root, 'sticker-abc-1.png')
+        payload = _run(self.api.delete_sticker({'assetId': 'sticker-abc-1', 'purge': True}))
+        self.assertTrue(payload['purged'])
+        self.assertTrue(payload['deletedFile'])
+        self.assertFalse(os.path.isfile(path))
+        # 行仍在（留痕：她曾经有过这个表情），但不再是 active。
+        stored = self.database.all('interlude_sticker', {'assetId': 'sticker-abc-1'})
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]['status'], 'missing')
+
+    def test_delete_rejects_a_non_boolean_purge(self):
+        self._insert('sticker-abc-1')
+        with self.assertRaises(ConsoleError):
+            _run(self.api.delete_sticker({'assetId': 'sticker-abc-1', 'purge': 'yes'}))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, 'sticker-abc-1.png')))
+
+    # ---- 重扫 ----
+
+    def test_rescan_reports_what_it_found(self):
+        scan_calls: list[Any] = []
+
+        async def scan() -> None:
+            scan_calls.append(1)
+
+        self.service.scan_sticker_library = scan
+        payload = _run(self.api.rescan_stickers({}))
+        self.assertTrue(payload['scanned'])
+        self.assertEqual(len(scan_calls), 1)
+        self.assertIn('assets', payload)
+        self.assertIn('added', payload)
+
+    def test_rescan_refuses_when_the_library_is_off(self):
+        self.bridge.config = {'stickers': {'enabled': False, 'directory': 'stickers'}}
+        self.service.config = {'stickers': {'enabled': False, 'directory': 'stickers'}}
+        with self.assertRaises(ConsoleError) as caught:
+            _run(self.api.rescan_stickers({}))
+        self.assertIn('未启用', str(caught.exception))
+
+    def test_rescan_without_a_service_is_a_clear_error(self):
+        self.bridge.service = None
+        with self.assertRaises(ConsoleError):
+            _run(self.api.rescan_stickers({}))
+
+    def test_reads_survive_a_missing_service(self):
+        """服务层没起来时列表仍然是空壳 + 配置里的根目录（面板打得开）。"""
+        self.bridge.service = None
+        payload = _run(self.api.stickers())
+        self.assertEqual(payload['items'], [])
+        self.assertTrue(payload['root'].endswith('stickers'))

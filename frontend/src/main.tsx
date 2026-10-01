@@ -11,7 +11,7 @@ import './style.css'
 import { apiPost, bootstrap, onContext, translate, type BridgeContext } from './bridge'
 import { useQuery } from './query'
 import { Icon, type IconName } from './components/Icon'
-import { Button, Select } from './components/ui'
+import { Button, ConfirmButton, Select } from './components/ui'
 import { canMergeStory, canPromoteStory, storyLabel } from './story-label'
 import type { StoryListPayload } from './types'
 import { Overview } from './panels/Overview'
@@ -28,11 +28,12 @@ import { Chats } from './panels/Chats'
 import { TokenStats } from './panels/TokenStats'
 import { Actions } from './panels/Actions'
 import { Works } from './panels/Works'
+import { Stickers } from './panels/Stickers'
 
 type PanelKey =
   | 'overview' | 'models' | 'script' | 'memory'
   | 'alter' | 'agency' | 'delivery' | 'chats' | 'tokens'
-  | 'actions' | 'works' | 'database' | 'logs' | 'config'
+  | 'actions' | 'works' | 'stickers' | 'database' | 'logs' | 'config'
 
 const NAV: Array<{ key: PanelKey; icon: IconName; label: string; fallback: string }> = [
   { key: 'overview', icon: 'overview', label: '总览', fallback: '总览' },
@@ -47,6 +48,8 @@ const NAV: Array<{ key: PanelKey; icon: IconName; label: string; fallback: strin
   { key: 'actions', icon: 'shield', label: '动作', fallback: '动作' },
   // 共同作品：上游 rc28 `works.ts` 的界面（入口由本移植版补）
   { key: 'works', icon: 'code', label: '作品', fallback: '作品' },
+  // 表情库：她攒下来的本地表情包素材（描述进模型可见的素材目录）
+  { key: 'stickers', icon: 'image', label: '表情库', fallback: '表情库' },
   { key: 'database', icon: 'database', label: '数据库', fallback: '数据库' },
   { key: 'logs', icon: 'logs', label: '日志', fallback: '日志' },
   { key: 'config', icon: 'config', label: '配置', fallback: '配置' },
@@ -88,11 +91,6 @@ function App() {
 
   async function mergeSelected() {
     if (!selected || !main || !canMergeStory(selected, main)) return
-    const ok = window.confirm(
-      `把「${storyLabel(selected)}」并入主剧本？\n\n`
-      + '它的剧本条目、记忆、事实、场景会搬进主剧本，原剧本转为「已归档」（内容不会删除）。',
-    )
-    if (!ok) return
     setMerging(true)
     setMergeError('')
     try {
@@ -111,12 +109,6 @@ function App() {
 
   async function promoteSelected() {
     if (!selected || !canPromoteStory(selected, main)) return
-    const ok = window.confirm(
-      `把「${storyLabel(selected)}」立为共享主剧本？\n\n`
-      + '它会成为那个「一个角色一条时间线」的主剧本（继承它的设定与当前状态），'
-      + '其余旧剧本之后可以「并入主剧本」。',
-    )
-    if (!ok) return
     setMerging(true)
     setMergeError('')
     try {
@@ -209,14 +201,26 @@ function App() {
               </div>
             ) : null}
             {canMergeStory(selected, main) ? (
-              <Button icon="link" disabled={merging} onClick={mergeSelected}>
-                {merging ? '处理中…' : '并入主剧本'}
-              </Button>
+              <ConfirmButton
+                label={merging ? '处理中…' : '并入主剧本'}
+                confirmLabel={`确认把「${storyLabel(selected)}」并进主剧本`}
+                warning="它的剧本条目、记忆、事实、场景会搬进主剧本，原剧本转为「已归档」（内容不删，但之后只在归档里看）。"
+                variant="default"
+                icon="link"
+                disabled={merging}
+                onConfirm={mergeSelected}
+              />
             ) : null}
             {canPromoteStory(selected, main) ? (
-              <Button icon="star" disabled={merging} onClick={promoteSelected}>
-                {merging ? '处理中…' : '设为主剧本'}
-              </Button>
+              <ConfirmButton
+                label={merging ? '处理中…' : '设为主剧本'}
+                confirmLabel={`确认把「${storyLabel(selected)}」立为主剧本`}
+                warning="它会成为那个「一个角色一条时间线」的主剧本（继承它的设定与当前状态），其余旧剧本之后只能「并入主剧本」。"
+                variant="default"
+                icon="star"
+                disabled={merging}
+                onConfirm={promoteSelected}
+              />
             ) : null}
             <Button icon="refresh" onClick={() => setRefreshKey((value) => value + 1)}>
               刷新
@@ -264,6 +268,8 @@ function App() {
             <Actions {...props} />
           ) : panel === 'works' ? (
             <Works {...props} />
+          ) : panel === 'stickers' ? (
+            <Stickers {...props} />
           ) : panel === 'database' ? (
             <Database {...props} />
           ) : panel === 'logs' ? (

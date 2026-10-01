@@ -664,6 +664,22 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertEqual(stickers["directory"]["default"], "data/hds-interlude/stickers")
         self.assertEqual(stickers["catalog_limit"]["default"], 40)
         self.assertEqual(stickers["description_response_format"]["default"], "json-object")
+        # 本移植版新增（v1.8.0）：自动收藏**默认开**，但仍受上面的 `enabled` 总闸；
+        # hint 是给用户的那句"拿不准就不收"。
+        self.assertIs(stickers["auto_collect"]["default"], True)
+        self.assertEqual(
+            stickers["auto_collect"]["hint"],
+            "别人发来的表情包自动收进表情库；拿不准是不是表情包时不收。",
+        )
+        # 本移植版新增（v1.8.0 第二层判据，§45.7）：让识图模型判断普通图片是不是表情包。
+        # **默认关**——用户要先主动打开才多花 token；description 与 hint 各管一件事
+        # （标题短、说明短，"会增加识图调用"是用户唯一需要预知的代价）。
+        self.assertIs(stickers["auto_collect_guess"]["default"], False)
+        self.assertEqual(
+            stickers["auto_collect_guess"]["description"],
+            "让识图模型判断普通图片是不是表情包",
+        )
+        self.assertEqual(stickers["auto_collect_guess"]["hint"], "拿不准就不收；会增加识图调用。")
 
     # -- 上游第 4 条：Blind Mode defaults --------------------------------------
 
@@ -1027,7 +1043,7 @@ class ConfigurationSchemaTest(unittest.TestCase):
             "governor_min_call_interval_ms", "governor_breaker_failures",
             "governor_breaker_cooldown_seconds",
         },
-        "stickers": {"provider_id"},
+        "stickers": {"provider_id", "auto_collect", "auto_collect_guess"},
         # v1.3.0 受控偏离：三张名单各自的"仅处理名单内"开关（上游只有一个总闸 `enabled`，
         # 本移植版删掉它、换成这三个正交开关）。见 `docs/PORTING_NOTES.md` §22。
         "qq_access": {"bot_accounts_only", "user_accounts_only", "group_chats_only"},

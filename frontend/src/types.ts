@@ -703,3 +703,85 @@ export interface WorkExportPayload {
   chars: number
   hint: string
 }
+
+/* ------------------------------------------------ 表情库（`console/stickers`） */
+
+/** 一条素材（一行的 wire 形状；字段名与 `console_api.sticker_item()` 逐字一致）。 */
+export interface StickerItem {
+  assetId: string
+  name: string
+  description: string
+  /** `image`（静止）| `animated`（会动）。 */
+  kind: string
+  /** `auto`（她收到时自动收藏的）| `manual`（从表情库目录扫进来的）。 */
+  source: string
+  addedAt: string
+  updatedAt: string
+  /** 被她选中投递过几次。 */
+  uses: number
+  disabled: boolean
+  /** 相对表情库根目录的文件名（只显示，不用来拼路径）。 */
+  file: string
+  /** **相对**地址：要经 `endpointUrl()` 拼上插件名才能当图片 `src`。 */
+  thumbnailUrl: string
+  /** 描述是不是**人写的**（自动描述不会覆盖它）。 */
+  manual: boolean
+  /** `active` | `pending` | `missing` | `disabled`。 */
+  status: string
+  group: string
+  size: number
+  aliases: unknown[]
+  mimeType: string
+}
+
+/** 各状态的条数（`total` 是当前筛选条件下的合计）。 */
+export interface StickerCounts {
+  total: number
+  active: number
+  pending: number
+  missing: number
+  disabled: number
+}
+
+export interface StickerListPayload {
+  items: StickerItem[]
+  total: number
+  /** 后端的扫描窗口被卡住了（素材比窗口还多，更早的没算进来）。 */
+  truncated: boolean
+  limit: number
+  offset: number
+  counts: StickerCounts
+  /** 库总闸（`stickers.enabled`）：关着时重扫会被拒。 */
+  enabled: boolean
+  /** 自动收藏开关（`stickers.auto_collect`）。 */
+  auto_collect: boolean
+  directory: string
+  root: string
+}
+
+export interface StickerUpdateResult {
+  assetId: string
+  changed: string[]
+  item: StickerItem
+}
+
+export interface StickerRestoreResult extends StickerUpdateResult {
+  hint?: string
+}
+
+export interface StickerDeleteResult {
+  assetId: string
+  /** `true` = 文件真删了；`false` = 只标记（可恢复）。 */
+  purged: boolean
+  deletedFile: boolean
+  file: string
+  changed: string[]
+}
+
+export interface StickerRescanResult {
+  scanned: boolean
+  /** 扫完库里有多少条。 */
+  assets: number
+  /** 这一轮新增了几条。 */
+  added: number
+}

@@ -16,7 +16,7 @@ import { apiPost, describeError } from '../bridge'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { ActionsCatalogPayload, PlatformActionRow } from '../types'
-import { Badge, Button, Empty, ErrorNote, Grid, Loading, Panel, Select, Stack, Stat, Table } from '../components/ui'
+import { Badge, Button, ConfirmButton, Empty, ErrorNote, Grid, Loading, Panel, Select, Stack, Stat, Table } from '../components/ui'
 import {
   backendBadges, backendNote, describeParam, filterNapcatOnly, groupActions, napcatOnlyCount,
   riskLabel, riskTone, rowState, scopeLabel, tierBreakdown, tierDescription,
@@ -64,7 +64,6 @@ export function Actions({ refreshKey }: PanelProps) {
   }
 
   async function resetTable() {
-    if (!window.confirm('把动作权限表清空？所有动作会回到目录默认档位（危险动作默认关闭）。')) return
     setSaving('__reset__')
     setSaveError('')
     try {
@@ -222,10 +221,16 @@ export function Actions({ refreshKey }: PanelProps) {
             <Badge tone="danger">危险动作</Badge> 默认档位是「关闭」，开关分别在各自的类别组里；
             {data?.risk_warning}
           </p>
-          <div class="pt-1">
-            <Button variant="danger" icon="close" disabled={Boolean(saving)} onClick={resetTable}>
-              清空权限表（全部回默认档）
-            </Button>
+          <div class="flex flex-wrap items-center gap-2 pt-1">
+            <ConfirmButton
+              label="清空权限表（全部回默认档）"
+              confirmLabel="确认清空权限表（不可撤销）"
+              warning="整张权限表会被清空，所有动作回到目录默认档位（危险动作默认关闭），要重来只能一条条再选。"
+              variant="danger"
+              icon="close"
+              disabled={Boolean(saving)}
+              onConfirm={resetTable}
+            />
           </div>
         </div>
       </Panel>

@@ -420,6 +420,23 @@ STICKER = TableSpec(
         'aliases': _spec('json'),
         'status': _spec('string(16)'),
         'embedding': _spec('json'),
+        #: 本移植版新增（v1.8.0，自动收藏 + 控制台表情库页）：
+        #: `name` 手工可改的短名（与 `description` 分开，见 `docs/PORTING_NOTES.md` §45）；
+        #: `source` = `auto`（自动收藏入站表情包）/ `manual`（磁盘扫描进来的）；
+        #: `uses` 被选中投递过几次（控制台按它排序 / 展示）；
+        #: `descriptionManual` = 描述是**人写的**，自动扫描不得覆盖（扫描直接跳过模型）。
+        #: 旧库没有这几列，`register_tables()` 会 `ALTER TABLE ADD COLUMN` 增量补上；
+        #: 补出来的旧行是 NULL，读取侧一律当空串 / 0 / False 处理。
+        #:
+        #: 本移植版新增（v1.8.0 第二层判据，§45.7）：
+        #: `guessed` = 这一条是**识图模型猜出来的**（`kind == 'image'` 的普通图片经判定入库）。
+        #: `source` 仍是 `auto`（前端契约只有 auto / manual 两个取值，不加第三个），
+        #: 所以"模型猜的"这件事必须有自己的一列；控制台以额外字段 `guessed` 暴露。
+        'name': _spec('string(255)'),
+        'source': _spec('string(16)'),
+        'uses': _spec('unsigned'),
+        'descriptionManual': _spec('boolean'),
+        'guessed': _spec('boolean'),
         'createdAt': _spec('timestamp'),
         'updatedAt': _spec('timestamp'),
     },

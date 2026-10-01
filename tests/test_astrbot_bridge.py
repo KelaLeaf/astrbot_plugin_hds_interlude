@@ -211,13 +211,19 @@ class FakeHandlerRegistry:
 
 
 class _FakeWebResponse:
-    """`json_response` / `file_response` / `error_response` 的桩。"""
+    """`json_response` / `file_response` / `error_response` 的桩。
 
-    def __init__(self, payload=None, status_code=200, path=None, filename=None):
+    `content_type` 只有 blob 通道（`file_response`）会给：`sticker-file` 的两条分支
+    要能被区分（JSON 信封 vs 图片字节），断言得看得到这个头。
+    """
+
+    def __init__(self, payload=None, status_code=200, path=None, filename=None,
+                 content_type=None):
         self.payload = payload
         self.status_code = status_code
         self.path = path
         self.filename = filename
+        self.content_type = content_type
 
 
 class _FakeUpload:
@@ -236,11 +242,14 @@ class _FakeMultiDict(dict):
 
 
 class _FakeWebRequest:
-    """插件页请求的桩：`files()` / `json()` 由各用例按需设置。"""
+    """插件页请求的桩：`files()` / `json()` / `query` 由各用例按需设置。"""
 
-    def __init__(self, uploads=None, body=None):
+    def __init__(self, uploads=None, body=None, query=None):
         self.uploads = _FakeMultiDict(uploads or {})
         self.body = body
+        #: 真实宿主的 `request.query` 是个 MultiDict（`sticker-file` 的 `assetId` /
+        #: `inline` 就从这里读）；桩里缺了它 = 拿不到查询参数的插件页测不了。
+        self.query = _FakeMultiDict(query or {})
 
     async def files(self):
         return self.uploads
@@ -340,7 +349,7 @@ def _install_astrbot_stub():
         )
 
     def _file_response(path, *, filename=None, content_type=None, headers=None):  # noqa: ARG001
-        return _FakeWebResponse(path=str(path), filename=filename)
+        return _FakeWebResponse(path=str(path), filename=filename, content_type=content_type)
 
     web_module.json_response = _json_response
     web_module.error_response = _error_response
@@ -360,6 +369,10 @@ def _install_astrbot_stub():
 
         async def json(self, default=None):
             return await self._current().json(default=default)
+
+        @property
+        def query(self):
+            return self._current().query
 
     web_module.request = _RequestProxy()
 
@@ -821,11 +834,11 @@ def _make_plugin(config=None, context=None):
     return plugin
 
 
-def _install_web_request(uploads=None, body=None):
+def _install_web_request(uploads=None, body=None, query=None):
     """把插件页请求桩装进 `astrbot.api.web`，返回还原回调。"""
     web = sys.modules['astrbot.api.web']
     previous = web._hdsi_fake_request
-    web._hdsi_fake_request = _FakeWebRequest(uploads=uploads, body=body)
+    web._hdsi_fake_request = _FakeWebRequest(uploads=uploads, body=body, query=query)
 
     def restore():
         web._hdsi_fake_request = previous
@@ -2334,6 +2347,13 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/work-generate',
             f'/{main_module.PLUGIN_NAME}/console/work-export',
             f'/{main_module.PLUGIN_NAME}/console/work-cancel',
+            # 表情库（v1.8.0）：列表 / 原图 / 改描述 / 交回自动描述 / 删除 / 重扫。
+            f'/{main_module.PLUGIN_NAME}/console/stickers',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-file',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-update',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-restore-description',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-delete',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-rescan',
             f'/{main_module.PLUGIN_NAME}/config-export',
             f'/{main_module.PLUGIN_NAME}/config-import-preview',
             f'/{main_module.PLUGIN_NAME}/config-import-apply',
@@ -2386,6 +2406,11 @@ class ConfigPageRegistrationTests(unittest.TestCase):
             f'/{main_module.PLUGIN_NAME}/console/work-edit',
             f'/{main_module.PLUGIN_NAME}/console/work-generate',
             f'/{main_module.PLUGIN_NAME}/console/work-cancel',
+            # 表情库：改描述 / 交回自动描述 / 删除 / 重扫（写操作一律 POST）
+            f'/{main_module.PLUGIN_NAME}/console/sticker-update',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-restore-description',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-delete',
+            f'/{main_module.PLUGIN_NAME}/console/sticker-rescan',
         ])
 
     def test_every_registration_carries_a_description(self):

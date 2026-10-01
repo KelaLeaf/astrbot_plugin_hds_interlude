@@ -25,8 +25,8 @@ import {
   worksEmptyHint,
 } from '../works-view'
 import {
-  Badge, Button, Empty, ErrorNote, Grid, Input, KeyValue, Loading, LongList, Note, Panel,
-  Select, Stack, Stat, Table, Textarea,
+  Badge, Button, ConfirmButton, CopyFallback, Empty, ErrorNote, Grid, Input, KeyValue, Loading,
+  LongList, Note, Panel, Select, Stack, Stat, Table, Textarea,
 } from '../components/ui'
 
 /** 正文 / 提案正文的内滚高度（仓库约定：长文固定高度内滚，页面高度不跟着内容涨）。 */
@@ -48,6 +48,9 @@ export function Works({ storyId, refreshKey, onNavigate }: PanelProps) {
   const [brief, setBrief] = useState('')
   const [exported, setExported] = useState<WorkExportPayload | null>(null)
   const [copied, setCopied] = useState(-1)
+  // 剪贴板写不进去时的兜底：就地展开只读 textarea（内容已全选）让用户自己 Ctrl+C。
+  // 沙箱 iframe 里 `clipboard-write` 默认不给跨源 iframe，这条路必须存在。
+  const [manualCopy, setManualCopy] = useState<{ scope: 'all' | 'part'; index: number } | null>(null)
   const [creating, setCreating] = useState(false)
   const [newOwner, setNewOwner] = useState('')
   const [newTitle, setNewTitle] = useState('')
@@ -180,9 +183,6 @@ export function Works({ storyId, refreshKey, onNavigate }: PanelProps) {
     const id = selectedId
     const endpoint = accept ? 'console/work-accept' : 'console/work-reject'
     const verb = accept ? '接受' : '驳回'
-    if (accept && !window.confirm(
-      '接受这条提案？\n\n正文会立刻变成提案里的那一版（一条新版本，旧版本仍然留着）。',
-    )) return
     return run(`${verb}-${proposal.id}`, () => apiPost(endpoint, {
       work_id: id, proposal_id: proposal.id,
     }), accept ? '已接受：新版本已经生效' : '已驳回：正文没有改动')
@@ -200,13 +200,21 @@ export function Works({ storyId, refreshKey, onNavigate }: PanelProps) {
     }
   }
 
+  /**
+   * 复制一段：能直接写剪贴板就写，写不了（沙箱里没有 clipboard-write 权限 →
+   * `NotAllowedError`）就**就地**展开只读 textarea 兜底，而不是丢一句错误了事。
+   */
   async function copyPart(index: number, text: string) {
     try {
       await navigator.clipboard.writeText(text)
       setCopied(index)
+      setManualCopy(null)
       setError('')
-    } catch (failure) {
-      setError(`复制失败（浏览器可能不允许剪贴板访问）：${describeError(failure)}`)
+    } catch {
+      setCopied(-1)
+      setError('')
+      setNotice('')
+      setManualCopy({ scope: 'part', index })
     }
   }
 
@@ -214,9 +222,12 @@ export function Works({ storyId, refreshKey, onNavigate }: PanelProps) {
     try {
       await navigator.clipboard.writeText(text)
       setNotice('全文已复制到剪贴板')
+      setManualCopy(null)
       setError('')
-    } catch (failure) {
-      setError(`复制失败（浏览器可能不允许剪贴板访问）：${describeError(failure)}`)
+    } catch {
+      setNotice('')
+      setError('')
+      setManualCopy({ scope: 'all', index: -1 })
     }
   }
 
@@ -465,6 +476,13 @@ export function Works({ storyId, refreshKey, onNavigate }: PanelProps) {
                 }>
                   <Stack>
                     <span class="text-[11px] text-muted">{exportSummary(exported.count, exported.chars)}</span>
+                    {manualCopy?.scope === 'all' ? (
+                      <CopyFallback
+                        what="全文"
+                        text={exported.parts.join('')}
+                        onClose={() => setManualCopy(null)}
+                      />
+                    ) : null}
                     {exported.count === 0 ? <Empty text={exported.hint || '没有可导出的内容'} /> : (
                       <LongList
                         items={exported.parts}
@@ -485,6 +503,13 @@ export function Works({ storyId, refreshKey, onNavigate }: PanelProps) {
                             <div class="prose-body max-h-40 overflow-y-auto rounded-lg border border-line bg-raised p-3 font-mono text-[11px]">
                               {part}
                             </div>
+                            {manualCopy?.scope === 'part' && manualCopy.index === index ? (
+                              <CopyFallback
+                                what={`第 ${index + 1} 段`}
+                                text={part}
+                                onClose={() => setManualCopy(null)}
+                              />
+                            ) : null}
                           </div>
                         )}
                       />
@@ -551,22 +576,24 @@ export function Works({ storyId, refreshKey, onNavigate }: PanelProps) {
                           </div>
                           {proposal.pending ? (
                             <div class="flex flex-wrap items-center gap-2">
-                              <Button
+                              <ConfirmButton
+                                label={busy === `接受-${proposal.id}` ? '处理中…' : '接受（变成新版本）'}
+                                confirmLabel="确认接受：正文会换成这一版"
+                                warning="接受后正文立刻变成提案里那一版（成为一条新版本，旧版本仍然留在时间线里）。"
                                 variant="primary"
                                 icon="tick"
                                 disabled={Boolean(busy)}
-                                onClick={() => resolve(proposal, true)}
-                              >
-                                {busy === `接受-${proposal.id}` ? '处理中…' : '接受（变成新版本）'}
-                              </Button>
-                              <Button
+                                onConfirm={() => resolve(proposal, true)}
+                              />
+                              <ConfirmButton
+                                label={busy === `驳回-${proposal.id}` ? '处理中…' : '驳回（正文不动）'}
+                                confirmLabel="确认驳回这条提案"
+                                warning="驳回只留一条结论，正文一个字都不动；她之后还能再提。"
                                 variant="danger"
                                 icon="close"
                                 disabled={Boolean(busy)}
-                                onClick={() => resolve(proposal, false)}
-                              >
-                                {busy === `驳回-${proposal.id}` ? '处理中…' : '驳回（正文不动）'}
-                              </Button>
+                                onConfirm={() => resolve(proposal, false)}
+                              />
                               <span class="text-[11px] text-muted">她不会自己决定：只有你能按这两个键。</span>
                             </div>
                           ) : (

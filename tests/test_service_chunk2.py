@@ -35,14 +35,17 @@ host 对象**上跑。本移植版用 `ServiceChunk2.__new__(ServiceChunk2)` + �
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 import time
 import unittest
+import zlib
 from typing import Any, Optional
 
 from plugin.core.bubbles import VOICE_MARKER
 from plugin.core.database import Database
+from plugin.core.narrator import SilentStickerDescriber
 from plugin.core.script.episode_index import episode_excerpt
 from plugin.core.script.recall_navigation import (
     index_original,
@@ -52,6 +55,7 @@ from plugin.core.script.recall_navigation import (
     score_original,
 )
 from plugin.core.service.base import InterludeContext
+from plugin.core.service import chunk2 as chunk2_module
 from plugin.core.service import chunk3 as chunk3_module
 from plugin.core.service.chunk2 import (
     ServiceChunk2,
@@ -108,6 +112,11 @@ def _host(**overrides: Any) -> Any:
     service.sticker_by_id = {}
     service.sticker_scan_running = False
     service.sticker_describer = None
+    #: 自动收藏的节流时间戳（生产里由 `_warn_sticker_collect_unavailable` 首次写入）。
+    service._sticker_collect_warn_at = 0
+    #: 第二层判据（§45.7）的两处实例状态：能力缺失的 warn 时间戳，以及判定调用的滑动窗口。
+    service._sticker_guess_warn_at = 0
+    service._sticker_guess_calls = []
     service.vision_describer = None
     service.history_vectors = {}
     service.history_vectors_ready = set()
@@ -199,6 +208,21 @@ class _MemoryRecorderTransport:
 
 class _BareTransport:
     """没有任何可选能力的 Transport：用来验证 Chunk2 的安全降级路径。"""
+
+
+class _ByteTransport:
+    """只实现 `fetch_image` 的传输桩：按 URL 回字节，并记下被请求过哪些 URL。
+
+    `payloads` 里没有的 URL 回 `None`（等价"下载失败"）；**绝不真实联网**。
+    """
+
+    def __init__(self, payloads: Optional[dict[str, bytes]] = None) -> None:
+        self.payloads: dict[str, bytes] = dict(payloads or {})
+        self.fetched: list[str] = []
+
+    async def fetch_image(self, url: str) -> Optional[bytes]:
+        self.fetched.append(url)
+        return self.payloads.get(url)
 
 
 async def _noop_ensure_history_vectors(story_id: str) -> None:
@@ -1448,6 +1472,344 @@ class StickerLibraryTests(unittest.IsolatedAsyncioTestCase):
         host.config = {'model': {'embedding': {'semantic_sticker_filter': True}}}
         self.assertTrue(host.semantic_sticker_embedding_enabled(), '配置层归一化后是 snake_case')
 
+    async def test_scan_leaves_the_manual_description_alone(self):
+        """手工描述压过自动描述：扫描不覆盖、不重调模型（受控偏离 §45.2）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'stickers')
+            os.makedirs(root)
+            with open(os.path.join(root, 'a.png'), 'wb') as handle:
+                handle.write(b'\x89PNG\r\n\x1a\n' + b'x' * 32)
+            database = Database(':memory:')
+            database.register_tables()
+            host = _host(
+                ctx=InterludeContext(base_dir=tmp),
+                config={'stickers': {'enabled': True, 'directory': 'stickers'}},
+                db=database,
+                transport=_BareTransport(),
+            )
+            described: list[Any] = []
+
+            class _Describer:
+                def available(self) -> bool:
+                    return True
+
+                async def describe_sticker(self, *_args: Any) -> dict[str, Any]:
+                    described.append(_args)
+                    return {'description': '模型写的', 'aliases': []}
+
+            host.sticker_describer = _Describer()
+
+            async def image_bytes_to_native(data: bytes, mime_type: str) -> dict[str, Any]:
+                return {'mime_type': 'image/png', 'data_uri': 'data:image/png;base64,AA=='}
+
+            host.image_bytes_to_native = image_bytes_to_native
+            await host.scan_sticker_library()
+            row = (await host.db_get('interlude_sticker', {}))[0]
+            self.assertEqual(row['description'], '模型写的')
+
+            # 用户手改成"她看到的其实是只猫"，然后重扫。
+            await host.save_sticker_description(row['id'], '一只挥手的小猫')
+            described.clear()
+            await host.scan_sticker_library()
+            after = (await host.db_get('interlude_sticker', {}))[0]
+            self.assertEqual(after['description'], '一只挥手的小猫', '手改的描述不得被重扫覆盖')
+            self.assertEqual(described, [], '标记了 manual 的素材不该再花一次模型调用')
+            self.assertTrue(after['descriptionManual'])
+            self.assertEqual(after['status'], 'active')
+            # 目录（模型看到的那份）里也必须是新描述。
+            self.assertEqual(
+                [item['description'] for item in host.sticker_catalog], ['一只挥手的小猫'],
+            )
+            database.close()
+
+    async def test_restore_sticker_description_hands_it_back_to_the_model(self):
+        """摘掉手工标记 → 回到 `pending` + 空描述，下一轮扫描重新描述。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'stickers')
+            os.makedirs(root)
+            with open(os.path.join(root, 'a.png'), 'wb') as handle:
+                handle.write(b'\x89PNG\r\n\x1a\n' + b'x' * 32)
+            database = Database(':memory:')
+            database.register_tables()
+            host = _host(
+                ctx=InterludeContext(base_dir=tmp),
+                config={'stickers': {'enabled': True, 'directory': 'stickers'}},
+                db=database,
+                transport=_BareTransport(),
+            )
+            await host.scan_sticker_library()
+            row = (await host.db_get('interlude_sticker', {}))[0]
+            await host.save_sticker_description(row['id'], '人工写的')
+            await host.restore_sticker_description(row['id'])
+            restored = (await host.db_get('interlude_sticker', {}))[0]
+            self.assertEqual(restored['description'], '')
+            self.assertFalse(restored['descriptionManual'])
+            self.assertEqual(restored['status'], 'pending')
+            self.assertEqual(host.sticker_catalog, [])
+            database.close()
+
+
+def _png(payload: bytes = b'x') -> bytes:
+    """一张最小的"合法" PNG 字节串（魔数正确就够，内容不参与判据）。"""
+    return b'\x89PNG\r\n\x1a\n' + payload * 32
+
+
+class AutomaticStickerCollectionTests(unittest.IsolatedAsyncioTestCase):
+    """自动收藏：**只收确认是表情包的**（受控偏离 §45.1，用户点名的红线）。
+
+    每个用例都断言"库里到底有几行"——这条功能的全部风险都在误收。
+    """
+
+    def _collect_host(self, tmp: str, **stickers: Any) -> Any:
+        database = Database(':memory:')
+        database.register_tables()
+        self.addCleanup(database.close)
+        directory = stickers.pop('directory', 'stickers')
+        os.makedirs(os.path.join(tmp, directory), exist_ok=True)
+        return _host(
+            ctx=InterludeContext(base_dir=tmp),
+            config={'stickers': {'enabled': True, 'directory': directory, **stickers}},
+            db=database,
+            transport=_ByteTransport({'https://cdn.example.com/x.png': _png()}),
+        )
+
+    async def test_only_observed_sticker_kinds_are_collected(self):
+        """`sticker` / `animated` / `market` 各收一张；`image` 与未知种类零入库。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            sources = ['https://cdn.example.com/%s' % name for name in
+                       ('sticker', 'animated', 'market', 'photo', 'unknown', 'card')]
+            media = [
+                {'source': sources[0], 'kind': 'sticker', 'summary': '', 'label': '[表情包]'},
+                {'source': sources[1], 'kind': 'animated', 'summary': '[动画表情]', 'label': '[动画表情]'},
+                {'source': sources[2], 'kind': 'market', 'summary': '[QQ 商城表情]', 'label': '[QQ 商城表情]'},
+                # ⚠️ 普通照片 / 截图：**绝不收藏**。
+                {'source': sources[3], 'kind': 'image', 'summary': '[图片]', 'label': '[图片]'},
+                # 种类缺失 / 未知：拿不准就不收（这一条是用户点名的红线）。
+                {'source': sources[4], 'kind': '', 'summary': '', 'label': '[图片]'},
+                {'source': sources[5], 'kind': 'card', 'summary': '', 'label': '[分享卡片]'},
+            ]
+            # 每张图内容不同，避免被 sha256 去重合并成一条。
+            for index, source in enumerate(sources):
+                host.transport.payloads[source] = _png(bytes([65 + index]))
+            collected = await host.collect_incoming_stickers(media, sources)
+
+            self.assertEqual(len(collected), 3, '只有三种表情包种类该入库')
+            rows = await host.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 3)
+            self.assertEqual({row['source'] for row in rows}, {'auto'})
+            self.assertEqual({row['group'] for row in rows}, {'collected'})
+            self.assertEqual({row['status'] for row in rows}, {'pending'})
+            for row in rows:
+                self.assertTrue(row['assetId'].startswith('sticker-'))
+                self.assertEqual(row['mimeType'], 'image/png')
+                self.assertEqual(len(row['hash']), 64, '内容 sha256 必须落库（去重的依据）')
+                self.assertTrue(row['filePath'].startswith('collected/'))
+                self.assertTrue(os.path.isfile(os.path.join(tmp, 'stickers', row['filePath'])))
+            # 文件与库行一一对应（"收了但磁盘上没有"是最坏的形态）。
+            self.assertEqual(
+                sorted(os.listdir(os.path.join(tmp, 'stickers', 'collected'))),
+                sorted(os.path.basename(row['filePath']) for row in rows),
+            )
+
+    async def test_plain_photos_and_unknown_kinds_never_enter_the_library(self):
+        """单独钉死红线：`image` / 缺种类 / 未知种类 → 零入库、零网络请求。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            sources = ['https://cdn.example.com/%d.png' % index for index in range(4)]
+            media = [
+                {'source': sources[0], 'kind': 'image'},
+                {'source': sources[1]},                       # 连 kind 键都没有
+                {'source': sources[2], 'kind': 'photo'},      # 没人认识的种类
+                {'source': sources[3], 'kind': None},         # 显式 None
+            ]
+            collected = await host.collect_incoming_stickers(media, sources)
+            self.assertEqual(collected, [])
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+            self.assertEqual(host.transport.fetched, [], '不是表情包就不该去下载')
+            self.assertEqual(host.sticker_catalog, [])
+
+    async def test_missing_kind_metadata_skips_everything(self):
+        """没有 media 元数据（拿不到种类）→ 一个都不收，哪怕来源是图片 URL。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            sources = ['https://cdn.example.com/a.png']
+            host.transport.payloads[sources[0]] = _png()
+            self.assertEqual(await host.collect_incoming_stickers(None, sources), [])
+            self.assertEqual(await host.collect_incoming_stickers([], sources), [])
+            self.assertEqual(host.transport.fetched, [])
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+
+    async def test_bytes_that_are_not_images_are_skipped(self):
+        """种类对但字节不是图片（HTML 错误页 / 纯文本 / 空）→ 零入库 + 一条 warn。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            sources = ['https://cdn.example.com/not-image.png']
+            host.transport.payloads[sources[0]] = b'<html>404 not found</html>'
+            media = [{'source': sources[0], 'kind': 'sticker'}]
+            self.assertEqual(await host.collect_incoming_stickers(media, sources), [])
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+            collected_dir = os.path.join(tmp, 'stickers', 'collected')
+            self.assertEqual(
+                sorted(os.listdir(collected_dir)) if os.path.isdir(collected_dir) else [], [],
+                '不是图片就不该落盘',
+            )
+
+    async def test_same_content_is_collected_once(self):
+        """重复内容只入库一次（内容 sha256 去重），两张不同的图各一条。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            sources = ['https://cdn.example.com/a.png', 'https://cdn.example.com/b.png']
+            host.transport.payloads[sources[0]] = _png(b'same')
+            host.transport.payloads[sources[1]] = _png(b'same')   # 同内容、不同 URL
+            media = [{'source': source, 'kind': 'animated'} for source in sources]
+            collected = await host.collect_incoming_stickers(media, sources)
+            self.assertEqual(len(collected), 1)
+            rows = await host.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 1)
+            # 再收一遍（同一个表情再被发一次）仍然只有一条。
+            again = await host.collect_incoming_stickers(media, sources)
+            self.assertEqual(again, [])
+            self.assertEqual(len(await host.db_get('interlude_sticker', {})), 1)
+
+    async def test_fetch_failure_warns_once_without_raising(self):
+        """拿不到字节（无本地路径 + fetch_image 失败）→ 跳过 + **一条节流 warn**。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Database(':memory:')
+            database.register_tables()
+            self.addCleanup(database.close)
+            os.makedirs(os.path.join(tmp, 'stickers'))
+
+            class _Broken:
+                async def fetch_image(self, url: str) -> Any:
+                    raise RuntimeError('network down')
+
+            host = _host(
+                ctx=InterludeContext(base_dir=tmp),
+                config={'stickers': {'enabled': True, 'directory': 'stickers'}},
+                db=database,
+                transport=_Broken(),
+            )
+            sources = ['https://cdn.example.com/%d.png' % index for index in range(5)]
+            media = [{'source': source, 'kind': 'sticker'} for source in sources]
+            self.assertEqual(await host.collect_incoming_stickers(media, sources), [])
+            warns = [
+                entry for entry in host.reports
+                if entry and entry[0] == 'warn' and '拿不到图片字节' in str(entry[1])
+            ]
+            self.assertEqual(len(warns), 1, '同一批只报一条 warn（节流）')
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+            self.assertEqual(host.sticker_catalog, [])
+
+    async def test_local_file_sources_are_read_without_network(self):
+        """适配器给的本地路径（`onebot-file:`）直接读盘，不走网络。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            local = os.path.join(tmp, 'inbound.png')
+            with open(local, 'wb') as handle:
+                handle.write(_png(b'local'))
+            source = 'onebot-file:%s' % local
+            media = [{'source': source, 'kind': 'sticker'}]
+            collected = await host.collect_incoming_stickers(media, [source])
+            self.assertEqual(len(collected), 1)
+            self.assertEqual(host.transport.fetched, [], '本地文件不该走网络')
+            self.assertTrue(os.path.isfile(
+                os.path.join(tmp, 'stickers', collected[0]['filePath']),
+            ))
+
+    async def test_auto_collect_respects_the_master_switch_and_its_own(self):
+        """`enabled=false`（总闸）与 `auto_collect=false` 都必须一个都不收。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            host.transport.payloads['https://cdn.example.com/a.png'] = _png()
+            media = [{'source': 'https://cdn.example.com/a.png', 'kind': 'sticker'}]
+            host.config = {'stickers': {'enabled': True, 'auto_collect': False}}
+            host.cached_sticker_config = None
+            self.assertEqual(
+                await host.collect_incoming_stickers(media, list(host.transport.payloads)), [],
+            )
+            host.config = {'stickers': {'enabled': False}}
+            host.cached_sticker_config = None
+            self.assertEqual(await host.collect_incoming_stickers(media, ['https://cdn.example.com/a.png']), [])
+            self.assertEqual(host.transport.fetched, [])
+
+    async def test_collected_asset_gets_a_description_immediately(self):
+        """入库后**立刻**描述 + 进目录（不等下一个完整扫描周期）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            described: list[Any] = []
+
+            class _Describer:
+                def available(self) -> bool:
+                    return True
+
+                async def describe_sticker(self, data_uri: str, mime_type: str, file_path: str,
+                                           animated: Any, response_format: Any, max_tokens: Any) -> dict[str, Any]:
+                    described.append((data_uri, mime_type, file_path, animated))
+                    return {'description': '一只挥手的猫', 'aliases': ['打招呼']}
+
+            host.sticker_describer = _Describer()
+
+            async def image_bytes_to_native(data: bytes, mime_type: str) -> dict[str, Any]:
+                return {'mime_type': 'image/png', 'data_uri': 'data:image/png;base64,AA=='}
+
+            host.image_bytes_to_native = image_bytes_to_native
+            source = 'https://cdn.example.com/a.png'
+            host.transport.payloads[source] = _png()
+            collected = await host.collect_incoming_stickers(
+                [{'source': source, 'kind': 'sticker'}], [source],
+            )
+            self.assertEqual(len(collected), 1)
+            self.assertEqual(len(described), 1)
+            self.assertEqual(described[0][1], 'image/png')
+            self.assertTrue(described[0][2].startswith('collected/'))
+            row = (await host.db_get('interlude_sticker', {}))[0]
+            self.assertEqual(row['status'], 'active')
+            self.assertEqual(row['description'], '一只挥手的猫')
+            # 进目录 = 下一次 payload 里模型看得到它。
+            self.assertEqual(
+                [item['assetId'] for item in host.sticker_catalog], [row['assetId']],
+            )
+            self.assertEqual(host.sticker_catalog[0]['description'], '一只挥手的猫')
+            self.assertEqual(host.sticker_catalog[0]['aliases'], ['打招呼'])
+
+    async def test_buffered_turn_entry_point_uses_the_queued_message(self):
+        """旁路入口从**已入队的**那条消息里回读来源与种类（不靠调用方另拼一份）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            source = 'https://cdn.example.com/a.png'
+            host.transport.payloads[source] = _png()
+            host.buffered_narrative_turns['p1'] = {
+                'messages': [{
+                    'content': '', 'image_sources': [source],
+                    'media': [{'source': source, 'kind': 'market'}],
+                }],
+            }
+            collected = await host.collect_stickers_from_buffered_turn('p1', 0)
+            self.assertEqual(len(collected), 1)
+            self.assertEqual(collected[0]['source'], 'auto')
+            # 索引对不上 / 参与者没有回合：安静返回，不抛。
+            self.assertEqual(await host.collect_stickers_from_buffered_turn('p1', 5), [])
+            self.assertEqual(await host.collect_stickers_from_buffered_turn('nobody', 0), [])
+            self.assertEqual(await host.collect_stickers_from_buffered_turn('p1', -1), [])
+
+    async def test_sticker_use_counter_increments_after_a_delivery(self):
+        """`uses` 计的是投递次数（控制台按它排序）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            source = 'https://cdn.example.com/a.png'
+            host.transport.payloads[source] = _png()
+            collected = await host.collect_incoming_stickers(
+                [{'source': source, 'kind': 'sticker'}], [source],
+            )
+            asset_id = collected[0]['assetId']
+            await host.record_sticker_use({'assetId': asset_id})
+            await host.record_sticker_use({'assetId': asset_id})
+            row = (await host.db_get('interlude_sticker', {}))[0]
+            self.assertEqual(row['uses'], 2)
+            # 不存在的素材只 warn，不抛。
+            await host.record_sticker_use({'assetId': 'nope'})
+
     async def test_backfill_sticker_embeddings_only_indexes_described_assets_in_batches_of_eight(self):
         """`backfillStickerEmbeddings()`（本范围成员，`:2398`）。"""
         embedded: list[str] = []
@@ -1483,6 +1845,426 @@ class StickerLibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(embedded, [])
 
 
+class ModelGuessedStickerCollectionTests(unittest.IsolatedAsyncioTestCase):
+    """第二层判据：**普通图片**（`kind == 'image'`）交给识图模型确认是不是表情包。
+
+    受控偏离 `§45.7`。这一层的全部风险有两条，两类用例各钉一条：
+
+    * **误收**——"拿不准"必须等于"不收"，任何失败（没模型 / 超时 / JSON 坏 / 置信度不够）
+      都不许入库；
+    * **烧 token**——不像表情包的图**一次模型调用都不该有**，第一层认的种类同样不许
+      经过模型，开关关着时连候选都不产生。
+    """
+
+    def _guess_host(self, tmp: str, describer: Any = None, **stickers: Any) -> Any:
+        """一个开着第二层判据的宿主（默认的 `auto_collect_guess` 由用例显式给）。"""
+        database = Database(':memory:')
+        database.register_tables()
+        self.addCleanup(database.close)
+        os.makedirs(os.path.join(tmp, 'stickers'), exist_ok=True)
+        host = _host(
+            ctx=InterludeContext(base_dir=tmp),
+            config={'stickers': {
+                'enabled': True, 'directory': 'stickers', 'auto_collect_guess': True, **stickers,
+            }},
+            db=database,
+            transport=_ByteTransport(),
+        )
+        host.sticker_describer = describer if describer is not None else _GuessingDescriber()
+
+        async def image_bytes_to_native(data: bytes, mime_type: str) -> dict[str, Any]:
+            return {'mime_type': mime_type, 'data_uri': 'data:%s;base64,AA==' % mime_type}
+
+        host.image_bytes_to_native = image_bytes_to_native
+        return host
+
+    async def test_a_small_square_image_the_model_calls_a_sticker_is_collected_with_its_description(self):
+        """`image` + 近方形小图 + 模型说 is_sticker=true → 入库、guessed=true、用回执描述。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber(verdict={
+                'is_sticker': True, 'kind': 'meme', 'confidence': 0.91, 'description': '一只挥手的猫',
+            })
+            host = self._guess_host(tmp, describer)
+            source = 'https://cdn.example.com/plain.png'
+            host.transport.payloads[source] = _sized_png(120, 120)
+            collected = await host.collect_incoming_stickers(
+                [{'source': source, 'kind': 'image'}], [source],
+            )
+
+            self.assertEqual(len(collected), 1, '模型确认过的表情包该入库')
+            self.assertEqual(len(describer.guessed), 1, '近方形小图问了一次模型')
+            row = (await host.db_get('interlude_sticker', {}))[0]
+            # SQLite 的 boolean 落在列里就是 0/1（坑 8：`is True` 会漏掉它），
+            # 读外部这一列的口径在 `console_api._truthy_boolean`。
+            self.assertEqual(row['guessed'], 1, '「模型猜的」要留痕')
+            self.assertEqual(row['source'], 'auto', 'source 仍只有 auto / manual 两个取值')
+            self.assertEqual(row['description'], '一只挥手的猫', '回执里的描述直接用')
+            self.assertFalse(row['descriptionManual'], '模型写的描述不是「人写的」')
+            self.assertEqual(row['status'], 'active', '有描述就该立刻可用')
+            # ⚠️ 关键：**没有再跑一次描述调用**（不为同一张图付两次钱）。
+            self.assertEqual(describer.described, [], '回执带了描述就不该再调描述模型')
+            self.assertEqual(
+                [item['assetId'] for item in host.sticker_catalog], [row['assetId']],
+                '入库即可进目录',
+            )
+            self.assertEqual(host.sticker_catalog[0]['description'], '一只挥手的猫')
+
+    async def test_receipt_without_a_description_falls_back_to_the_description_flow(self):
+        """回执**没有**描述 → 照旧走描述流程（只有这一种情况才多一次调用）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber(verdict={
+                'is_sticker': True, 'kind': 'reaction', 'confidence': 0.8, 'description': '   ',
+            })
+            host = self._guess_host(tmp, describer)
+            source = 'https://cdn.example.com/plain.png'
+            host.transport.payloads[source] = _sized_png(100, 100)
+            collected = await host.collect_incoming_stickers(
+                [{'source': source, 'kind': 'image'}], [source],
+            )
+            self.assertEqual(len(collected), 1)
+            self.assertEqual(len(describer.described), 1, '没有描述就得走原来的描述流程')
+            row = (await host.db_get('interlude_sticker', {}))[0]
+            self.assertEqual(row['guessed'], 1)
+            self.assertEqual(row['description'], '模型后来补的描述')
+            self.assertEqual(row['status'], 'active')
+
+    async def test_anything_short_of_a_confident_yes_never_enters_the_library(self):
+        """判成照片 / 置信度不够 / JSON 坏 / 抛异常 → 一律不收（穷举）。"""
+        cases: list[tuple[str, Any]] = [
+            ('判成实拍照片', {'is_sticker': False, 'kind': 'photo', 'confidence': 0.99}),
+            ('判成截图', {'is_sticker': False, 'kind': 'screenshot', 'confidence': 0.95}),
+            ('置信度不够', {'is_sticker': True, 'kind': 'meme', 'confidence': 0.2}),
+            ('缺 confidence', {'is_sticker': True, 'kind': 'meme'}),
+            ('is_sticker 不是布尔', {'is_sticker': 'true', 'confidence': 0.99}),
+            ('回执不是对象（JSON 解析后的原样文本）', '不是 JSON'),
+            ('回执缺字段', {}),
+        ]
+        for label, verdict in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                describer = _GuessingDescriber(verdict=verdict)
+                host = self._guess_host(tmp, describer)
+                source = 'https://cdn.example.com/plain.png'
+                host.transport.payloads[source] = _sized_png(64, 64)
+                self.assertEqual(
+                    await host.collect_incoming_stickers(
+                        [{'source': source, 'kind': 'image'}], [source],
+                    ),
+                    [], label,
+                )
+                self.assertEqual(await host.db_get('interlude_sticker', {}), [], label)
+                self.assertEqual(host.sticker_catalog, [], label)
+                # 判定**被问过**（不是"没问就拒"），只是答案不达标。
+                self.assertEqual(len(describer.guessed), 1, label)
+                # 也没留下文件。
+                collected_dir = os.path.join(tmp, 'stickers', 'collected')
+                self.assertEqual(
+                    sorted(os.listdir(collected_dir)) if os.path.isdir(collected_dir) else [], [], label,
+                )
+
+    async def test_a_failing_model_call_is_not_collected_and_never_raises(self):
+        """模型调用抛异常 / 超时 → 按"不收"处理，异常不许冒到收藏任务之外。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber(error=RuntimeError('network down'))
+            host = self._guess_host(tmp, describer)
+            source = 'https://cdn.example.com/plain.png'
+            host.transport.payloads[source] = _sized_png(64, 64)
+            self.assertEqual(
+                await host.collect_incoming_stickers([{'source': source, 'kind': 'image'}], [source]), [],
+            )
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+
+            # 超时：把软时限压到 1ms，让模拟的慢模型必然超时。
+            hung = _GuessingDescriber(delay=0.05)
+            host = self._guess_host(tmp, hung)
+            host.transport.payloads[source] = _sized_png(64, 64)
+            original = chunk2_module.STICKER_GUESS_TIMEOUT_SECONDS
+            chunk2_module.STICKER_GUESS_TIMEOUT_SECONDS = 0.001
+            self.addCleanup(setattr, chunk2_module, 'STICKER_GUESS_TIMEOUT_SECONDS', original)
+            self.assertEqual(
+                await host.collect_incoming_stickers([{'source': source, 'kind': 'image'}], [source]), [],
+            )
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+
+    async def test_no_vision_model_warns_once_and_collects_nothing(self):
+        """根本没配识图模型 → 零入库 + **一条节流 warn**（能力缺失，坑 25）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._guess_host(tmp, SilentStickerDescriber())
+            sources = ['https://cdn.example.com/%d.png' % index for index in range(3)]
+            media = [{'source': source, 'kind': 'image'} for source in sources]
+            for index, source in enumerate(sources):
+                host.transport.payloads[source] = _sized_png(80 + index, 80)
+            self.assertEqual(await host.collect_incoming_stickers(media, sources), [])
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+            warns = [
+                entry for entry in host.reports
+                if entry and entry[0] == 'warn' and '没有可用的识图模型' in str(entry[1])
+            ]
+            self.assertEqual(len(warns), 1, '三张图只报一条 warn（节流）')
+
+    async def test_photo_shaped_and_unparsable_images_never_cost_a_model_call(self):
+        """大图 / 长宽比像照片 / 图片头解析不出 → **零模型调用**（预筛在调模型之前）。"""
+        cases: dict[str, bytes] = {
+            '2000×1500 的照片': _sized_png(2000, 1500),
+            '800×200 的长条截图': _sized_png(800, 200),
+            '500×200 的横幅': _sized_png(500, 200),
+            '只有魔数的残缺 PNG': b'\x89PNG\r\n\x1a\n' + b'x' * 40,
+        }
+        for label, payload in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                describer = _GuessingDescriber()
+                host = self._guess_host(tmp, describer)
+                source = 'https://cdn.example.com/plain.png'
+                host.transport.payloads[source] = payload
+                self.assertEqual(
+                    await host.collect_incoming_stickers(
+                        [{'source': source, 'kind': 'image'}], [source],
+                    ),
+                    [], label,
+                )
+                self.assertEqual(describer.guessed, [], '%s：不该调模型' % label)
+                self.assertEqual(await host.db_get('interlude_sticker', {}), [], label)
+                self.assertEqual(host.transport.fetched, [source], '字节还是要下的（预筛读图片头）')
+                # 没判定的原因要留在 debug 里（用户问"为什么这张没被判定"时靠它）。
+                prefiltered = [
+                    entry for entry in host.reports
+                    if entry and '尺寸/形状预筛' in str(entry[2] if len(entry) > 2 else entry[1])
+                ]
+                self.assertEqual(len(prefiltered), 1, '%s：该留一条预筛 debug' % label)
+
+    async def test_a_gif_and_a_transparent_png_are_candidates_even_when_large(self):
+        """GIF 与带 alpha 的 PNG 一律算候选（聊天里这两种几乎只当表情用）。"""
+        for label, payload in (
+            ('GIF', _sized_gif(800, 600)),
+            ('RGBA PNG', _sized_png(900, 900, color_type=6)),
+            ('tRNS PNG', _sized_png(900, 900, color_type=2, trns=True)),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                describer = _GuessingDescriber()
+                host = self._guess_host(tmp, describer)
+                source = 'https://cdn.example.com/plain.bin'
+                host.transport.payloads[source] = payload
+                collected = await host.collect_incoming_stickers(
+                    [{'source': source, 'kind': 'image'}], [source],
+                )
+                self.assertEqual(len(describer.guessed), 1, '%s：该问模型' % label)
+                self.assertEqual(len(collected), 1, label)
+                self.assertEqual((await host.db_get('interlude_sticker', {}))[0]['guessed'], 1)
+
+    async def test_the_first_layer_never_touches_the_model(self):
+        """`sticker` / `animated` / `market` → 直接收，**零模型调用**（穷举）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber()
+            host = self._guess_host(tmp, describer)
+            kinds = ('sticker', 'animated', 'market')
+            sources = ['https://cdn.example.com/%s' % kind for kind in kinds]
+            media = [{'source': source, 'kind': kind} for source, kind in zip(sources, kinds)]
+            for index, source in enumerate(sources):
+                host.transport.payloads[source] = _sized_png(2000, 1500 + index, color_type=2 + 0)
+            collected = await host.collect_incoming_stickers(media, sources)
+            self.assertEqual(len(collected), 3, '第一层认的种类不受预筛影响')
+            self.assertEqual(describer.guessed, [], '第一层永远不该走模型')
+            rows = await host.db_get('interlude_sticker', {})
+            self.assertEqual({row['guessed'] for row in rows}, {False}, '不是"猜的"')
+
+    async def test_the_switch_off_means_zero_model_calls_and_zero_rows(self):
+        """`auto_collect_guess=false`（默认）→ 普通图片零候选、零模型调用、零入库。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber()
+            host = self._guess_host(tmp, describer, auto_collect_guess=False)
+            source = 'https://cdn.example.com/plain.png'
+            host.transport.payloads[source] = _sized_png(64, 64)
+            media = [{'source': source, 'kind': 'image'}]
+            self.assertEqual(await host.collect_incoming_stickers(media, [source]), [])
+            self.assertEqual(describer.guessed, [])
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+            # 连"要不要建任务"的同步预筛也说不：开关关着时与今天逐字一致。
+            self.assertFalse(chunk2_module._has_collectible_media(media))
+            self.assertTrue(chunk2_module._has_collectible_media(media, True))
+
+    async def test_dedup_wins_over_the_model_and_over_the_second_layer(self):
+        """同内容已经在库（`missing` 也算）→ 不调模型、不入库，只把行复活。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber()
+            host = self._guess_host(tmp, describer)
+            source = 'https://cdn.example.com/plain.png'
+            payload = _sized_png(64, 64)
+            host.transport.payloads[source] = payload
+            now = host.now()
+            created = await host.db_create('interlude_sticker', {
+                'assetId': 'sticker-old', 'filePath': 'collected/old.png', 'group': 'collected',
+                'mimeType': 'image/png', 'animated': False, 'size': len(payload),
+                'hash': hashlib.sha256(payload).hexdigest(), 'name': 'old', 'source': 'auto',
+                'description': '早就描述过', 'descriptionManual': False, 'aliases': [],
+                'status': 'missing', 'guessed': True, 'createdAt': now, 'updatedAt': now,
+            })
+            self.assertEqual(
+                await host.collect_incoming_stickers([{'source': source, 'kind': 'image'}], [source]), [],
+            )
+            self.assertEqual(describer.guessed, [], '同内容已经在库里就不该再问模型')
+            rows = await host.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 1, '不重复入库')
+            # 文件曾被删、同内容又回来：只复活状态（不重花模型调用）。
+            self.assertEqual(rows[0]['id'], created['id'])
+            self.assertEqual(rows[0]['status'], 'active')
+            self.assertEqual(rows[0]['description'], '早就描述过')
+
+    async def test_per_message_and_per_minute_budgets_cap_the_model_calls(self):
+        """一条消息多张候选 + 短时间大量图片：判定调用数被两个上限夹住。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber()
+            host = self._guess_host(tmp, describer)
+
+            def batch(prefix: str, count: int) -> tuple[list[dict[str, Any]], list[str]]:
+                sources = ['https://cdn.example.com/%s-%d.png' % (prefix, index) for index in range(count)]
+                for index, source in enumerate(sources):
+                    # 每张内容都不同（否则会被 sha256 去重合并成一条）。
+                    host.transport.payloads[source] = _sized_png(
+                        64, 64, extra=('%s-%d' % (prefix, index)).encode(),
+                    )
+                return [{'source': source, 'kind': 'image'} for source in sources], sources
+
+            media, sources = batch('a', 5)
+            await host.collect_incoming_stickers(media, sources)
+            self.assertEqual(
+                len(describer.guessed), chunk2_module.STICKER_GUESS_MAX_PER_MESSAGE,
+                '一条消息最多问 %d 次' % chunk2_module.STICKER_GUESS_MAX_PER_MESSAGE,
+            )
+
+            # 再来两条消息：每条仍只花「每条消息上限」，三条累计正好触到每分钟窗口的上限。
+            for prefix in ('b', 'c'):
+                media, sources = batch(prefix, 5)
+                await host.collect_incoming_stickers(media, sources)
+            self.assertEqual(
+                len(describer.guessed), chunk2_module.STICKER_GUESS_MAX_PER_MINUTE,
+                '一分钟内的总量被窗口夹住',
+            )
+
+            media, sources = batch('d', 5)
+            await host.collect_incoming_stickers(media, sources)
+            self.assertEqual(
+                len(describer.guessed), chunk2_module.STICKER_GUESS_MAX_PER_MINUTE,
+                '超出窗口额度的调用一律丢弃（只记 debug）',
+            )
+            # 超限的那些**不入库**（拿不准就不收），但也不抛。
+            self.assertEqual(
+                len(await host.db_get('interlude_sticker', {})),
+                chunk2_module.STICKER_GUESS_MAX_PER_MINUTE,
+            )
+
+    async def test_an_oversized_local_file_is_never_downloaded_nor_guessed(self):
+        """来源自带体积（本地文件）超过上限 → 连字节都不读、不调模型。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber()
+            host = self._guess_host(tmp, describer, max_file_size_mb=1)
+            local = os.path.join(tmp, 'big.png')
+            with open(local, 'wb') as handle:
+                handle.write(_sized_png(64, 64) + b'x' * (1024 * 1024))
+            source = 'onebot-file:%s' % local
+            self.assertEqual(
+                await host.collect_incoming_stickers([{'source': source, 'kind': 'image'}], [source]), [],
+            )
+            self.assertEqual(describer.guessed, [], '不下载就不该有判定调用')
+            self.assertEqual(host.transport.fetched, [])
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+
+    async def test_guessed_assets_get_their_embedding_indexed_like_described_ones(self):
+        """回执描述进向量索引（否则"模型猜进来的"素材在语义过滤里永远缺一条）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber(verdict={
+                'is_sticker': True, 'kind': 'meme', 'confidence': 0.9, 'description': '一只猫',
+            })
+            host = self._guess_host(tmp, describer)
+            embedded: list[str] = []
+
+            async def embed_text(value: str) -> list[float]:
+                embedded.append(value)
+                return [1.0, 0.0]
+
+            host.embed_text = embed_text
+            host.config = {'model': {'embedding': {'semanticStickerFilter': True}},
+                           'stickers': {'enabled': True, 'directory': 'stickers', 'auto_collect_guess': True}}
+            host.cached_sticker_config = None
+            source = 'https://cdn.example.com/plain.png'
+            host.transport.payloads[source] = _sized_png(64, 64)
+            await host.collect_incoming_stickers([{'source': source, 'kind': 'image'}], [source])
+            self.assertEqual(embedded, ['一只猫'])
+            row = (await host.db_get('interlude_sticker', {}))[0]
+            self.assertEqual(row['embedding'], [1.0, 0.0])
+
+
+def _png_chunk(name: bytes, data: bytes) -> bytes:
+    """一个结构合法的 PNG 块（长度 + 类型 + 数据 + CRC）。"""
+    return (
+        len(data).to_bytes(4, 'big') + name + data
+        + zlib.crc32(name + data).to_bytes(4, 'big')
+    )
+
+
+def _sized_png(
+    width: int, height: int, color_type: int = 2, trns: bool = False, extra: bytes = b'',
+) -> bytes:
+    """一张**图片头合法**的 PNG：宽高真的写在 `IHDR` 里（第二层的预筛要读它）。
+
+    与 `_png()`（只保证魔数）刻意分开：第一层不关心尺寸，第二层全靠它。
+    """
+    ihdr = (
+        width.to_bytes(4, 'big') + height.to_bytes(4, 'big')
+        + bytes([8, color_type, 0, 0, 0])
+    )
+    body = _png_chunk(b'IHDR', ihdr)
+    if trns:
+        body += _png_chunk(b'tRNS', b'\x00' * 6)
+    body += _png_chunk(b'IDAT', b'') + _png_chunk(b'IEND', b'')
+    return b'\x89PNG\r\n\x1a\n' + body + extra
+
+
+def _sized_gif(width: int, height: int) -> bytes:
+    """一张 GIF：逻辑屏幕描述符里带宽高（小端 16 位）。"""
+    return b'GIF89a' + width.to_bytes(2, 'little') + height.to_bytes(2, 'little') + b'\x00' * 8
+
+
+class _GuessingDescriber:
+    """第二层判据的模型桩：只实现 `StickerDescriber` 协议里这一层要用的两个方法。
+
+    同时实现 `available()` / `describe_sticker()`，好把"描述调用"单独计数——
+    "回执带描述时不许再调描述模型"那条断言全靠 `described`。
+    """
+
+    def __init__(
+        self, verdict: Any = None, error: Optional[BaseException] = None, delay: float = 0.0,
+    ) -> None:
+        self.verdict = {'is_sticker': True, 'kind': 'meme', 'confidence': 0.9,
+                        'description': '一只猫'} if verdict is None else verdict
+        self.error = error
+        self.delay = delay
+        self.guessed: list[tuple[str, str, str]] = []
+        self.described: list[Any] = []
+
+    def available(self) -> bool:
+        return True
+
+    def guess_sticker_available(self) -> bool:
+        return True
+
+    async def guess_sticker(
+        self, data_uri: str, mime_type: str, file_name: str = '',
+        response_format: Any = 'json-object', max_tokens: Any = 256,
+    ) -> Any:
+        self.guessed.append((data_uri, mime_type, file_name))
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return self.verdict
+
+    async def describe_sticker(
+        self, data_uri: str, mime_type: str, file_name: str, animated: Any,
+        response_format: Any = 'json-object', max_tokens: Any = 768,
+    ) -> Any:
+        self.described.append((data_uri, mime_type, file_name, animated))
+        return {'description': '模型后来补的描述', 'aliases': ['猫']}
+
+
 class ConfigGetterTests(unittest.TestCase):
     def test_audio_config_defaults_and_clamps(self):
         """`get audioConfig()`（本范围成员，`:2247`）。"""
@@ -1505,7 +2287,8 @@ class ConfigGetterTests(unittest.TestCase):
         """`get stickerConfig()`（本范围成员，`:2260`）。"""
         host = _host()
         self.assertEqual(host.sticker_config, {
-            'enabled': False, 'directory': 'data/hds-interlude/stickers',
+            'enabled': False, 'auto_collect': True, 'auto_collect_guess': False,
+            'directory': 'data/hds-interlude/stickers',
             'max_file_size_mb': 10, 'catalog_limit': 40,
             'description_max_tokens': 768, 'description_response_format': 'json-object',
         })
@@ -1514,13 +2297,39 @@ class ConfigGetterTests(unittest.TestCase):
             'catalogLimit': 999, 'descriptionMaxTokens': 10, 'descriptionResponseFormat': 'prompt-only',
         }})
         self.assertEqual(configured.sticker_config, {
-            'enabled': True, 'directory': 'my/stickers', 'max_file_size_mb': 30.0,
+            'enabled': True, 'auto_collect': True, 'auto_collect_guess': False,
+            'directory': 'my/stickers', 'max_file_size_mb': 30.0,
             'catalog_limit': 80, 'description_max_tokens': 256,
             'description_response_format': 'prompt-only',
         })
         fallback = _host(config={'stickers': {'catalogLimit': 0, 'descriptionResponseFormat': 'json-object'}})
         self.assertEqual(fallback.sticker_config['catalog_limit'], 40)
         self.assertEqual(fallback.sticker_config['description_response_format'], 'json-object')
+        # 自动收藏：默认开，**只有显式 false 才关**（camelCase 旧名也认）。
+        self.assertIs(fallback.sticker_config['auto_collect'], True)
+        self.assertIs(
+            _host(config={'stickers': {'autoCollect': False}}).sticker_config['auto_collect'], False,
+        )
+        self.assertIs(
+            _host(config={'stickers': {'auto_collect': False}}).sticker_config['auto_collect'], False,
+        )
+        # 第二层（模型判定普通图片，§45.7）：**默认关**，只有显式 true 才开
+        # （`is True` 是刻意的：缺失 / NULL / 字符串一律当关——多花 token 的开关不许"意外打开"）。
+        self.assertIs(fallback.sticker_config['auto_collect_guess'], False)
+        self.assertIs(
+            _host(config={'stickers': {'autoCollectGuess': True}}).sticker_config['auto_collect_guess'], True,
+        )
+        self.assertIs(
+            _host(config={'stickers': {'auto_collect_guess': True}}).sticker_config['auto_collect_guess'], True,
+        )
+        for noise in (1, 'true', 'yes'):
+            with self.subTest(noise=noise):
+                self.assertIs(
+                    _host(config={'stickers': {'auto_collect_guess': noise}})
+                    .sticker_config['auto_collect_guess'],
+                    False,
+                    '非布尔真值不当成"打开"',
+                )
 
 
 class WorkingDetailTests(unittest.TestCase):

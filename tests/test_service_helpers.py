@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import unittest
+import zlib
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -541,6 +542,166 @@ class StickerVisionHelperTests(unittest.TestCase):
         self.assertNotEqual(h.stable_sticker_asset_id('bq (6).png', hash_a),
                             h.stable_sticker_asset_id('bq [6].png', hash_b))
         self.assertRegex(h.stable_sticker_asset_id('bq (6).png', hash_a), r'aaaaaaaaaaaaaaaa$')
+
+
+class StickerGuessHelperTests(unittest.TestCase):
+    """第二层判据的纯函数（本移植版新增，受控偏离 `§45.7`）。
+
+    这一层只在**便宜**这一侧正确才有意义：宽高要能在不引入 Pillow 的前提下读出来，
+    明显不像表情包的图要在调模型之前被挡掉，而"收不收"的阈值只有一处。
+    """
+
+    def test_image_dimensions_are_read_from_the_header_of_the_four_allowed_formats(self):
+        self.assertEqual(h.guess_image_dimensions(png(320, 200)), (320, 200))
+        self.assertEqual(h.guess_image_dimensions(png(320, 200, color_type=6)), (320, 200))
+        self.assertEqual(h.guess_image_dimensions(gif(96, 64)), (96, 64))
+        self.assertEqual(h.guess_image_dimensions(jpeg(640, 480)), (640, 480))
+        self.assertEqual(h.guess_image_dimensions(webp_vp8x(300, 200)), (300, 200))
+        self.assertEqual(h.guess_image_dimensions(webp_vp8(120, 90)), (120, 90))
+        self.assertEqual(h.guess_image_dimensions(webp_vp8l(64, 48)), (64, 48))
+
+    def test_unparsable_or_unknown_bytes_have_no_dimensions(self):
+        for label, payload in (
+            ('空字节', b''),
+            ('None', None),
+            ('纯文本', b'this is not an image at all, really'),
+            ('只有魔数的残缺 PNG', b'\x89PNG\r\n\x1a\n' + b'x' * 4),
+            ('没有 SOF 的 JPEG', b'\xff\xd8' + b'\xff\xd9'),
+            ('VP8X 但没有尺寸字段', b'RIFF\x10\x00\x00\x00WEBPVP8X\x04\x00\x00\x00\x00\x00\x00\x00'),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNone(h.guess_image_dimensions(payload))
+
+    def test_the_prefilter_only_rejects_what_clearly_is_not_a_sticker(self):
+        # 近方形 + 两边都小 = 表情包的典型尺寸。
+        self.assertTrue(h.sticker_guess_candidate(png(120, 120), 'image/png'))
+        self.assertTrue(h.sticker_guess_candidate(png(512, 400, color_type=2), 'image/png'))
+        # 大图 / 长宽比明显像照片或截图 → 不值得问模型。
+        self.assertFalse(h.sticker_guess_candidate(png(2000, 1500, color_type=2), 'image/png'))
+        self.assertFalse(h.sticker_guess_candidate(png(800, 300, color_type=2), 'image/png'))
+        self.assertFalse(h.sticker_guess_candidate(jpeg(1920, 1080), 'image/jpeg'))
+        # 解析不出宽高 = 拿不准 = 不花钱。
+        self.assertFalse(h.sticker_guess_candidate(b'\x89PNG\r\n\x1a\n' + b'x' * 40, 'image/png'))
+        self.assertFalse(h.sticker_guess_candidate(None, 'image/png'))
+
+    def test_gifs_and_transparent_pngs_are_always_candidates(self):
+        # 聊天里 GIF 几乎只当动图 / 表情用，哪怕它是张大图。
+        self.assertTrue(h.sticker_guess_candidate(gif(800, 600), 'image/gif'))
+        # 透明底是表情的典型特征：色彩类型 4 / 6 与 tRNS 三种都要认。
+        self.assertTrue(h.sticker_guess_candidate(png(900, 900, color_type=6), 'image/png'))
+        self.assertTrue(h.sticker_guess_candidate(png(900, 900, color_type=4), 'image/png'))
+        self.assertTrue(h.sticker_guess_candidate(png(900, 900, color_type=2, trns=True), 'image/png'))
+        # 不透明的大 PNG 仍然被挡（alpha 才放行）。
+        self.assertFalse(h.sticker_guess_candidate(png(900, 900, color_type=2), 'image/png'))
+
+    def test_acceptance_needs_a_confident_boolean_yes(self):
+        accepted = h.sticker_guess_result({
+            'is_sticker': True, 'kind': 'meme', 'confidence': 0.85, 'description': '  一只猫  ',
+        })
+        self.assertEqual(accepted, {
+            'is_sticker': True, 'kind': 'meme', 'confidence': 0.85, 'description': '一只猫',
+        })
+        # 阈值是启发式常量：正好在阈值上算通过。
+        self.assertIsNotNone(h.sticker_guess_result(
+            {'is_sticker': True, 'confidence': h.GUESS_STICKER_MIN_CONFIDENCE},
+        ))
+        rejected = [
+            ('判成照片', {'is_sticker': False, 'kind': 'photo', 'confidence': 0.99}),
+            ('置信度不够', {'is_sticker': True, 'confidence': 0.59}),
+            ('缺 confidence', {'is_sticker': True, 'kind': 'meme'}),
+            ('confidence 不是数', {'is_sticker': True, 'confidence': '0.9'}),
+            ('confidence 是布尔', {'is_sticker': True, 'confidence': True}),
+            ('is_sticker 是字符串', {'is_sticker': 'true', 'confidence': 0.99}),
+            ('is_sticker 是 1（不是布尔）', {'is_sticker': 1, 'confidence': 0.99}),
+            ('空对象', {}),
+            ('不是对象', 'not json'),
+            ('None', None),
+            ('列表', [1, 2]),
+        ]
+        for label, value in rejected:
+            with self.subTest(label=label):
+                self.assertIsNone(h.sticker_guess_result(value), label)
+
+    def test_unknown_kinds_fall_back_to_other_and_camel_case_aliases_are_read(self):
+        # `kind` 只做白名单归一，**不参与**收不收的判断。
+        self.assertEqual(h.sticker_guess_result(
+            {'is_sticker': True, 'kind': 'Meme!!!', 'confidence': 0.7},
+        )['kind'], 'other')
+        self.assertEqual(h.sticker_guess_result(
+            {'is_sticker': True, 'kind': 'caption_photo', 'confidence': 0.7},
+        )['kind'], 'caption_photo')
+        # 中转站改写了键名也认（本仓库读外部输入一律双读）。
+        accepted = h.sticker_guess_result({'isSticker': True, 'confidence': 0.7})
+        self.assertEqual(accepted['description'], '', '没给描述就是空串（调用方据此走描述流程）')
+
+    def test_the_heuristic_constants_are_the_documented_ones(self):
+        self.assertEqual(h.GUESS_STICKER_KIND, 'image')
+        self.assertEqual(h.GUESS_STICKER_MAX_DIMENSION, 512)
+        self.assertEqual(h.GUESS_STICKER_MAX_ASPECT, 1.6)
+        self.assertEqual(h.GUESS_STICKER_MIN_CONFIDENCE, 0.6)
+        self.assertEqual(h.STICKER_GUESS_KINDS, (
+            'meme', 'reaction', 'caption_photo', 'photo', 'screenshot', 'other',
+        ))
+
+
+def png(
+    width: int, height: int, color_type: int = 2, trns: bool = False,
+) -> bytes:
+    """一张结构合法的 PNG（宽高真的写在 `IHDR` 里）。"""
+    ihdr = (
+        width.to_bytes(4, 'big') + height.to_bytes(4, 'big') + bytes([8, color_type, 0, 0, 0])
+    )
+    body = _chunk(b'IHDR', ihdr)
+    if trns:
+        body += _chunk(b'tRNS', b'\x00' * 6)
+    body += _chunk(b'IDAT', b'') + _chunk(b'IEND', b'')
+    return b'\x89PNG\r\n\x1a\n' + body
+
+
+def _chunk(name: bytes, data: bytes) -> bytes:
+    return len(data).to_bytes(4, 'big') + name + data + zlib.crc32(name + data).to_bytes(4, 'big')
+
+
+def gif(width: int, height: int) -> bytes:
+    """一张 GIF：逻辑屏幕描述符里带宽高（小端 16 位）。"""
+    return b'GIF89a' + width.to_bytes(2, 'little') + height.to_bytes(2, 'little') + b'\x00' * 8
+
+
+def jpeg(width: int, height: int) -> bytes:
+    """一张 JPEG：`SOI` + `APP0` + `SOF0`（尺寸就在 SOF 里）。"""
+    app0 = b'\xff\xe0' + (16).to_bytes(2, 'big') + b'JFIF\x00' + b'\x00' * 9
+    sof = (
+        b'\xff\xc0' + (17).to_bytes(2, 'big') + b'\x08'
+        + height.to_bytes(2, 'big') + width.to_bytes(2, 'big') + b'\x03' + b'\x00' * 9
+    )
+    return b'\xff\xd8' + app0 + sof + b'\xff\xd9'
+
+
+def _webp(chunk: bytes) -> bytes:
+    body = b'WEBP' + chunk
+    return b'RIFF' + len(body).to_bytes(4, 'little') + body
+
+
+def webp_vp8x(width: int, height: int) -> bytes:
+    """扩展格式：画布尺寸是 24 位小端的「宽-1 / 高-1」。"""
+    payload = b'\x00' * 4 + (width - 1).to_bytes(3, 'little') + (height - 1).to_bytes(3, 'little')
+    return _webp(b'VP8X' + len(payload).to_bytes(4, 'little') + payload)
+
+
+def webp_vp8(width: int, height: int) -> bytes:
+    """有损格式：帧头起始码之后的两个 16 位（有效 14 位）。"""
+    payload = (
+        b'\x00\x00\x00' + b'\x9d\x01\x2a'
+        + width.to_bytes(2, 'little') + height.to_bytes(2, 'little') + b'\x00' * 4
+    )
+    return _webp(b'VP8 ' + len(payload).to_bytes(4, 'little') + payload)
+
+
+def webp_vp8l(width: int, height: int) -> bytes:
+    """无损格式：签名 0x2F + 位打包的（宽-1, 高-1）各 14 位。"""
+    bits = (width - 1) | ((height - 1) << 14)
+    payload = b'\x2f' + bits.to_bytes(4, 'little')
+    return _webp(b'VP8L' + len(payload).to_bytes(4, 'little') + payload)
 
 
 class GroupIdentityTests(unittest.TestCase):

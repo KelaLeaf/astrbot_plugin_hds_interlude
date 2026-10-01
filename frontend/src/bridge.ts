@@ -10,6 +10,8 @@ export interface BridgeContext {
   locale?: string
   isDark?: boolean
   i18n?: Record<string, unknown>
+  /** 宿主给的插件名（页面所在插件）。相对端点要靠它才能拼成真实地址。 */
+  pluginName?: string
   [key: string]: unknown
 }
 
@@ -103,6 +105,38 @@ export function translate(key: string, fallback: string): string {
   } catch {
     return fallback
   }
+}
+
+/** WebUI 的 API 根 + 插件扩展接口前缀（宿主自己也是这么拼的）。 */
+const EXTENSION_PREFIX = '/api/v1/plugins/extensions'
+/** 已经是绝对地址（`http(s):` / `data:` / `blob:` / `//host` / `/path`）就直接用。 */
+const ABSOLUTE_URL = /^(?:[a-z][a-z0-9+.-]*:|\/\/|\/)/i
+
+/**
+ * 把一个**相对端点**解析成可以直接用的真实地址（`<img src>`、`fetch` 等）。
+ *
+ * 为什么需要它：`apiGet` / `apiPost` 走的是宿主 postMessage 通道、拿回来的是 JSON，
+ * 图片字节（`console/sticker-file`）走不了那条路；而后端给的 `thumbnailUrl` 是**相对**
+ * 地址，必须拼上插件名才取得回来。
+ *
+ * 插件名只从宿主上下文（`pluginName`）里取，**不写死在源码里**——同一份构建产物要能
+ * 在用户自己的插件目录名下工作。上下文还没就绪 / 拿不到插件名时回空串，
+ * 调用方据此显示占位图（绝不拼一个必然 404 的地址出来）。
+ */
+export function endpointUrl(endpoint: string): string {
+  const path = String(endpoint || '').trim()
+  if (!path) return ''
+  // 后端哪天改成回绝对地址（或内联 data:）也不用改前端。
+  if (ABSOLUTE_URL.test(path)) return path
+  let name = ''
+  try {
+    const context = bridge().getContext()
+    name = typeof context?.pluginName === 'string' ? context.pluginName.trim() : ''
+  } catch {
+    return ''
+  }
+  if (!name) return ''
+  return `${EXTENSION_PREFIX}/${encodeURIComponent(name)}/${path}`
 }
 
 export { describe as describeError }

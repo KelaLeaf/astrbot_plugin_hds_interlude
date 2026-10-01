@@ -2,3 +2,16 @@ __pycache__/
 *.pyc
 # 运行期投递坐标（桥自动落盘，不该进仓库）
 delivery_endpoints.json
+
+# 前端依赖：用户装插件不需要 Node，同步时也容易漏 --exclude
+node_modules/
+
+# 测试用临时 sqlite 目录（Database 用例的 tempdir 兜底）。
+# ⚠️ 历史上曾被误提交 100 个（tests/hdsi_db_*/interlude.sqlite3，每个 80 KiB、内容完全相同，
+#    共占 HEAD 树 7.81 MB / 当时全仓跟踪内容的 56%）；gitignore 只能挡住**新**目录，
+#    已跟踪的那些必须 `git rm -r --cached tests/hdsi_db_*` 才会从仓库里消失。
+hdsi_db_*/
+
+# 运行时数据与日志
+data/
+*.log

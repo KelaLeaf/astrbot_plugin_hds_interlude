@@ -36,7 +36,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 import unittest
+import zlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -1252,6 +1255,349 @@ class ReceiveGroupTests(ServiceHarness):
         self.make_story()
         service.database_resetting = True
         self.assertFalse(await service.receive_group(group_session()))
+
+
+# =========================================================================== #
+# 群聊入站的表情包自动收藏（受控偏离 §45.6）
+# =========================================================================== #
+
+def _png(payload: bytes = b'x') -> bytes:
+    """一张最小的"合法" PNG 字节串（魔数正确就够，内容不参与判据）。"""
+    return b'\x89PNG\r\n\x1a\n' + payload * 32
+
+
+def _gif(payload: bytes = b'x') -> bytes:
+    """一张最小的"合法" GIF 字节串（动图那条链路用）。"""
+    return b'GIF89a' + payload * 32
+
+
+def _png_chunk(name: bytes, data: bytes) -> bytes:
+    return len(data).to_bytes(4, 'big') + name + data + zlib.crc32(name + data).to_bytes(4, 'big')
+
+
+def _sized_png(width: int, height: int, color_type: int = 2) -> bytes:
+    """一张**图片头合法**的 PNG（第二层判据的预筛要读 `IHDR` 里的宽高）。
+
+    与 `_png()` 刻意分开：第一层只看魔数，第二层全靠尺寸。
+    """
+    ihdr = (
+        width.to_bytes(4, 'big') + height.to_bytes(4, 'big') + bytes([8, color_type, 0, 0, 0])
+    )
+    return (
+        b'\x89PNG\r\n\x1a\n' + _png_chunk(b'IHDR', ihdr)
+        + (_png_chunk(b'IDAT', b'') + _png_chunk(b'IEND', b''))
+    )
+
+
+#: 群里 `<img>` 的四种写法（属性串就是适配层 `serialize_message_chain` 写出来的形状：
+#: `kind` 只在**不是**普通图片时才写，所以裸 `<img src>` 就是"照片/截图"）。
+PHOTO_TAG = '<img src="https://cdn.example.com/photo.png"/>'
+STICKER_TAG = '<img src="https://cdn.example.com/sticker.png" kind="sticker"/>'
+ANIMATED_TAG = (
+    '<img src="https://cdn.example.com/animated.gif" kind="animated" summary="[动画表情]"/>'
+)
+UNKNOWN_KIND_TAG = '<img src="https://cdn.example.com/wat.png" kind="wat"/>'
+
+
+class _GroupByteTransport:
+    """只实现 `fetch_image` 的传输桩：按 URL 回字节，并记下被请求过哪些 URL。
+
+    `payloads` 里没有的 URL 回 `None`（等价"下载失败"）；**绝不真实联网**。
+    """
+
+    def __init__(self, payloads: Optional[dict[str, bytes]] = None) -> None:
+        self.payloads: dict[str, bytes] = dict(payloads or {})
+        self.fetched: list[str] = []
+
+    async def fetch_image(self, url: str) -> Optional[bytes]:
+        self.fetched.append(url)
+        return self.payloads.get(url)
+
+
+class GroupStickerCollectionTests(ServiceHarness):
+    """群聊入站的自动收藏。
+
+    与私聊共用**同一个判据**（`helpers.collectible_sticker_kind`）与**同一个实现**
+    （`chunk2.collect_incoming_stickers`）。这里钉的是群路径自己的四件事：
+
+    1. 种类来自**文本化之前**的 `<img kind=…>`（与私聊同一条 `extract_session_media`），
+       而不是 `describe_group_attachments` 翻出来的 `[表情包]` / `[动画表情]` 文本；
+    2. 被拒绝的群（白名单 / 关掉的群 / `mention-only` 里没 @）**连收藏任务都不挂**；
+    3. 一条群消息多个附件时只收表情包那几张（`source` 对齐；照片在下载前就被跳过）；
+    4. `stickers.enabled`（总闸）与 `stickers.auto_collect` 与私聊同样生效。
+    """
+
+    def _transport(self) -> Any:
+        return _GroupByteTransport({
+            'https://cdn.example.com/sticker.png': _png(b'sticker'),
+            'https://cdn.example.com/animated.gif': _gif(b'animated'),
+        })
+
+    def _service(self, config: dict[str, Any], transport: Any, tmp: str = '') -> Any:
+        service = self.make_service(config, transport=transport)
+        # 库里开着的时候 `__init__` 会 `call_soon(start_background_tasks)`，那会顺带挂一个
+        # 目录扫描任务（名字里也带 sticker），与"还挂着哪些收藏任务"的断言相互干扰。
+        # 收藏钩子不依赖后台调度，这里直接把它关掉（`background_started` 是它的闸门）。
+        service.background_started = True
+        if tmp:
+            service.ctx.base_dir = tmp
+        return service
+
+    def _collect_service(self, tmp: str, transport: Any, **stickers: Any) -> Any:
+        os.makedirs(os.path.join(tmp, 'stickers'), exist_ok=True)
+        return self._service(
+            onebot_config(
+                onebot={'groupChats': [group_rule_stub(responseMode='always')]},
+                stickers={'enabled': True, 'directory': 'stickers', **stickers},
+            ),
+            transport,
+            tmp,
+        )
+
+    @staticmethod
+    def _pending_sticker_tasks() -> list[Any]:
+        """还挂着的收藏旁路任务（`ensure_future` 出去、调用方不 await 的那些）。"""
+        current = asyncio.current_task()
+        found: list[Any] = []
+        for task in asyncio.all_tasks():
+            if task is current:
+                continue
+            coro = task.get_coro() if hasattr(task, 'get_coro') else None
+            if 'sticker' in str(getattr(coro, '__qualname__', '')).lower():
+                found.append(task)
+        return found
+
+    async def _drain_sticker_tasks(self) -> None:
+        """把旁路收藏推到跑完（不 await 的任务只能这样等）；卡住就失败。"""
+        for _ in range(500):
+            if not self._pending_sticker_tasks():
+                return
+            await asyncio.sleep(0)
+        self.fail('收藏任务没有在预期时间内结束')
+
+    def _group_entries(self) -> list[dict[str, Any]]:
+        return [row for row in self.rows('interlude_script_entry') if row['kind'] == 'group-message']
+
+    @needs('receive_group', 'collect_incoming_stickers')
+    async def test_group_stickers_are_collected_from_the_structured_kind(self) -> None:
+        """`sticker` / `animated` 入库；种类来自 `<img kind=…>`，不是 `[表情包]` 文本。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self._transport()
+            service = self._collect_service(tmp, transport)
+            self.make_story()
+            self.assertTrue(await service.receive_group(
+                group_session(content=STICKER_TAG + ANIMATED_TAG), STORY_TIME,
+            ))
+            await self._drain_sticker_tasks()
+
+            rows = await service.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 2, '两张表情包都该入库')
+            self.assertEqual({row['source'] for row in rows}, {'auto'})
+            self.assertEqual({row['group'] for row in rows}, {'collected'})
+            self.assertEqual(len({row['assetId'] for row in rows}), 2)
+            self.assertEqual(
+                sorted(transport.fetched),
+                ['https://cdn.example.com/animated.gif', 'https://cdn.example.com/sticker.png'],
+            )
+            for row in rows:
+                self.assertTrue(row['filePath'].startswith('collected/'))
+                self.assertTrue(os.path.isfile(os.path.join(tmp, 'stickers', row['filePath'])))
+            # gif 是动图、png 不是（`animated` 列按嗅探出来的 MIME 定）。
+            self.assertEqual(
+                {row['animated'] for row in rows}, {False, True},
+            )
+            # 进叙事的正文仍是**文本化**的那一份：收藏不是从它反推的，它也没被改动。
+            entries = self._group_entries()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]['content'], '[表情包][动画表情]')
+
+    @needs('receive_group', 'collect_incoming_stickers')
+    async def test_group_photos_and_unknown_kinds_are_never_collected_or_downloaded(self) -> None:
+        """普通照片与未知种类：零任务、零入库、**零下载**。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self._transport()
+            service = self._collect_service(tmp, transport)
+            self.make_story()
+            self.assertTrue(await service.receive_group(
+                group_session(content=PHOTO_TAG + UNKNOWN_KIND_TAG), STORY_TIME,
+            ))
+            await self._drain_sticker_tasks()
+            self.assertEqual(self._pending_sticker_tasks(), [], '没有值得收藏的种类就不该建任务')
+            self.assertEqual(await service.db_get('interlude_sticker', {}), [])
+            self.assertEqual(transport.fetched, [], '不是表情包就不该去下载')
+
+    @needs('receive_group', 'collect_incoming_stickers')
+    async def test_group_message_without_structured_kind_is_never_collected(self) -> None:
+        """拿不到结构化种类（只剩 CQ 码）→ 零任务、零入库、零下载。
+
+        这一条同时是"**不许从文本反推种类**"的回归：`[CQ:image,…]` 与正文里的
+        `[表情包]` 三个字都不构成"观测到的种类"。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self._transport()
+            service = self._collect_service(tmp, transport)
+            self.make_story()
+            for content in (
+                '[CQ:image,file=sticker.png,url=https://cdn.example.com/sticker.png]',
+                '[表情包][动画表情] https://cdn.example.com/sticker.png',
+            ):
+                with self.subTest(content=content):
+                    self.assertTrue(await service.receive_group(group_session(content=content), STORY_TIME))
+                    await self._drain_sticker_tasks()
+                    self.assertEqual(self._pending_sticker_tasks(), [])
+                    self.assertEqual(await service.db_get('interlude_sticker', {}), [])
+                    self.assertEqual(transport.fetched, [])
+
+    @needs('receive_group', 'collect_incoming_stickers')
+    async def test_one_group_message_only_collects_the_sticker_attachments(self) -> None:
+        """一条消息多个附件：只收表情包那几张，照片与卡片一个不碰。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self._transport()
+            transport.payloads['https://cdn.example.com/photo.png'] = _png(b'photo')
+            service = self._collect_service(tmp, transport)
+            self.make_story()
+            self.assertTrue(await service.receive_group(group_session(content=(
+                PHOTO_TAG + STICKER_TAG + ANIMATED_TAG
+                + '<card app="com.tencent.miniapp_01" title="农场"/>'
+            )), STORY_TIME))
+            await self._drain_sticker_tasks()
+
+            self.assertEqual(len(await service.db_get('interlude_sticker', {})), 2)
+            self.assertEqual(
+                transport.fetched,
+                ['https://cdn.example.com/sticker.png', 'https://cdn.example.com/animated.gif'],
+                '同一批里只有表情包那几张会被下载（照片在判据处就被跳过）',
+            )
+            self.assertEqual(self._group_entries()[0]['content'], '[图片][表情包][动画表情][QQ小程序：农场]')
+
+    @needs('receive_group', 'collect_incoming_stickers')
+    async def test_rejected_groups_never_collect(self) -> None:
+        """白名单外的群 / 关掉的群 / `mention-only` 里没 @ 的消息：零任务、零入库、零下载。"""
+        sticker_content = STICKER_TAG
+        cases: list[tuple[str, dict[str, Any], Any]] = [
+            (
+                '「仅处理名单内的群聊」开着，而这个群不在名单里',
+                make_config(onebot={'groupChatsOnly': True, 'groupChats': [group_rule_stub()]}),
+                group_session(channel_id='77', guild_id='77', content=sticker_content),
+            ),
+            (
+                '名单里的群写了 enabled=false',
+                make_config(onebot={
+                    'groupChatsOnly': True, 'groupChats': [group_rule_stub(enabled=False)],
+                }),
+                group_session(content=sticker_content),
+            ),
+            (
+                'mention-only 且这条没 @ 机器人',
+                onebot_config(onebot={'groupChats': [group_rule_stub(responseMode='mention-only')]}),
+                group_session(content=sticker_content),
+            ),
+        ]
+        self.make_story()
+        for label, config, session in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                transport = self._transport()
+                service = self._service(
+                    {**config, 'stickers': {'enabled': True, 'directory': 'stickers'}}, transport, tmp,
+                )
+                self.assertFalse(await service.receive_group(session, STORY_TIME))
+                self.assertEqual(service.buffered_group_turns, {}, '被拒绝的消息不该进群回合缓冲')
+                self.assertEqual(self._pending_sticker_tasks(), [], '被拒绝的群连收藏任务都不该挂')
+                self.assertEqual(await service.db_get('interlude_sticker', {}), [])
+                self.assertEqual(transport.fetched, [])
+
+    @needs('receive_group', 'collect_incoming_stickers')
+    async def test_group_collection_respects_both_sticker_switches(self) -> None:
+        """`stickers.enabled`（总闸）与 `stickers.auto_collect` 各关一次都不收。"""
+        self.make_story()
+        for label, stickers in (
+            ('auto_collect=false', {'auto_collect': False}),
+            ('enabled=false（总闸）', {'enabled': False}),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                transport = self._transport()
+                service = self._collect_service(tmp, transport, **stickers)
+                self.assertTrue(await service.receive_group(
+                    group_session(content=STICKER_TAG), STORY_TIME,
+                ))
+                await self._drain_sticker_tasks()
+                self.assertEqual(await service.db_get('interlude_sticker', {}), [])
+                self.assertEqual(transport.fetched, [])
+
+    @needs('receive_group', 'collect_incoming_stickers')
+    async def test_group_plain_photo_is_guessed_by_the_model_when_the_second_layer_is_on(self) -> None:
+        """第二层判据在群路径上同形（`§45.7`）：普通图片由识图模型判定后入库。
+
+        群入口的"要不要建任务"那一句（`_has_collectible_media`）必须把开关带上，
+        否则 `kind == 'image'` 的消息连任务都不建，第二层永远没机会跑。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self._transport()
+            transport.payloads['https://cdn.example.com/photo.png'] = _sized_png(128, 128)
+            service = self._collect_service(tmp, transport, auto_collect_guess=True)
+            describer = _GroupGuessingDescriber()
+            service.sticker_describer = describer
+
+            async def image_bytes_to_native(data: bytes, mime_type: str) -> Any:
+                return {'mime_type': mime_type, 'data_uri': 'data:%s;base64,AA==' % mime_type}
+
+            service.image_bytes_to_native = image_bytes_to_native
+            self.make_story()
+            self.assertTrue(await service.receive_group(group_session(content=PHOTO_TAG), STORY_TIME))
+            await self._drain_sticker_tasks()
+
+            self.assertEqual(len(describer.guessed), 1, '群里的普通图片也该被问一次')
+            rows = await service.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['guessed'], 1, '群路径同样要留下"模型猜的"痕迹')
+            self.assertEqual(rows[0]['source'], 'auto')
+            self.assertEqual(rows[0]['description'], '群里猜出来的猫')
+            self.assertEqual(describer.described, [], '回执带了描述就不再调描述模型')
+
+    @needs('receive_group', 'collect_incoming_stickers')
+    async def test_group_plain_photo_costs_nothing_when_the_second_layer_is_off(self) -> None:
+        """开关关着（默认）→ 群里的普通图片**连任务都不建**（与今天逐字一致）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = self._transport()
+            transport.payloads['https://cdn.example.com/photo.png'] = _sized_png(128, 128)
+            service = self._collect_service(tmp, transport)
+            describer = _GroupGuessingDescriber()
+            service.sticker_describer = describer
+            self.make_story()
+            self.assertTrue(await service.receive_group(group_session(content=PHOTO_TAG), STORY_TIME))
+            await self._drain_sticker_tasks()
+            self.assertEqual(self._pending_sticker_tasks(), [])
+            self.assertEqual(describer.guessed, [])
+            self.assertEqual(await service.db_get('interlude_sticker', {}), [])
+            self.assertEqual(transport.fetched, [])
+
+
+class _GroupGuessingDescriber:
+    """群路径用的第二层模型桩（描述调用单独计数）。"""
+
+    def __init__(self) -> None:
+        self.guessed: list[Any] = []
+        self.described: list[Any] = []
+
+    def available(self) -> bool:
+        return True
+
+    def guess_sticker_available(self) -> bool:
+        return True
+
+    async def guess_sticker(
+        self, data_uri: str, mime_type: str, file_name: str = '',
+        response_format: Any = 'json-object', max_tokens: Any = 256,
+    ) -> Any:
+        self.guessed.append((data_uri, mime_type, file_name))
+        return {'is_sticker': True, 'kind': 'meme', 'confidence': 0.9, 'description': '群里猜出来的猫'}
+
+    async def describe_sticker(
+        self, data_uri: str, mime_type: str, file_name: str, animated: Any,
+        response_format: Any = 'json-object', max_tokens: Any = 768,
+    ) -> Any:
+        self.described.append((data_uri, mime_type, file_name, animated))
+        return {'description': '描述流程补的', 'aliases': []}
 
 
 # =========================================================================== #

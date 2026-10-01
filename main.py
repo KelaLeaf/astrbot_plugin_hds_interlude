@@ -254,6 +254,28 @@ def _text(value: Any) -> str:
     return '' if value is None else str(value)
 
 
+#: 表情包按扩展名给的 `Content-Type`（控制台的 `sticker-file` 用）。
+#: 与 `core/service/chunk2.sticker_mime` 同一套映射；这里不跨层 import 那个私有实现，
+#: 因为 `main.py` 的约定是"只经 bridge"。
+_STICKER_CONTENT_TYPES = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+}
+
+
+def _sticker_content_type(path: str) -> str:
+    """按扩展名给图片 MIME（认不出来按 PNG：浏览器仍会按魔数渲染）。"""
+    return _STICKER_CONTENT_TYPES.get(os.path.splitext(_text(path))[1].lower(), 'image/png')
+
+
+#: `sticker-file?inline=` 认的真值写法（前端 bridge 发的是 `inline=1`；
+#: 其余写法只是方便手敲 curl 调试，缺省 / 其他值一律走 blob 老行为）。
+_STICKER_INLINE_TRUE = ('1', 'true', 'yes', 'on')
+
+
 def _format_fixed(value: Any) -> str:
     """上游 `.toFixed(2)` 的等价物。"""
     try:
@@ -517,6 +539,21 @@ class HDSInterludePlugin(Star):
              '控制台：导出共同作品（按消息长度分段）'),
             (f'/{PLUGIN_NAME}/console/work-cancel', self.page_console_work_cancel, ['POST'],
              '控制台：取消一个写手任务'),
+            # 表情库（v1.8.0）：列表 / 原图 / 改描述 / 删除 / 重扫。
+            # 删除语义是**默认只标记**，`purge=true` 才连文件一起删（见 PORTING_NOTES §45）。
+            (f'/{PLUGIN_NAME}/console/stickers', self.page_console_stickers, ['GET'],
+             '控制台：本地表情库清单'),
+            (f'/{PLUGIN_NAME}/console/sticker-file', self.page_console_sticker_file, ['GET'],
+             '控制台：读取一张表情包（缺省回原图字节，`inline=1` 回 base64 JSON）'),
+            (f'/{PLUGIN_NAME}/console/sticker-update', self.page_console_sticker_update, ['POST'],
+             '控制台：改表情包的描述 / 名字 / 停用'),
+            (f'/{PLUGIN_NAME}/console/sticker-restore-description',
+             self.page_console_sticker_restore_description, ['POST'],
+             '控制台：把表情包交回自动描述'),
+            (f'/{PLUGIN_NAME}/console/sticker-delete', self.page_console_sticker_delete, ['POST'],
+             '控制台：删除表情包（默认只标记，purge 才删文件）'),
+            (f'/{PLUGIN_NAME}/console/sticker-rescan', self.page_console_sticker_rescan, ['POST'],
+             '控制台：重扫表情库目录'),
             # 配置备份（原 config-backup 页并入控制台）
             (f'/{PLUGIN_NAME}/config-export', self.page_config_export, ['GET'],
              '导出 HDS Interlude 配置'),
@@ -699,6 +736,75 @@ class HDSInterludePlugin(Star):
     async def page_console_work_export(self):
         """导出整件作品：`{parts, count}`，每段都在单条消息的安全长度内。"""
         return await self._console_json(lambda api, q: api.export_work(q('work_id')))
+
+    # ---- 控制台的「表情库」面板（v1.8.0） ---- #
+
+    async def page_console_stickers(self):
+        """本地表情库清单（`status` / `kind` / `source` / `q` 都可选）。"""
+        return await self._console_json(lambda api, q: api.stickers(
+            q('status'), q('kind'), q('source'), q('q'),
+            _to_int(q('limit'), 60), _to_int(q('offset'), 0),
+        ))
+
+    async def page_console_sticker_file(self):
+        """回一张表情包：缺省是**原始图片字节**（宿主按 `file_response` 走 blob）。
+
+        `inline=1` 时改成回 base64 JSON 信封（`{assetId, mimeType, size, data}`）——
+        沙箱 iframe 里 `<img src>` 拿不到登录态、bridge 又只有 JSON 通道，形状见
+        `docs/PORTING_NOTES.md` §45.8（前端 `src/sticker-images.ts` 已按它接好）。
+        **不带 `inline` 时逐字保持老的 blob 行为**（老客户端兼容），两条分支共用同一批
+        校验与异常分支，所以 400 / 404 的措辞逐字一致。
+
+        `file_response` 之外还要给下载文件名：素材的 `filePath` basename 就是它在
+        表情库里的名字，直接拿来当 `filename` 最直观（前端也可以不下载、只显示）。
+        """
+        from astrbot.api.web import error_response, file_response, json_response
+
+        from .adapters.console_api import ConsoleError
+
+        asset_id = ''
+        inline = False
+        try:
+            from astrbot.api.web import request
+
+            asset_id = str(request.query.get('assetId', '') or '')
+            raw_inline = request.query.get('inline', '')
+            inline = str(raw_inline or '').strip().lower() in _STICKER_INLINE_TRUE
+        except Exception:  # noqa: BLE001 - 取不到查询参数就是没给
+            asset_id = ''
+            inline = False
+        try:
+            if inline:
+                return json_response(await self._console.sticker_file_inline(asset_id))
+            path = await self._console.sticker_file(asset_id)
+        except ConsoleError as error:
+            return error_response(str(error), status_code=400)
+        except FileNotFoundError:
+            return error_response('表情包文件不存在（可能已被删除）', status_code=404)
+        except Exception as error:  # noqa: BLE001
+            logger.warning('hds-interlude：读取表情包失败：%s' % error)
+            return error_response('读取表情包失败：%s' % error, status_code=500)
+        return file_response(
+            path, filename=os.path.basename(path), content_type=_sticker_content_type(path),
+        )
+
+    async def page_console_sticker_update(self):
+        """改描述 / 名字 / 停用（白名单在 `ConsoleApi.update_sticker` 里）。"""
+        return await self._console_write(lambda api, body: api.update_sticker(body))
+
+    async def page_console_sticker_restore_description(self):
+        """把描述交回自动描述（摘掉手工标记）。"""
+        return await self._console_write(
+            lambda api, body: api.restore_sticker_description(body),
+        )
+
+    async def page_console_sticker_delete(self):
+        """删除一条素材：默认只标记，`purge=true` 才连文件一起删。"""
+        return await self._console_write(lambda api, body: api.delete_sticker(body))
+
+    async def page_console_sticker_rescan(self):
+        """重扫表情库目录（跑完整 `scan_sticker_library()`）。"""
+        return await self._console_write(lambda api, body: api.rescan_stickers(body))
 
     async def _console_write(self, action):
         """跑一个控制台写操作。

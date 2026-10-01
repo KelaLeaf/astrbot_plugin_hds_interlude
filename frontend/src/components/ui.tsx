@@ -96,6 +96,7 @@ export function Button({
   disabled,
   icon,
   type = 'button',
+  title,
 }: {
   children?: ComponentChildren
   onClick?: () => void
@@ -103,6 +104,8 @@ export function Button({
   disabled?: boolean
   icon?: IconName
   type?: 'button' | 'submit'
+  /** 悬停说明（危险操作先讲清后果、灰按钮说明为什么不能按）。 */
+  title?: string
 }) {
   const variants = {
     default: 'border-line bg-panel hover:bg-raised text-fg',
@@ -114,11 +117,139 @@ export function Button({
       type={type}
       onClick={onClick}
       disabled={disabled}
+      title={title}
       class={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${variants[variant]}`}
     >
       {icon && <Icon name={icon} class="h-3.5 w-3.5" />}
       {children}
     </button>
+  )
+}
+
+/**
+ * 危险操作的**就地二次确认**按钮：第一下把按钮换成危险态的第二下，并在旁边写明后果。
+ *
+ * 为什么不用浏览器原生确认框：插件页跑在宿主 iframe 的 `sandbox`
+ * 里，没带 `allow-modals` 时 Chrome 会**静默忽略**它——返回 `false`、不弹框、不报错，
+ * 于是"点了没反应"（实测：动作「清空权限表」、作品「接受提案」、顶栏「并入/设为主剧本」
+ * 在真机上是死键）。就地确认不依赖任何浏览器模态能力，而且后果文案就摆在动作旁边。
+ *
+ *     <ConfirmButton
+ *       label="清空权限表"
+ *       confirmLabel="确认清空（不可撤销）"
+ *       warning="所有动作会回到目录默认档位，危险动作默认关闭。"
+ *       onConfirm={resetTable}
+ *     />
+ */
+export function ConfirmButton({
+  label,
+  confirmLabel,
+  warning,
+  onConfirm,
+  variant = 'default',
+  disabled,
+  icon,
+  title,
+}: {
+  label: string
+  /** 第二下的按钮文字：写清"会发生什么"，不要写「确定吗」。 */
+  confirmLabel: string
+  /** 挂在那里给用户看的后果说明（armed 时才显示）。 */
+  warning: string
+  onConfirm: () => void | Promise<unknown>
+  variant?: 'default' | 'primary' | 'danger'
+  disabled?: boolean
+  icon?: IconName
+  title?: string
+}) {
+  const [armed, setArmed] = useState(false)
+  const [running, setRunning] = useState(false)
+  // 父组件把它禁用了（别的地方在忙）就顺手收回确认态，免得下次点直接执行。
+  useEffect(() => {
+    if (disabled) setArmed(false)
+  }, [disabled])
+  if (!armed) {
+    return (
+      <Button icon={icon} variant={variant} disabled={disabled} title={title} onClick={() => setArmed(true)}>
+        {label}
+      </Button>
+    )
+  }
+  return (
+    <>
+      <Button
+        icon="warning"
+        variant="danger"
+        disabled={disabled || running}
+        onClick={() => {
+          setRunning(true)
+          void Promise.resolve(onConfirm()).finally(() => {
+            setRunning(false)
+            setArmed(false)
+          })
+        }}
+      >
+        {running ? '处理中…' : confirmLabel}
+      </Button>
+      <span class="text-[11px] leading-4 text-warn">{warning}</span>
+      <Button icon="close" disabled={running} onClick={() => setArmed(false)}>
+        取消
+      </Button>
+    </>
+  )
+}
+
+/**
+ * 剪贴板写不进去时的**就地兜底**：只读 textarea + 内容已全选 + 「按 Ctrl+C 复制」+「收起」。
+ *
+ * 为什么要它：插件页在宿主 iframe 的 `sandbox` 里（opaque origin），权限策略里
+ * `clipboard-write` 默认**不给跨源 iframe**——`navigator.clipboard.writeText` 会抛
+ * `NotAllowedError`（"文档没聚焦"与"权限被挡"在真机上分不开，说明它不可靠）。
+ * 那两个复制按钮如果只能弹个错，就是"看起来有功能"的死键，跟浏览器原生确认框一类。
+ *
+ * 失败就退化成**不依赖任何权限**的形态：用户自己按 Ctrl+C。
+ * **不用那个已废弃的文档级复制命令**：它同样受这套权限策略管辖、照样可能被拒，
+ * 而 `scripts/check-no-blocking-apis.ts` 已经把这种写法钉死了（扫源码，注释不算）。
+ *
+ * 就地渲染、放在被复制内容旁边、可收起，不是第二个弹窗。
+ */
+export function CopyFallback({
+  text,
+  onClose,
+  what = '内容',
+}: {
+  text: string
+  onClose: () => void
+  what?: string
+}) {
+  const box = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    const node = box.current
+    if (!node) return
+    node.focus()
+    node.select()
+    // 有些情况下 `select()` 不够（焦点被别处抢走），再显式设一次范围。
+    node.setSelectionRange(0, node.value.length)
+  }, [text])
+  return (
+    <div class="flex flex-col gap-1">
+      <div class="flex items-start gap-2">
+        <span class="min-w-0 flex-1">
+          <Note tone="warn">
+            浏览器没让页面直接写剪贴板（沙箱里的插件页没有 clipboard-write 权限）。
+            {what}已经全选，按 Ctrl+C 复制。
+          </Note>
+        </span>
+        <Button icon="close" onClick={onClose}>收起</Button>
+      </div>
+      <textarea
+        ref={box}
+        readOnly
+        value={text}
+        aria-label={`${what}（只读，已全选）`}
+        class="h-32 w-full resize-y rounded-lg border border-line bg-panel px-2 py-1.5 font-mono text-[11px] leading-5 outline-none"
+      />
+    </div>
   )
 }
 
@@ -559,6 +690,10 @@ function ListFrame({
 /**
  * 卡片式长列表：收起时只渲染前 `limit` 条，展开后套固定高度的滚动框。
  * 用 `render` 而不是 children，省得在调用处再 slice 一遍。
+ *
+ * `alwaysScroll`：收起时也套那个固定高度框。给**行很高的卡片**用——
+ * 12 张卡片每张两百多像素，收起也有三千像素高，"页面高度不跟条目数涨"是做到了，
+ * 但用户得滚很久才看得到下面的东西。
  */
 export function LongList<T>({
   items,
@@ -566,19 +701,23 @@ export function LongList<T>({
   limit = DEFAULT_LIST_LIMIT,
   unit = '条',
   class: className = 'flex flex-col gap-2',
+  alwaysScroll = false,
 }: {
   items: T[]
   render: (item: T, index: number) => ComponentChildren
   limit?: number
   unit?: string
   class?: string
+  /** `true` = 收起时也内滚（高度恒定，不随条目数涨）。 */
+  alwaysScroll?: boolean
 }) {
   const [expanded, setExpanded] = useState(false)
   const window = listWindow(items.length, limit, expanded)
   const shown = expanded ? items : items.slice(0, window.shown)
+  const scroll = window.scroll || alwaysScroll
   return (
     <div class="flex flex-col gap-2">
-      <div class={`${className} ${window.scroll ? LIST_SCROLL : ''}`}>
+      <div class={`${className} ${scroll ? LIST_SCROLL : ''}`}>
         {shown.map((item, index) => render(item, index))}
       </div>
       {(window.hidden > 0 || expanded) && (

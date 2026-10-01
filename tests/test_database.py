@@ -176,7 +176,13 @@ EXPECTED_COLUMNS = {
     ],
     'interlude_sticker': [
         'id', 'assetId', 'filePath', 'group', 'mimeType', 'animated', 'size', 'hash',
-        'description', 'aliases', 'status', 'embedding', 'createdAt', 'updatedAt',
+        'description', 'aliases', 'status', 'embedding',
+        # 本移植版新增（v1.8.0）：手工短名 / 来源 / 用过几次 / 「描述是人写的」标记
+        # （旧库走增量补列，读取侧把 NULL 当空串 / 0 / False）。
+        'name', 'source', 'uses', 'descriptionManual',
+        # v1.8.0 第二层判据（§45.7）：这一条是**识图模型猜出来的**表情包。
+        'guessed',
+        'createdAt', 'updatedAt',
     ],
     'interlude_schedule_preplan': [
         'storyId', 'revision', 'timezone', 'validFrom', 'validThrough',
@@ -496,6 +502,40 @@ class IncrementalColumnTests(_DatabaseTestCase):
             self.db.get('interlude_script_entry', {'id': rows[0]['id']})['embedding'],
             [0.25, -1.5],
         )
+
+    def test_missing_sticker_guessed_column_is_added(self):
+        """v1.8.0 第二层判据（§45.7）：旧 `interlude_sticker` 补 `guessed` 列。
+
+        造一个**没有** `guessed` 列的旧表（有 `hash` / `description`，够走过读取路径），
+        升级后旧行还在、`guessed` 是 NULL（读取侧当 False）。
+        """
+        self.db.conn.execute(
+            'CREATE TABLE interlude_sticker (\n'
+            '  "id" INTEGER,\n'
+            '  "assetId" TEXT,\n'
+            '  "hash" TEXT,\n'
+            '  "description" TEXT,\n'
+            '  PRIMARY KEY ("id" AUTOINCREMENT)\n'
+            ')',
+        )
+        self.db.conn.execute(
+            "INSERT INTO interlude_sticker (assetId, hash, description) "
+            "VALUES ('sticker-old', 'deadbeef', '旧的表情包')",
+        )
+        self.db.conn.commit()
+        self.assertNotIn('guessed', self._table_info('interlude_sticker'))
+
+        self.db.register_tables()
+
+        self.assertIn('guessed', self._table_info('interlude_sticker'))
+        rows = self.db.all('interlude_sticker')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['description'], '旧的表情包')
+        self.assertIsNone(rows[0]['guessed'], '补出来的旧行是 NULL（读取侧当 False）')
+        self.db.update('interlude_sticker', {'id': rows[0]['id']}, {'guessed': True})
+        # SQLite 的 boolean 落到列里就是 0/1（坑 8：`is True` 会漏掉它）；
+        # 读外部这一列的口径在 `console_api._truthy_boolean`。
+        self.assertEqual(self.db.get('interlude_sticker', {'id': rows[0]['id']})['guessed'], 1)
 
     def test_full_legacy_database_upgrades_in_place(self):
         """完整的旧库（缺 sticker / preplan / 两个新列）升级后 13 张表齐全。"""

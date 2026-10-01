@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import inspect
 import json
 import os
@@ -31,6 +33,8 @@ from ..core.service.config import (
     merge_legacy_section_values,
     read_section_path,
 )
+#: 图片 MIME 的**唯一**嗅探实现（`inline=1` 信封用它；不另抄一份扩展名表）。
+from ..core.service.helpers import guess_image_mime
 from ..core.token_stats import normalize_range, range_bounds, summarize_usage
 from ..core.story_state import decode_story_state
 # 作品正文 / 创作意图 / 修改理由的上限与分段长度：**单一事实源在 `core/works.py`**，
@@ -87,6 +91,116 @@ CONTEXT_SECTION_LABELS = {
 }
 
 INTERNAL_INTENT_TYPES: frozenset[str] = frozenset({'split-message', 'narrative-retry'})
+
+# ===================================================================== #
+# 控制台「表情库」面板（v1.8.0）
+#
+# 面板自己不改存储：列表读 `interlude_sticker`，写操作一律走服务层的
+# `save_sticker_description` / `rename_sticker` / `set_sticker_disabled` /
+# `restore_sticker_description` / `delete_sticker`（那五个方法是**唯一写入路径**，
+# 见 `docs/PORTING_NOTES.md` §45）。
+# ===================================================================== #
+
+#: 表情库列表一次最多回多少行（窗口 + `truncated`，与 `_chat_rows()` 同一套做法）。
+STICKER_ROW_LIMIT = 500
+#: `limit` 查询参数的上限（前端翻页；真到 500 条说明页面该筛选了）。
+STICKER_PAGE_MAX = 200
+
+#: 一个素材最多接受多长的描述（与 `interlude_work` 的正文上限同一量级；
+#: 描述是要进提示词的，几万字会直接把上下文顶爆）。
+STICKER_DESCRIPTION_MAX = 2_000
+#: 短名上限（列表里显示的标签，不是提示词的一部分）。
+STICKER_NAME_MAX = 60
+
+#: 允许改的字段（**白名单**；其余一律 400，与 `set_config_value` 同一条纪律）。
+STICKER_EDITABLE_FIELDS: tuple[str, ...] = ('description', 'name', 'disabled')
+
+#: 停用即改 `status`：`disabled` 不参与 `refresh_sticker_catalog` 的 `status='active'`
+#: 查询，所以它立刻从模型可见的目录里消失，但**行与文件都还在**。
+STICKER_STATUS_DISABLED = 'disabled'
+
+#: `sticker-file?inline=1` 一次最多内联多少字节。
+#:
+#: **这是防轰炸的保护，不是为了省流量**：`inline=1` 是给宿主 bridge 的 JSON 通道用的
+#: （沙箱 iframe 里 `<img src>` 拿不到登录态，见 `docs/PORTING_NOTES.md` §45.8），
+#: 而整张图会以 base64 塞进响应体（体积 ×4/3）并由**父页面**先完整收下再 postMessage 递回，
+#: 库里要是有几张几十 MB 的 GIF，一屏 12 张能把控制台直接卡死。超过就明确报错让用户
+#: 走「保存原图」（`download` 那条路是流式落盘，不受这个上限约束）。
+#: 数量级照 `audio.max_file_size_mb` 的既有口径取 8MB —— 表情包正常都在 1MB 以内。
+STICKER_INLINE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def sticker_source(row: Any) -> str:
+    """素材来源：`auto`（自动收藏入站表情包）/ `manual`（磁盘扫描进来的）。
+
+    优先读列（v1.8.0 起有这一列）；旧库补列前写入的行是 NULL，
+    按资产 id 前缀兜底——`sticker-…` 是自动收藏的命名空间，**不必回填旧数据**。
+    """
+    record = _record(row)
+    value = _text(record.get('source')).strip().lower()
+    if value in ('auto', 'manual'):
+        return value
+    asset_id = _text(record.get('assetId') or record.get('asset_id'))
+    return 'auto' if asset_id.startswith('sticker-') else 'manual'
+
+
+def sticker_kind(row: Any) -> str:
+    """素材形式：`animated`（会动）/ `image`（静止）。
+
+    布尔列用 `_truthy_boolean` 读：**原始行**（`Database.all` 直读）里 `animated`
+    是 SQLite 的 `0/1`，`is True` 会把它判成静止（`scan_sticker_library` 建出来的
+    gif 行正好是这一种）。
+    """
+    record = _record(row)
+    if _truthy_boolean(record.get('animated')):
+        return 'animated'
+    return 'animated' if _text(record.get('mimeType')).lower() == 'image/gif' else 'image'
+
+
+def sticker_relative_file(row: Any) -> str:
+    """相对表情库根目录的文件名（**只取 basename**）。
+
+    `filePath` 在库里理应就是相对名，但它是可从旧版本继承的数据，
+    不能让一个被改坏的 `filePath` 变成"读任意文件"。取 basename 之后，
+    任何 `../` 都被结构性地消掉了。
+    """
+    return os.path.basename(_text(_record(row).get('filePath')).replace('\\', '/'))
+
+
+def sticker_item(row: Any) -> dict[str, Any]:
+    """一行 `interlude_sticker` → 面板列表项（wire camelCase + 契约里的 `file`）。"""
+    record = _record(row)
+    asset_id = _text(record.get('assetId') or record.get('asset_id'))
+    file_name = sticker_relative_file(record)
+    return {
+        'assetId': asset_id,
+        'name': _text(record.get('name')),
+        'description': _text(record.get('description')),
+        'kind': sticker_kind(record),
+        'source': sticker_source(record),
+        'addedAt': _timestamp_text(record.get('createdAt')) or _timestamp_text(record.get('updatedAt')),
+        'updatedAt': _timestamp_text(record.get('updatedAt')),
+        'uses': _int(record.get('uses'), 0),
+        'disabled': _text(record.get('status')).lower() == STICKER_STATUS_DISABLED,
+        #: 描述是不是**人写的**：前端据此显示"手工"徽章，并给出"恢复自动描述"按钮。
+        'manual': _truthy_boolean(record.get('descriptionManual')),
+        # 扩展字段（前端可以直接忽略）：状态、分组、体积、别名、MIME 都是列表里
+        # 想显示 / 想筛的东西，多回几个比让前端再发一次请求便宜。
+        'status': _text(record.get('status')),
+        'group': _text(record.get('group')),
+        'size': _int(record.get('size'), 0),
+        'aliases': record.get('aliases') if isinstance(record.get('aliases'), list) else [],
+        'mimeType': _text(record.get('mimeType')),
+        #: **模型猜出来的**（第二层判据，`§45.7`）：`kind == 'image'` 的普通图片经识图模型
+        #: 判定成表情包才入库。`source` 仍是 `auto`（契约只有 auto / manual 两个取值），
+        #: 所以"猜的"这件事只能靠这个额外字段暴露——控制台**暂未显示**这个徽章，
+        #: 留给下一轮（见 `docs/PORTING_NOTES.md` §45.7）。
+        'guessed': _truthy_boolean(record.get('guessed')),
+        #: 前端可直接用的**相对**地址（宿主会把插件页请求拼到插件名下）。
+        'file': file_name,
+        'thumbnailUrl': 'console/sticker-file?assetId=%s' % asset_id if asset_id else '',
+    }
+
 
 #: 共同作品（`interlude_work` 表，上游 rc28 `works.ts`；入口由本移植版补）的取数下限。
 #: 服务层没就绪时控制台回这个空壳，**不抛**（§29：一个没接线的功能不该让整页打不开）。
@@ -376,6 +490,39 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 def _text(value: Any) -> str:
     return value if isinstance(value, str) else ('' if value is None else str(value))
+
+
+def _truthy_boolean(value: Any) -> bool:
+    """布尔列的宽松读取：SQLite 存的是 0/1，`is True` 会漏掉 `1`（坑 8 的老病）。"""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _timestamp_text(value: Any) -> str:
+    """把时间列折成 ISO 文本（控制台只做展示，不做时间运算）。
+
+    `interlude_sticker` 的 `createdAt` / `updatedAt` 是 timestamp 列：
+    **原始行**（`Database.all` 直读）回来是 datetime，`db_get` 归一化后也是 datetime。
+    控制台把它当字符串渲染，所以这里统一成 ISO —— 否则
+    `String(datetime)` 会给出 `2026-09-01 10:00:00+00:00` 这种带空格的形式，
+    同一份数据在面板和别处显示得不一样（且前端 `new Date(...)` 在部分浏览器上解析不了）。
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ''
+    to_iso = getattr(value, 'isoformat', None)
+    if callable(to_iso):
+        try:
+            return str(to_iso())
+        except Exception:  # noqa: BLE001 - 坏值按空串
+            return ''
+    return str(value)
 
 
 def _record(value: Any) -> dict[str, Any]:
@@ -2136,6 +2283,386 @@ class ConsoleApi:
             'chars': sum(len(part) for part in parts),
             'hint': '',
         }
+
+    # ------------------------------------------------------------------ #
+    # 表情库面板（v1.8.0）
+    # ------------------------------------------------------------------ #
+
+    async def stickers(
+        self,
+        status: str = '',
+        kind: str = '',
+        source: str = '',
+        query: str = '',
+        limit: Any = 60,
+        offset: Any = 0,
+    ) -> dict[str, Any]:
+        """本地表情库清单（**空库返回空壳，从不 500**）。
+
+        取数走窗口（`STICKER_ROW_LIMIT`）+ `truncated`，与 `_chat_rows()` 同一套做法：
+        素材库可以很大，把整张表拉进内存是控制台最容易犯的错（坑 54）。
+
+        筛选（都可选）：`status` = `active` / `pending` / `missing` / `disabled`；
+        `kind` = `animated` / `image`；`source` = `auto` / `manual`；
+        `query` 在描述 / 名字 / assetId 里做子串匹配（大小写不敏感）。
+        """
+        rows = [
+            row for row in _safe_all(
+                self.bridge.db, 'interlude_sticker', None, 'createdAt DESC', STICKER_ROW_LIMIT,
+            ) if isinstance(row, dict)
+        ]
+        # 旧库 / 缺列时 `createdAt` 可能是空串：稳定地按 id 倒序兜一层。
+        rows.sort(
+            key=lambda row: (_timestamp_text(row.get('createdAt')), _int(row.get('id'), 0)),
+            reverse=True,
+        )
+        truncated = len(rows) >= STICKER_ROW_LIMIT
+        items = [sticker_item(row) for row in rows]
+        wanted_status = _text(status).strip().lower()
+        wanted_kind = _text(kind).strip().lower()
+        wanted_source = _text(source).strip().lower()
+        needle = _text(query).strip().lower()
+        if wanted_status:
+            items = [item for item in items if _text(item.get('status')).lower() == wanted_status]
+        if wanted_kind:
+            items = [item for item in items if item.get('kind') == wanted_kind]
+        if wanted_source:
+            items = [item for item in items if item.get('source') == wanted_source]
+        if needle:
+            items = [
+                item for item in items
+                if needle in _text(item.get('description')).lower()
+                or needle in _text(item.get('name')).lower()
+                or needle in _text(item.get('assetId')).lower()
+            ]
+        total = len(items)
+        size = max(1, min(STICKER_PAGE_MAX, _int(limit, 60) or 60))
+        start = max(0, _int(offset, 0))
+        window = items[start:start + size]
+        counts = {'total': total, 'active': 0, 'pending': 0, 'missing': 0, 'disabled': 0}
+        for item in items:
+            key = _text(item.get('status')).lower()
+            if key in counts:
+                counts[key] += 1
+
+        root = ''
+        config: dict[str, Any] = {}
+        service = self._service()
+        reader = getattr(service, 'sticker_library_root', None)
+        if callable(reader):
+            try:
+                root = _text(reader())
+            except Exception:  # noqa: BLE001 - 路径推导失败不影响列表
+                root = ''
+        if not root:
+            section = self.bridge.section('stickers')
+            directory = _text(section.get('directory')).strip() or 'data/hds-interlude/stickers'
+            root = os.path.abspath(os.path.join(_text(self.bridge.data_dir), directory))
+        try:
+            config = dict(self.bridge.section('stickers'))
+        except Exception:  # noqa: BLE001
+            config = {}
+        return {
+            'items': window,
+            'total': total,
+            'truncated': truncated,
+            'limit': size,
+            'offset': start,
+            'counts': counts,
+            #: 面板顶部的"总闸"提示：库关着 / 自动收藏关着都得让用户看见。
+            'enabled': config.get('enabled') is True,
+            'auto_collect': config.get('autoCollect', config.get('auto_collect')) is not False,
+            'directory': _text(config.get('directory')),
+            'root': root,
+        }
+
+    async def sticker_file(self, asset_id: Any) -> str:
+        """按 `assetId` 解析图片的**绝对路径**（调用方用 `file_response` 回字节）。
+
+        只认库里那一行记着的 `filePath` 的 basename，并且再确认一次解析结果确实落在
+        表情库根目录里——`filePath` 是继承来的数据，不能让一个被改坏的值读任意文件。
+        非法 `assetId` 一律 `ConsoleError`（400），文件不在就是 404。
+        """
+        row = self._sticker_row_for_write(asset_id)
+        name = sticker_relative_file(row)
+        if not name:
+            raise ConsoleError('这条素材没有记录文件名')
+        root = self._sticker_root()
+        target = os.path.abspath(os.path.join(root, name))
+        if os.path.commonpath([target, root]) != root or not os.path.isfile(target):
+            raise FileNotFoundError('表情包文件不存在')
+        return target
+
+    async def sticker_file_inline(self, asset_id: Any) -> dict[str, Any]:
+        """同一张图，改成回 **base64 JSON 信封**（`sticker-file?inline=1` 分支）。
+
+        为什么需要它：插件页跑在无 `allow-same-origin` 的沙箱 iframe 里，`<img src>` 是
+        cross-site、拿不到宿主的 `SameSite=Strict` 登录 cookie（401）；而宿主 bridge 只有
+        JSON 通道（`apiGet` 走 axios 默认的 text 解码，PNG 字节按 UTF-8 解会丢字节）。
+        所以图片必须由后端包成 JSON 里的一串 base64（形状冻结在 `docs/PORTING_NOTES.md`
+        §45.8，前端 `src/sticker-images.ts` 按这个形状接）。
+
+        纪律：**取文件逻辑只有一条**——先走 `sticker_file()` 那套（白名单 / basename 收敛 /
+        库外文件不许读 / 缺失即 404），这里只把读出来的字节包一层，不另写一份校验；
+        错误措辞因此与字节分支逐字一致（同一批异常、调用方同一批 `except`）。
+        超过 `STICKER_INLINE_MAX_BYTES` 直接 400（防轰挂控制台，见该常量的注释）。
+        """
+        row = self._sticker_row_for_write(asset_id)
+        path = await self.sticker_file(asset_id)
+        try:
+            size = os.path.getsize(path)
+        except OSError as error:  # 拿到路径后文件被删了：与"文件不在"同一种结果
+            raise FileNotFoundError('表情包文件不存在') from error
+        # 先看体积再读字节：超限时**一个字节都不读进内存**（大 GIF 就不该走 JSON 通道）。
+        if size > STICKER_INLINE_MAX_BYTES:
+            raise ConsoleError(
+                '这张表情包太大（%.1f MB），不能内联显示（上限 %.0f MB）：请改用「保存原图」'
+                % (size / (1024 * 1024), STICKER_INLINE_MAX_BYTES / (1024 * 1024))
+            )
+        try:
+            with open(path, 'rb') as handle:
+                data = handle.read()
+        except OSError as error:
+            raise FileNotFoundError('表情包文件不存在') from error
+        return {
+            # 回显归一化后的 assetId（客户端用它把并发回来的信封对回自己那张图）。
+            'assetId': _text(asset_id).strip(),
+            # MIME 与字节分支同源：库里记的 `mimeType` 优先，没有才按魔数嗅探。
+            'mimeType': guess_image_mime(data, row.get('mimeType')) or 'image/png',
+            'size': len(data),
+            'data': base64.b64encode(data).decode('ascii'),
+        }
+
+    async def update_sticker(self, payload: Any) -> dict[str, Any]:
+        """改一个素材的**描述 / 名字 / 是否停用**（白名单之外一律 400）。
+
+        三条纪律（与 `set_config_value` 同源）：
+
+        1. **白名单**：只认 `description` / `name` / `disabled`，多一个键就 400
+           （静默丢字段会让用户以为改了、其实没改）。
+        2. **先校验后写**：`assetId` 必须命中库里的行，否则 400。
+        3. **写什么就生效什么**：写回走服务层的既有方法（`save_sticker_description`
+           / `rename_sticker` / `set_sticker_disabled`），写完立刻刷新
+           `sticker_catalog` —— 下一次 payload 里的目录文本就是新的描述。
+        """
+        body = _record(payload)
+        asset_id = _text(body.get('assetId') or body.get('asset_id')).strip()
+        if not asset_id:
+            raise ConsoleError('缺少 assetId')
+        unknown = sorted(
+            key for key in body
+            if key not in STICKER_EDITABLE_FIELDS and key not in ('assetId', 'asset_id')
+        )
+        if unknown:
+            raise ConsoleError(
+                '只能修改 %s；不认识这些字段：%s'
+                % ('、'.join(STICKER_EDITABLE_FIELDS), '、'.join(unknown)),
+            )
+        service = self._require_service()
+        row = self._sticker_row_for_write(asset_id)
+        row_id = row.get('id')
+        changed: list[str] = []
+
+        if 'description' in body:
+            description = body.get('description')
+            if description is None:
+                raise ConsoleError('description 不能是 null（清空请传空串）')
+            text = _text(description).strip()
+            if len(text) > STICKER_DESCRIPTION_MAX:
+                raise ConsoleError('描述最长 %d 个字符' % STICKER_DESCRIPTION_MAX)
+            await self._call_service(
+                'save_sticker_description', row_id, text, replace_aliases=True,
+            )
+            changed.append('description')
+        if 'name' in body:
+            name = body.get('name')
+            if name is None:
+                raise ConsoleError('name 不能是 null（清空请传空串）')
+            text = _text(name).strip()
+            if len(text) > STICKER_NAME_MAX:
+                raise ConsoleError('名字最长 %d 个字符' % STICKER_NAME_MAX)
+            await self._call_service('rename_sticker', row_id, text)
+            changed.append('name')
+        if 'disabled' in body:
+            disabled = body.get('disabled')
+            if not isinstance(disabled, bool):
+                raise ConsoleError('disabled 必须是布尔值')
+            await self._call_service('set_sticker_disabled', row_id, disabled)
+            changed.append('disabled')
+        if not changed:
+            raise ConsoleError('没有要修改的字段（%s）' % '、'.join(STICKER_EDITABLE_FIELDS))
+        await self._refresh_sticker_catalog()
+        return {
+            'assetId': asset_id,
+            'changed': changed,
+            'item': self._sticker_item_by_id(row_id),
+        }
+
+    async def delete_sticker(self, payload: Any) -> dict[str, Any]:
+        """删除一个素材：**默认只标记，`purge=true` 才真删文件**。
+
+        为什么默认不删文件：这是用户自己攒的表情库，"删错了"没有回收站；
+        标记成 `missing` 就足够让它从模型目录里消失（`refresh_sticker_catalog`
+        只取 `status='active'`），而文件留着还能靠一次重扫复活。
+        """
+        body = _record(payload)
+        asset_id = _text(body.get('assetId') or body.get('asset_id')).strip()
+        if not asset_id:
+            raise ConsoleError('缺少 assetId')
+        purge = body.get('purge')
+        if purge is not None and not isinstance(purge, bool):
+            raise ConsoleError('purge 必须是布尔值')
+        service = self._require_service()
+        row = self._sticker_row_for_write(asset_id)
+        row_id = row.get('id')
+        file_name = sticker_relative_file(row)
+        deleted_file = False
+        if purge:
+            root = self._sticker_root()
+            target = os.path.abspath(os.path.join(root, file_name)) if file_name else ''
+            if target and os.path.commonpath([target, root]) == root and os.path.isfile(target):
+                try:
+                    await asyncio.to_thread(os.remove, target)
+                    deleted_file = True
+                except OSError as error:
+                    raise ConsoleError('删除文件失败：%s' % error) from error
+        await self._call_service('delete_sticker', row_id, purge=purge is True)
+        await self._refresh_sticker_catalog()
+        return {
+            'assetId': asset_id,
+            'purged': purge is True,
+            'deletedFile': deleted_file,
+            'file': file_name,
+            'changed': ['deleted'],
+        }
+
+    async def restore_sticker_description(self, payload: Any) -> dict[str, Any]:
+        """把一条素材交回**自动描述**（摘掉"这是人写的"标记）。
+
+        配套 `sticker-update` 的 `description`：手工描述压过自动描述之后，
+        用户需要一个明确的"我不要这条手写的了、让模型重写"的入口。摘完标记
+        状态回到 `pending`，下一次 `sticker-rescan` 会用视觉模型重新描述它。
+        """
+        body = _record(payload)
+        asset_id = _text(body.get('assetId') or body.get('asset_id')).strip()
+        if not asset_id:
+            raise ConsoleError('缺少 assetId')
+        row = self._sticker_row_for_write(asset_id)
+        await self._call_service('restore_sticker_description', row.get('id'))
+        await self._refresh_sticker_catalog()
+        return {
+            'assetId': asset_id,
+            'changed': ['description'],
+            'item': self._sticker_item_by_id(row.get('id')),
+            'hint': '已交回自动描述；点「重扫表情库」会用视觉模型重新描述它。',
+        }
+
+    async def rescan_stickers(self, payload: Any = None) -> dict[str, Any]:
+        """触发一次完整的 `scan_sticker_library()`（**同步等它跑完**）。
+
+        等它跑完而不是甩个后台任务：扫描会顺带用视觉模型描述新素材，用户点完按钮
+        需要知道"跑完了、发现了几张"；单飞标志保证重复点击不会并发两轮。
+        """
+        service = self._service()
+        scanner = getattr(service, 'scan_sticker_library', None)
+        if not callable(scanner):
+            raise ConsoleError('表情库服务未就绪，稍后再试')
+        before = _safe_count(self.bridge.db, 'interlude_sticker')
+        section = self.bridge.section('stickers')
+        if section.get('enabled') is not True:
+            raise ConsoleError('本地表情包库未启用（配置 → 本地表情包 → 启用本地表情包库）')
+        await self._call_service('scan_sticker_library')
+        after = _safe_count(self.bridge.db, 'interlude_sticker')
+        return {
+            'scanned': True,
+            'assets': after,
+            'added': max(0, after - before),
+        }
+
+    # ---- 表情库面板的内部工具 ---- #
+
+    def _service(self) -> Any:
+        """拿服务层（未就绪时是 `None`，调用方自己决定回空壳还是报错）。"""
+        service = getattr(self.bridge, 'service', None)
+        return service if service is not None else None
+
+    def _require_service(self) -> Any:
+        service = self._service()
+        if service is None or not hasattr(service, 'db_get'):
+            raise ConsoleError('服务层尚未就绪')
+        return service
+
+    async def _call_service(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        """调服务层的一个方法；缺失时报 400（旧版服务层不该表现为 500）。"""
+        service = self._require_service()
+        method = getattr(service, name, None)
+        if not callable(method):
+            raise ConsoleError('当前服务层不支持这个操作（%s）' % name)
+        try:
+            return await method(*args, **kwargs)
+        except ConsoleError:
+            raise
+        except ValueError as error:
+            raise ConsoleError(str(error)) from error
+
+    async def _refresh_sticker_catalog(self) -> None:
+        """写完立刻刷新内存目录：**下一次 payload 里的 `stickerCatalog` 就是新的**。"""
+        service = self._service()
+        refresh = getattr(service, 'refresh_sticker_catalog', None)
+        if callable(refresh):
+            await refresh()
+
+    def _sticker_root(self) -> str:
+        """表情库根目录的绝对路径（服务层优先，回落到 bridge 数据目录 + 配置）。"""
+        service = self._service()
+        reader = getattr(service, 'sticker_library_root', None)
+        if callable(reader):
+            try:
+                root = _text(reader())
+                if root:
+                    return os.path.abspath(root)
+            except Exception:  # noqa: BLE001 - 回落
+                pass
+        section = self.bridge.section('stickers')
+        directory = _text(section.get('directory')).strip() or 'data/hds-interlude/stickers'
+        return os.path.abspath(os.path.join(_text(self.bridge.data_dir), directory))
+
+    def _sticker_row(self, asset_id: Any) -> Optional[dict[str, Any]]:
+        """按 `assetId` 取一行（取不到回 `None`）。"""
+        wanted = _text(asset_id).strip()
+        if not wanted:
+            return None
+        rows = _safe_all(self.bridge.db, 'interlude_sticker', {'assetId': wanted}, None, 1)
+        for row in rows:
+            if isinstance(row, dict):
+                return row
+        return None
+
+    def _sticker_row_for_write(self, asset_id: Any) -> dict[str, Any]:
+        """按 `assetId` 取一行；非法 / 不存在一律 `ConsoleError`（映射成 400）。"""
+        wanted = _text(asset_id).strip()
+        if not wanted:
+            raise ConsoleError('缺少 assetId')
+        if len(wanted) > 255:
+            raise ConsoleError('assetId 过长')
+        row = self._sticker_row(wanted)
+        if row is None:
+            raise ConsoleError('找不到这条素材：%s' % wanted)
+        return row
+
+    def _sticker_row_by_id(self, row_id: Any) -> Optional[dict[str, Any]]:
+        rows = _safe_all(self.bridge.db, 'interlude_sticker', {'id': row_id}, None, 1)
+        for row in rows:
+            if isinstance(row, dict):
+                return row
+        return None
+
+    def _sticker_item_by_id(self, row_id: Any) -> dict[str, Any]:
+        """写完之后回**库里那一行**（而不是回显请求），界面才是真值。"""
+        row = self._sticker_row_by_id(row_id)
+        if row is None:
+            return {}
+        return sticker_item(row)
 
     # ------------------------------------------------------------------ #
     # 内部

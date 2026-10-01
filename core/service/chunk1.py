@@ -92,7 +92,9 @@ from .helpers import (
 )
 # 群音频的批次预算（上游 2197-2215）住在 chunk3：那里有 `audioConfig` 的解析与
 # `load_native_audio`。chunk3 **不** import chunk1，所以这条模块级依赖不成环。
-from .chunk3 import _load_group_batch_audio
+# `_extract_session_media` 同源：群聊入站的自动收藏要**与私聊同一份**结构化媒体表
+# （`<img kind=…>` → `[{source, kind, summary, label}]`），不能另外推一份（见 §45.6）。
+from .chunk3 import _extract_session_media, _load_group_batch_audio
 
 __all__ = ['ServiceChunk1']
 
@@ -1069,6 +1071,13 @@ class ServiceChunk1(ServiceBase):
         sender_name = await self.group_sender_name(group_id, sender_id, session)
         character = pick(pick(story, 'setting'), 'character') or {}
         quote = describe_quoted_message(session, pick(character, 'name') or '主角')
+        # 自动收藏入站表情包（群聊覆盖，受控偏离 §45.6）：种类必须在**文本化之前**拿到。
+        # `describe_group_attachments` 会把 `<img kind=…>` 翻成 `[表情包]` / `[动画表情]`
+        # 文本，从那种文本反推种类就是"两种拼写、两处判据"的老病（坑 46）。
+        # 这里用的是与私聊**同一条** `extract_session_media`：同一个适配层标记
+        # （`raw_media_hints` → `<img kind=…>`）、同一个 `kind`，判据仍然只有
+        # `helpers.collectible_sticker_kind()` 一处。
+        group_media = _extract_session_media(session)
         message_content = describe_group_attachments(_session_read(session, 'content'))
 
         async def task() -> Any:
@@ -1104,6 +1113,10 @@ class ServiceChunk1(ServiceBase):
         self.buffer_group_message(
             story, rule, session, message, mentioned_bot, quoted_bot, audio_sources,
         )
+        # 群聊收藏钩子挂在**真正的入站处理点**（所有闸门之后）：白名单外的群、
+        # 关掉的群、`mention-only` 下没 @ 的消息、找不到 / 非 active 的剧本，
+        # 上面都已经 return 了 —— 那些消息既不进叙事，也不该顺手收藏别人的图。
+        self._spawn_group_sticker_collect(group_media)
         self.report_operation(
             'summary', 'info', story, 'user-message',
             '收到群聊消息 群=%s 发送者=%s', group_id, sender_id,

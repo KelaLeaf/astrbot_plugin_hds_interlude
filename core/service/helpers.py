@@ -70,6 +70,23 @@ __all__ = [
     'calibrated_native_face_willingness',
     'stable_sticker_asset_id',
     'normalize_allowed_reactions',
+    # ---- 自动收藏入站表情包（本移植版新增）----
+    'collectible_sticker_kind',
+    'verify_sticker_image_bytes',
+    'collected_sticker_asset_id',
+    'COLLECTED_STICKER_DIR',
+    'COLLECTIBLE_STICKER_KINDS',
+    'STICKER_IMAGE_MIMES',
+    'STICKER_FILE_SUFFIX',
+    # ---- 第二层：普通图片的模型判定（本移植版新增，§45.7）----
+    'GUESS_STICKER_KIND',
+    'GUESS_STICKER_MAX_DIMENSION',
+    'GUESS_STICKER_MAX_ASPECT',
+    'GUESS_STICKER_MIN_CONFIDENCE',
+    'STICKER_GUESS_KINDS',
+    'guess_image_dimensions',
+    'sticker_guess_candidate',
+    'sticker_guess_result',
     # ---- 用户自报时间 / 引用消息 ----
     'extract_user_reported_times',
     'describe_quoted_message',
@@ -796,6 +813,275 @@ def stable_sticker_asset_id(file_path: Any, hash_value: Any) -> str:
     stem = stem[:220] or 'sticker'
     suffix = re.sub(r'[^a-fA-F0-9]', '', _str(hash_value))[:16].lower() or 'unhashed'
     return ('%s-%s' % (stem, suffix))[:255]
+
+
+# =========================================================================== #
+# 自动收藏入站表情包（本移植版新增，受控偏离；见 `docs/PORTING_NOTES.md` §45）
+#
+# 判据是**适配层观测到的种类**，不是名字、不是画面内容、更不是"看着像表情包"。
+# 这些是纯函数：种类的归一化、字节的图片校验、落地文件名的派生。
+# =========================================================================== #
+
+#: 表情库根目录下自动收藏落地的子目录（`scan_sticker_library` 会把它当分组）。
+COLLECTED_STICKER_DIR = 'collected'
+
+#: 「值得收藏」的入站种类。**`image` 不在里面**（普通照片 / 截图一律不收），
+#: `card`（小程序 / 分享卡片）不在里面（它不是图片，也没有可下载的图片字节）。
+COLLECTIBLE_STICKER_KINDS = frozenset({'sticker', 'animated', 'market'})
+
+#: 自动收藏接受的图片 MIME（校验用的魔数就在 `guess_image_mime` 里，一份实现两处用）。
+STICKER_IMAGE_MIMES = frozenset({'image/png', 'image/jpeg', 'image/gif', 'image/webp'})
+
+#: 落地文件的扩展名（按**嗅探出来的** MIME 取，不按入站 URL 的后缀——URL 是对方给的）。
+STICKER_FILE_SUFFIX = {
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/gif': '.gif',
+    'image/webp': '.webp',
+}
+
+
+def collectible_sticker_kind(value: Any) -> str:
+    """入站附件的种类 → 「可收藏的种类」；**拿不准一律回空串**。
+
+    这是本功能的红线（用户点名的那条）：只有适配层从 OneBot 原始段**观测到**的
+    `sticker` / `animated` / `market` 才算数。缺失、未知、`image`、`card`、
+    大小写噪声、`None`、非字符串——全部回空串，调用方据此跳过并记 debug。
+
+    读外部输入两种拼写都认（`kind` / `kinds` 这种多值形态不在契约里，不认）。
+    """
+    text = _str(value).strip().lower()
+    return text if text in COLLECTIBLE_STICKER_KINDS else ''
+
+
+def verify_sticker_image_bytes(data: Any) -> str:
+    """字节是不是真图片？是就回 MIME（`image/…`），否则回空串。
+
+    要求「字节要真的验过是图片」：`guess_image_mime` 认的正是 gif / png / jpg / webp
+    四种魔数，嗅不出来（HTML 错误页、纯文本、空字节、别的格式）一律回空串。
+    空结果与 `random` 之类的碰撞无关——这里只看头几个字节。
+    """
+    if not data:
+        return ''
+    mime = guess_image_mime(data)
+    return mime if mime in STICKER_IMAGE_MIMES else ''
+
+
+def collected_sticker_asset_id(name: Any, content_hash: Any) -> str:
+    """自动收藏资产的 `assetId`：`sticker-<名字>--<哈希片段>`。
+
+    带 `sticker-` 前缀是为了让 id **自述来源**（控制台的 `source` 字段据此派生，
+    不必给表加一列），也让自动资产与磁盘扫描出来的资产在日志里一眼可分。
+    哈希片段让同内容永远得到同一个 id —— `assetId` 有唯一索引，撞了就是写失败。
+    """
+    digest = re.sub(r'[^a-fA-F0-9]', '', _str(content_hash)).lower()[:16] or 'unhashed'
+    stem = re.sub(r'[^a-zA-Z0-9_-]+', '-', _str(name).strip())[:80].strip('-') or 'inbound'
+    return ('sticker-%s-%s' % (stem, digest))[:255]
+
+
+# =========================================================================== #
+# 第二层判据：让识图模型确认"这张普通图片到底是不是表情包"（v1.8.0，受控偏离 §45.7）
+#
+# 第一层 `collectible_sticker_kind()` 只认**适配层观测到的**三类；这一层处理那些
+# **被当成普通图片发过来**的表情包。两层互不越权：
+#
+# * 第一层认了的种类**直接收**，永远不走模型（也永远不经过下面任何函数）；
+# * 这一层只处理 `kind == 'image'`，**永远不能否决第一层**；
+# * 这一层先做便宜的预筛（纯 Python 解析图片头），值得问才调模型。
+# =========================================================================== #
+
+#: 第二层唯一处理的入站种类（普通图片）。别的种类要么第一层已经收了，要么不收。
+GUESS_STICKER_KIND = 'image'
+
+#: —— 以下三个是**启发式阈值，不是平台规则** ——
+#:
+#: 聊天软件里的表情包几乎都是小尺寸、近方形的图；实拍照片与截图通常是长宽比明显的
+#: 大图。这三个数只用来把"明显不像"的图挡在模型调用之前（省 token 是这条功能的成败点），
+#: 判定权在模型回执与用户的开关，不在它们身上。
+GUESS_STICKER_MAX_DIMENSION = 512
+GUESS_STICKER_MAX_ASPECT = 1.6
+#: 判成"是表情包"的最低置信度（同样是**启发式**）：低于它按"拿不准"处理 = 不收。
+GUESS_STICKER_MIN_CONFIDENCE = 0.6
+
+#: 模型回执里认得的 `kind`（提示词逐字要求这几档）；白名单外一律归 `other`。
+STICKER_GUESS_KINDS = ('meme', 'reaction', 'caption_photo', 'photo', 'screenshot', 'other')
+
+#: JPEG 里带尺寸的段（`SOF0`…`SOF15`，跳过 `DHT`=0xC4 / `JPG`=0xC8 / `DAC`=0xCC）。
+_JPEG_SOF_MARKERS = frozenset(
+    {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF},
+)
+
+
+def guess_image_dimensions(data: Any) -> 'tuple[int, int] | None':
+    """按**图片头**解析 `(宽, 高)`；认不出来回 `None`（**不引入 Pillow**）。
+
+    只认自动收藏放行的四种格式的常见头：PNG `IHDR` / GIF 逻辑屏幕 / JPEG `SOF*` /
+    WebP `VP8X`、`VP8 `、`VP8L`。为什么不用 Pillow：它是**可选依赖**（`requirements.txt`
+    里 try-import 降级），把"能不能判定"绑在可选依赖上不值当——与 §45.1 里
+    "去重不做 dHash"是同一条理由。
+
+    解析不出来（截断 / 冷门变体 / 不是这四种）回 `None`，调用方按"拿不准"处理。
+    """
+    if not data or len(data) < 16:
+        return None
+    if bytes(data[:8]) == b'\x89PNG\r\n\x1a\n':
+        return _png_dimensions(data)
+    if bytes(data[:6]) in (b'GIF87a', b'GIF89a'):
+        width = int.from_bytes(data[6:8], 'little')
+        height = int.from_bytes(data[8:10], 'little')
+        return (width, height) if width and height else None
+    if bytes(data[:2]) == b'\xff\xd8':
+        return _jpeg_dimensions(data)
+    if bytes(data[:4]) == b'RIFF' and bytes(data[8:12]) == b'WEBP':
+        return _webp_dimensions(data)
+    return None
+
+
+def _png_dimensions(data: Any) -> 'tuple[int, int] | None':
+    """PNG：8 字节签名 + 4 字节块长 + `IHDR`，宽高各 4 字节**大端**（偏移 16 / 20）。"""
+    if len(data) < 24 or bytes(data[12:16]) != b'IHDR':
+        return None
+    width = int.from_bytes(data[16:20], 'big')
+    height = int.from_bytes(data[20:24], 'big')
+    return (width, height) if width and height else None
+
+
+def _png_has_alpha(data: Any) -> bool:
+    """PNG 带透明通道？（色彩类型 4=灰+alpha / 6=RGBA，或有 `tRNS` 块）。
+
+    `tRNS` 按规范必须在 `IDAT` 之前，所以扫到 `IDAT` / `IEND` 就可以停。
+    """
+    if len(data) < 26:
+        return False
+    if data[25] in (4, 6):
+        return True
+    index = 8
+    while index + 8 <= len(data):
+        length = int.from_bytes(data[index:index + 4], 'big')
+        name = bytes(data[index + 4:index + 8])
+        if name == b'tRNS':
+            return True
+        if name in (b'IDAT', b'IEND'):
+            break
+        index += 12 + length
+    return False
+
+
+def _jpeg_dimensions(data: Any) -> 'tuple[int, int] | None':
+    """JPEG：扫到 `SOF*` 段读高 / 宽（各 2 字节大端，偏移 +5 / +7）。"""
+    index = 2
+    size = len(data)
+    while index + 4 <= size:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        # 0xFF 填充、0x00 转义、TEM(0x01) 与 RST0..RST7 / SOI 都没有长度字段。
+        if marker in (0xFF, 0x00, 0x01) or 0xD0 <= marker <= 0xD8:
+            index += 2
+            continue
+        if marker == 0xDA:  # SOS：之后是压缩数据，不会再有段头
+            return None
+        length = int.from_bytes(data[index + 2:index + 4], 'big')
+        if length < 2:
+            return None
+        if marker in _JPEG_SOF_MARKERS:
+            if index + 9 > size:
+                return None
+            height = int.from_bytes(data[index + 5:index + 7], 'big')
+            width = int.from_bytes(data[index + 7:index + 9], 'big')
+            return (width, height) if width and height else None
+        index += 2 + length
+    return None
+
+
+def _webp_dimensions(data: Any) -> 'tuple[int, int] | None':
+    """WebP：`VP8X`（扩展）/ `VP8 `（有损）/ `VP8L`（无损）三种头各读各的。
+
+    RIFF 头 12 字节，块负载从偏移 20 开始；三种块的尺寸字段位置与位宽都不同。
+    """
+    if len(data) < 20:
+        return None
+    chunk = bytes(data[12:16])
+    if chunk == b'VP8X':
+        # 负载 = flags(1) + reserved(3) + (宽-1)(3, 小端) + (高-1)(3, 小端)。
+        if len(data) < 30:
+            return None
+        width = int.from_bytes(data[24:27], 'little') + 1
+        height = int.from_bytes(data[27:30], 'little') + 1
+        return (width, height)
+    if chunk == b'VP8 ':
+        # 帧头：3 字节 frame tag + 3 字节起始码，然后各 16 位（有效 14 位）。
+        if len(data) < 30 or bytes(data[23:26]) != b'\x9d\x01\x2a':
+            return None
+        width = int.from_bytes(data[26:28], 'little') & 0x3FFF
+        height = int.from_bytes(data[28:30], 'little') & 0x3FFF
+        return (width, height) if width and height else None
+    if chunk == b'VP8L':
+        if len(data) < 25 or data[20] != 0x2F:  # 25 字节够读满 14+14 位；0x2F 是无损签名
+            return None
+        bits = int.from_bytes(data[21:25], 'little')
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    return None
+
+
+def sticker_guess_candidate(data: Any, mime_type: Any = '') -> bool:
+    """**便宜的预筛**：这张图值不值得花一次识图调用？
+
+    只排除"明显不像表情包"的：GIF（聊天里几乎只有动图 / 表情用途）、带 alpha 的
+    PNG（表情通常是透明底），或者"近方形 + 两边都小"（表情包的典型尺寸）。
+    大图、长宽比明显像照片 / 截图的，以及**解析不出宽高**的，一律回 False——
+    "拿不准就不收"在这里等价于"拿不准就不花钱问"。
+
+    这些阈值都是**启发式**（见上面的常量），不是平台规则；真正的判定权在
+    `sticker_guess_result()` 与用户开关手里。
+    """
+    mime = _str(mime_type).strip().lower()
+    if mime == 'image/gif':
+        return True
+    if mime == 'image/png' and _png_has_alpha(data or b''):
+        return True
+    dimensions = guess_image_dimensions(data)
+    if dimensions is None:
+        return False
+    width, height = dimensions
+    if not width or not height:
+        return False
+    if max(width, height) > GUESS_STICKER_MAX_DIMENSION:
+        return False
+    longest, shortest = max(width, height), min(width, height)
+    return longest <= shortest * GUESS_STICKER_MAX_ASPECT
+
+
+def sticker_guess_result(value: Any) -> 'dict[str, Any] | None':
+    """模型回执 → 判定结果；**"收"的充要条件只有这一处**（第二层）。
+
+    收：`is_sticker == true` **且** `confidence >= GUESS_STICKER_MIN_CONFIDENCE`。
+    其余全部回 `None`（= 不收）：不是对象 / 缺 `is_sticker` / 不是布尔 / 缺 `confidence` /
+    置信度不是数 / 置信度不够。阈值是启发式常量。
+
+    `is_sticker` 这个键名**逐字保持**（提示词就是这么要求的，模型照这个键回）；
+    从外部读入按本仓库的规矩双读 `isSticker`，万一中转站改写了键名也认。
+    `kind` 只做白名单归一（不认识 → `other`），它**不参与**收不收的判断。
+    """
+    if not isinstance(value, dict):
+        return None
+    flag = value.get('is_sticker', value.get('isSticker'))
+    if flag is not True:
+        return None
+    confidence = value.get('confidence')
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return None
+    if float(confidence) < GUESS_STICKER_MIN_CONFIDENCE:
+        return None
+    kind = _str(value.get('kind')).strip().lower()
+    description = value.get('description')
+    return {
+        'is_sticker': True,
+        'kind': kind if kind in STICKER_GUESS_KINDS else 'other',
+        'confidence': float(confidence),
+        'description': description.strip()[:180] if isinstance(description, str) else '',
+    }
 
 
 # =========================================================================== #

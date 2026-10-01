@@ -1693,6 +1693,18 @@
         "description": "启用本地表情包库",
         "default": false
       },
+      "auto_collect": {
+        "type": "bool",
+        "description": "自动收藏收到的表情包",
+        "default": true,
+        "hint": "别人发来的表情包自动收进表情库；拿不准是不是表情包时不收。"
+      },
+      "auto_collect_guess": {
+        "type": "bool",
+        "description": "让识图模型判断普通图片是不是表情包",
+        "default": false,
+        "hint": "拿不准就不收；会增加识图调用。"
+      },
       "provider_id": {
         "type": "string",
         "default": "",

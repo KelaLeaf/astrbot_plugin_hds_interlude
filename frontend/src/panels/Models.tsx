@@ -3,7 +3,7 @@ import { apiPost } from '../bridge'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { ModelsPayload } from '../types'
-import { Badge, Button, Empty, ErrorNote, Grid, KeyValue, Loading, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
+import { Badge, Button, ConfirmButton, Empty, ErrorNote, Grid, KeyValue, Loading, Meter, Note, Panel, Stack, Stat, Table } from '../components/ui'
 import { ConnectionEditor } from '../components/ConnectionEditor'
 
 function fmt(value: number | null | undefined, unit = '') {
@@ -24,8 +24,7 @@ export function Models({ storyId, refreshKey }: PanelProps) {
   if (loading && !data) return <Loading />
   if (!data) return <Empty text="没有拿到数据" />
 
-  async function remove(index: number, label: string) {
-    if (!window.confirm(`确定删除连接「${label || '#' + index}」吗？此操作会立即写进插件配置。`)) return
+  async function remove(index: number) {
     setFailure('')
     try {
       const result = await apiPost<{ changed: string }>('console/connections-delete', { index })
@@ -140,9 +139,14 @@ export function Models({ storyId, refreshKey }: PanelProps) {
                       {row.has_key && <Badge tone="accent">有密钥</Badge>}
                       <span class="ml-auto text-[11px] text-muted">{row.model || '模型未填'}</span>
                       <Button icon="config" onClick={() => setEditing(index)}>编辑</Button>
-                      <Button variant="danger" icon="close" onClick={() => void remove(index, row.label)}>
-                        删除
-                      </Button>
+                      <ConfirmButton
+                        label="删除"
+                        confirmLabel="确认删除这条连接"
+                        warning={`「${row.label || '#' + index}」会立刻从插件配置里删掉（不可撤销）；用它跑的任务会失去这条模型来源。`}
+                        variant="danger"
+                        icon="close"
+                        onConfirm={() => remove(index)}
+                      />
                     </div>
                     <div class="mt-2">
                       <KeyValue

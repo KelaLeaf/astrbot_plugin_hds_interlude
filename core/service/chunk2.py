@@ -102,16 +102,22 @@ from .config import (
     should_request_turn_embedding,
 )
 from .helpers import (
+    COLLECTED_STICKER_DIR,
+    GUESS_STICKER_KIND,
     SEMANTIC_STICKER_LIMIT,
+    STICKER_FILE_SUFFIX,
     _turn_get,
     _turn_set,
     calibrated_native_face_willingness,
     clip,
+    collected_sticker_asset_id,
+    collectible_sticker_kind,
     cosine_similarity,
     describe_quoted_message,
     extract_session_audio_sources,
     extract_session_file_facts,
     format_group_speaker,
+    guess_image_dimensions,
     normalize_allowed_native_faces,
     normalize_allowed_reactions,
     normalize_expression_threshold,
@@ -119,6 +125,9 @@ from .helpers import (
     rank_sticker_catalog,
     should_supersede_narrative_request,
     stable_sticker_asset_id,
+    sticker_guess_candidate,
+    sticker_guess_result,
+    verify_sticker_image_bytes,
 )
 #: 上游 `normalizeVisibleMessageContent`（`src/service.ts:7649`，模块级导出函数）。
 #: `helpers.py` 把它实现成下划线私有（同文件里由 `normalizeGroupVisibleReply` 使用），
@@ -128,10 +137,150 @@ from .transport import NullTransport, voice_kwargs
 
 __all__ = [
     'ServiceChunk2',
+    'STICKER_COLLECT_WARN_INTERVAL_MS',
+    'STICKER_GUESS_MAX_PER_MESSAGE',
+    'STICKER_GUESS_MAX_PER_MINUTE',
+    'STICKER_GUESS_TIMEOUT_SECONDS',
+    'STICKER_GUESS_WINDOW_MS',
     'group_message_ref',
     'sticker_mime',
     'targetable_message_id',
 ]
+
+#: 同一个「拿不到字节」的能力缺失告警最短间隔（毫秒）。一次刷屏的消息里可能有十个表情包，
+#: 每个都打一条 warn 等于把日志淹掉；节流到一条，用户仍然看得见"这条路走不通"。
+STICKER_COLLECT_WARN_INTERVAL_MS = 10 * 60 * 1000
+
+#: 入站表情包下载的软时限（秒）。上游 `fetchNativeAudio` 的 `withTimeout(..., 30_000)`
+#: 是同类操作的口径；收藏是**旁路**，卡住一次网络不该拖住叙事回合。
+STICKER_FETCH_TIMEOUT_SECONDS = 30.0
+
+#: —— 第二层（模型判定普通图片）的节流常量（都是**防刷的启发式**，不是平台规则）——
+#:
+#: 一条消息里最多问几次：多张图的刷屏消息不该按图数线性烧 token，剩下的一律 debug 丢弃。
+STICKER_GUESS_MAX_PER_MESSAGE = 2
+#: 滑动窗口内最多问几次（跨消息、跨会话）：一次刷图潮不能变成 token 黑洞。
+STICKER_GUESS_MAX_PER_MINUTE = 6
+#: 上面那个窗口的长度（毫秒）。
+STICKER_GUESS_WINDOW_MS = 60 * 1000
+#: 一次判定的软时限（秒）：判定同样是**旁路**，卡住的请求不许拖着任务不放
+#: （连接自己的 `timeout` 之外再加一道硬上限）。
+STICKER_GUESS_TIMEOUT_SECONDS = 60.0
+
+
+def _local_sticker_path(value: Any) -> str:
+    """把适配器给的本地图片引用归一成文件系统路径（`file:///x` → `/x`）。
+
+    与 `chunk3._local_image_path` 同一套规则；复制在这里而不是 import，
+    是因为它只在这条冷路径上用，而且 `chunk2` 不依赖 `chunk3`（两个 mixin 平级）。
+    """
+    text = str(value if value is not None else '').strip()
+    if text.lower().startswith('file://'):
+        text = text[len('file://'):]
+        if not text.startswith('/'):
+            slash = text.find('/')
+            text = text[slash:] if slash >= 0 else ''
+        try:
+            from urllib.parse import unquote  # noqa: PLC0415
+
+            text = unquote(text)
+        except Exception:  # noqa: BLE001 - 解不开就按原文用
+            pass
+    return text
+
+
+def _read_local_bytes(path: str) -> bytes:
+    """读一个本地文件（`asyncio.to_thread` 的落地实现；失败由调用方 catch）。"""
+    with open(path, 'rb') as handle:
+        return handle.read()
+def _incoming_sticker_kinds(
+    media: Any,
+    sticker_rows: Any,
+    media_by_source: Any = None,
+) -> dict[str, str]:
+    """入站附件的 `来源 → 种类` 查找表（三份来源合并，先到先得）。
+
+    * `media`：`extract_session_media` 抽出来的 `[{source, kind, summary, label}]`；
+    * `media_by_source`：调用方按来源去重后的同一张表（私聊缓冲回合已经做过一次）；
+    * `sticker_rows`：`sticker_catalog_for_session()` 的输出（camelCase `assetId`）——
+      上游 wire format 里它就是"本地库素材标识"，适配层可能直接把它当图片来源给出来。
+
+    合并顺序固定（media → media_by_source → sticker_rows）：**先拿到的为准**，
+    后面只补空位。同一个来源出现两种说法时不猜，按第一条落定。
+    """
+    kinds: dict[str, str] = {}
+    for item in (media or []):
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get('source') if item.get('source') is not None else '').strip()
+        if source:
+            kinds.setdefault(source, _text_kind(item.get('kind')))
+    if isinstance(media_by_source, dict):
+        for source, item in media_by_source.items():
+            key = str(source if source is not None else '').strip()
+            if key and isinstance(item, dict):
+                kinds.setdefault(key, _text_kind(item.get('kind')))
+    for item in (sticker_rows or []):
+        if not isinstance(item, dict):
+            continue
+        asset_id = pick(item, 'assetId', 'asset_id')
+        if asset_id:
+            kinds.setdefault(str(asset_id).strip(), _text_kind(pick(item, 'kind')))
+    return kinds
+
+
+def _text_kind(value: Any) -> str:
+    """种类的原样文本（不做白名单判断——白名单在 `collectible_sticker_kind` 一处）。"""
+    return str(value if value is not None else '').strip().lower()
+
+
+def _has_collectible_media(media: Any, guess_enabled: bool = False) -> bool:
+    """这条消息里有没有**值得为它建一个收藏任务**的附件（同步的廉价预筛）。
+
+    只决定"要不要建任务"，真正的判据仍在 `collectible_sticker_kind` 一处——
+    这里放宽（认得 `kind` 键就算）不会让不该收的进来，只会让少数消息多做一次空跑。
+
+    `guess_enabled`（`stickers.auto_collect_guess`）打开时，**普通图片**也算"值得建任务"：
+    第二层判据（模型判定）只在 `kind == 'image'` 上有意义，而"这条消息里有没有普通图片"
+    只有这里能同步判出来（下载、解析图片头、调模型都在任务里做）。开关关着时行为与今天
+    逐字一致——纯文字 / 只有普通照片的消息**一个任务都不建**。
+    """
+    for item in (media or []):
+        if not isinstance(item, dict):
+            continue
+        if collectible_sticker_kind(item.get('kind')):
+            return True
+        if guess_enabled and _text_kind(item.get('kind')) == GUESS_STICKER_KIND:
+            return True
+    return False
+
+
+def _media_sources(media: Any) -> list[str]:
+    """`media` 里**带来源**的那几条 → 去重后的来源表（顺序保持）。
+
+    群聊的收藏钩子用它当 `collect_incoming_stickers(media, sources)` 的来源表：
+    `media` 与 `image_sources` 本来就是同一条链路（`_fallback_extract_session_media`
+    与 `_fallback_extract_session_image_sources` 共用同一套来源归一化），再抽一次
+    来源只会多一处对齐点。没有来源的条目（小程序卡片）本来也收不了。
+    """
+    sources: list[str] = []
+    for item in (media or []):
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get('source') if item.get('source') is not None else '').strip()
+        if source and source not in sources:
+            sources.append(source)
+    return sources
+
+
+def _collected_sticker_name(asset: Any) -> str:
+    """给收藏进来的素材起一个**稳定**的短名（数据集前置词 + 哈希前缀）。
+
+    名字是给人看的：控制台列表里 `sticker-collected-a1b2c3…` 比一串 URL 强。
+    用户随时能在控制台改成"坏笑的猫"——那时 `name` 已经存在，这里不再覆盖。
+    """
+    digest = re.sub(r'[^a-fA-F0-9]', '', str(pick(asset, 'hash') or ''))[:8].lower() or 'unknown'
+    return 'collected-%s' % digest
 
 
 # =========================================================================== #
@@ -671,9 +820,7 @@ class ServiceChunk2(ServiceBase):
         路径解析与越界检查逐字照搬：素材文件必须真的落在表情库目录里。
         出站走 `Transport.send_sticker`（分解契约 §7）。
         """
-        root = os.path.abspath(os.path.join(
-            str(getattr(self.ctx, 'base_dir', '') or ''), str(self.sticker_config.get('directory') or ''),
-        ))
+        root = self.sticker_library_root()
         file_path = os.path.abspath(os.path.join(root, str(pick(asset, 'filePath', 'file_path') or '')))
         relative_path = os.path.relpath(file_path, root)
         if (
@@ -724,6 +871,9 @@ class ServiceChunk2(ServiceBase):
                     )
 
             await self.serial(story.get('id'), commit)
+            # 用量计数（v1.8.0）：控制台按它排"哪些表情她真的在用"。
+            # 计数失败**只 warn**——它不该把一次已经成功发出去的投递判成失败。
+            await self.record_sticker_use(asset)
             self.report_operation(
                 'standard', 'info', story, 'user-message',
                 '聊天动作完成 类型=本地表情包 素材=%s', asset_id,
@@ -987,6 +1137,14 @@ class ServiceChunk2(ServiceBase):
             lambda: self.flush_buffered_narrative(key, revision), delay_ms,
         )
         self.buffered_narrative_turns[key] = turn
+        # 自动收藏（本移植版新增，受控偏离 §45）：**旁路**，不 await。
+        # 为什么在入队时而不是叙事请求里：① 手上就有这一条消息的来源与种类，不必再对齐；
+        # ② 收藏要下载 / 读盘 / 调视觉模型，把它放进关键路径就是给每回合加延迟。
+        # 失败只记日志（`_spawn_sticker_collect` 里兜住），绝不影响叙事。
+        # 纯文字消息（绝大多数）**不建任务**：这里先做一次同步判断，别给每条消息都挂一个
+        # 空跑的 task（"旁路"也不该按消息量线性增加调度开销）。
+        if _has_collectible_media(message.get('media'), self._sticker_guess_enabled()):
+            self._spawn_sticker_collect(key, len(turn['messages']) - 1)
         self.report_operation(
             'diagnostic', 'debug', story, 'user-message',
             '短时消息合并 参与者=%s 待处理=%d 等待=%dms',
@@ -1130,6 +1288,16 @@ class ServiceChunk2(ServiceBase):
         directory = _config_value(configured, 'directory')
         self.cached_sticker_config = {
             'enabled': _config_value(configured, 'enabled') is True,
+            # 本移植版新增（受控偏离 §45）：别人发来的表情包自动收进库。
+            # **默认真**，但仍然受上面的 `enabled` 总闸约束（`enabled=false` 时整个库都不动）。
+            # 双读：配置层写 snake_case，旧文件 / 上游名写 camelCase。
+            'auto_collect': _config_value(configured, 'autoCollect', 'auto_collect') is not False,
+            # 本移植版新增（受控偏离 §45.7）：第二层判据——让识图模型判断**普通图片**
+            # 是不是表情包。**默认假**：用户要先主动打开才多花 token（`is True` 是刻意的，
+            # 缺失 / NULL / 字符串一律当关）。同样受上面的 `enabled` 总闸约束。
+            'auto_collect_guess': _config_value(
+                configured, 'autoCollectGuess', 'auto_collect_guess',
+            ) is True,
             'directory': str(directory if directory else 'data/hds-interlude/stickers').strip(),
             'max_file_size_mb': max(1.0, min(
                 30.0, _config_number(configured, 'maxFileSizeMB', 'max_file_size_mb', 10),
@@ -1232,9 +1400,7 @@ class ServiceChunk2(ServiceBase):
             return
         self.sticker_scan_running = True
         try:
-            root = os.path.abspath(os.path.join(
-                str(getattr(self.ctx, 'base_dir', '') or ''), str(config.get('directory') or ''),
-            ))
+            root = self.sticker_library_root()
             lister = getattr(self.transport, 'list_sticker_files', None)
             files = await lister(root) if callable(lister) else _list_sticker_files(root)
             existing = await self.db_get('interlude_sticker', {})
@@ -1259,6 +1425,18 @@ class ServiceChunk2(ServiceBase):
                     if isinstance(prior, dict) and prior.get('hash') == digest:
                         if prior.get('status') == 'active':
                             continue
+                        # 用户**刻意停用**的资产（控制台勾掉 disabled）不归扫描管：
+                        # 它只是不参与选图，不是"文件没了"，重扫不许把它复活成 pending。
+                        if prior.get('status') == 'disabled':
+                            continue
+                        # 曾被标记 missing、文件又回来了：已经描述过的直接复活成 active，
+                        # 不花一次视觉模型调用（只复活状态，不是重描述）。
+                        if prior.get('status') == 'missing' and prior.get('description'):
+                            await self.db_set(
+                                'interlude_sticker', {'id': prior.get('id')},
+                                {'status': 'active', 'updatedAt': self.now()},
+                            )
+                            continue
                         prior_updated = parse_dt(prior.get('updatedAt'))
                         age_ms = (
                             self.now_ms() - dt_ms(prior_updated)
@@ -1280,7 +1458,11 @@ class ServiceChunk2(ServiceBase):
                         'animated': bool(re.search(r'\.gif$', file_path, re.IGNORECASE)),
                         'size': len(payload),
                         'hash': digest,
+                        # 名字由用户手工给（控制台可改）；扫描只维护一个稳定短名。
+                        'name': ((prior or {}).get('name') if isinstance(prior, dict) else '') or '',
+                        'source': 'manual',
                         'description': '',
+                        'descriptionManual': False,
                         'aliases': [],
                         'status': 'pending',
                         'updatedAt': now,
@@ -1313,57 +1495,7 @@ class ServiceChunk2(ServiceBase):
             for item in pending[:5]:
                 if not _provider_available(self.sticker_describer):
                     break
-                item_asset = item['asset']
-                item_id = item_asset.get('id')
-                description: Any = None
-                try:
-                    visual = await self.image_bytes_to_native(item['bytes'], item_asset.get('mimeType'))
-                    if visual:
-                        # `imageBytesToNative` 的移植版按内部结构约定输出
-                        # `mime_type` / `data_uri`（`types.NarrativeImage`），双读兼容。
-                        description = await self.sticker_describer.describe_sticker(
-                            pick(visual, 'dataUri', 'data_uri'),
-                            pick(visual, 'mimeType', 'mime_type'),
-                            item_asset.get('filePath'),
-                            item_asset.get('animated'), config.get('description_response_format'),
-                            config.get('description_max_tokens'),
-                        )
-                except Exception as error:
-                    self.report_standalone_operation(
-                        'standard', 'warn', '表情包描述失败，已冷却后重试 素材=%s 错误=%s',
-                        item_asset.get('assetId'), error,
-                    )
-                    await self.db_set('interlude_sticker', {'id': item_id}, {'updatedAt': self.now()})
-                    continue
-                if not description:
-                    self.report_standalone_operation(
-                        'standard', 'warn', '表情包描述未返回可用 JSON，已冷却后重试 素材=%s',
-                        item_asset.get('assetId'),
-                    )
-                    await self.db_set('interlude_sticker', {'id': item_id}, {'updatedAt': self.now()})
-                    continue
-                updated = await self.db_set('interlude_sticker', {'id': item_id}, {
-                    'description': pick(description, 'description'),
-                    'aliases': pick(description, 'aliases'),
-                    'status': 'active',
-                    'updatedAt': self.now(),
-                })
-                if updated and self.semantic_sticker_embedding_enabled():
-                    # Index a freshly described asset immediately so the semantic filter
-                    # can consider it on the very next turn instead of the next scan.
-                    aliases = pick(description, 'aliases') or []
-                    embedding = await self.embed_text(
-                        ('%s %s' % (pick(description, 'description'), ' '.join(str(a) for a in aliases))).strip(),
-                    )
-                    if embedding:
-                        await self.db_set(
-                            'interlude_sticker', {'id': item_id},
-                            {'embedding': embedding, 'updatedAt': self.now()},
-                        )
-                self.report_standalone_operation(
-                    'standard', 'info', '表情包描述完成 素材=%s 分组=%s',
-                    item_asset.get('assetId'), item_asset.get('group'),
-                )
+                await self.describe_sticker_asset(item['asset'], item['bytes'], config)
             await self.refresh_sticker_catalog()
             await self.backfill_sticker_embeddings()
             await self.refresh_sticker_catalog()
@@ -1371,6 +1503,801 @@ class ServiceChunk2(ServiceBase):
             self.report_standalone('warn', '表情包库扫描失败：%s', error)
         finally:
             self.sticker_scan_running = False
+
+    def sticker_library_root(self) -> str:
+        """表情库根目录的绝对路径（配置里的 `directory` 相对插件数据目录）。
+
+        `scan_sticker_library()` 与自动收藏都从这一个地方取根 —— 两份路径推导迟早漂移，
+        而"收藏写进了 A 目录、扫描看的是 B 目录"会表现为"收了但库里没有"。
+        """
+        return os.path.abspath(os.path.join(
+            str(getattr(self.ctx, 'base_dir', '') or ''),
+            str(self.sticker_config.get('directory') or ''),
+        ))
+
+    async def describe_sticker_asset(
+        self, asset: Any, payload: bytes, config: Any = None,
+    ) -> bool:
+        """描述一个素材并立即登记 + 回填向量；成功返回 True。
+
+        从 `scan_sticker_library()` 的循环体里**原样提取**（v1.8.0）：自动收藏要在写完
+        文件后**立刻**触发同一个动作，而不是等下一个完整扫描周期。两条路径共用这一份，
+        否则"补描述"和"扫描描述"会在冷却、告警文案、向量化上慢慢分家。
+        """
+        settings = config if isinstance(config, dict) else self.sticker_config
+        asset_row = asset if isinstance(asset, dict) else {}
+        item_id = asset_row.get('id')
+        if item_id is None or not _provider_available(self.sticker_describer):
+            return False
+        if asset_row.get('descriptionManual') in (True, 1):
+            # 用户手写的描述**压过**自动描述：不花模型调用，也不覆盖那一行
+            # （受控偏离 §45.2；扫描与自动收藏都要走这条判定，所以放在这个方法里）。
+            return False
+        description: Any = None
+        try:
+            visual = await self.image_bytes_to_native(payload, asset_row.get('mimeType'))
+            if visual:
+                # `imageBytesToNative` 的移植版按内部结构约定输出
+                # `mime_type` / `data_uri`（`types.NarrativeImage`），双读兼容。
+                description = await self.sticker_describer.describe_sticker(
+                    pick(visual, 'dataUri', 'data_uri'),
+                    pick(visual, 'mimeType', 'mime_type'),
+                    asset_row.get('filePath'),
+                    asset_row.get('animated'), settings.get('description_response_format'),
+                    settings.get('description_max_tokens'),
+                )
+        except Exception as error:
+            self.report_standalone_operation(
+                'standard', 'warn', '表情包描述失败，已冷却后重试 素材=%s 错误=%s',
+                asset_row.get('assetId'), error,
+            )
+            await self.db_set('interlude_sticker', {'id': item_id}, {'updatedAt': self.now()})
+            return False
+        if not description:
+            self.report_standalone_operation(
+                'standard', 'warn', '表情包描述未返回可用 JSON，已冷却后重试 素材=%s',
+                asset_row.get('assetId'),
+            )
+            await self.db_set('interlude_sticker', {'id': item_id}, {'updatedAt': self.now()})
+            return False
+        await self.db_set('interlude_sticker', {'id': item_id}, {
+            'description': pick(description, 'description'),
+            'aliases': pick(description, 'aliases'),
+            'status': 'active',
+            'updatedAt': self.now(),
+        })
+        await self._index_sticker_description(
+            item_id, pick(description, 'description'), pick(description, 'aliases') or [],
+        )
+        self.report_standalone_operation(
+            'standard', 'info', '表情包描述完成 素材=%s 分组=%s',
+            asset_row.get('assetId'), asset_row.get('group'),
+        )
+        return True
+
+    async def _index_sticker_description(
+        self, item_id: Any, description: Any, aliases: Any = None,
+    ) -> None:
+        """给一条**已有描述**的素材立刻做向量回填（语义过滤下一回合就能考虑它）。
+
+        从 `describe_sticker_asset()` 原样提取（§45.7）：第二层判据的描述来自**判定回执**，
+        不走描述流程，但同样要进向量索引，否则"模型猜进来的"表情包在语义过滤里
+        永远缺一条。没开语义过滤时什么都不做（不花 embedding 调用）。
+        """
+        if item_id is None or not self.semantic_sticker_embedding_enabled():
+            return
+        text = ('%s %s' % (description if description is not None else '',
+                           ' '.join(str(alias) for alias in (aliases or [])))).strip()
+        if not text:
+            return
+        embedding = await self.embed_text(text)
+        if embedding:
+            await self.db_set(
+                'interlude_sticker', {'id': item_id},
+                {'embedding': embedding, 'updatedAt': self.now()},
+            )
+
+    # ------------------------------------------------------------------ #
+    # 自动收藏入站表情包（本移植版新增，受控偏离；见 `docs/PORTING_NOTES.md` §45）
+    # ------------------------------------------------------------------ #
+
+    def _spawn_sticker_collect(self, participant_key: Any, message_index: int) -> None:
+        """把一次自动收藏挂到事件循环上（**不 await**）；失败只记日志。
+
+        **私聊**的旁路入口（`buffer_user_narrative` 调用）。群聊走
+        `_spawn_group_sticker_collect`：两个入口形状相同，只是"来源与种类从哪拿"不同
+        （私聊回读缓冲回合、群聊直接用入站那一次解析的 `media`）。
+        """
+        self._spawn_sticker_task(
+            self.collect_stickers_from_buffered_turn(participant_key, message_index),
+        )
+
+    def _spawn_group_sticker_collect(self, media: Any) -> None:
+        """**群聊**的自动收藏旁路入口（`receive_group` 在通过全部入站闸门后调用）。
+
+        为什么直接把这次解析出来的 `media` 带过来、而不是像私聊那样回读缓冲回合：
+        群批次的 `turn['messages']` 会在 `flush_group_turn` 里被
+        `del turn['messages'][:]` 清空，回读等于跟刷出抢时序（刷出先跑就静默丢收藏）。
+        `media` 就是**同一次解析**的结果——群与私聊共用同一条
+        `extract_session_media`（`session.content` 的 `<img kind=…>` → `[{source,kind,…}]`），
+        判据仍然只有 `helpers.collectible_sticker_kind()` 一处，不从 `[表情包]` 文本反推。
+
+        纯文字 / 只有普通照片的群消息**不建任务**（同私聊：旁路也不该按消息量线性增加调度）；
+        `auto_collect_guess` 打开时普通照片也算"值得建任务"（第二层判据只对 `kind == 'image'`
+        有意义，见 `_has_collectible_media`）。
+        """
+        if not _has_collectible_media(media, self._sticker_guess_enabled()):
+            return
+        self._spawn_sticker_task(
+            self.collect_incoming_stickers(media, _media_sources(media)),
+        )
+
+    def _sticker_guess_enabled(self) -> bool:
+        """第二层判据（模型判定普通图片）开了没？读不到配置一律按关处理。
+
+        私聊与群聊两个旁路入口都要在**建任务之前**问这一句：开关关着时，
+        普通图片连任务都不该建（与今天逐字一致）。
+        """
+        try:
+            return self.sticker_config.get('auto_collect_guess') is True
+        except Exception:  # noqa: BLE001 - 配置层异常不该影响入站路径
+            return False
+
+    def _spawn_sticker_task(self, coroutine: Any) -> None:
+        """把一次收藏挂到事件循环上（**不 await**）；失败只记日志。
+
+        收藏是旁路能力：读盘 / 下载 / 调视觉模型都可能慢或失败，而叙事回合不该等它。
+        这里唯一要小心的是**别留下没人消费的异常**（`InvalidStateError` 之类会被
+        asyncio 打成 "Task exception was never retrieved"，看起来像崩了）。
+        """
+        try:
+            task = asyncio.ensure_future(coroutine)
+        except RuntimeError:
+            # 没有运行中的事件循环（同步调用路径 / 测试直接调 buffer）：跳过收藏。
+            # 协程没进过循环，关掉它免得 Python 打 "coroutine was never awaited"。
+            close = getattr(coroutine, 'close', None)
+            if callable(close):
+                close()
+            return
+        add_done = getattr(task, 'add_done_callback', None)
+        if callable(add_done):
+            add_done(self._consume_sticker_collect_result)
+
+    def _consume_sticker_collect_result(self, task: Any) -> None:
+        """消费收藏任务的异常（两个收藏协程自己都已 try/except 兜底）。"""
+        try:
+            error = task.exception()
+        except Exception:  # noqa: BLE001 - 已取消 / 无结果都按无事发生
+            return
+        if error is not None:
+            self.report_standalone('warn', '表情包自动收藏失败：%s', error)
+
+    async def collect_stickers_from_buffered_turn(
+        self, participant_key: Any, message_index: int,
+    ) -> list[dict[str, Any]]:
+        """从**已经入队的**那条消息里收表情包（`buffer_user_narrative` 的旁路入口）。
+
+        为什么从回合里回读而不是让调用方传参：来源与种类必须来自**同一次解析**——
+        调用方临时拼一份就又多一个"两处推导会漂移"的地方（坑 46 的老病）。
+        消息还没进队列（索引对不上）时安静返回，不抛。
+        """
+        try:
+            turn = self.buffered_narrative_turns.get(participant_key)
+            messages = turn.get('messages') if isinstance(turn, dict) else None
+            if not isinstance(messages, list):
+                return []
+            if not isinstance(message_index, int) or message_index < 0 or message_index >= len(messages):
+                return []
+            message = messages[message_index]
+            if not isinstance(message, dict):
+                return []
+            return await self.collect_incoming_stickers(
+                message.get('media'),
+                _turn_get(message, 'imageSources', 'image_sources') or [],
+            )
+        except Exception as error:  # noqa: BLE001 - 旁路能力绝不打断回合
+            self.report_standalone('warn', '表情包自动收藏异常：%s', error)
+            return []
+
+    async def collect_incoming_stickers(
+        self,
+        media: Any = None,
+        sources: Any = None,
+        media_by_source: Any = None,
+        sticker_rows: Any = None,
+    ) -> list[dict[str, Any]]:
+        """把**确认是表情包**的入站附件收进本地表情库；返回新入库的资产行。
+
+        判据分**两层，互不越权**：
+
+        **第一层**（`helpers.collectible_sticker_kind()`，唯一入口，用户点名的红线）
+
+        1. **种类必须是观测到的**：只有 `sticker` / `animated` / `market` 才考虑收藏。
+           种类来自适配层从 OneBot 原始段捞出来的 `sub_type` / `summary`（见
+           `astrbot_bridge.raw_media_hints`），经 `extract_session_media` 成了
+           每条媒体的 `kind`。**缺失 / 未知 / `image` / `card` 一律不收**，记 debug。
+           第一层认了的种类**直接收，永远不走模型**（行为与 v1.8.0 逐字一致）。
+        2. **字节要真的验过是图片**：魔数嗅探（png/jpg/gif/webp）不过就跳过 + debug。
+        3. **上限**：超过 `max_file_size_mb` 的字节在 `store_collected_sticker` 里被挡掉
+           （字节已经拿到手才判，所以这一步不会因为"太大"而跳过下载）。
+        4. **去重**：内容 sha256。同一个表情重复发、或者库里已经有同内容素材，都不再入库。
+
+        **第二层**（`_sticker_guess_enabled()` + `guess_sticker_like()`，`§45.7`）
+
+        只处理 `kind == 'image'`，且**只在 `stickers.auto_collect_guess` 打开时**才可能
+        被调用——那些"被当成普通图片发过来"的表情包走这一层。**它永远不能否决第一层**，
+        第一层也永远不该走模型。判定顺序刻意从便宜到贵：来源自带的体积（不下载就排除）
+        → 图片头预筛（`sticker_guess_candidate`）→ 去重 → 节流 → 才调模型。
+
+        拿不到字节时：**一条节流 warn**（这是能力缺失，用户该看见），本批不再重复报。
+
+        只看 `media` / `sources` 里**适配器给出来的**来源——正文里手写的 URL 不在其中，
+        所以这条路径不会变成"任意 URL 抓取器"。
+        """
+        try:
+            config = self.sticker_config
+        except Exception:  # noqa: BLE001 - 配置层异常不该影响叙事回合
+            return []
+        if not config.get('enabled') or not config.get('auto_collect'):
+            return []
+        guess_enabled = config.get('auto_collect_guess') is True
+        rows = [row for row in (sticker_rows or []) if isinstance(row, dict)]
+        kind_of = _incoming_sticker_kinds(media, rows, media_by_source)
+
+        unique: list[str] = []
+        seen: set[str] = set()
+        for source in (sources or []):
+            value = str(source if source is not None else '').strip()
+            if value and value not in seen:
+                seen.add(value)
+                unique.append(value)
+
+        collected: list[dict[str, Any]] = []
+        missing_bytes = 0
+        guessed_calls = 0
+        for source in unique:
+            kind = kind_of.get(source, '')
+            first_layer = collectible_sticker_kind(kind)
+            guessing = False
+            if not first_layer:
+                # 第二层只处理普通图片；`kind == 'image'` 且开关打开时才可能走到这里。
+                # 走到这里就说明**第一层本来就不收**，所以第二层不可能否决第一层。
+                if guess_enabled and kind == GUESS_STICKER_KIND:
+                    if not self._sticker_guess_prefetch_ok(source, config):
+                        self.report_standalone_operation(
+                            'diagnostic', 'debug', '图片超过体积上限，未下载也未判定 来源=%s',
+                            clip(source, 120),
+                        )
+                        continue
+                    guessing = True
+                else:
+                    # ⚠️ 红线：`photo` / 空串（种类未知）一律不收藏，只留一条 debug。
+                    self.report_standalone_operation(
+                        'diagnostic', 'debug', '入站附件不是表情包，未收藏 种类=%s 来源=%s',
+                        kind or 'unknown', clip(source, 120),
+                    )
+                    continue
+            payload = await self._sticker_source_bytes(source)
+            if not payload:
+                # 种类确认是表情包、但字节拿不到 —— 这是**能力缺失**，按纪律用 warn
+                # （节流；见坑 25：需要用户看见的东西不许走 diagnostic）。
+                missing_bytes += 1
+                continue
+            mime = verify_sticker_image_bytes(payload)
+            if not mime:
+                self.report_standalone_operation(
+                    'diagnostic', 'debug', '入站表情包字节不是图片，未收藏 种类=%s 来源=%s',
+                    kind, clip(source, 120),
+                )
+                continue
+            if guessing:
+                if not sticker_guess_candidate(payload, mime):
+                    # 记下尺寸：用户问"为什么这张没被判定"时，这一行就是答案
+                    # （阈值是启发式，见 `helpers.GUESS_STICKER_*`）。
+                    size = guess_image_dimensions(payload)
+                    self.report_standalone_operation(
+                        'diagnostic', 'debug',
+                        '图片不像表情包（尺寸/形状预筛），未调模型 尺寸=%s 来源=%s',
+                        ('%dx%d' % size) if size else 'unknown', clip(source, 120),
+                    )
+                    continue
+                # 去重仍然**优先于**模型：同内容已经在库里（任何状态）就不问模型、不重复入库。
+                prior = await self._sticker_prior_by_hash(hashlib.sha256(payload).hexdigest())
+                if prior is not None:
+                    await self._revive_missing_sticker(prior)
+                    continue
+                if guessed_calls >= STICKER_GUESS_MAX_PER_MESSAGE or not self._sticker_guess_budget():
+                    self.report_standalone_operation(
+                        'diagnostic', 'debug', '图片判定调用已达上限，本张跳过 来源=%s',
+                        clip(source, 120),
+                    )
+                    continue
+                guessed_calls += 1
+                verdict = await self.guess_sticker_like(payload, mime, source)
+                if not verdict:
+                    continue
+                asset = await self.store_collected_sticker(
+                    payload, GUESS_STICKER_KIND, guessed=True,
+                    description=str(verdict.get('description') or ''),
+                )
+                if asset:
+                    collected.append(asset)
+                continue
+            asset = await self.store_collected_sticker(payload, kind)
+            if asset:
+                collected.append(asset)
+        if missing_bytes:
+            self._warn_sticker_collect_unavailable(missing_bytes)
+        if collected:
+            await self.refresh_sticker_catalog()
+            for asset in collected:
+                if asset.get('_described'):
+                    # 判定回执里已经带了描述（§45.7）：直接用它入库，**不再花第二次模型调用**。
+                    continue
+                await self.describe_sticker_asset(asset, asset.get('_payload') or b'', config)
+            await self.refresh_sticker_catalog()
+        return collected
+
+    async def store_collected_sticker(
+        self, payload: bytes, kind: str = '', guessed: bool = False, description: str = '',
+    ) -> Optional[dict[str, Any]]:
+        """把一份**已验过是图片**的字节写进表情库；返回资产行（已入库的返回 `None`）。
+
+        写盘 → 建档 → 返回。描述与向量化由调用方紧接着做（`describe_sticker_asset`），
+        因为"立刻进目录"和"落盘"是两件事：先让资产可被扫描看到，再补描述。
+
+        `guessed=True` 标记"这一条是**模型猜出来的**"（第二层判据，§45.7），落在
+        `guessed` 列上；`source` 仍然是 `auto`（前端契约只有 `auto` / `manual` 两个取值，
+        不加第三个）。`description` 是**判定回执里带回来的描述**：有值就直接入库并
+        置 `active`（调用方据此跳过第二次描述调用），没有才走原来的描述流程。
+        """
+        if not payload:
+            return None
+        mime = verify_sticker_image_bytes(payload)
+        if not mime:
+            return None
+        config = self.sticker_config
+        max_bytes = float(config.get('max_file_size_mb') or 10) * 1024 * 1024
+        if len(payload) > max_bytes:
+            return None
+        digest = hashlib.sha256(payload).hexdigest()
+        # 去重：同内容已经在库里（任何状态）就不重复入库。`assetId` 有唯一索引，
+        # 拿内容哈希当唯一键比"文件名不撞"可靠（对方可以把同一张图换个名字发过来）。
+        prior = await self._sticker_prior_by_hash(digest)
+        if prior is not None:
+            if prior.get('status') == 'missing':
+                # 文件曾被删、现在对方又发了一遍：把行复活（描述还在，不重花模型调用）。
+                await self._revive_missing_sticker(prior)
+                return {**prior, 'status': 'active' if prior.get('description') else 'pending'}
+            return None
+
+        root = self.sticker_library_root()
+        file_path = '%s/%s%s' % (
+            COLLECTED_STICKER_DIR, digest[:32], STICKER_FILE_SUFFIX.get(mime, '.png'),
+        )
+        target = os.path.join(root, file_path.replace('/', os.sep))
+        # `filePath` 是**磁盘相对名**（相对表情库根目录），控制台与扫描都按它取值。
+        # 落盘前不查"文件在不在"：`write` 本来就会覆盖，而内容一致时覆盖是幂等的。
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, 'wb') as handle:
+                handle.write(payload)
+        except OSError as error:
+            self.report_standalone_operation(
+                'standard', 'warn', '表情包收藏落盘失败 文件=%s 错误=%s', file_path, error,
+            )
+            return None
+
+        asset_id = collected_sticker_asset_id(kind or 'sticker', digest)
+        now = self.now()
+        given = str(description or '').strip()
+        base: dict[str, Any] = {
+            'assetId': asset_id,
+            'filePath': file_path,
+            'group': COLLECTED_STICKER_DIR,
+            'mimeType': mime,
+            'animated': mime == 'image/gif',
+            'size': len(payload),
+            'hash': digest,
+            'name': _collected_sticker_name({'hash': digest}),
+            'source': 'auto',
+            # 描述来自判定回执时**不置** `descriptionManual`：它不是人写的，
+            # 用户手改之后仍由 `save_sticker_description` 接管（§45.2 的排序式标记）。
+            'description': given,
+            'descriptionManual': False,
+            'aliases': [],
+            # 已经有描述 = 可用了，直接进目录（`refresh_sticker_catalog` 只取 active）。
+            'status': 'active' if given else 'pending',
+            # 模型猜出来的（§45.7）；第一层收藏与磁盘扫描都是 False。
+            'guessed': True if guessed else False,
+            'updatedAt': now,
+        }
+        try:
+            created = await self.db_create('interlude_sticker', {**base, 'createdAt': now})
+        except Exception as error:  # noqa: BLE001 - 唯一索引冲突 / 旧库缺列都别炸叙事
+            self.report_standalone_operation(
+                'standard', 'warn', '表情包收藏建档失败 素材=%s 错误=%s', asset_id, error,
+            )
+            return None
+        asset = created if isinstance(created, dict) else {**base, 'createdAt': now}
+        self.report_standalone_operation(
+            'standard', 'info', '已收藏入站表情包 素材=%s 大小=%dB 来源种类=%s 模型判定=%s',
+            asset_id, len(payload), kind or 'sticker', 'yes' if guessed else 'no',
+        )
+        if given and isinstance(asset, dict) and asset.get('id') is not None:
+            await self._index_sticker_description(asset.get('id'), given, [])
+        return {**asset, '_payload': payload, '_described': bool(given)}
+
+    async def _sticker_prior_by_hash(self, digest: str) -> Optional[dict[str, Any]]:
+        """同内容已经在库里的那一行（**任何状态**）；没有回 `None`。
+
+        抽出来是因为两条路径都要它，而且**判定的时机不同**：第一层在写盘前
+        （`store_collected_sticker` 内部），第二层必须**在调模型之前**就问
+        （§45.7："不要为同一张图付两次钱"）。
+        """
+        for row in await self.db_get('interlude_sticker', {}):
+            if isinstance(row, dict) and row.get('hash') == digest:
+                return row
+        return None
+
+    async def _revive_missing_sticker(self, prior: Any) -> None:
+        """文件曾被删、同内容又回来了：只复活状态（描述还在，**不重花模型调用**）。
+
+        `status != 'missing'` 时什么都不做——别的状态意味着"这一行好好的"，
+        去重逻辑本来就会让调用方跳过它。
+        """
+        if not isinstance(prior, dict) or prior.get('status') != 'missing':
+            return
+        await self.db_set(
+            'interlude_sticker', {'id': prior.get('id')},
+            {'status': 'active' if prior.get('description') else 'pending', 'updatedAt': self.now()},
+        )
+
+    def _sticker_guess_prefetch_ok(self, source: str, config: Any) -> bool:
+        """**不下载就能排除的**：来源自带的体积信息先卡一道（超过上限根本不下载）。
+
+        **同步**（不是协程）：里面只有一次 `stat` 与一次长度乘法，没有 await 点。
+        写成 `async def` 会让调用方拿到一个"永远为真"的协程对象——闸门静默失效
+        （这个坑在实现时踩过一次，回归用例 `test_an_oversized_local_file_...` 钉着）。
+
+        `http(s)` 来源在下载前拿不到体积（适配层给不出 content-length），只能等
+        `_sticker_source_bytes()` 拿回来之后再判（那时 `store_collected_sticker`
+        还有一道同样的上限）。这里能省的是**本地文件**与 **data URI** 这两种：
+        前者一次 `stat`，后者按 base64 的上界算（每 4 字符解出 3 字节），不必解码。
+        """
+        max_bytes = float((config or {}).get('max_file_size_mb') or 10) * 1024 * 1024
+        value = str(source if source is not None else '').strip()
+        if not value:
+            return False
+        if value.startswith('data:image/'):
+            return len(value) * 3 / 4 <= max_bytes
+        if value.startswith('onebot-file:'):
+            value = _local_sticker_path(value[len('onebot-file:'):])
+        elif value.lower().startswith('file://'):
+            value = _local_sticker_path(value)
+        else:
+            return True  # 网络来源：体积未知，交给下载后的校验
+        try:
+            return os.path.getsize(value) <= max_bytes
+        except OSError:
+            return True  # 读不到大小（文件没了 / 权限）→ 交给后面的字节校验去判
+
+    def _sticker_guess_budget(self) -> bool:
+        """这一分钟还能不能再花一次判定调用？（滑动窗口；超了回 `False` 且不记账）
+
+        防的是刷图潮：一次发二十张图不该变成二十次识图调用（token 黑洞）。
+        跨消息累计，与"每条消息最多几张"（`STICKER_GUESS_MAX_PER_MESSAGE`）正交。
+        """
+        now = self.now_ms()
+        recent = [
+            stamp for stamp in (getattr(self, '_sticker_guess_calls', None) or [])
+            if now - stamp < STICKER_GUESS_WINDOW_MS
+        ]
+        if len(recent) >= STICKER_GUESS_MAX_PER_MINUTE:
+            self._sticker_guess_calls = recent
+            return False
+        recent.append(now)
+        self._sticker_guess_calls = recent
+        return True
+
+    def _warn_sticker_guess_unavailable(self) -> None:
+        """节流 warn：开了第二层判据，却**没有**可用的识图模型。
+
+        这是**能力缺失**（坑 25：需要用户看见的东西不许走 diagnostic）——用户打开开关
+        是期待"表情包能自己进库"的，不报就等于静默失效。但一条接一条的图片不能各报一条。
+        """
+        now = self.now_ms()
+        last = getattr(self, '_sticker_guess_warn_at', 0) or 0
+        if now - last < STICKER_COLLECT_WARN_INTERVAL_MS:
+            return
+        self._sticker_guess_warn_at = now
+        self.report_standalone(
+            'warn', '已开启「识图模型判断普通图片」，但没有可用的识图模型；已跳过图片判定。',
+        )
+
+    async def guess_sticker_like(
+        self, payload: bytes, mime_type: str, source: str = '',
+    ) -> Optional[dict[str, Any]]:
+        """**第二层判据**：问识图模型这张普通图片是不是表情包（`§45.7`）。
+
+        调用前提（由 `collect_incoming_stickers` 保证）：入站种类是 `image`、
+        `stickers.auto_collect_guess` 打开、预筛通过、去重没命中、节流还有额度。
+        **它永远不能否决第一层**——第一层认的种类根本走不到这里。
+
+        **任何失败一律回 `None`（= 不收）**：没有可用模型 / 超时 / 异常 / JSON 解析失败 /
+        字段缺失 / 置信度不够。能力缺失打一条节流 warn；"判成照片 / 拿不准"只记 debug，
+        不刷屏。收的充要条件在 `helpers.sticker_guess_result()` 一处。
+        """
+        describer = self.sticker_describer
+        guesser = getattr(describer, 'guess_sticker', None)
+        available = getattr(describer, 'guess_sticker_available', None)
+        if not callable(guesser) or not callable(available):
+            # 老描述器 / 没有这一层能力：按"能力缺失"处理（fail closed，绝不收）。
+            self._warn_sticker_guess_unavailable()
+            return None
+        try:
+            usable = bool(available())
+        except Exception:  # noqa: BLE001 - 提供者内部异常按"不可用"处理
+            usable = False
+        if not usable:
+            self._warn_sticker_guess_unavailable()
+            return None
+        try:
+            visual = await self.image_bytes_to_native(payload, mime_type)
+        except Exception as error:  # noqa: BLE001 - 转不成原生视觉输入 = 判不了
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '图片判定跳过：图片转换失败 来源=%s 错误=%s',
+                clip(source, 120), error,
+            )
+            return None
+        if not visual:
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '图片判定跳过：无法转成原生视觉输入 来源=%s',
+                clip(source, 120),
+            )
+            return None
+        try:
+            raw = await asyncio.wait_for(
+                guesser(
+                    pick(visual, 'dataUri', 'data_uri'),
+                    pick(visual, 'mimeType', 'mime_type'),
+                    clip(source, 255),
+                ),
+                STICKER_GUESS_TIMEOUT_SECONDS,
+            )
+        except Exception as error:  # noqa: BLE001 - 超时 / 网络 / 解析异常都按"不收"
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '图片判定失败（按不收处理）来源=%s 错误=%s',
+                clip(source, 120), error,
+            )
+            return None
+        verdict = sticker_guess_result(raw)
+        if not verdict:
+            # 判成照片 / 截图 / 置信度不够 / 回执缺字段：**只记 debug，不刷屏**。
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '图片判定不是表情包，未收藏 来源=%s 回执种类=%s',
+                clip(source, 120), str(pick(raw if isinstance(raw, dict) else {}, 'kind') or ''),
+            )
+            return None
+        self.report_standalone_operation(
+            'standard', 'info', '图片判定为表情包 来源=%s 种类=%s 置信度=%.2f',
+            clip(source, 120), verdict.get('kind'), float(verdict.get('confidence') or 0),
+        )
+        return verdict
+
+    async def _sticker_source_bytes(self, source: str) -> Optional[bytes]:
+        """按入站来源取原始字节：本地文件 → 适配器解析 → 远程抓取。
+
+        读本地文件的口子**只对适配器给出来的来源开放**（`onebot-file:` / `file://`），
+        与 `chunk3.fetch_native_image` 的信任边界同源；`onebot-url:` / `http(s)` 走
+        `Transport.fetch_image`（`ctx.http_get` 是它的回退，由 `chunk3` 提供）。
+        """
+        value = source.strip()
+        if not value:
+            return None
+        if value.startswith('data:image/'):
+            match = re.match(r'^data:(image/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$', value, re.IGNORECASE)
+            if not match:
+                return None
+            try:
+                import base64 as _base64  # noqa: PLC0415 - 只在这条冷路径上需要
+
+                return _base64.b64decode(match.group(2))
+            except Exception:  # noqa: BLE001 - 坏 base64 按拿不到字节处理
+                return None
+        if value.startswith('onebot-file:'):
+            return await self._read_sticker_local_file(_local_sticker_path(value[len('onebot-file:'):]))
+        if value.lower().startswith('file://'):
+            return await self._read_sticker_local_file(_local_sticker_path(value))
+        if re.match(r'^https?://', value, re.IGNORECASE):
+            fetcher = getattr(self.transport, 'fetch_image', None)
+            if not callable(fetcher):
+                return None
+            try:
+                data = await asyncio.wait_for(fetcher(value), STICKER_FETCH_TIMEOUT_SECONDS)
+            except Exception as error:  # noqa: BLE001 - 网络失败 = 拿不到字节
+                self.report_standalone_operation(
+                    'diagnostic', 'debug', '入站表情包下载失败 错误=%s', error,
+                )
+                return None
+            return bytes(data) if data else None
+        # 既不是本地路径也不是 http —— 不猜（`onebot-file` 之外的自造前缀一律跳过）。
+        return None
+
+    async def _read_sticker_local_file(self, path: str) -> Optional[bytes]:
+        """读本地图片文件；失败只记 debug（**绝不**把路径铺到标准频道）。"""
+        if not path:
+            return None
+        try:
+            return await asyncio.to_thread(_read_local_bytes, path)
+        except Exception as error:  # noqa: BLE001 - 文件没了 / 权限不够都算拿不到
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '入站表情包本地文件读取失败 错误=%s', error,
+            )
+            return None
+
+    def _warn_sticker_collect_unavailable(self, count: int) -> None:
+        """节流 warn：一批里有表情包但一个字节都没拿到。
+
+        为什么不静默：这是**能力缺失**（没配 vision 之外的另一种缺失——拿不到字节），
+        用户看不到就会以为"她怎么不收表情包"。但同一批十个表情包不能打十条。
+        """
+        now = self.now_ms()
+        last = getattr(self, '_sticker_collect_warn_at', 0) or 0
+        if now - last < STICKER_COLLECT_WARN_INTERVAL_MS:
+            return
+        self._sticker_collect_warn_at = now
+        self.report_standalone(
+            'warn', '收到 %d 个表情包，但拿不到图片字节（本地路径与 fetch_image 都不可用），已跳过收藏。',
+            count,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 表情库资产的人工维护（本移植版新增 v1.8.0；控制台「表情库」页的写入路径）
+    #
+    # 这三条是**唯一**的写入路径：控制台不许自己拼 SQL / 自己写文件。
+    # 纪律与 `console_api.set_config_value` 同源：白名单 + 先校验后写 + 写完即生效。
+    # ------------------------------------------------------------------ #
+
+    async def sticker_asset_row(self, row_id: Any) -> Optional[dict[str, Any]]:
+        """按主键取一行素材；取不到回 `None`（调用方自己给 400）。"""
+        if row_id is None:
+            return None
+        rows = await self.db_get('interlude_sticker', {'id': row_id}, {'limit': 1})
+        for row in rows:
+            if isinstance(row, dict):
+                return row
+        return None
+
+    async def save_sticker_description(
+        self, row_id: Any, description: Any, replace_aliases: bool = True,
+    ) -> Optional[dict[str, Any]]:
+        """人工写入一条描述，并**钉住**它不被自动扫描覆盖。
+
+        为什么需要"钉住"：`scan_sticker_library()` 按"文件哈希没变 + 状态不是 active"
+        重新登记。用户把一条已经描述过的素材**停用**再启用、或描述被清空，
+        下一次扫描就会把它当"待描述"交给视觉模型 —— 于是用户手改的描述被模型顶掉。
+
+        做法（受控偏离 §45.2，**排序式**而不是加锁标记）：
+
+        * `descriptionManual = true` 是"这一条是人写的"的持久标记；
+        * 扫描在描述前先看这个标记：已标记的素材**跳过模型调用**，直接按 `active` 登记；
+        * 用户清空描述（传空串）时标记**保留** —— 清空也是人的意思，扫描不许替她编回去；
+        * 想恢复自动描述就走 `restore_sticker_description()`（控制台按钮），
+          它把标记摘掉并交给下一轮扫描。
+        """
+        row = await self.sticker_asset_row(row_id)
+        if row is None:
+            raise ValueError('找不到这条素材')
+        text = str(description if description is not None else '').strip()
+        patch: dict[str, Any] = {
+            'description': text,
+            'descriptionManual': True,
+            'updatedAt': self.now(),
+        }
+        if replace_aliases:
+            patch['aliases'] = []
+        if text:
+            # 有描述就说明它可用了：立刻进目录（`refresh_sticker_catalog` 只取 active）。
+            patch['status'] = 'active' if row.get('status') != 'missing' else 'missing'
+        await self.db_set('interlude_sticker', {'id': row_id}, patch)
+        await self.refresh_sticker_catalog()
+        return await self.sticker_asset_row(row_id)
+
+    async def restore_sticker_description(self, row_id: Any) -> Optional[dict[str, Any]]:
+        """摘掉"人写的"标记，让下一轮扫描用视觉模型重新描述。"""
+        row = await self.sticker_asset_row(row_id)
+        if row is None:
+            raise ValueError('找不到这条素材')
+        await self.db_set('interlude_sticker', {'id': row_id}, {
+            'descriptionManual': False,
+            'description': '',
+            'aliases': [],
+            'embedding': [],
+            'status': 'pending',
+            'updatedAt': self.now(),
+        })
+        await self.refresh_sticker_catalog()
+        return await self.sticker_asset_row(row_id)
+
+    async def rename_sticker(self, row_id: Any, name: Any) -> Optional[dict[str, Any]]:
+        """改一个素材的短名（只影响界面，不进提示词的目录文本）。"""
+        row = await self.sticker_asset_row(row_id)
+        if row is None:
+            raise ValueError('找不到这条素材')
+        await self.db_set('interlude_sticker', {'id': row_id}, {
+            'name': str(name if name is not None else '').strip(),
+            'updatedAt': self.now(),
+        })
+        return await self.sticker_asset_row(row_id)
+
+    async def set_sticker_disabled(self, row_id: Any, disabled: Any) -> Optional[dict[str, Any]]:
+        """停用 / 启用一条素材：只改 `status`，**不动文件**。
+
+        `disabled` 不在 `refresh_sticker_catalog` 的 `status='active'` 查询里，
+        所以停用后它立刻从模型可见的目录消失；启用时按"有没有描述"回到
+        `active` / `pending`（没描述的交给扫描补）。
+        """
+        row = await self.sticker_asset_row(row_id)
+        if row is None:
+            raise ValueError('找不到这条素材')
+        if disabled is True:
+            status = 'disabled'
+        elif row.get('description'):
+            status = 'active'
+        else:
+            status = 'pending'
+        await self.db_set('interlude_sticker', {'id': row_id}, {
+            'status': status, 'updatedAt': self.now(),
+        })
+        await self.refresh_sticker_catalog()
+        return await self.sticker_asset_row(row_id)
+
+    async def delete_sticker(
+        self, row_id: Any, purge: bool = False, purge_file: bool = False,
+    ) -> bool:
+        """删除一条素材。
+
+        **语义（控制台契约）：默认只标记不删文件。**
+
+        * `purge=False`：行标成 `missing`（文件与描述都留着）。它立刻退出模型目录，
+          重扫时如果文件还在会被复活 —— 这是"误删可恢复"的那条路。
+        * `purge=True`：**连文件一起删**（行还是保留成 `missing`，留一个"这里曾经有东西"
+          的痕迹，也让"同一个表情再被发一次"不会重新入库 —— 与参考插件的 orphan
+          索引同一考虑）。
+
+        文件删除由控制台侧（`console_api`）执行，因为它才是"路径必须落在表情库内"
+        的那个校验点；服务层这里只维护数据。
+        """
+        row = await self.sticker_asset_row(row_id)
+        if row is None:
+            return False
+        await self.db_set('interlude_sticker', {'id': row_id}, {
+            'status': 'missing', 'updatedAt': self.now(),
+        })
+        await self.refresh_sticker_catalog()
+        return True
+
+    async def record_sticker_use(self, asset: Any) -> None:
+        """投递成功后给素材的 `uses` 加一（控制台排序用）。
+
+        计数失败**只 warn**：一次已经发出去的投递不该因为计数失败被判成失败。
+        """
+        asset_id = pick(asset, 'assetId', 'asset_id')
+        if not asset_id:
+            return
+        try:
+            rows = await self.db_get('interlude_sticker', {'assetId': asset_id}, {'limit': 1})
+            row = rows[0] if rows and isinstance(rows[0], dict) else None
+            if row is None:
+                return
+            current = row.get('uses')
+            uses = int(current) + 1 if isinstance(current, int) and not isinstance(current, bool) else 1
+            await self.db_set('interlude_sticker', {'id': row.get('id')}, {'uses': uses})
+        except Exception as error:  # noqa: BLE001 - 计数是旁路
+            self.report_standalone(
+                'warn', '表情包用量计数失败 素材=%s 错误=%s', asset_id, error,
+            )
 
     async def refresh_sticker_catalog(self) -> None:
         """上游 `refreshStickerCatalog()`（`src/service.ts:2386`）。"""
