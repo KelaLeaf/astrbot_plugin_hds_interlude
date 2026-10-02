@@ -73,7 +73,7 @@ CORE_HANDLED_ACTIONS = frozenset({
     # ⚠️ 这两条**必须**留在本表里（v1.7.8 复核）：NapCat 的公开动作表里**没有**
     # `get_qzone_feeds` / `get_qzone_msg_list`（它只有发 / 删说说），一旦被当平台动作
     # 派到传输层，就是 `retcode 1404 不支持的Api`（用户贴过日志）。`_PLATFORM_CALLS`
-    # 里那两条映射只是目录↔平台的双向对账与 SnowLuma 直通口，默认路径走不到。
+    # 里那两条映射现已改成 `@unsupported`（没有任何后端认识它们），默认路径走不到。
     'list_qzone_posts', 'list_qzone_feeds',
 })
 

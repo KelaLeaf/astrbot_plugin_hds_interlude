@@ -513,7 +513,7 @@ def extract_session_audio_sources(session: Any) -> list[str]:
     """上游 `extractSessionAudioSources`：抽出原生音频通道可取回的语音 / 音频 token。
 
     与图片不同，语音记录优先用 OneBot 的 file token：原始语音 URL 提供的是 SILK，
-    只有 SnowLuma 的服务端转码（`get_record out_format`）才能变成模型可读的载荷。
+    只有服务端转码（NapCat `get_record` 的 `out_format`）才能变成模型可读的载荷。
     """
     raw = _str(session.get('content') if isinstance(session, dict) else getattr(session, 'content', None))
     sources: list[str] = []
@@ -554,7 +554,7 @@ def extract_session_audio_sources(session: Any) -> list[str]:
         for match in _AUDIO_TAG_RE.finditer(raw):
             add(match.group(1))
     # OneBot 可能只留下一个只带 file token 的 CQ record 段（典型的 NapCat /
-    # SnowLuma 私聊语音），或者带一个我们无法转码的额外 url 字段。
+    # 私聊语音），或者带一个我们无法转码的额外 url 字段。
     for match in _CQ_RECORD_RE.finditer(raw):
         fields: dict[str, str] = {}
         for part in match.group(1).split(','):

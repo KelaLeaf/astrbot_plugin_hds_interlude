@@ -51,12 +51,15 @@ from ..qzone import (
     call_qzone_action,
     call_qzone_cgi,
     QZONE_CGI_BY_ID,
+    QZONE_COOKIE_APIS,
+    QZONE_COOKIE_DOMAINS,
     QzoneCgiUnavailable,
     evaluate_qzone_gate,
     match_qzone_feed_content,
     normalize_qzone_feed_entry,
     normalize_qzone_msg_entry,
     probe_qzone_available,
+    qzone_action_label,
     qzone_feed_candidates,
     qzone_intent_from_payload,
     qzone_records_for_endpoint,
@@ -162,7 +165,7 @@ def _target_uin_param(value: Any) -> Any:
     """`target_uin` 参数：上游 `Number(targetUin)`；非数字则**不带这个键**。
 
     JS 的 `Number('abc')` 是 NaN、序列化成 JSON 会变 `null`；本移植版直接省略，
-    免得把 `null` 当"归属 0"发给 SnowLuma。
+    免得把 `null` 当"归属 0"发给平台。
     """
     if value is None or value == '':
         return None
@@ -183,8 +186,7 @@ def _target_uin_param(value: Any) -> Any:
 def _qzone_feed_row(raw: Any) -> dict[str, Any]:
     """把动态行补成"归一化层认识"的形状：只做**时间字段的搬运**。
 
-    两条读通道的时间字段名不一样：SnowLuma 的 `get_qzone_feeds` 回 `time`（秒），
-    NapCat WS 方案（QZone CGI）回 `abstime`（秒，`feedstime` 是人读格式）。
+    平台接口回的是 `abstime`（秒，`feedstime` 是人读格式），而归一化层只认 `time`。
     而 `normalize_qzone_feed_entry` / `fresh_qzone_feeds` / `qzone_feed_candidates`
     只认 `time`——不补这一下，CGI 通道回来的每条动态都会被当成 1970 年、被新鲜度
     过滤整批丢掉（"看着在轮询、其实一条都不进剧本"）。
@@ -205,6 +207,31 @@ def _qzone_feed_row(raw: Any) -> dict[str, Any]:
 def _js_round(value: float) -> int:
     """JS `Math.round`：半值向上（Python 的 `round` 是银行家舍入）。"""
     return int(math.floor(value + 0.5))
+
+
+def _qzone_channel_required_text(action: str, reason: Any = '') -> str:
+    """空间动作**当前做不了**时的失败文案（`_qzone_run_action` 用）。
+
+    必须让人看完就知道下一步做什么：说清这条能力靠谁（NapCat 取登录凭据 + QZone CGI）、
+    别人为什么不行（这条动作在任何后端的 API 清单里都不存在，发给平台只会换回
+    `retcode 1404 不支持的Api`）、**取凭据要哪两个接口 / 哪个版本**、以及当前卡在哪一步。
+    `reason` 由 `qzone_cgi_auth` 逐接口逐域写好（"接口不存在（1404）"、"没登录"、
+    "这个域没 p_skey" 三种现场一眼分得开）。
+    """
+    label = qzone_action_label(action)
+    why = str(reason or '').strip() or 'NapCat 的取凭据通道本次没有走通'
+    return (
+        '「%s」需要 NapCat 通道（取登录凭据 → 打 QZone CGI），当前没走通：%s。'
+        '这条动作不在任何后端的 API 清单里（NapCat 的空间动作只有发/删说说两条，'
+        '`%s` 发给平台只会换回 retcode 1404 不支持的Api），所以只能靠这条通道。'
+        '可执行的路：① 确认 NapCat 在线且已登录、版本够新——取凭据要 `%s` '
+        '（AstrBot 参考插件 astrbot_plugin_qzone_tools v5.7.5 把这条要求写成'
+        '「NapCat > 4.17.55」）；两个接口按这个顺序试，域按 %s 依次试，'
+        '谁能给出 p_skey 就用谁；'
+        '② 平台实例是 aiocqhttp/NapCat（其它 OneBot 实现给不出 cookie）；'
+        '③ 都正常还是失败就看上面那句原因——它是平台/传输层给的原话。'
+    ) % (label, why, action, ' / '.join(QZONE_COOKIE_APIS),
+         ' / '.join(QZONE_COOKIE_DOMAINS))
 
 
 class ServiceChunk13(ServiceBase):
@@ -242,8 +269,11 @@ class ServiceChunk13(ServiceBase):
         runtime = self.qzone_runtime()
         call = self._qzone_call_onebot()
         request = self._qzone_cgi_request()
-        if not callable(call) and not callable(request):
-            return {'ok': False, 'error': '没有可用的 OneBot 连接（QQ 空间读取需要 NapCat 或 SnowLuma）。'}
+        if not callable(call):
+            return {
+                'ok': False,
+                'error': _qzone_channel_required_text('get_qzone_feeds', '没有可用的 OneBot 连接'),
+            }
         target = str(payload.get('targetUin') or payload.get('target_uin') or '').strip()
         count = payload.get('count')
         try:
@@ -257,40 +287,54 @@ class ServiceChunk13(ServiceBase):
         if kind == 'feed':
             rows = await self._qzone_run_action(call, 'get_qzone_feeds', cgi_params, cgi_action)
             items = _as_list(rows.get('feeds') if isinstance(rows, dict) else rows)
-            return {'ok': True, 'error': '', 'feeds': items, 'count': len(items),
-                    'channel': 'napcat' if callable(request) else 'snowluma'}
+            return {'ok': True, 'error': '', 'feeds': items, 'count': len(items)}
         if not target and not include_self:
             return {'ok': False, 'error': '读取某人的说说需要 target_uin（留空时只表示"她自己"）。'}
         rows = await self._qzone_run_action(call, 'get_qzone_msg_list', cgi_params, cgi_action)
         items = _as_list(rows.get('posts') if isinstance(rows, dict) else rows)
-        return {'ok': True, 'error': '', 'posts': items, 'count': len(items),
-                'channel': 'napcat' if callable(request) else 'snowluma'}
+        return {'ok': True, 'error': '', 'posts': items, 'count': len(items)}
 
     async def _qzone_run_action(
         self, call: Any, action: str, params: dict[str, Any], cgi_action: str = '',
     ) -> Any:
-        """执行一次空间动作：**优先 NapCat WebSocket 方案**（get_cookies + QZone CGI），
-        拿不到 cookie（没装 NapCat / 没登录 / 不是 OneBot）才回退到 SnowLuma 扩展动作。
+        """执行一次空间动作：**只有一条路**——NapCat 的 `get_cookies` + QZone CGI。
 
         参考实现 `Eganchiyu/qzone-sdk` 的 NapCat 认证：AstrBot 本来就用 WebSocket 连着
-        NapCat，所以 `get_cookies` 直通即可，**不需要额外依赖、也不需要 SnowLuma**。
+        NapCat，所以 `get_cookies` 直通即可，**不需要额外依赖**。
+
+        `action` 是**本插件内部的动作键**（`QZONE_CGI_BY_ID`），不是任何后端的 action 名：
+        这条动作在平台的 API 清单里根本不存在，所以**没有"回退平台动作"这条路**。
+        拿不到 cookie / 传输层没有原始 HTTP 能力时直接以一句能照着做的话失败
+        （`QzoneCgiUnavailable` + `_qzone_channel_required_text`），绝不把不存在的 API
+        打出去换一个 `retcode 1404 不支持的Api`。
+
+        历史：v1.7.1–v1.7.9 这里挂着一条"回退上游 Koishi QQ 空间适配器扩展动作"的分支，
+        在 AstrBot 上那个后端根本不存在——真机表现就是每轮好友动态扫描都以
+        `retcode 1404 不支持的Api get_qzone_feeds` + "结果未知，请勿自动重试"告终
+        （用户贴日志点名）。v1.7.10 整条分支删除。
+
+        `action` 不在 `QZONE_CGI_BY_ID` 里时（例如标准 OneBot 的 `send_msg`）**不进**
+        这条通道：那不是空间动作，照旧交给 `call_qzone_action` 打平台。
         """
         cgi_action = cgi_action or QZONE_CGI_BY_ID.get(action, '')
+        if not cgi_action:
+            return await call_qzone_action(call, action, params)
         request = self._qzone_cgi_request()
-        if cgi_action and callable(request):
-            try:
-                data = await call_qzone_cgi(request, call, cgi_action, params)
-                self.report_standalone(
-                    'debug', 'QQ 空间动作走 NapCat WS 通道 动作=%s', cgi_action,
-                )
-                return data
-            except QzoneCgiUnavailable as error:
-                # 没 cookie 是**预期**情况（例如平台不是 NapCat）——静默回退，
-                # 只在真的两个通道都不可用时才让上层报错。
-                self.report_standalone(
-                    'debug', 'QQ 空间 NapCat 通道不可用，回退扩展动作 动作=%s 原因=%s', action, error,
-                )
-        return await call_qzone_action(call, action, params)
+        if not callable(request):
+            raise QzoneCgiUnavailable(
+                _qzone_channel_required_text(action, '传输层没有原始 HTTP 能力（request_text）'),
+                action, None, False,
+            )
+        try:
+            data = await call_qzone_cgi(request, call, cgi_action, params)
+        except QzoneCgiUnavailable as error:
+            # 没 cookie / 没接上：把原因包进"下一步做什么"的文案再上抛。**不回退**——
+            # 没有任何后端认识这个动作名（回退只会换 1404），而且写动作更不能重发。
+            raise QzoneCgiUnavailable(
+                _qzone_channel_required_text(action, error), action, error.retcode, False,
+            ) from error
+        self.report_standalone('debug', 'QQ 空间动作走 NapCat QZone CGI 动作=%s', cgi_action)
+        return data
 
     def _qzone_call_onebot(self) -> Any:
         """`Transport.call_onebot` 的绑定方法；传输层没这个能力时返回 None。"""
@@ -374,7 +418,7 @@ class ServiceChunk13(ServiceBase):
         prefer_self_id: str = '',
     ) -> dict[str, Any]:
         """执行一条空间动作（上游 `qzoneExecute`）：限流门 → pending 审计行（在故事
-        串行队列内**原子预留配额**）→ SnowLuma 动作（网络调用留在队列外）→ 回写
+        串行队列内**原子预留配额**）→ 空间动作（网络调用留在队列外）→ 回写
         `confirmed` / `failed` / `unknown`。
 
         传输类异常与"成功帧但无 tid"都记 `unknown`——结果不明按已发生保守计入
@@ -399,7 +443,7 @@ class ServiceChunk13(ServiceBase):
             self.report_standalone('warn', 'QQ 空间动作没有可用连接 账号=%s 原因=传输层未提供 call_onebot', account_self_id)
             return {
                 'ok': False, 'tid': '',
-                'error': '没有可用的 OneBot（SnowLuma）连接（账号 %s 不在线）；不会改用其他账号执行空间动作。' % account_self_id,
+                'error': '没有可用的 OneBot 连接（账号 %s 不在线）；不会改用其他账号执行空间动作。' % account_self_id,
             }
         now = self.now()
         story_id = str(pick(story, 'id') or '')
@@ -525,7 +569,7 @@ class ServiceChunk13(ServiceBase):
                 }
                 target_uin = _target_uin_param(payload.get('targetUin'))
                 if target_uin is not None:
-                    params['target_uin'] = target_uin
+                    params['targetUin'] = target_uin
                 await self._qzone_run_action(call, 'comment_qzone', params, 'comment')
                 await self._qzone_set_status(pending_id, {
                     'status': 'confirmed', 'postedAt': self.now(),
@@ -550,7 +594,7 @@ class ServiceChunk13(ServiceBase):
                     forward_params['content'] = payload.get('content')
                 forward_target = _target_uin_param(payload.get('targetUin'))
                 if forward_target is not None:
-                    forward_params['target_uin'] = forward_target
+                    forward_params['targetUin'] = forward_target
                 await self._qzone_run_action(call, 'forward_qzone', forward_params, 'forward')
                 await self._qzone_set_status(pending_id, {
                     'status': 'confirmed', 'postedAt': self.now(),
@@ -572,7 +616,7 @@ class ServiceChunk13(ServiceBase):
             params = {'tid': payload.get('tid') or ''}
             target_uin = _target_uin_param(payload.get('targetUin'))
             if target_uin is not None:
-                params['target_uin'] = target_uin
+                params['targetUin'] = target_uin
             await self._qzone_run_action(call, 'like_qzone', params, 'like')
             await self._qzone_set_status(pending_id, {
                 'status': 'confirmed', 'postedAt': self.now(),
@@ -589,7 +633,7 @@ class ServiceChunk13(ServiceBase):
             # `failed`——`unknown` 保守计入配额（**可能已发生**），语义上禁止自动重试。
             # 这一条是**所有写路径共用**的收口（发帖 / 评论 / 点赞 / 转发 / 改可见范围
             # 都从这里出去），所以漏标的可能只出在"抛出来的异常是不是
-            # `QzoneActionError`"这一层——`call_qzone_action`（SnowLuma）与
+            # `QzoneActionError`"这一层——`call_qzone_action`（平台原生动作）与
             # `call_qzone_cgi`（NapCat WS）两条通道都已经按同一口径打标。
             ambiguous = isinstance(error, QzoneActionError) and error.ambiguous
             note = '（结果未知：请求可能已生效，为避免重复不会自动重试。）' if ambiguous else ''
@@ -641,7 +685,7 @@ class ServiceChunk13(ServiceBase):
         此后带附件的说说一律拒绝改可见范围（纯文字不受影响），直到用户删掉那个文件——
         "绝不允许静默毁第二条说说"。上次的 tid / 时间 / 解除办法都写在日志与拒绝理由里。
 
-        这条动作**只有** NapCat WS 通道能做（NapCat / SnowLuma 都没有原生动作），
+        这条动作**只有** QZone CGI 通道能做（任何后端的 API 清单里都没有它），
         拿不到 cookie 就明确失败，**不**回落平台。
 
         成功会：写剧本条目（她自己记得改了谁能看）+ 审计行 `confirmed` + 一条标准日志。
@@ -1006,14 +1050,14 @@ class ServiceChunk13(ServiceBase):
             now = self.now()
             try:
                 # **只读动作一律走 `_qzone_run_action`**：NapCat WS 方案（get_cookies +
-                # QZone CGI）优先，拿不到 cookie 才回落 SnowLuma 扩展动作。
+                # QZone CGI）；拿不到 cookie 就明确失败，不再回落平台动作。
                 # 早先这里直接 `call_qzone_action`，等于把 `get_qzone_feeds` 当成
                 # NapCat 的**原生动作**打过去——NapCat 根本没有这条 API，于是每轮都
                 # 以 `retcode 1404 不支持的Api get_qzone_feeds` 失败（用户贴日志点名）。
-                # 两个通道认的参数名不同：CGI 认 `page`、SnowLuma 认 `page_num`，都带上。
+                # `page` 是 CGI 认的那个键（历史上另有一条回退通道认 `page_num`，
+                # 已随 v1.7.10 删除；这里只留真正会用到的那一个）。
                 raw = _mapping(await self._qzone_run_action(call, 'get_qzone_feeds', {
                     'page': QZONE_FEED_PAGE_NUM,
-                    'page_num': QZONE_FEED_PAGE_NUM,
                     'count': QZONE_FEED_PAGE_SIZE,
                 }, 'feed'))
                 feeds = [
@@ -1022,6 +1066,13 @@ class ServiceChunk13(ServiceBase):
                         for item in _rows(pick(raw, 'feeds'))
                     ) if entry
                 ]
+            except QzoneCgiUnavailable as error:
+                # **通道没接上** ≠ 这轮网不好：静默跳过会让"开了自动浏览却永远没动静"
+                # 变成无解之谜。按小时节流把原因与下一步做什么说一次（可见 warn）。
+                self.note_access_skip(
+                    'qzone-channel-required', QZONE_AUTO_FEED_NOTE_INTERVAL_MS, '%s', error,
+                )
+                return
             except Exception:  # noqa: BLE001 - feeds CGI 间歇失败：静默跳过，下轮再试
                 return
             # 去重账本：`feed-seen` 行的 tid 即 `feeds.key`（7 天窗足够覆盖时间窗双倍）。
@@ -1040,18 +1091,16 @@ class ServiceChunk13(ServiceBase):
                 try:
                     # 同一条口径：正文对齐也走 CGI 优先的读通道（NapCat 没有
                     # `get_qzone_msg_list` 这条原生动作）。参数名两个通道各取所需：
-                    # CGI 认 `targetUin` + `count`，SnowLuma 认 `target_uin` + `num`。
+                    # CGI 认 `targetUin` + `count`。
                     target_uin = _target_uin_param(pick(feed, 'uin'))
                     list_raw = _mapping(await self._qzone_run_action(call, 'get_qzone_msg_list', {
-                        'target_uin': target_uin,
                         'targetUin': target_uin,
-                        'num': QZONE_FEED_MSG_NUM,
                         'count': QZONE_FEED_MSG_NUM,
                     }, 'moods'))
                     entries = [
                         entry for entry in (
                             normalize_qzone_msg_entry(item)
-                            # CGI 通道把说说列表放在 `posts` 里，SnowLuma 放在 `msglist`。
+                            # CGI 通道把说说列表放在 `posts` 里。
                             for item in _rows(pick(list_raw, 'msglist', 'posts'))
                         ) if entry
                     ]

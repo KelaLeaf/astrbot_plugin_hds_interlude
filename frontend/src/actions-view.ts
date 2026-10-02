@@ -148,7 +148,8 @@ export function rowState(row: PlatformActionRow): {
  * `test_qzone_napcat_channel.BackendCatalogTests` 与这里的断言互为对账。
  *
  * core 只声明**正式通道**，所以这里也没有"回退徽章"这种东西：一条动作的非标准后端
- * 全部平铺成一枚枚同权重的标注（回退实现留在适配层，不在界面上承诺）。
+ * 全部平铺成一枚枚同权重的标注（**没有回退实现**：上游那套扩展动作名在 AstrBot 的任何
+ * 后端上都不存在，回退分支已整条删除——见 `docs/PORTING_NOTES.md` §34.1）。
  */
 export const BACKEND_ONEBOT = '标准 OneBot'
 export const BACKEND_NAPCAT = 'NapCat 专属'

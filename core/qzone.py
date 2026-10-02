@@ -50,9 +50,18 @@ __all__ = [
     'QZONE_CONFIG_BOUNDS',
     'QZONE_FEED_APPID_TALK',
     'QZONE_UGC_RIGHT_VALUES',
+    'QZONE_CGI_BY_ID',
+    'QZONE_ACTION_LABELS',
+    'QZONE_COOKIE_APIS',
+    'QZONE_COOKIE_DOMAINS',
+    'QZONE_CGI_READ_ACTIONS',
+    'QZONE_READ_ACTIONS',
     'TID_PATTERN',
     'QzoneActionError',
+    'QzoneCgiUnavailable',
     'call_qzone_action',
+    'qzone_action_is_read',
+    'qzone_action_label',
     'evaluate_qzone_gate',
     'fresh_qzone_feeds',
     'local_day_key',
@@ -402,7 +411,7 @@ def evaluate_qzone_gate(
 
 
 # --------------------------------------------------------------------------- #
-# SnowLuma 动作防御性归一化
+# 空间条目防御性归一化
 # --------------------------------------------------------------------------- #
 
 
@@ -555,11 +564,17 @@ async def call_qzone_action(call: Any, action: str, params: Any = None) -> Any:
     `call` 就是 `Transport.call_onebot` 的绑定方法（或任何
     `async (action, params) -> frame` 的可调用对象）；失败抛 `QzoneActionError`。
     成功时返回回执的 `data`（缺失按 `{}`，与上游 `frame.data ?? {}` 一致）。
+
+    **失败口径按动作的读写性质分**（`qzone_action_is_read`）：只读动作（看好友动态 /
+    看某人说说）重试永远安全，拿不到响应就明说"只读动作，重试安全"、`ambiguous=False`；
+    写动作（发 / 删 / 评 / 赞 / 转 / 改可见范围）一律 `ambiguous=True`——"可能已生效"
+    的东西禁止自动重试，否则就是重复发帖那条老路。
     """
+    read_only = qzone_action_is_read(action)
     if not callable(call):
         raise QzoneActionError(
-            '%s 调用异常（结果未知，请勿自动重试）：传输层不可用' % action,
-            action, None, True,
+            _transport_failure_text(action, read_only, '传输层不可用'),
+            action, None, not read_only,
         )
     try:
         frame = await call(action, dict(params or {}))
@@ -567,7 +582,7 @@ async def call_qzone_action(call: Any, action: str, params: Any = None) -> Any:
         raise
     except Exception as error:  # noqa: BLE001 - 传输层异常一律收敛成 QzoneActionError
         raise QzoneActionError(
-            '%s 调用异常（结果未知，请勿自动重试）：%s' % (action, error), action, None, True,
+            _transport_failure_text(action, read_only, error), action, None, not read_only,
         ) from error
     if not _is_ok_frame(frame):
         row = frame if _is_mapping(frame) else {}
@@ -580,14 +595,64 @@ async def call_qzone_action(call: Any, action: str, params: Any = None) -> Any:
     return {} if data is None else data
 
 
+def _transport_failure_text(action: str, read_only: bool, detail: Any) -> str:
+    """传输层失败（拿不到回执 / 抛异常）的文案。
+
+    写动作保留「结果未知，请勿自动重试」这句话——它是调用方（`chunk13` 的审计行与
+    限流闸）认的标记；只读动作用另一句，**不**许出现"重试"两个字的否定式：
+    日志层的 `[自动重试]` 标签早先就是被我们自己写的"请勿自动重试"命中的
+    （标签与正文说的是反话，真机日志点名）。
+    """
+    if read_only:
+        return '%s 读取失败：%s（只读动作，重试不会产生副作用）' % (action, detail)
+    return '%s 调用异常（结果未知，请勿自动重试）：%s' % (action, detail)
+
+
 # --------------------------------------------------------------------------- #
 # NapCat WebSocket 方案（本移植版新增，参考 Eganchiyu/qzone-sdk 的 NapCat 认证）
 # --------------------------------------------------------------------------- #
 
-#: 取 Cookie 的域（腾讯只认这个域下的 p_skey）。
-QZONE_COOKIE_DOMAIN = 'user.qzone.qq.com'
+#: 取 Cookie 的域，**按顺序尝试**（`qzone_cgi_auth`）。
+#:
+#: 腾讯把 QZone 的 `p_skey` 放在 QZone 那个域下，但"那个域"在不同实现里写法不同：
+#:
+#: * `user.qzone.qq.com` —— 参考实现 `Eganchiyu/qzone-sdk`（v1.7.1 的移植依据）；
+#: * `qzone.qq.com` —— AstrBot 参考插件 `Wyccotccy/astrbot_plugin_qzone_tools` v5.7.5
+#:   （`main.py:866` / `main.py:870`，README.md:374 也把它列为"发说说失败"的排查项）。
+#:
+#: NapCat 的取 Cookie 接口是按后缀匹配还是精确相等，文档（napcat.apifox.cn/226657041e0）
+#: 只写了"需要获取 cookies 的域名"、没说匹配规则——**未核实**。所以两个都试，
+#: 谁能给出带 `p_skey` 的 Cookie 就用谁（都拿不到才失败，失败文案里逐域写明原因）。
+QZONE_COOKIE_DOMAINS: tuple[str, ...] = ('user.qzone.qq.com', 'qzone.qq.com')
 
-#: 走 "NapCat WS 方案" 的 qzone 动作 → CGI 动作名（`core/qzone_cgi.py` 里的构造函数）。
+#: 取 Cookie 的**两个 NapCat 接口，按顺序尝试**（`qzone_cgi_auth`）：
+#:
+#: * `get_credentials`（napcat.apifox.cn/226657054e0，系统接口「获取登录凭证」）：
+#:   回 `data.cookies` + `data.token`（CSRF token，number）。**参考插件的主路**
+#:   （`astrbot_plugin_qzone_tools` v5.7.5 `main.py:866`，失败才退到 `:870` 的
+#:   `get_cookies`），它的 README.md:374 说版本要求 `> 4.17.55` 正是"需支持
+#:   `get_credentials` / `get_cookies`"。
+#: * `get_cookies`（napcat.apifox.cn/226657041e0，用户接口「获取 Cookies」）：
+#:   回 `data.cookies` + `data.bkn`（CSRF token）。
+#:
+#: 两个接口的**参数完全一样**（`domain` 必填）、回执的 Cookie 字段也同名——
+#: 所以解析只写一份（`_cookie_string_from_frame`），"剥壳"那一层更是全动作共用
+#: （`astrbot_bridge._onebot_payload_frame`）。
+#: 顺序即优先级：先用参考插件验证过的那条，不可用（不存在 / 没登录 / 没 cookie）再退。
+QZONE_COOKIE_APIS: tuple[str, ...] = ('get_credentials', 'get_cookies')
+
+#: 主域（失败文案与历史调用点引用它）。
+QZONE_COOKIE_DOMAIN = QZONE_COOKIE_DOMAINS[0]
+
+#: **目录 id → CGI 动作名**（`core/qzone_cgi.py` 里的构造函数）。
+#:
+#: 这张表回答"这条目录动作有没有 CGI 出口"，与 `QZONE_CGI_BY_ID`（内部键 → CGI）配对，
+#: 两个方向由 `test_qzone_napcat_channel` 对账。
+#:
+#: ⚠️ 前两行的 CGI 出口**生产路径不走**：发/删说说用 NapCat 的原生动作
+#: （`send_qzone_msg` / `delete_qzone_msg`，`_PLATFORM_CALLS` 里那两条），
+#: 能不用 cookie 就不用 cookie；CGI 构造器留着是为了"平台原生那条不可用时还有路可走"
+#: 的完整性（v1.7.10 复核时确认：只有 `publish` / `delete` 两个构造器有两条路）。
 QZONE_CGI_ACTIONS = {
     'publish_qzone_post': 'publish',
     'delete_qzone_post': 'delete',
@@ -600,14 +665,21 @@ QZONE_CGI_ACTIONS = {
     'set_qzone_visibility': 'update_visibility',
 }
 
-#: 平台动作名 → CGI 动作名。Chunk13 用它决定"这条动作能不能走 NapCat WS 通道"
+#: **内部动作键 → QZone CGI 动作名**。Chunk13 用它决定"这条动作有没有 CGI 出口"
 #: （`_qzone_run_action` 不传 `cgi_action` 时的默认查表）。
 #: （`QZONE_CGI_ACTIONS` 是**目录 id** → CGI，两者别混。）
 #:
-#: **唯一例外**：`set_qzone_visibility`（v1.7.5）。NapCat 与 SnowLuma 都**没有**
-#: "改说说可见范围"这条原生动作（NapCat 扩展动作只有 `send_qzone_msg` /
-#: `delete_qzone_msg`），所以这里的键直接用**目录 id**——它没有平台名字可用。
-#: 这个动作也只能走 CGI（`chunk13` 拿不到 cookie 时明确失败，不回落平台）。
+#: ⚠️ 这里的键是**本插件内部的选择名**，**不是任何后端的 action 名**：
+#: `comment_qzone` / `like_qzone` / `forward_qzone` / `get_qzone_feeds` /
+#: `get_qzone_msg_list` 在 AstrBot 世界的任何后端上都不存在（v1.7.1 曾把它们当"上游
+#: Koishi QQ 空间适配器的扩展动作"、发给平台做回退，换回的就是
+#: `retcode 1404 不支持的Api get_qzone_feeds`；v1.7.10 整条回退通道已删）。
+#: NapCat 自己的空间动作**只有** `/send_qzone_msg` 与 `/delete_qzone_msg` 两条
+#: （权威清单 https://napcat.apifox.cn/llms.txt：496813058e0 / 496813059e0），
+#: 评论 / 点赞 / 转发 / 看好友动态 / 看某人说说 / 改可见范围**都只能由本插件自己
+#: 打 QZone CGI**（`core/qzone_cgi.py`，前提是 NapCat 通道给得出 cookie）。
+#: 前两行的键恰好等于 NapCat 的原生动作名（同一条能力有原生与 CGI 两条路），
+#: 这也是全表里**唯一**两个可以原样发给平台的键。
 QZONE_CGI_BY_ID = {
     'send_qzone_msg': 'publish',
     'delete_qzone_msg': 'delete',
@@ -619,41 +691,130 @@ QZONE_CGI_BY_ID = {
     'set_qzone_visibility': 'update_visibility',
 }
 
+#: 内部动作键 → 中文标签。失败文案要点名"哪个动作需要什么"，别让用户拿动作名去猜。
+QZONE_ACTION_LABELS: dict[str, str] = {
+    'send_qzone_msg': '发表说说',
+    'delete_qzone_msg': '删除说说',
+    'comment_qzone': '评论说说',
+    'like_qzone': '点赞说说',
+    'forward_qzone': '转发说说',
+    'get_qzone_msg_list': '看某人的说说',
+    'get_qzone_feeds': '看好友动态',
+    'set_qzone_visibility': '改说说可见范围',
+}
+
+#: **只读**的 CGI 动作：不产生任何副作用，重试永远安全。
+QZONE_CGI_READ_ACTIONS = frozenset({'feed', 'moods'})
+
+#: 只读的**内部**动作键——从 `QZONE_CGI_BY_ID` 派生（别在两处各抄一份）。
+QZONE_READ_ACTIONS = frozenset(
+    name for name, cgi in QZONE_CGI_BY_ID.items() if cgi in QZONE_CGI_READ_ACTIONS
+)
+
+
+def qzone_action_is_read(action: Any) -> bool:
+    """这个动作是不是**只读**（重试安全）。内部动作键与 CGI 动作名两种写法都认。
+
+    读写性质决定失败口径：只读动作拿不到响应就明说"可以重试"；写动作一律
+    `ambiguous`（"可能已生效"，禁止自动重试）——发帖 / 删除 / 评论 / 点赞 / 转发 /
+    改可见范围一个都不许重试。
+    """
+    name = str(action or '').strip()
+    return name in QZONE_READ_ACTIONS or name in QZONE_CGI_READ_ACTIONS
+
+
+def qzone_action_label(action: Any) -> str:
+    """动作的中文标签（查不到就用动作名本身：宁可显示机器名，也别显示空白）。"""
+    name = str(action or '').strip()
+    return QZONE_ACTION_LABELS.get(name) or name or 'QQ 空间动作'
+
 #: v1.7.6 删掉了 `QZONE_NAPCAT_ONLY_ACTIONS`：它只被测试引用，运行期没有任何消费点，
 #: 而"哪些动作是 NapCat 专属"的**唯一真源**是目录里的
 #: `platform_actions.napcat_actions()`（由每条 `PlatformAction.backends` 派生）。
 #: 留着它就是第二个真源——两处迟早对不上，界面上标的和跑起来的就会不一致。
+#:
+#: v1.7.10 同理删掉了"NapCat 原生动作白名单"常量：上游 Koishi 的 QQ 空间适配器回退
+#: 通道整条删掉之后，没有任何运行期代码需要它（"哪些键可以发给平台"由适配层
+#: `_PLATFORM_CALLS` 一处表达）。NapCat API 清单的权威依据留在 `QZONE_CGI_BY_ID`
+#: 的注释与 `test_astrbot_bridge.MissingPlatformActionTests` 的对账用例里。
 
 
 class QzoneCgiUnavailable(QzoneActionError):
-    """拿不到 NapCat cookie（没装 NapCat / 没登录 / 平台不是 OneBot）。"""
+    """NapCat 通道用不了（拿不到 cookie / 传输层没有原始 HTTP 能力）。
+
+    与"网络不好"是两回事：重试一万次也还是同一个结果，所以要按节流把原因与
+    "下一步做什么"说给用户听（`chunk13.qzone_feed_sweep` 的可见 warn）。
+    `ambiguous` 恒为 `False`：这条动作**没有发出去**，不涉及"结果未知"。
+    """
+
+
+def _cookie_string_from_frame(frame: Any) -> str:
+    """从取 Cookie 的回执里读 Cookie 串（`get_credentials` / `get_cookies` **共用这一份**）。
+
+    两个接口都是 `{'ok': True, 'data': {'cookies': …}}` 这个形状（传输层的
+    `Transport.call_onebot` 契约；"剥掉 OneBot 信封"那一步在适配层
+    `astrbot_bridge._onebot_payload_frame` 一处完成，两个动作走的是同一条路，
+    所以这里**不**需要按动作分支）。拿不到就是空串。
+    """
+    return str(_pick(_pick(frame, 'data') or {}, 'cookies') or '')
 
 
 async def qzone_cgi_auth(call: Any, login_call: Any = None) -> dict[str, Any]:
-    """按 qzone-sdk 的 NapCat 方案取认证：`get_cookies` + `get_login_info`。
+    """按 NapCat 方案取认证：`get_credentials` → `get_cookies`（各自逐域）+ `get_login_info`。
 
     `call` 是 OneBot 直通（`Transport.call_onebot`）；`login_call` 缺省复用 `call`。
-    拿不到 `p_skey` 一律抛 `QzoneCgiUnavailable`（**不静默降级**：QQ 空间写动作
+    拿不到 `p_skey` 一律抛 `QzoneCgiUnavailable`（**不静默降级**：QQ 空间动作
     没有 cookie 就是做不了，得让上层说清楚）。
+
+    **两层顺序，都照参考实现来**：
+
+    1. **接口顺序** `QZONE_COOKIE_APIS`：先 `get_credentials`（参考插件
+       `astrbot_plugin_qzone_tools` v5.7.5 `main.py:866` 的主路），不可用再 `get_cookies`
+       （它的 `:870`）。两个接口参数相同（`domain` 必填）、Cookie 字段同名，解析共用
+       `_cookie_string_from_frame`；"剥壳"在适配层一处完成。
+    2. **域顺序** `QZONE_COOKIE_DOMAINS`：`user.qzone.qq.com` → `qzone.qq.com`。
+       光有 Cookie 串不算数——没有 `p_skey` 就算不出 `g_tk`，等于这个域白问。
+
+    都拿不到时失败文案**按接口分段、逐域写明原因**：这样"接口不存在（1404）"、
+    "没登录"、"这个域没 p_skey" 三种现场一眼分得开。
     """
     from .qzone_cgi import qzone_auth_from_cookies
 
     if not callable(call):
         raise QzoneCgiUnavailable('QQ 空间（NapCat 通道）不可用：传输层没接上', None, None, False)
-    try:
-        cookie_frame = await call('get_cookies', {'domain': QZONE_COOKIE_DOMAIN})
-    except Exception as error:  # noqa: BLE001 - 平台异常收敛成"不可用"
+    sections: list[str] = []
+    cookies = ''
+    for api in QZONE_COOKIE_APIS:
+        api_reasons: list[str] = []
+        for domain in QZONE_COOKIE_DOMAINS:
+            try:
+                cookie_frame = await call(api, {'domain': domain})
+            except Exception as error:  # noqa: BLE001 - 平台异常收敛成"这个域没戏"
+                api_reasons.append('%s：调用异常（%s）' % (domain, error))
+                continue
+            if not _is_ok_frame(cookie_frame):
+                head, detail = _frame_status_text(cookie_frame if _is_mapping(cookie_frame) else {})
+                api_reasons.append('%s：%s %s' % (domain, head, detail))
+                continue
+            candidate = _cookie_string_from_frame(cookie_frame)
+            if not candidate.strip():
+                api_reasons.append('%s：平台没回 cookie' % domain)
+                continue
+            try:
+                qzone_auth_from_cookies(candidate, '')
+            except Exception as error:  # noqa: BLE001
+                api_reasons.append('%s：%s' % (domain, error))
+                continue
+            cookies = candidate
+            break
+        if cookies:
+            break
+        sections.append('%s（%s）' % (api, '；'.join(api_reasons) or '没有可用结果'))
+    if not cookies:
         raise QzoneCgiUnavailable(
-            'QQ 空间（NapCat 通道）不可用：get_cookies 失败（%s）' % error, 'get_cookies', None, True,
-        ) from error
-    if not _is_ok_frame(cookie_frame):
-        head, detail = _frame_status_text(cookie_frame if _is_mapping(cookie_frame) else {})
-        raise QzoneCgiUnavailable(
-            'QQ 空间（NapCat 通道）不可用：%s %s' % (head, detail), 'get_cookies', None, False,
+            'QQ 空间（NapCat 通道）不可用：取登录凭据失败——%s' % '；'.join(sections),
+            '/'.join(QZONE_COOKIE_APIS), None, False,
         )
-    cookies = _pick(_pick(cookie_frame, 'data') or {}, 'cookies') or ''
-    if not str(cookies).strip():
-        raise QzoneCgiUnavailable('QQ 空间（NapCat 通道）不可用：平台没回 cookie', 'get_cookies', None, False)
     uin = ''
     info_call = login_call if callable(login_call) else call
     try:
@@ -662,10 +823,10 @@ async def qzone_cgi_auth(call: Any, login_call: Any = None) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - 取不到 uin 时下面的 cookie 解析还能兜
         uin = ''
     try:
-        return qzone_auth_from_cookies(str(cookies), uin)
+        return qzone_auth_from_cookies(cookies, uin)
     except Exception as error:  # noqa: BLE001
         raise QzoneCgiUnavailable(
-            'QQ 空间（NapCat 通道）不可用：%s' % error, 'get_cookies', None, False,
+            'QQ 空间（NapCat 通道）不可用：%s' % error, '/'.join(QZONE_COOKIE_APIS), None, False,
         ) from error
 
 
@@ -746,7 +907,9 @@ async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = Non
     **失败分类与 `call_qzone_action` 同一套口径**（别在这里另造词汇）：
 
     * 传输层拿不到响应（`request_text` 回 `None`，或它抛了异常 / 超时）→
-      `ambiguous=True`：请求**可能已经打到腾讯**了，结果未知，禁止自动重试；
+      **写**动作 `ambiguous=True`：请求**可能已经打到腾讯**了，结果未知，禁止自动
+      重试；**只读**动作（`feed` / `moods`）`ambiguous=False` 且文案写"重试安全"
+      ——读不产生副作用，没必要按写动作的保守口径吓自己；
     * 拿到响应而 `success_or_error` 判 `code != 0` → `ambiguous=False`：
       接口明确拒绝（没登录 / 风控 / 参数不对），重试是安全的；
     * 成功 → 回动作结果。`upload_image` 回的是上传回执里的 `data`（一张图的描述：
@@ -757,6 +920,7 @@ async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = Non
 
     if not callable(request):
         raise QzoneCgiUnavailable('QQ 空间（NapCat 通道）不可用：传输层没有原始 HTTP 能力', action, None, False)
+    read_only = qzone_action_is_read(action)
     if auth is None:
         auth = await qzone_cgi_auth(call, login_call)
     method, url, headers, data = qzone_cgi_request(action, auth, params or {})
@@ -769,13 +933,14 @@ async def call_qzone_cgi(request: Any, call: Any, action: str, params: Any = Non
         raise
     except Exception as error:  # noqa: BLE001 - 与 `call_qzone_action` 同一个收敛口径
         raise QzoneActionError(
-            '%s 调用异常（结果未知，请勿自动重试）：%s' % (action, error), action, None, True,
+            _transport_failure_text(action, read_only, error), action, None, not read_only,
         ) from error
     if text is None:
-        # 与上面那条同一条文案口径：'结果未知，请勿自动重试' 是调用方认的那句话。
+        # 与上面那条同一条文案口径：写动作的 '结果未知，请勿自动重试' 是调用方认的那句话；
+        # 只读动作（feed / moods）重试安全，走 `_transport_failure_text` 的另一句。
         raise QzoneActionError(
-            '%s 调用异常（结果未知，请勿自动重试）：请求没有回执（网络或平台拦截）' % action,
-            action, None, True,
+            _transport_failure_text(action, read_only, '请求没有回执（网络或平台拦截）'),
+            action, None, not read_only,
         )
     if action == 'feed':
         items = cgi.feed_items_from_text(text)

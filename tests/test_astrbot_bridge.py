@@ -1182,27 +1182,76 @@ def _async_return(value):
     return fake
 
 
-class _FakeOneBotClient:
-    """`aiocqhttp` 客户端的桩：把 `call_action` 的调用记下来并按 id 回帧。
+#: "这个动作没登记过"与"登记成 None"必须分得开（后者是平台真的回了 `data: null`）。
+_MISSING = object()
 
-    `pages` 的每条可以是一个帧（dict）、一个 `id -> 帧` 的函数，或一个要抛的异常。
-    真实宿主的 `call_action` 是协程，所以这里也是 `async def`。
+
+class _FakeActionFailed(Exception):
+    """`aiocqhttp.ActionFailed` 的最小替身（只保留探针用得到的两个属性）。
+
+    真实那个类在 `aiocqhttp/exceptions.py:45`：`.result` 是整只失败回执、
+    `.retcode` 是它的返回码，`__repr__` 打印成 `<ActionFailed status:'failed', …>`。
+    桥接层**不 import** 它（宿主换实现时要能降级），只用属性探针认，所以替身要一样。
     """
 
-    def __init__(self, pages=None):
+    def __init__(self, result: dict):
+        super().__init__(
+            "<ActionFailed " + ", ".join('%s:%r' % item for item in result.items()) + ">"
+        )
+        self.result = result
+
+    @property
+    def retcode(self):
+        return self.result['retcode']
+
+
+class _FakeOneBotClient:
+    """`aiocqhttp` 客户端的桩：把 `call_action` 的调用记下来并按 id / 动作名回帧。
+
+    **回执形状逐字照抄宿主的真实契约**（`aiocqhttp/api_impl.py:28-39` 的
+    `_handle_api_result`）：`status == 'failed'` 时**抛** `ActionFailed`，成功时
+    **只回 `result['data']`**。早先这个桩回的是整只信封，于是桥接层那个
+    "把剥了壳的 `data` 当成'平台没有回执'"的 bug 在测试里永远看不见
+    （真机上 `get_cookies` 就是这么废掉的，坑 39）。
+
+    * `pages`：按 `params['id']` 取页（合并转发那批用例）；
+    * `actions`：按动作名取（QQ 空间的 `get_cookies` / `get_login_info` 等）；
+    * 每条可以是 dict（`data` 本身）、要抛的异常、或 `(action, params) -> 值` 的函数；
+    * `envelope=True` 改回"整只信封"的老形状：用来覆盖**另一种** OneBot 客户端实现
+      （不是 aiocqhttp 那种会自己抛异常的），桥接层对两种都得认。
+    """
+
+    def __init__(self, pages=None, actions=None, envelope: bool = False):  # noqa: D107
         self.pages = dict(pages or {})
+        self.actions = dict(actions or {})
+        self.envelope = envelope
         self.calls: list[tuple[str, dict]] = []
 
     async def call_action(self, action, **params):
         self.calls.append((action, dict(params)))
-        page = self.pages.get(params.get('id'))
-        if isinstance(page, BaseException):
-            raise page
-        if callable(page):
-            return page(params.get('id'))
-        if page is None:
-            return {'status': 'ok', 'retcode': 0, 'data': {'messages': []}}
-        return page
+        value = _MISSING
+        if action in self.actions:
+            value = self.actions[action]
+        elif params.get('id') in self.pages:
+            value = self.pages[params.get('id')]
+        if isinstance(value, BaseException):
+            raise value
+        if callable(value):
+            value = value(action, params)
+        if value is _MISSING:
+            data: Any = {'messages': []}
+        elif value is None:
+            return None  # 平台回 `data: null`（显式登记的 None ≠ 没登记）
+        elif isinstance(value, dict):
+            data = value
+        else:
+            return value  # 非 dict 的形状原样回（桥接层要能报"平台没有回执（X）"）
+        if self.envelope:
+            return data
+        status = data.get('status')
+        if status == 'failed':
+            raise _FakeActionFailed(data)
+        return data.get('data') if 'data' in data else data
 
     def request_ids(self):
         return [params.get('id') for _action, params in self.calls]
@@ -4021,6 +4070,286 @@ class ModelCapabilitySelfCheckTests(unittest.TestCase):
         plugin.bridge.log_model_capabilities = boom  # type: ignore[method-assign]
         asyncio.run(plugin.initialize())
         asyncio.run(plugin._self_check_model_capabilities())
+
+def _aiocqhttp_available() -> bool:
+    """宿主库在不在当前解释器里（CI 的纯工作区环境没有它）。"""
+    try:
+        import aiocqhttp  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+# --------------------------------------------------------------------------- #
+# OneBot 动作回执的**真实形状**（aiocqhttp 剥过信封）
+# --------------------------------------------------------------------------- #
+
+
+class OnebotFrameShapeTests(unittest.TestCase):
+    """`_call_onebot_on` 必须认**宿主真正回的那只形状**。
+
+    真机现场（用户贴的日志）：
+
+        [WARN] OneBot 动作执行失败：get_cookies 失败：平台没有回执（dict）
+
+    宿主的 OneBot 客户端就是 `aiocqhttp.CQHttp`（`AiocqhttpAdapter` 把它挂在平台实例的
+    `bot` 上），而 `call_action` **不回整只信封**：`aiocqhttp/api_impl.py:28-39` 的
+    `_handle_api_result` 在 `status == 'failed'` 时抛 `ActionFailed`，成功只回
+    `result['data']`。`get_cookies` 的成功回执因此是 `{'cookies': …, 'bkn': …}`
+    ——一个**没有 status / retcode 的 dict**，早先被判成"平台没有回执"，
+    于是整条 QZone CGI 通道（评论 / 点赞 / 转发 / 看好友动态）跟着废掉。
+    """
+
+    def _transport(self, bot):
+        """装好平台实例**并登记一次会话坐标**——`call_onebot` 是按坐标取客户端的。"""
+        bridge = _bridge_with_bot({}, bot)
+        event = FakeMessageEvent(components=[Plain('hi')])
+        endpoint = bridge_module.endpoint_for_event(event)
+        bridge.remember_event(event, session_view(event, endpoint), endpoint)
+        return bridge.transport
+
+    def _call(self, bot, action='get_cookies', params=None):
+        return asyncio.run(self._transport(bot).call_onebot(action, dict(params or {})))
+
+    def test_unwrapped_data_is_a_success_not_a_missing_receipt(self):
+        """`{'cookies': …, 'bkn': …}`（剥壳后的 `data`）= **成功**，且值原样带出。"""
+        bot = _FakeOneBotClient(actions={'get_cookies': {
+            'cookies': 'uin=o010001; p_skey=pin1n2x3', 'bkn': '1869525896',
+        }})
+        result = self._call(bot, params={'domain': 'user.qzone.qq.com'})
+        self.assertIs(result['ok'], True, result)
+        self.assertEqual(result['error'], '')
+        self.assertEqual(result['data'], {
+            'cookies': 'uin=o010001; p_skey=pin1n2x3', 'bkn': '1869525896',
+        })
+        # 参数逐字一致：`domain` 是 NapCat `/get_cookies` 的**必填**参数
+        # （权威文档 https://napcat.apifox.cn/226657041e0.md 的 requestBody.required）。
+        self.assertEqual(bot.calls, [('get_cookies', {'domain': 'user.qzone.qq.com'})])
+
+    def test_get_credentials_has_the_same_unwrapped_shape(self):
+        """取凭据的**另一个**接口（`get_credentials`）也是剥壳 data：判据只有一份。
+
+        `/get_credentials`（napcat.apifox.cn/226657054e0）回 `data.cookies` + `data.token`，
+        `/get_cookies`（226657041e0）回 `data.cookies` + `data.bkn` —— 参数与 Cookie 字段
+        都一样，所以桥接层与 `core/qzone` 都不按接口名分支。
+        """
+        bot = _FakeOneBotClient(actions={'get_credentials': {
+            'cookies': 'uin=o010001; p_skey=pin1n2x3', 'token': 1869525896,
+        }})
+        result = self._call(bot, action='get_credentials', params={'domain': 'qzone.qq.com'})
+        self.assertIs(result['ok'], True, result)
+        self.assertEqual(result['data']['cookies'], 'uin=o010001; p_skey=pin1n2x3')
+        self.assertEqual(bot.calls, [('get_credentials', {'domain': 'qzone.qq.com'})])
+
+    def test_send_qzone_msg_tid_survives_the_unwrapping(self):
+        """`/send_qzone_msg` 的成功回执同样是剥壳后的 `data`（`{'tid': …}`）。"""
+        bot = _FakeOneBotClient(actions={'send_qzone_msg': {'tid': 'TID-0001'}})
+        result = self._call(bot, action='send_qzone_msg')
+        self.assertIs(result['ok'], True, result)
+        self.assertEqual(result['data'], {'tid': 'TID-0001'})
+
+    def test_none_and_scalars_are_still_reported_as_no_receipt(self):
+        """非 dict（`None` / bool / 字符串）= 平台什么都没给：照旧报"没有回执"。
+
+        这几种形状**不能**当成功——`data: null` 与"客户端根本没说"从这里分不开，
+        宁可让调用方看见一句明确的失败（`get_cookies` 拿不到 cookie 会自己再失败一次）。
+        """
+        for value, shown in ((None, 'NoneType'), (True, 'bool'), ('oops', 'str'), (17, 'int')):
+            with self.subTest(value=value):
+                bot = _FakeOneBotClient(actions={'get_cookies': value})
+                result = self._call(bot)
+                self.assertIs(result['ok'], False, value)
+                self.assertIn('平台没有回执（%s）' % shown, result['error'])
+                self.assertNotIn('ambiguous', result)
+
+    def test_a_platform_failure_frame_is_definite_not_ambiguous(self):
+        """`ActionFailed`（`status:failed` + retcode）是**明确答复**：不许标 ambiguous。
+
+        真机日志里那句 `不支持的Api get_qzone_feeds` 被写成
+        "传输异常（结果未知，请勿自动重试）"，与 `[自动重试]` 标签自相矛盾——
+        根因就是这里把平台的明确拒绝并进了"可能没送到"那一支。
+        """
+        bot = _FakeOneBotClient(actions={'get_qzone_feeds': {
+            'status': 'failed', 'retcode': 1404, 'message': '不支持的Api get_qzone_feeds',
+        }})
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            result = self._call(bot, action='get_qzone_feeds')
+        self.assertIs(result['ok'], False)
+        self.assertEqual(result['retcode'], 1404)
+        self.assertIn('retcode=1404', result['error'])
+        self.assertIn('不支持的Api get_qzone_feeds', result['error'])
+        self.assertNotIn('ambiguous', result, '明确答复不是"结果未知"')
+        self.assertNotIn('结果未知', result['error'])
+        levels = [item.args[0] for item in logged.call_args_list if item.args]
+        self.assertIn('warn', levels, '平台明确拒绝也要留一条可见 warn')
+
+    def test_a_transport_exception_stays_ambiguous(self):
+        """真·传输异常（超时 / 断连）仍然 `ambiguous`：调用方不得自动重试。"""
+        bot = _FakeOneBotClient(actions={'comment_qzone': asyncio.TimeoutError('timed out')})
+        result = self._call(bot, action='comment_qzone')
+        self.assertIs(result['ok'], False)
+        self.assertIs(result['ambiguous'], True)
+        self.assertIn('结果未知，请勿自动重试', result['error'])
+
+    def test_the_debug_shape_line_never_prints_cookie_values(self):
+        """debug 的形状行只报类型与键名——**cookie 值绝不进日志**。"""
+        secret = 'p_skey=THIS-MUST-NOT-APPEAR-IN-LOGS'
+        bot = _FakeOneBotClient(actions={'get_cookies': {'cookies': secret, 'bkn': '1869525896'}})
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            self._call(bot)
+        rendered = ' '.join(str(item) for item in logged.call_args_list)
+        self.assertNotIn('THIS-MUST-NOT-APPEAR-IN-LOGS', rendered)
+        self.assertIn('cookies=<已隐去>', rendered)
+        self.assertIn('bkn=<已隐去>', rendered)
+        # 形状本身要看得到（真机排障就靠它分辨"整只信封"与"剥了壳的 data"）。
+        # `log_fallback` 在这一路被 mock 掉了，拿到的是**模板 + 参数**，所以分开断。
+        self.assertIn('回执形状', rendered)
+        self.assertIn('dict{cookies=<已隐去>, bkn=<已隐去>}', rendered)
+
+    def test_an_envelope_from_another_client_is_still_understood(self):
+        """另一种 OneBot 客户端实现（回整只信封）也要能跑：两种形状都认。"""
+        bot = _FakeOneBotClient(actions={'get_cookies': {
+            'status': 'ok', 'retcode': 0, 'data': {'cookies': 'uin=o1; p_skey=x'},
+        }}, envelope=True)
+        result = self._call(bot)
+        self.assertIs(result['ok'], True, result)
+        self.assertEqual(result['data'], {'cookies': 'uin=o1; p_skey=x'})
+
+    @unittest.skipUnless(_aiocqhttp_available(), '装了 aiocqhttp 才核对宿主的真实契约')
+    def test_the_host_library_contract_is_what_we_modelled(self):
+        """**契约哨兵**：直接读宿主库里那段代码，确认桩与实现说的是同一件事。
+
+        `_handle_api_result` 必须是"失败抛 `ActionFailed`、成功只回 `data`"。
+        宿主哪天换了这套契约，这条用例先红，而不是等真机日志再来一次。
+        """
+        import inspect
+        import aiocqhttp.api_impl as api_impl
+
+        source = inspect.getsource(api_impl._handle_api_result)
+        self.assertIn("result['status'] == 'failed'", source)
+        self.assertIn('raise ActionFailed(result=result)', source)
+        self.assertIn("return result.get('data')", source)
+
+# --------------------------------------------------------------------------- #
+# 与 NapCat 的 API 清单对账：**不许把不存在的动作名发给平台**
+# --------------------------------------------------------------------------- #
+
+
+#: 上游 Koishi 的 QQ 空间适配器才有的扩展动作名 —— AstrBot 世界的**任何**后端都没有。
+#:
+#: 权威依据：NapCat 的整份 API 清单（https://napcat.apifox.cn/llms.txt）里只有两条
+#: QQ 空间动作：`496813058e0`「发表QQ空间说说」`/send_qzone_msg` 与 `496813059e0`
+#: 「删除QQ空间说说」`/delete_qzone_msg`。真机上把这几个名字发给 NapCat 的回报就是
+#: `retcode 1404 不支持的Api get_qzone_feeds`。
+MISSING_PLATFORM_ACTIONS = (
+    'get_qzone_feeds', 'get_qzone_msg_list', 'comment_qzone', 'like_qzone', 'forward_qzone',
+)
+
+
+class MissingPlatformActionTests(unittest.TestCase):
+    """目录动作 → 平台动作名这张表里，**一个不存在的名字都不许有**。
+
+    这几个名字在 v1.7.1–v1.7.9 是"回退通道"用的出口；NapCat 上没有它们，
+    发出去只会失败。现在它们只能作为**插件内部的 CGI 选择键**存在
+    （`core/qzone.py::QZONE_CGI_BY_ID`），永远不许流到平台调用这一层。
+    """
+
+    def test_no_catalog_action_maps_to_a_name_no_backend_has(self):
+        offenders = {
+            action_id: name
+            for action_id, (name, _mapping) in bridge_module._PLATFORM_CALLS.items()
+            if name in MISSING_PLATFORM_ACTIONS
+        }
+        self.assertEqual(
+            offenders, {},
+            '这些动作名在平台的 API 清单里不存在：发过去只会换回 retcode 1404',
+        )
+
+    def test_the_cgi_only_qzone_actions_are_explicitly_unsupported(self):
+        """只能走 QZone CGI 的那几条，在适配层必须显式 `@unsupported`（不是"同名"）。"""
+        for action_id in (
+            'comment_qzone_post', 'like_qzone_post', 'forward_qzone_post',
+            'list_qzone_feeds', 'list_qzone_posts', 'set_qzone_visibility',
+        ):
+            with self.subTest(action_id=action_id):
+                self.assertEqual(
+                    bridge_module._PLATFORM_CALLS[action_id][0],
+                    bridge_module._PLATFORM_ACTION_UNSUPPORTED,
+                    '这几条没有平台出口（只有 CGI），标错了就会往平台打不存在的动作',
+                )
+
+    def test_the_two_native_qzone_actions_still_go_to_the_platform(self):
+        """NapCat 真的有的那两条照旧直发平台（别把能用的也一并关掉）。"""
+        self.assertEqual(bridge_module._PLATFORM_CALLS['publish_qzone_post'][0], 'send_qzone_msg')
+        self.assertEqual(bridge_module._PLATFORM_CALLS['delete_qzone_post'][0], 'delete_qzone_msg')
+
+    def test_the_qzone_internal_keys_never_reach_the_platform_layer(self):
+        """源码哨兵：`_qzone_run_action` 的内部动作键只能是 `QZONE_CGI_BY_ID` 的键。
+
+        它们出现在 core 里是**对的**（那是插件自己的 CGI 选择名）；出现在
+        `_PLATFORM_CALLS` 的值里就是错的（上一条用例盯着）。这条防止有人
+        "顺手把回退接回来"时只改一边。
+        """
+        from plugin.core import qzone as q
+
+        self.assertEqual(set(q.QZONE_CGI_BY_ID), {
+            'send_qzone_msg', 'delete_qzone_msg', 'comment_qzone', 'like_qzone',
+            'forward_qzone', 'get_qzone_msg_list', 'get_qzone_feeds', 'set_qzone_visibility',
+        })
+
+
+# --------------------------------------------------------------------------- #
+# 端到端：真机形状的客户端 → 桥接 → core 的空间读通道
+# --------------------------------------------------------------------------- #
+
+
+class QzoneEndToEndTests(unittest.TestCase):
+    """把真机那条链整条跑通一遍：`aiocqhttp` 形状的客户端 → `AstrbotTransport` →
+    `ServiceChunk13.qzone_read` → QZone CGI。
+
+    真机上坏掉的正是这条链：`get_cookies` 的剥壳回执被判成"没有回执" →
+    拿不到 cookie → 读通道整条不通（而每一段单独看都正常）。
+    这里**不发任何真实请求**：OneBot 侧是桩，HTTP 侧换成返回一页动态文本的假函数。
+    """
+
+    def test_reading_feeds_works_end_to_end_with_the_hosts_real_reply_shape(self):
+        from plugin.tests import test_qzone as qz
+
+        bot = _FakeOneBotClient(actions={
+            # 宿主（aiocqhttp）成功时只回 `data`：两个取凭据接口的真实形状各一份。
+            'get_credentials': {'cookies': 'uin=o010001; p_skey=pin1n2x3', 'token': 1869525896},
+            'get_cookies': {'cookies': 'uin=o010001; p_skey=pin1n2x3', 'bkn': '1869525896'},
+            'get_login_info': {'user_id': 10001},
+        })
+        bridge = _bridge_with_bot({}, bot)
+        event = FakeMessageEvent(components=[Plain('hi')])
+        endpoint = bridge_module.endpoint_for_event(event)
+        bridge.remember_event(event, session_view(event, endpoint), endpoint)
+
+        http_calls: list[dict] = []
+
+        async def fake_request_text(method, url, *, headers=None, data=None, timeout_ms=20000):
+            http_calls.append({'method': method, 'url': url, 'data': dict(data or {})})
+            return (
+                "{ver:1,key:'K1',appid:311,uin:10002,nickname:'\u597d\u53cb',"
+                "abstime:%d,html:'<div>\u4eca\u5929\u5929\u6c14\u5f88\u597d</div>',}"
+                % int(qz.NOW.timestamp() - 1200)
+            )
+
+        bridge.request_text = fake_request_text  # type: ignore[method-assign]
+        host = qz._Host(transport=bridge.transport)
+        result = asyncio.run(host.qzone_read(qz.STORY, 'feed', {'count': 5}))
+
+        self.assertIs(result['ok'], True, result)
+        self.assertEqual([item['key'] for item in result['feeds']], ['K1'])
+        # 平台侧只出现了取登录态那几条：主路 `get_credentials` 通了就不问备路，
+        # **没有**任何空间动作被发出去。
+        self.assertEqual(
+            [name for name, _ in bot.calls], ['get_credentials', 'get_login_info'],
+        )
+        self.assertEqual(bot.calls[0][1], {'domain': 'user.qzone.qq.com'})
+        # CGI 那一页真的被打了，且带上了由 p_skey 算出的 g_tk。
+        self.assertEqual(len(http_calls), 1)
+        self.assertIn('feeds3_html_more', http_calls[0]['url'])
 
 
 if __name__ == '__main__':

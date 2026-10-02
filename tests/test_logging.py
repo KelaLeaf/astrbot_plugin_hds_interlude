@@ -144,6 +144,30 @@ class DetectLogActionTests(unittest.TestCase):
     def test_hard_failure_keywords(self):
         self.assertEqual(detect_log_action("模型调用失败 任务=主叙事", "info"), "error")
 
+    def test_a_negated_retry_is_not_a_retry(self):
+        """"请勿自动重试"是**别重试**，不是要重试。
+
+        真机日志现场：写动作的失败口径里带着这句否定式，`/重试/` 一命中就给整条 warn
+        打上 `[自动重试]` 标签——**标签与正文说的是反话**，看日志的人只会被带偏。
+        """
+        for text in (
+            "OneBot 动作 comment_qzone 传输异常（结果未知，请勿自动重试）：socket closed",
+            "QQ 空间说说发表结果未知（无 tid），已按保守计入配额且不自动重试",
+            "结果未知：请求可能已生效，为避免重复不会自动重试。",
+            "禁止自动重试：这条动作不是幂等的",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(detect_log_action(text, "warn"), "retry")
+
+    def test_a_real_retry_mention_still_counts(self):
+        """反向用例：真的在重试（"已安排自动重试" / "自动重试已停止"）标签照旧。"""
+        for text in (
+            "叙事模型请求失败，已安排自动重试 次数=1/3",
+            "叙事模型自动重试已停止 已尝试=3",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_log_action(text, "warn"), "retry")
+
     def test_warn_level_falls_back_to_warning(self):
         self.assertEqual(detect_log_action("叙事模型响应缓慢", "warn"), "warning")
 

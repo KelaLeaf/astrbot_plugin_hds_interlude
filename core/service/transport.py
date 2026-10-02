@@ -19,7 +19,7 @@
 | 网页观察（Chunk5，上游 Puppeteer） | `ctx.puppeteer.page()` | `search_web` / `visit_web` |
 | typ-0 后台投递出口（Chunk0 `desktop_delivery_handler`） | bridge handler | `deliver_background` |
 | 平台动作目录（本移植版新增，`core/platform_actions.py`） | 参考插件的 `bot.internal._request(action, params)` | `platform_action` |
-| QQ 空间等 SnowLuma 扩展动作直通 | 同上 | `call_onebot` |
+| QQ 空间原生动作直通（发/删说说） | 同上 | `call_onebot` |
 | 「正在输入」状态（NapCat `set_input_status`） | 同上 | `set_input_status` |
 
 **降级原则**（移植约定）：确实无法在 AstrBot 复现的能力
@@ -227,7 +227,7 @@ class Transport(Protocol):
         raise NotImplementedError
 
     async def call_onebot(self, action: str, params: dict[str, Any]) -> SendResult:
-        """原生 OneBot / SnowLuma 动作直通（QQ 空间的 `send_qzone_msg` 等走这里）。
+        """原生 OneBot 动作直通（QQ 空间的 `send_qzone_msg` 等走这里）。
 
         回执校验：帧里 `status == 'ok'` 或 `retcode == 0` → `ok=True` 且
         `data=帧里的 data`；否则 `ok=False`，`error` 带上 status/retcode/message。

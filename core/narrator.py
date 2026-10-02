@@ -415,7 +415,7 @@ class AudioConfig(TypedDict, total=False):
     """原生音频输入配置（上游 `AudioConfig`）。"""
 
     enabled: bool
-    # SnowLuma server-side transcode container for QQ voice records.
+    # Server-side transcode container for QQ voice records (NapCat `get_record`).
     out_format: Literal['mp3', 'wav', 'ogg', 'm4a', 'flac', 'amr']
     # Hard upper bound for one native audio attachment; larger files are skipped.
     max_file_size_mb: float

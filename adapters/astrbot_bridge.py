@@ -1259,7 +1259,7 @@ def _limits_payload(limits: Any) -> dict[str, Any]:
 
 
 def _onebot_forward_fetcher(client: Any) -> Callable[[str], Any]:
-    """`get_forward_msg` 的取一页入口（原生 OneBot 动作，非 SnowLuma）。
+    """`get_forward_msg` 的取一页入口（原生 OneBot 动作）。
 
     core 那边只认"`fetch(id)` 返回 awaitable"这一条契约，参数怎么拼是这里的事
     （OneBot 要 `{'id': …}`）。用 `client.call_action` 直连：`get_forward_msg` 是
@@ -1445,7 +1445,7 @@ def _extract_message_ids(value: Any, depth: int = 0) -> list[str]:
 #
 # 动作 id 用 snake_case 且与 NapCat 的 API 名一致（见 `platform_actions` 的模块
 # 注释），所以映射表里**同名参数也照写一遍**：这张表要能一眼看出"这个动作到底
-# 打给谁、带哪些参数"，而不是靠"没写就是同名"去脑补。改 NapCat / SnowLuma 的
+# 打给谁、带哪些参数"，而不是靠"没写就是同名"去脑补。改 NapCat 的动作名 /
 # 拼写时只动这一处。
 
 #: 值 = `@local`：由适配层自己实现（宿主 TTS / 组合多个平台调用），不经 OneBot 直通。
@@ -1456,7 +1456,7 @@ _PLATFORM_ACTION_UNSUPPORTED = '@unsupported'
 #: 目录动作 id → `(平台动作名, 参数名映射)`；参数名映射是「目录里的 snake_case → 平台要的拼写」。
 _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
     # ---------------- 互动 ----------------
-    # 戳一戳：SnowLuma 有自动路由的 `send_poke`，NapCat 只有 `group_poke` / `friend_poke`。
+    # 戳一戳：NapCat 只有 `group_poke` / `friend_poke`（没有自动路由的 `send_poke`）。
     # 这里的 `@poke` 只是**占位标记**（不是说要把 `@poke` 发出去）：真正的动作名在
     # `_resolve_platform_call` 里按会话类型挑，两个协议端都能用。
     'send_poke': ('@poke', {'user_id': 'user_id', 'group_id': 'group_id'}),
@@ -1483,7 +1483,7 @@ _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
     # 目录里 `get_qq_status` 没有参数（"查自己的状态"），而 `nc_get_user_status`
     # 要一个 user_id：由 `_PLATFORM_SESSION_PARAMS` 从会话坐标补机器人自己。
     'get_qq_status': ('nc_get_user_status', {}),
-    # NapCat / SnowLuma 的公开动作表里都没有这一条；按目录 id 原样试一次，
+    # NapCat 的公开动作表里没有这一条；按目录 id 原样试一次，
     # 平台不认识时会带着它的错误文案失败（不静默、也不假装成功）。
     'get_fun_status_list': ('get_fun_status_list', {}),
     # ---------------- 群信息（只读） ----------------
@@ -1503,7 +1503,7 @@ _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
     ),
     'set_essence_msg': ('set_essence_msg', {'message_id': 'message_id'}),
     'delete_essence_msg': ('delete_essence_msg', {'message_id': 'message_id'}),
-    # NapCat 的 go-cqhttp 兼容名是 `send_group_sign`，SnowLuma 是 `set_group_sign`；
+    # NapCat 两个名字都有（`send_group_sign` 与 go-cqhttp 兼容名 `set_group_sign`）；
     # 目录 id 取的是前者（目录 id 与 NapCat 的 API 名一致）。
     'send_group_sign': ('send_group_sign', {'group_id': 'group_id'}),
     'set_group_card': ('set_group_card', {'user_id': 'user_id', 'card': 'card', 'group_id': 'group_id'}),
@@ -1557,38 +1557,24 @@ _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
     'send_voice': (_PLATFORM_ACTION_LOCAL, {'content': 'content'}),
     'list_voices': (_PLATFORM_ACTION_LOCAL, {}),
     # ---------------- QQ 空间 ----------------
-    # **NapCat 原生的只有发/删说说**（`send_qzone_msg` / `delete_qzone_msg`，见
-    # napcat.apifox.cn/496813058e0 / 496813059e0）；评论、点赞、看说说列表、看好友动态是
-    # **SnowLuma 扩展动作**（`comment_qzone` / `like_qzone` / `get_qzone_msg_list` /
-    # `get_qzone_feeds`）——只装 NapCat 时这四个会以平台原话失败，不会假装成功。
+    # **能发给平台的只有 NapCat 原生那两条**：`send_qzone_msg` / `delete_qzone_msg`
+    # （权威清单 https://napcat.apifox.cn/llms.txt：496813058e0 / 496813059e0）。
+    # 评论 / 点赞 / 转发 / 看好友动态 / 看某人说说 / 改可见范围在**任何后端的 API 清单
+    # 里都不存在**，只能由插件自己打 QZone CGI（`chunk13` + `core/qzone_cgi.py`，
+    # 前提是 NapCat 通道给得出 cookie）——所以下面这几条一律标 `@unsupported`：
+    # 万一有哪条新路径绕到传输层，它会拿到 `unsupported-platform-action`，
+    # 而不是往平台打一个不存在的动作名换回 `retcode 1404 不支持的Api`（真机日志点名）。
     'publish_qzone_post': (
         'send_qzone_msg',
         {'content': 'content', 'ugc_right': 'ugc_right', 'images': 'images',
          'target_uins': 'target_uins'},
     ),
-    'comment_qzone_post': (
-        'comment_qzone', {'tid': 'tid', 'content': 'content', 'target_uin': 'target_uin'},
-    ),
-    'like_qzone_post': ('like_qzone', {'tid': 'tid', 'target_uin': 'target_uin'}),
-    # v1.7.1：转发与"看好友动态"。**首选 NapCat WebSocket 方案**（chunk13 里 CGI 优先），
-    # 这里的 SnowLuma 名只是回退通道；映射必须存在（目录动作不许有"没有出口"的）。
-    'forward_qzone_post': (
-        'forward_qzone', {'tid': 'tid', 'content': 'content', 'target_uin': 'target_uin'},
-    ),
-    # v1.7.5：改说说可见范围（`emotion_cgi_update`）。**NapCat 与 SnowLuma 都没有**
-    # 这条原生动作（NapCat 的扩展动作只有 `send_qzone_msg` / `delete_qzone_msg`），
-    # 它只能走本机的 QZone CGI 通道（`chunk13` 的 `qzone_execute`，需要
-    # `get_cookies`）。这里显式标 `@unsupported`：万一它绕到传输层，
-    # 会拿到 `unsupported-platform-action`，而不是往平台打一个不存在的动作名。
+    'comment_qzone_post': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    'like_qzone_post': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    'forward_qzone_post': (_PLATFORM_ACTION_UNSUPPORTED, {}),
     'set_qzone_visibility': (_PLATFORM_ACTION_UNSUPPORTED, {}),
-    # v1.7.8 复核：下面两条**只是目录↔平台的双向对账 + SnowLuma 直通口**，
-    # **默认路径走不到**——`chunk12.CORE_HANDLED_ACTIONS` 把这两个目录动作收在本机，
-    # 由 `chunk13.qzone_read` 走 CGI 读通道（拿不到 cookie 才回落这里）。
-    # NapCat 没有这两个原生动作，所以任何"把它们当平台动作派出去"的路径都会拿到
-    # `retcode 1404 不支持的Api`（用户贴过日志）——别再让哪条新路径从这儿过。
-    'list_qzone_feeds': ('get_qzone_feeds', {'count': 'num'}),
-    # 指了归属 QQ = 看那个人的说说列表；没指 = 看好友动态（见 `_resolve_platform_call`）。
-    'list_qzone_posts': ('get_qzone_msg_list', {'target_uin': 'target_uin', 'count': 'num'}),
+    'list_qzone_feeds': (_PLATFORM_ACTION_UNSUPPORTED, {}),
+    'list_qzone_posts': (_PLATFORM_ACTION_UNSUPPORTED, {}),
     'delete_qzone_post': ('delete_qzone_msg', {'tid': 'tid'}),
     # ---------------- 联系人与群 ----------------
     'list_contacts': (_PLATFORM_ACTION_LOCAL, {'type': 'type', 'limit': 'limit'}),
@@ -1604,9 +1590,6 @@ _PLATFORM_CALLS: dict[str, tuple[str, dict[str, str]]] = {
     ),
     'delete_friend': ('delete_friend', {'user_id': 'user_id', 'block': 'temp_block'}),
 }
-
-#: `list_qzone_posts` 在「没指归属 QQ」时的映射：好友动态用 `get_qzone_feeds`。
-_QZONE_FEEDS_CALLS: dict[str, str] = {'count': 'count'}
 
 #: 目录动作 → 「目录参数 ← 会话坐标」的缺省补全表。
 #: 目录里标了「留空＝本回合对话对象」的参数都在这里补；`set_group_card.user_id`
@@ -1980,13 +1963,8 @@ def _resolve_platform_call(
     action_name, mapping = _PLATFORM_CALLS[action_id]
     notes: list[str] = []
     if action_id == 'send_poke':
-        # 群聊打 `group_poke`，私聊打 `friend_poke`：这两个名字 NapCat / SnowLuma 都有。
+        # 群聊打 `group_poke`，私聊打 `friend_poke`：这两个名字 NapCat 都有。
         action_name = 'group_poke' if _clean(params.get('group_id')) else 'friend_poke'
-    elif action_id == 'list_qzone_posts' and not _clean(params.get('target_uin')):
-        # 没指归属 QQ = 看好友动态；SnowLuma 的 `get_qzone_msg_list` 只吃目标 QQ。
-        action_name = 'get_qzone_feeds'
-        mapping = _QZONE_FEEDS_CALLS
-        notes.append('未指定 target_uin：按好友动态读取（get_qzone_feeds）')
     mapped: dict[str, Any] = {}
     for param_name, platform_name in mapping.items():
         if param_name not in params:
@@ -2003,19 +1981,17 @@ def _resolve_platform_call(
         value = _session_value(session_key, target)
         if value:
             mapped[platform_param] = value
-    if action_name == 'get_qzone_feeds':
-        mapped.setdefault('page_num', 1)
     if action_id == 'update_qq_status':
         dropped = [name for name in ('minutes', 'text') if _clean(params.get(name))]
         if dropped:
-            # NapCat / SnowLuma 的 `set_online_status` 只有 status/ext_status/battery_status：
+            # NapCat 的 `set_online_status` 只有 status/ext_status/battery_status：
             # 状态能改，但「到点自动恢复」「自定义文本」没有落点。
             notes.append('%s 在当前平台没有对应字段，已忽略（状态不会到点自动恢复）' % '、'.join(dropped))
     return action_name, mapped, notes
 
 
 def _frame_ok(frame: Any) -> bool:
-    """OneBot / SnowLuma 的回执是不是成功（`status == 'ok'` 或 `retcode == 0`）。"""
+    """OneBot 的回执是不是成功（`status == 'ok'` 或 `retcode == 0`）。"""
     if not isinstance(frame, Mapping):
         return False
     return frame.get('status') == 'ok' or frame.get('retcode') == 0
@@ -2026,6 +2002,11 @@ def _frame_has_verdict(frame: Any) -> bool:
 
     即发即忘的接口（`set_input_status`）用得到：NapCat 不保证给回执，"什么都没说"
     不是失败，只有**明确说了** `status`/`retcode`/`message` 且不是成功帧才算失败。
+
+    这也是**"拿到的是整只信封，还是已经剥掉信封的 `data`"** 的判据：`aiocqhttp` 的
+    `_handle_api_result`（`aiocqhttp/api_impl.py:28-39`）在 `status == 'failed'` 时抛
+    `ActionFailed`、成功时只回 `result['data']`——所以宿主的 `call_action` 成功返回的
+    **必然是业务数据**，里面不会有 `status` / `retcode`。详见 `_onebot_payload_frame`。
     """
     if not isinstance(frame, Mapping):
         return False
@@ -2034,8 +2015,97 @@ def _frame_has_verdict(frame: Any) -> bool:
     return bool(frame.get('message') or frame.get('msg') or frame.get('wording'))
 
 
+#: 回执里**必须隐去**的键（Cookie / 令牌：debug 日志是给人看的，不是给日志系统存密钥的）。
+_FRAME_SECRET_KEYS = frozenset({
+    'cookies', 'cookie', 'bkn', 'token', 'access_token', 'skey', 'p_skey', 'csrf',
+})
+
+
+def _frame_shape(frame: Any, limit: int = 400) -> str:
+    """回执的**形状**（类型 + 键名 + 各值的类型/长度），cookie 类值一律隐去。
+
+    真机排查"平台没有回执（dict）"这类问题时，需要的是形状而不是内容：一眼看出
+    拿到的是整只信封（有 `status`/`retcode`）还是已剥壳的 `data`。所以这里**只**
+    输出键名与值的类型；字符串另外给长度，敏感键连长度都不给。
+    """
+    if isinstance(frame, Mapping):
+        parts: list[str] = []
+        for key in list(frame)[:20]:
+            if str(key).lower() in _FRAME_SECRET_KEYS:
+                parts.append('%s=<已隐去>' % key)
+                continue
+            value = frame[key]
+            if isinstance(value, str):
+                parts.append('%s=%s(%d 字符)' % (key, type(value).__name__, len(value)))
+            elif isinstance(value, (list, tuple, dict, Mapping)):
+                parts.append('%s=%s(%d)' % (key, type(value).__name__, len(value)))
+            else:
+                text = repr(value)
+                parts.append('%s=%s' % (key, text[:60]))
+            if sum(len(part) for part in parts) > limit:
+                parts.append('…')
+                break
+        return '%s{%s}' % (type(frame).__name__, ', '.join(parts))
+    text = repr(frame)
+    return '%s %s' % (type(frame).__name__, text[:limit])
+
+
+def _action_failed_frame(error: Any) -> Optional[Mapping[str, Any]]:
+    """`aiocqhttp.ActionFailed` → 它带的那只失败回执；不是这类异常就回 `None`。
+
+    **为什么要单独认它**：平台"不认识的 action"是**明确答复**（`status:failed` +
+    `retcode:1404`），不是"超时/断连"那种结果未知。早先它被并进"传输异常"那一支，
+    于是每条 `不支持的Api …` 都变成 `ambiguous`（写动作记 `unknown`、日志打上
+    「结果未知，请勿自动重试」），真机日志里那句和 `[自动重试]` 标签自相矛盾。
+
+    只用属性探针（`retcode` / `result`），不 import `aiocqhttp`——适配层之外的
+    依赖都按可选处理（宿主换实现时这里只会退化成原来的保守口径）。
+    """
+    result = getattr(error, 'result', None)
+    if isinstance(result, Mapping) and ('status' in result or 'retcode' in result):
+        return result
+    if type(error).__name__ == 'ActionFailed':
+        retcode = getattr(error, 'retcode', None)
+        if retcode is not None:
+            return {'status': 'failed', 'retcode': retcode, 'message': str(error)}
+    return None
+
+
+def _onebot_payload_frame(frame: Any) -> Optional[Any]:
+    """已剥壳的成功回执 → 业务数据；不是这种形状就回 `None`。
+
+    宿主的 OneBot 客户端是 `aiocqhttp.CQHttp` 原实例（`AiocqhttpAdapter` 把
+    `self.bot = CQHttp(...)` 挂在平台实例上，本模块的 `onebot_client` 直接取它），
+    而它的 `call_action` **不回整只信封**：`_handle_api_result` 把 `status == 'failed'`
+    抛成 `ActionFailed`，成功只回 `result['data']`。所以成功帧长这样：
+
+    * `get_cookies` → `{'cookies': '…', 'bkn': '…'}`
+    * `send_qzone_msg` → `{'tid': '…'}`
+    * `set_input_status` → `None`
+
+    **没有 verdict 键的 Mapping 就是业务数据本身**，不能当成"平台没有回执"判失败
+    ——早先恰恰如此，于是 `get_cookies` 永远拿不到 cookie、整条 QZone CGI 通道跟着废掉
+    （真机日志：`get_cookies 失败：平台没有回执（dict）`）。
+
+    非 Mapping（`None` / 字符串 / 列表）**不算**：那是"平台什么都没给"，交给调用方
+    按各自口径处理（即发即忘的接口当成功，其余报"平台没有回执"）。
+    """
+    if isinstance(frame, Mapping) and not _frame_has_verdict(frame):
+        return dict(frame)
+    return None
+
+
 def _frame_error_text(action_name: str, frame: Any) -> str:
-    """失败回执 → 带 status / retcode / message 的中文错误串。"""
+    """失败回执 → 带 status / retcode / message 的中文错误串。
+
+    `frame` 走到这里时**一定没有可判的成功信号**（`_onebot_payload_frame` 已经把
+    "没有 verdict 键的 Mapping = 业务数据" 那一路接走了），所以这里只剩两种：
+
+    * 有 verdict 但说的是失败（`status` / `retcode` / `message`）→ 平台**明确表态**，
+      照抄它的原话（`retcode 1404 不支持的Api get_cookies` 就是这一种，一眼看出是
+      "API 不存在"）；
+    * 一个 verdict 都没有、而且不是 Mapping（`None` / bool / 字符串）→ 报形状。
+    """
     row = frame if isinstance(frame, Mapping) else {}
     status = row.get('status')
     retcode = row.get('retcode')
@@ -2047,6 +2117,7 @@ def _frame_error_text(action_name: str, frame: Any) -> str:
     if retcode is not None and status is not None:
         parts.append('retcode=%s' % retcode)
     detail = ' '.join(part for part in (_text(message),) if part).strip()
+
     if detail:
         parts.append(detail)
     return '%s 失败：%s' % (action_name, ' '.join(part for part in parts if part))
@@ -2630,18 +2701,44 @@ class AstrbotTransport:
             frame = call(name, **payload)
             if inspect.isawaitable(frame):
                 frame = await frame
-        except Exception as error:  # noqa: BLE001 - 传输异常可能已在平台侧生效
-            # 超时 / 断连时请求可能已经被服务端执行：**不能**让调用方自动重试。
+        except Exception as error:  # noqa: BLE001
+            failed = _action_failed_frame(error)
+            if failed is not None:
+                # 平台**明确答复**（`status:failed` + `retcode`）——不是"结果未知"：
+                # 请求已经在服务端被处理过了（例如 `retcode 1404 不支持的Api`），
+                # 既不该记 ambiguous，也不该在日志里写"请勿自动重试"。
+                error_text = _frame_error_text(name, failed)
+                if not fire_and_forget:
+                    log_fallback('warn', 'OneBot 动作执行失败：%s', error_text)
+                definite: dict[str, Any] = {'ok': False, 'error': error_text, 'data': None}
+                if failed.get('retcode') is not None:
+                    definite['retcode'] = failed.get('retcode')
+                return definite
+            # 其余（超时 / 断连 / 客户端自己抛的异常）可能已在平台侧生效：
+            # **不能**让调用方自动重试。
             if not fire_and_forget:
-                log_fallback('warn', 'OneBot 动作 %s 传输异常（%s）：%s', name, _AMBIGUOUS_TAIL, error)
+                log_fallback(
+                    'warn', 'OneBot 动作 %s 传输异常（%s）：%s',
+                    name, _AMBIGUOUS_TAIL, error,
+                )
             return {
                 'ok': False,
                 'error': '%s 调用异常：%s；%s' % (name, error, _AMBIGUOUS_TAIL),
                 'data': None,
                 'ambiguous': True,
             }
+        if not fire_and_forget:
+            # 真机排障要的就是这一行：拿到的是整只信封还是已剥壳的 `data`、
+            # 键叫什么、值是什么类型（cookie 类值已隐去，见 `_frame_shape`）。
+            log_fallback('debug', 'OneBot 动作 %s 回执形状=%s', name, _frame_shape(frame))
         if _frame_ok(frame):
             return {'ok': True, 'error': '', 'data': frame.get('data') if isinstance(frame, Mapping) else None}
+        payload_frame = _onebot_payload_frame(frame)
+        if payload_frame is not None:
+            # `aiocqhttp` 剥过信封的成功回执：这个 Mapping **就是** `data`。
+            # 早先按"平台没有回执（dict）"判失败，`get_cookies` 因此永远拿不到
+            # cookie、整条 QZone CGI 通道跟着废掉（真机日志点名）。
+            return {'ok': True, 'error': '', 'data': payload_frame}
         if fire_and_forget and not _frame_has_verdict(frame):
             # 即发即忘的接口：平台没给 dict 回执（`None` / 空帧 / 别的形状）——按成功记。
             # NapCat 的 `set_input_status` 就是这样：早先判成"平台没有回执"失败，
@@ -2679,7 +2776,7 @@ class AstrbotTransport:
         )
 
     async def call_onebot(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
-        """原生 OneBot / SnowLuma 动作直通（QQ 空间等扩展动作走这里）。"""
+        """原生 OneBot 动作直通（QQ 空间的发/删说说等走这里）。"""
         return await self._call_onebot_on(self._client_for(self.bridge.current_target()), action, params)
 
     async def platform_action(self, action: str, params: dict[str, Any]) -> dict[str, Any]:

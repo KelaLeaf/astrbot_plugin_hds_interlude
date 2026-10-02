@@ -952,7 +952,7 @@ class NarrativeImage(TypedDict, total=False):
 
 class NarrativeAudio(TypedDict, total=False):
     """当前私聊回合的瞬时原生音频附件。
-    载荷是 QQ 语音记录经 SnowLuma 服务端转码后的结果；
+    载荷是 QQ 语音记录经服务端（NapCat `get_record`）转码后的结果；
     它刻意永不写入剧本条目、记忆或事实。"""
 
     id: Required[str]

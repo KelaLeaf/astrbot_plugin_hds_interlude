@@ -4,8 +4,8 @@
 
 | 契约 | 出错的样子 | 用例 |
 | --- | --- | --- |
-| 空间动作优先走 NapCat WS（`get_cookies` + QZone CGI），拿不到 cookie 才回退 SnowLuma | 静默走回退：装了 SnowLuma 的用户以为在走 NapCat，没装的人发现动作"没反应" | `NapcatChannelTests` |
-| CGI **真打出去了**但失败 → **不许**再走回退（否则一次动作写两次） | 重复评论 / 重复点赞 | `test_a_failed_cgi_call_never_falls_back_to_snowluma` |
+| 空间动作**只有** NapCat WS（`get_cookies` + QZone CGI）一条路：拿不到 cookie 就明确失败 | 把不存在的动作名发给平台 → `retcode 1404 不支持的Api`；或静默什么都不做 | `NapcatChannelTests` / `MissingPlatformActionTests` |
+| CGI **真打出去了**但失败 → 记 `unknown`，绝不重发（否则一次动作写两次） | 重复评论 / 重复点赞 | `test_a_failed_cgi_call_never_retries_the_write` |
 | CGI **拿不到响应**（回 `None` / 抛异常）→ `unknown`（"可能已发生"，不自动重试）；`code != 0` → `failed` | 发帖的网络错误记成 `failed` → 调用方重试 → **重复发帖** | `CgiOutcomeClassificationTests` / `WritePathAmbiguityTests` |
 | 只读的 `qzone_read` 不落审计行、不占配额 | 她"看一眼好友动态"就把当天的评论额度花光 | `QzoneReadTests` |
 | `napcat_actions()` = 那 9 条；`backend_labels` 顺序 = `backends` 顺序 | 面板把 NapCat 专属标丢 / 标签顺序与运行期优先级不一致 | `BackendCatalogTests` |
@@ -117,12 +117,21 @@ def _visibility_http(moods: str = MOODS_TEXT, result: str = '{"code":0}',
 
 
 def _napcat_handler(calls: list) -> object:
-    """NapCat 侧的 OneBot 直通：只认 `get_cookies` / `get_login_info`。"""
+    """NapCat 侧的 OneBot 直通：认**两个**取凭据接口 + `get_login_info`。
+
+    现代 NapCat 两个取凭据接口都有（`get_credentials` / `get_cookies`，
+    napcat.apifox.cn/226657054e0 与 226657041e0），主路是前者（参考插件
+    `astrbot_plugin_qzone_tools` v5.7.5 `main.py:866`），所以夹具两个都服务——
+    夹具不许比生产少一条路（坑 39/66）。**顺序**由
+    `CredentialApiOrderTests` 专门钉住，这里不掺和。
+    """
 
     def handler(action: str, params: dict) -> dict:
         calls.append((action, dict(params)))
+        if action == 'get_credentials':
+            return {'ok': True, 'error': '', 'data': {'cookies': COOKIES, 'token': 1869525896}}
         if action == 'get_cookies':
-            return {'ok': True, 'error': '', 'data': {'cookies': COOKIES}}
+            return {'ok': True, 'error': '', 'data': {'cookies': COOKIES, 'bkn': '1869525896'}}
         if action == 'get_login_info':
             return {'ok': True, 'error': '', 'data': {'user_id': 10001}}
         return {'ok': False, 'error': 'NapCat 没有这个动作'}
@@ -136,7 +145,7 @@ class _NapcatTransport(_StubTransport):
 
     v1.7.9 起改可见范围**不许**再下载原图，`fetch_image` 留在桩上就是为了让
     `self.fetch_calls == []` 这条断言有意义（能力还在，只是这条路不该用）。
-    `has_http=False` 模拟"传输层没接原始 HTTP"（纯 SnowLuma 环境）；
+    `has_http=False` 模拟"传输层没接原始 HTTP"（打不了 QZone CGI）；
     `has_fetch=False` 模拟"传输层不能下载图片"（改可见范围应当照常成功）。
     """
 
@@ -194,13 +203,13 @@ class _Host(_QzoneHost):
 
 
 # --------------------------------------------------------------------------- #
-# 1. 通道优先级：NapCat WS 优先，SnowLuma 只在拿不到 cookie 时兜底
+# 1. 唯一通道：NapCat WS（get_cookies + QZone CGI）——没有第二条路
 # --------------------------------------------------------------------------- #
 
 
 class NapcatChannelTests(unittest.IsolatedAsyncioTestCase):
     async def test_comment_prefers_the_napcat_websocket_channel(self):
-        """CGI 优先：`get_cookies` + `get_login_info` 被调用，SnowLuma 动作**一次都没调**。"""
+        """`get_cookies` + `get_login_info` 被调用，**一个空间平台动作都没发出去**。"""
         host = _Host(config=dict(BASE_CONFIG, daily_comment_cap=5))
         seen: list[tuple[str, dict]] = []
         transport = _NapcatTransport(
@@ -215,11 +224,14 @@ class NapcatChannelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result['ok'], result)
         names = [name for name, _ in seen]
-        self.assertIn('get_cookies', names)
-        self.assertIn('get_login_info', names)
-        self.assertNotIn('comment_qzone', names, '走了 NapCat 就不该再打 SnowLuma 动作')
+        # 主路是 `get_credentials`（参考插件验证过的那条），域是主域。
+        self.assertEqual(names, ['get_credentials', 'get_login_info'])
+        self.assertNotIn(
+            'comment_qzone', names,
+            '`comment_qzone` 不是任何后端的动作名（发了就是 1404）：只许走 CGI',
+        )
         # 取 cookie 的域是腾讯只认的那一个（写错域 = 永远拿不到 p_skey）。
-        self.assertEqual(dict(seen)['get_cookies']['domain'], q.QZONE_COOKIE_DOMAIN)
+        self.assertEqual(dict(seen)['get_credentials']['domain'], q.QZONE_COOKIE_DOMAIN)
         self.assertEqual(q.QZONE_COOKIE_DOMAIN, 'user.qzone.qq.com')
 
         self.assertEqual(len(transport.http_calls), 1)
@@ -268,9 +280,9 @@ class NapcatChannelTests(unittest.IsolatedAsyncioTestCase):
             return {'ok': True, 'error': '', 'data': {'plain': action}}
 
         transport = _NapcatTransport(handler)
-        # 平台侧直通：只认 SnowLuma 动作名（`handler` 只会在问 cookie 时被调到）。
+        # 平台侧直通：`handler` 只会在问凭据时被调到（这条动作没有 CGI 映射）。
         async def call(action: str, params: dict) -> dict:
-            self.assertNotIn(action, ('get_cookies', 'get_login_info'))
+            self.assertNotIn(action, q.QZONE_COOKIE_APIS + ('get_login_info',))
             return plain(action, params)
 
         host.transport = transport
@@ -279,8 +291,12 @@ class NapcatChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.http_calls, [])
         self.assertEqual(transport.calls, [])
 
-    async def test_cookies_without_p_skey_fall_back_to_snowluma(self):
-        """拿不到 `p_skey` = 没有 `g_tk` = CGI 做不了：**静默回退**到 SnowLuma 动作名。"""
+    async def test_cookies_without_p_skey_fails_actionably_without_calling_the_platform(self):
+        """拿不到 `p_skey` = 没有 `g_tk` = CGI 做不了：**明确失败**，不许换个动作名再试。
+
+        `like_qzone` 在任何后端的 API 清单里都不存在，回退只会换回
+        `retcode 1404 不支持的Api`（真机日志点名）——所以这里连一个平台动作都不许发。
+        """
         host = _Host(config=dict(BASE_CONFIG, daily_like_cap=5))
         calls: list[str] = []
 
@@ -294,27 +310,67 @@ class NapcatChannelTests(unittest.IsolatedAsyncioTestCase):
 
         transport = _NapcatTransport(handler, http=lambda *a: '{"code":0}')
         host.transport = transport
-        result = await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
+        with self.assertRaises(q.QzoneCgiUnavailable) as caught:
+            await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
 
-        self.assertEqual(result, {})
-        self.assertIn('get_cookies', calls)
-        self.assertIn('like_qzone', calls)
-        self.assertEqual(transport.http_calls, [], '没有 p_skey 就不该发 CGI')
-        self.assertTrue(
-            any('NapCat 通道不可用' in text and '回退' in text for text in host.notes()),
-            host.standalone,
+        text = str(caught.exception)
+        self.assertIn('点赞说说', text, '要点名是哪个动作')
+        self.assertIn('需要 NapCat 通道', text, '要说清靠谁')
+        self.assertIn('like_qzone', text, '要把动作名摆出来（它就是 1404 的那个名字）')
+        self.assertIn('可执行的路', text, '要给出下一步动作')
+        # 两个取凭据接口 × 两个域各问一次（`QZONE_COOKIE_APIS` / `QZONE_COOKIE_DOMAINS`），
+        # 之后**一个动作都不发**——除取凭据外不发任何空间动作。
+        self.assertEqual(
+            calls,
+            ['get_credentials', 'get_credentials', 'get_cookies', 'get_cookies'],
+            '只许问取凭据接口，不许发空间动作',
         )
+        self.assertIn('p_skey', text, '失败文案要说清缺的是 p_skey')
+        self.assertEqual(transport.http_calls, [], '没有 p_skey 就不该发 CGI')
+        self.assertFalse(caught.exception.ambiguous, '这条动作根本没发出去，不是"结果未知"')
 
-    async def test_a_transport_without_http_capability_uses_snowluma_without_asking_for_cookies(self):
-        """纯 SnowLuma 环境（没接原始 HTTP）：连 `get_cookies` 都不该问。"""
+    async def test_a_transport_without_http_capability_fails_without_asking_for_cookies(self):
+        """传输层没有原始 HTTP 能力（打不了 QZone CGI）：明确失败，一个动作都不发。"""
         host = _Host(config=dict(BASE_CONFIG, daily_like_cap=5))
         transport = _NapcatTransport(lambda a, p: {'ok': True, 'error': '', 'data': {}}, has_http=False)
         host.transport = transport
-        await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
-        self.assertEqual(host.actions_called(), ['like_qzone'])
+        with self.assertRaises(q.QzoneCgiUnavailable) as caught:
+            await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
+        self.assertIn('原始 HTTP', str(caught.exception))
+        self.assertEqual(transport.calls, [], '没有 CGI 出口就不许问 cookie、也不许发平台动作')
 
-    async def test_a_failed_cgi_call_never_falls_back_to_snowluma(self):
-        """CGI **已经发出去了**但没回执：记 `unknown`、绝不回退（回退 = 写两次）。"""
+    async def test_the_cookie_domain_chain_accepts_the_first_usable_domain(self):
+        """逐域试：主域给不出 `p_skey` 就换备用域（两个参考实现写法不同）。
+
+        谁给出可用的 `p_skey` 就用谁——"域写错了"与"平台没有这条 API"在失败文案里
+        也分得开（逐域写明原因）。取到之后**不再多问**（也不再去问下一个接口）。
+        """
+        host = _Host(config=dict(BASE_CONFIG, daily_like_cap=5))
+        seen: list[tuple[str, dict]] = []
+
+        def handler(action: str, params: dict) -> dict:
+            seen.append((action, dict(params)))
+            if action in q.QZONE_COOKIE_APIS:
+                if params.get('domain') == q.QZONE_COOKIE_DOMAINS[0]:
+                    # 主域有这个域自己的 cookie，但**没有 p_skey** → 换了域才可用。
+                    return {'ok': True, 'error': '', 'data': {'cookies': 'uin=o1; skey=@x'}}
+                return {'ok': True, 'error': '', 'data': {'cookies': COOKIES}}
+            return {'ok': True, 'error': '', 'data': {'user_id': 10001}}
+
+        transport = _NapcatTransport(handler, http=lambda *a: '{"code":0}')
+        host.transport = transport
+        result = await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
+        self.assertIs(result.get('success'), True, result)
+        self.assertEqual(
+            [params['domain'] for name, params in seen if name in q.QZONE_COOKIE_APIS],
+            list(q.QZONE_COOKIE_DOMAINS),
+        )
+        self.assertEqual([name for name, _ in seen].count('get_credentials'), 2)
+        self.assertNotIn('get_cookies', [name for name, _ in seen], '主路通了就别再问下一个接口')
+        self.assertEqual(len(transport.http_calls), 1, '第二个域可用就不再往下问')
+
+    async def test_a_failed_cgi_call_never_retries_the_write(self):
+        """CGI **已经发出去了**但没回执：记 `unknown`、绝不重发（重发 = 写两次）。"""
         host = _Host(config=dict(BASE_CONFIG, daily_comment_cap=5))
         seen: list[tuple[str, dict]] = []
         transport = _NapcatTransport(_napcat_handler(seen), http=lambda *a: None)
@@ -330,8 +386,8 @@ class NapcatChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('comment_qzone', names, '结果不明时回退会写成两条评论')
         self.assertEqual(host.rows[-1]['status'], 'unknown')
 
-    async def test_a_platform_side_failure_frame_falls_back(self):
-        """NapCat 明确回失败帧（没登录 / 没这个动作）= 通道不可用 → 允许回退。"""
+    async def test_a_platform_side_failure_frame_fails_actionably_without_a_retry(self):
+        """NapCat 明确回失败帧（没登录 / Cookie 被清）= 通道不可用 → 明确失败，**不回退**。"""
         host = _Host(config=dict(BASE_CONFIG, daily_like_cap=5))
         seen: list[tuple[str, dict]] = []
 
@@ -343,10 +399,147 @@ class NapcatChannelTests(unittest.IsolatedAsyncioTestCase):
 
         transport = _NapcatTransport(handler)
         host.transport = transport
-        result = await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
-        self.assertEqual(result, {'fallback': True})
-        self.assertEqual([name for name, _ in seen], ['get_cookies', 'like_qzone'])
+        with self.assertRaises(q.QzoneCgiUnavailable) as caught:
+            await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
+        self.assertIn('get_cookies 不可用', str(caught.exception), '平台的原话要带出来')
+        self.assertEqual(
+            [name for name, _ in seen],
+            ['get_credentials', 'get_credentials', 'get_cookies', 'get_cookies'],
+            '两个接口 × 两个域各问一次就停（失败后不许再发空间动作）',
+        )
         self.assertEqual(transport.http_calls, [])
+
+
+# --------------------------------------------------------------------------- #
+# 1b. 取凭据：两个接口 + 顺序（`get_credentials` → `get_cookies`，各自逐域）
+# --------------------------------------------------------------------------- #
+
+
+def _credential_handler(calls: list, credentials: bool = True) -> Any:
+    """取凭据的 OneBot 直通：`credentials=False` 时模拟"老 NapCat 没有 get_credentials"。"""
+    def handler(action: str, params: dict) -> dict:
+        calls.append((action, dict(params)))
+        if action == 'get_credentials':
+            if not credentials:
+                return _unusable(action, params)
+            return {'ok': True, 'error': '', 'data': {'cookies': COOKIES, 'token': 1869525896}}
+        if action == 'get_cookies':
+            return {'ok': True, 'error': '', 'data': {'cookies': COOKIES, 'bkn': '1869525896'}}
+        if action == 'get_login_info':
+            return {'ok': True, 'error': '', 'data': {'user_id': 10001}}
+        return {'ok': False, 'error': 'NapCat 没有这个动作'}
+
+    return handler
+
+
+def _unusable(action: str, params: dict) -> dict:
+    """这个取凭据接口**不存在**：宿主的真实形状是 `ActionFailed(retcode 1404)`。"""
+    return {
+        'ok': False, 'retcode': 1404,
+        'error': '%s 失败：failed retcode=1404 不支持的Api %s' % (action, action),
+        'data': None,
+    }
+
+
+class CredentialApiOrderTests(unittest.IsolatedAsyncioTestCase):
+    """取登录凭据的两条 API 与它们的**顺序**。
+
+    参考插件 `Wyccotccy/astrbot_plugin_qzone_tools` v5.7.5 是
+    `get_credentials(domain=…)`（`main.py:866`）→ 失败再 `get_cookies(domain=…)`
+    （`main.py:870`），它的 README.md:374 把 `> 4.17.55` 直接绑在"需支持
+    `get_credentials` / `get_cookies`"上。顺序不是随手定的：它决定
+    "两个都能用时走哪条"——所以①那条用例既钉能力也**钉顺序**。
+    """
+
+    def _host(self, handler: Any) -> tuple[Any, Any]:
+        host = _Host(config=dict(BASE_CONFIG, daily_like_cap=5))
+        transport = _NapcatTransport(handler, http=lambda *a: '{"code":0}')
+        host.transport = transport
+        return host, transport
+
+    async def test_credentials_api_alone_is_enough(self):
+        """① 只有 `get_credentials` 能用（老/新 NapCat 都可能）：通道打通，**不问** `get_cookies`。"""
+        calls: list[tuple[str, dict]] = []
+        host, transport = self._host(_credential_handler(calls))
+
+        result = await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
+
+        self.assertIs(result.get('success'), True, result)
+        self.assertEqual(
+            [name for name, _ in calls], ['get_credentials', 'get_login_info'],
+            '顺序：主路先上；通了就不该再去问另一个接口',
+        )
+        self.assertEqual(len(transport.http_calls), 1, '登录态拿到了就该打 CGI')
+
+    async def test_cookies_api_is_the_fallback(self):
+        """② 只有 `get_cookies` 能用（`get_credentials` 回 1404）：仍打通。"""
+        calls: list[tuple[str, dict]] = []
+        host, transport = self._host(_credential_handler(calls, credentials=False))
+
+        result = await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
+
+        self.assertIs(result.get('success'), True, result)
+        self.assertEqual(
+            [name for name, _ in calls],
+            ['get_credentials', 'get_credentials', 'get_cookies', 'get_login_info'],
+            '主路对两个域各失败一次后，才轮到备路',
+        )
+        self.assertEqual(len(transport.http_calls), 1)
+
+    async def test_both_apis_missing_fails_actionably_without_any_retry(self):
+        """③ 两个接口都不存在（都回 1404）：明确失败、**零重试**、不是 ambiguous。"""
+        calls: list[tuple[str, dict]] = []
+        host, transport = self._host(lambda a, p: (calls.append((a, dict(p))), _unusable(a, p))[1])
+
+        with self.assertRaises(q.QzoneCgiUnavailable) as caught:
+            await host._qzone_run_action(transport.call_onebot, 'like_qzone', {'tid': TID})
+
+        error = caught.exception
+        self.assertIs(error.ambiguous, False, '请求压根没发出去，不是"结果未知"')
+        text = str(error)
+        self.assertIn('点赞说说', text, '要点名动作')
+        self.assertIn('get_credentials', text, '要说清第一步为什么没成')
+        self.assertIn('get_cookies', text, '也要说清第二步')
+        self.assertIn('retcode=1404', text, '平台的原话要带出来')
+        self.assertIn('可执行的路', text)
+        self.assertEqual(transport.http_calls, [], '拿不到登录态就一个 CGI 都不许打')
+        self.assertEqual(
+            [name for name, _ in calls],
+            ['get_credentials', 'get_credentials', 'get_cookies', 'get_cookies'],
+            '每个接口 × 每个域**恰好一次**：不许自动重试',
+        )
+
+    async def test_the_failure_text_names_the_napcat_version_requirement(self):
+        """④ 两个接口都缺：文案点名"需要支持这两个接口的 NapCat（> 4.17.55）"。"""
+        host, transport = self._host(lambda a, p: _unusable(a, p))
+        with self.assertRaises(q.QzoneCgiUnavailable) as caught:
+            await host._qzone_run_action(transport.call_onebot, 'get_qzone_feeds', {'count': 5})
+        text = str(caught.exception)
+        self.assertIn('get_credentials', text)
+        self.assertIn('get_cookies', text)
+        self.assertIn('4.17.55', text, '上不了就是 NapCat 版本不够：把参考插件那条要求写给用户')
+        self.assertIn('看好友动态', text)
+
+    async def test_both_apis_are_parsed_with_the_same_unwrapped_shape(self):
+        """两种回执**同一个判据**：都是 `{'ok': True, 'data': {'cookies': …}}`（剥壳后的 data）。
+
+        这里断言的是 core 侧：接口名不影响解析（`_cookie_string_from_frame` 一份）；
+        "剥壳"本身在适配层一处（`astrbot_bridge._onebot_payload_frame`），见
+        `test_astrbot_bridge.OnebotFrameShapeTests`。
+        """
+        for api in q.QZONE_COOKIE_APIS:
+            with self.subTest(api=api):
+                def handler(a: str, p: dict) -> dict:
+                    if a == api:
+                        return {'ok': True, 'error': '', 'data': {'cookies': COOKIES}}
+                    if a == 'get_login_info':
+                        return {'ok': True, 'error': '', 'data': {'user_id': 10001}}
+                    return _unusable(a, p)
+
+                host, transport = self._host(handler)
+                auth = await q.qzone_cgi_auth(transport.call_onebot)
+                self.assertEqual(auth.uin, '10001')
+                self.assertEqual(auth.p_skey, P_SKEY)
 
 
 # --------------------------------------------------------------------------- #
@@ -367,7 +560,6 @@ class QzoneReadTests(unittest.IsolatedAsyncioTestCase):
         result = await host.qzone_read(STORY, 'feed', {'count': 5})
 
         self.assertTrue(result['ok'], result)
-        self.assertEqual(result['channel'], 'napcat')
         self.assertEqual(result['error'], '')
         self.assertEqual(result['count'], len(result['feeds']))
         self.assertEqual([item['key'] for item in result['feeds']], ['K1'])
@@ -387,7 +579,6 @@ class QzoneReadTests(unittest.IsolatedAsyncioTestCase):
         result = await host.qzone_read(STORY, 'moods', {'targetUin': FRIEND_UIN, 'count': 3})
 
         self.assertTrue(result['ok'], result)
-        self.assertEqual(result['channel'], 'napcat')
         self.assertEqual(result['count'], 1)
         self.assertEqual(result['posts'][0]['tid'], TID)
         self.assertEqual(result['posts'][0]['content'], '晚安')
@@ -409,22 +600,25 @@ class QzoneReadTests(unittest.IsolatedAsyncioTestCase):
 
         allowed = await host.qzone_read(STORY, 'moods', {}, include_self=True)
         self.assertTrue(allowed['ok'], allowed)
-        self.assertEqual(allowed['channel'], 'napcat')
         self.assertEqual(host.transport.http_calls[0]['data']['uin'], '')
 
-    async def test_reads_fall_back_to_snowluma_and_say_so_in_the_channel_field(self):
-        """没有原始 HTTP 能力（纯 SnowLuma 环境）：走平台动作，`channel` 如实写 `snowluma`。"""
+    async def test_without_the_cgi_channel_a_read_fails_actionably_and_sends_nothing(self):
+        """没有原始 HTTP 能力 → 读不了好友动态：**明确失败**，一个平台动作都不发。
+
+        （v1.7.1–v1.7.9 这里会回退去打 `get_qzone_feeds`——那个动作名在 AstrBot 的
+        任何后端上都不存在，真机换回 `retcode 1404 不支持的Api`。）
+        """
         host = _Host(config=dict(BASE_CONFIG))
         transport = _NapcatTransport(
             lambda a, p: {'ok': True, 'error': '', 'data': {'feeds': [{'key': 'K9'}]}},
             has_http=False,
         )
         host.transport = transport
-        result = await host.qzone_read(STORY, 'feed', {'count': 2})
-        self.assertTrue(result['ok'], result)
-        self.assertEqual(result['channel'], 'snowluma')
-        self.assertEqual(result['feeds'], [{'key': 'K9'}])
-        self.assertEqual(host.actions_called(), ['get_qzone_feeds'])
+        with self.assertRaises(q.QzoneCgiUnavailable) as caught:
+            await host.qzone_read(STORY, 'feed', {'count': 2})
+        self.assertIn('看好友动态', str(caught.exception))
+        self.assertIn('原始 HTTP', str(caught.exception))
+        self.assertEqual(host.actions_called(), [], '不许把不存在的动作名发给平台')
 
     async def test_reads_do_not_consume_the_write_quota(self):
         """读三次不占配额：评论上限 1 时，读完仍然写得进去；第二条才被每日上限拦下。"""
@@ -505,12 +699,16 @@ class FeedSweepChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('get_qzone_feeds', actions,
                          'NapCat 没有这条动作，绝不许当平台动作发出去（1404 的来源）')
         self.assertNotIn('get_qzone_msg_list', actions)
-        self.assertEqual(actions, ['get_cookies', 'get_login_info', 'get_cookies', 'get_login_info'])
+        self.assertEqual(
+            actions,
+            ['get_credentials', 'get_login_info', 'get_credentials', 'get_login_info'],
+            '一轮轮询 = 两个 CGI 动作各取一次登录态；**零个**空间平台动作',
+        )
         urls = [call['url'] for call in host.transport.http_calls]
         self.assertEqual(len(urls), 2, '一条动态 + 一次正文对齐，两条都走 CGI')
         self.assertTrue(any('feeds3_html_more' in url for url in urls))
         self.assertTrue(any('emotion_cgi_msglist_v6' in url for url in urls))
-        # 参数按 CGI 的口径发：`pagenum` / `count` / `num`（不是 SnowLuma 的 `page_num`）。
+        # 参数按 CGI 的口径发：`pagenum` / `count`（动态）与 `num`（说说正文）。
         feed_call = host.transport.http_calls[0]
         self.assertEqual(feed_call['data']['pagenum'], '1')
         self.assertEqual(feed_call['data']['count'], '20')
@@ -528,33 +726,28 @@ class FeedSweepChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[0]['tid'], 'K1')
 
     async def test_the_cgi_time_field_keeps_the_entry_inside_the_freshness_window(self):
-        """CGI 那条通道的时间字段叫 `abstime`（SnowLuma 叫 `time`）：归一化前必须补上，
-        否则每条动态都会被当成 1970 年、被新鲜度过滤整批丢掉（悄悄什么都不进剧本）。"""
+        """CGI 那页的时间字段叫 `abstime`（归一化层只认 `time`）：搬不过去就会被当成
+        1970 年、被新鲜度过滤整批丢掉（悄悄什么都不进剧本）。"""
         host = self._sweep_host()
         await host.qzone_feed_sweep()
         self.assertEqual(len(host.entries), 1, '时间字段搬运没做对时这里会是 0')
 
-    async def test_without_any_cgi_channel_the_snowluma_fallback_is_the_only_path(self):
-        """两条通道的边界：**只有**传输层没有原始 HTTP 能力（纯 SnowLuma 环境）时，
-        读才回落成平台动作 `get_qzone_feeds`。默认（装了 NapCat）走不到这里。"""
+    async def test_without_any_cgi_channel_the_sweep_says_why_and_sends_nothing(self):
+        """没有 CGI 通道时轮询**不发任何平台动作**，只留一条可见说明（按小时节流）。
+
+        真机上的表现曾是每轮都打 `get_qzone_feeds` → `retcode 1404`；用户看到的
+        除了刷屏的 1404 之外什么都没有。现在是一条说清"缺什么、去哪修"的 warn，
+        并且**零个请求**。
+        """
         host = _Host(config=dict(BASE_CONFIG, auto_feed=True, daily_comment_cap=1))
-        host.transport = _NapcatTransport(
-            lambda a, p: (
-                {'ok': True, 'error': '', 'data': {'feeds': [{
-                    'key': 'K1', 'uin': '10002', 'appid': 311,
-                    'time': NOW.timestamp() - 1200,
-                }]}}
-                if a == 'get_qzone_feeds'
-                else {'ok': True, 'error': '', 'data': {'msglist': []}}
-            ),
-            has_http=False,
-        )
+        host.transport = _NapcatTransport(_napcat_handler([]), has_http=False)
         await host.qzone_feed_sweep()
-        self.assertEqual(host.transport.http_calls, [])
-        self.assertEqual(
-            [name for name in host.actions_called() if name.startswith('get_qzone')],
-            ['get_qzone_feeds', 'get_qzone_msg_list'],
-        )
+        self.assertEqual(host.entries, [])
+        self.assertEqual(host.actions_called(), [], '一个动作都不许发（包括取 cookie）')
+        warned = host.notes('warn')
+        self.assertTrue(warned, '通道缺失必须可见')
+        self.assertIn('需要 NapCat 通道', warned[0])
+        self.assertIn('get_qzone_feeds', warned[0])
 
 
 # --------------------------------------------------------------------------- #
@@ -678,10 +871,11 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update['method'], 'POST')
         self.assertIn('g_tk=%d' % cgi.compute_g_tk(P_SKEY), update['url'])
         self.assertTrue(update['url'].startswith('https://user.qzone.qq.com/proxy/domain/'))
-        # 平台侧**只**被问了 cookie / 登录信息（读正文一次 + 回读校验一次 + 改可见范围
+        # 平台侧**只**被问了取凭据 / 登录信息（读正文一次 + 回读校验一次 + 改可见范围
         # 一次；没有"改可见范围"这条原生动作可打）。
         self.assertEqual(
-            {name for name, _ in host.transport.calls}, {'get_cookies', 'get_login_info'},
+            {name for name, _ in host.transport.calls},
+            {'get_credentials', 'get_login_info'},
         )
         self.assertTrue(
             any('update_visibility' in text for _level, text in host.standalone),
@@ -896,7 +1090,7 @@ class SetVisibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(host.rows[-1]['status'], 'failed')
 
     async def test_without_the_cgi_channel_it_fails_instead_of_falling_back(self):
-        """没有原始 HTTP 能力（纯 SnowLuma 环境）：明确失败，**不**回落平台动作。"""
+        """没有原始 HTTP 能力：明确失败，**不**往平台打任何动作（那条动作不存在）。"""
         host = _Host(config=dict(BASE_CONFIG, daily_post_cap=5, min_interval_minutes=0))
         host.ctx = types.SimpleNamespace(base_dir=self._tmp.name)
         host.transport = _NapcatTransport(_napcat_handler([]), has_http=False)
@@ -1016,8 +1210,9 @@ class CgiOutcomeClassificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_raising_transport_is_ambiguous(self):
         """① 传输层抛异常（超时 / 断连）→ `ambiguous`，且**不是** `QzoneCgiUnavailable`。
 
-        这一点必须钉住：`_qzone_run_action` 只对 `QzoneCgiUnavailable` 回落 SnowLuma，
-        写动作的传输异常要是落进那个类，就会被当成"通道不可用"再发一次。
+        这一点必须钉住：`_qzone_run_action` 只把 `QzoneCgiUnavailable`（拿不到登录态）
+        当成"通道没接上"；写动作的**传输异常**要是落进那个类，就会被当成"通道不可用"
+        再发一次 = 重复评论。
         """
         async def request(method: str, url: str, headers: object = None, data: object = None) -> object:
             raise RuntimeError('socket closed')
@@ -1051,6 +1246,52 @@ class CgiOutcomeClassificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.retcode, -3000)
         self.assertIn('操作太频繁', str(caught.exception))
         self.assertNotIn('结果未知', str(caught.exception))
+
+    async def test_a_read_only_action_may_be_retried_and_says_so(self):
+        """只读（feed / moods）拿不到响应 → `ambiguous=False` + "可重试"。
+
+        读不产生副作用，没必要按写动作的保守口径吓自己；更要紧的是**文案里不能出现
+        "请勿自动重试"**——日志层早先被我们自己写的这句否定式坑过（标签打成
+        `[自动重试]`，与正文说的正好相反）。
+        """
+        async def request(method: str, url: str, headers: object = None, data: object = None) -> object:
+            raise RuntimeError('socket closed')
+
+        for action in ('feed', 'moods'):
+            with self.subTest(action=action):
+                with self.assertRaises(q.QzoneActionError) as caught:
+                    await q.call_qzone_cgi(request, _auth_only, action, {'count': 5})
+                self.assertIs(caught.exception.ambiguous, False, '只读动作重试安全')
+                self.assertIn('读取失败', str(caught.exception))
+                self.assertIn('重试不会产生副作用', str(caught.exception))
+                self.assertNotIn('请勿自动重试', str(caught.exception))
+                # 内部动作键（`get_qzone_feeds` / `get_qzone_msg_list`）也是同一分类。
+        for action in ('get_qzone_feeds', 'get_qzone_msg_list'):
+            with self.subTest(action=action):
+                self.assertIs(q.qzone_action_is_read(action), True)
+
+    async def test_a_read_only_action_without_a_receipt_is_not_ambiguous_either(self):
+        async def request(method: str, url: str, headers: object = None, data: object = None) -> object:
+            return None
+
+        with self.assertRaises(q.QzoneActionError) as caught:
+            await q.call_qzone_cgi(request, _auth_only, 'feed', {'count': 5})
+        self.assertIs(caught.exception.ambiguous, False)
+        self.assertNotIn('请勿自动重试', str(caught.exception))
+
+    async def test_a_write_action_says_do_not_retry(self):
+        """反向用例：写动作（comment / like / forward / publish / delete / visibility）
+        拿不到响应一律 `ambiguous=True` + "结果未知，请勿自动重试"。"""
+        async def request(method: str, url: str, headers: object = None, data: object = None) -> object:
+            return None
+
+        for action in ('comment', 'like', 'forward', 'publish', 'delete', 'update_visibility'):
+            with self.subTest(action=action):
+                with self.assertRaises(q.QzoneActionError) as caught:
+                    await q.call_qzone_cgi(request, _auth_only, action, {'tid': TID, 'content': 'x'})
+                self.assertIs(caught.exception.ambiguous, True, '%s 是写动作，不许重试' % action)
+                self.assertIn('结果未知，请勿自动重试', str(caught.exception))
+                self.assertIs(q.qzone_action_is_read(action), False)
 
     async def test_a_successful_call_returns_the_parsed_result(self):
         """③ 成功：回 `success_or_error` 解析出来的那份结果。"""
@@ -1248,18 +1489,24 @@ class BackendCatalogTests(unittest.TestCase):
     def test_backend_labels_are_the_two_literals_the_panel_pins(self):
         """前端 `actions-view.ts` 也钉了这两条字面量（徽章语气按后端种类分）。
 
-        v1.7.3：界面上只有**正式通道**——回退实现（SnowLuma 那套动作名）留在适配层的
-        `_PLATFORM_CALLS` 里当运行期兜底，**不进这张表**，也就不可能被下发到面板上。
+        v1.7.10：`OneBot` / `NapCat` 两档表达的是**现在真实存在的差别**——
+        NapCat 那 9 条要么是 NapCat 原生动作、要么要靠 NapCat 的 `get_cookies` 打
+        QZone CGI；换成别的 OneBot 实现（Lagrange / LLOneBot / go-cqhttp）拿不到 cookie，
+        这些动作就做不了。所以面板上的"NapCat 专属"徽章与筛选**仍然有意义**，保留。
         """
         self.assertEqual(pa.BACKEND_LABELS, {
             'onebot': '标准 OneBot',
             'napcat': 'NapCat 专属',
         })
-        self.assertNotIn('snowluma', pa.BACKEND_LABELS)
+        # 删除哨兵：后端集合只能是这两档（`BACKEND_LABELS` 是唯一真源）。
+        # 上游 Koishi 那套扩展动作名（v1.7.10 删除）**刻意不在这里点名**——
+        # 点名等于给它留了个位置；这条断言对任何"新加一个后端名"都会红。
         for action in pa.ACTIONS.values():
             with self.subTest(action=action.id):
-                self.assertNotIn('snowluma', action.backends,
-                                 '回退通道不许写进目录（界面上不承诺它）')
+                self.assertTrue(
+                    set(action.backends) <= set(pa.BACKEND_LABELS),
+                    '%s 声明了表外的后端：%s' % (action.id, action.backends),
+                )
 
     def test_every_action_declares_at_least_one_known_backend(self):
         for action in pa.ACTIONS.values():

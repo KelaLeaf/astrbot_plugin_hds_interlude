@@ -62,7 +62,7 @@
 * Puppeteer 的降采样 / 抽帧 → `PIL`（try-import）。`PIL` 缺失时
   `downscale_image_for_vision` / `render_animated_image_frame` 返回 `None`，
   调用方继续透传原图并记一条 debug 日志，**不抛异常**。
-* `onebot-file:` 语音的 SnowLuma 服务端转码 → `session.bot.internal._request`
+* `onebot-file:` 语音的服务端转码（NapCat `get_record`）→ `session.bot.internal._request`
   或 `Transport.transcode_record` 的可选钩子；两者都不可用时返回 `None`
   （等价上游 `typeof internal?._request !== 'function' ? undefined`）。
 * 图片 `content-type` 头：`Transport.fetch_image` 只回字节，故 MIME 走魔数嗅探
@@ -678,7 +678,7 @@ async def _archive_window_after(service: Any, story_id: str, cursor: int) -> lis
 async def _request_record_transcode(
     service: Any, session: Any, file: str, out_format: str, max_bytes: int,
 ) -> Optional[dict[str, Any]]:
-    """上游 `fetchNativeAudio` 的 `onebot-file:` 分支（SnowLuma 服务端转码）。
+    """上游 `fetchNativeAudio` 的 `onebot-file:` 分支（服务端转码）。
 
     优先走适配器原生 `session.bot.internal._request('get_record', ...)`，
     其次走 `Transport.transcode_record(file, out_format)` 可选钩子；两条路都
@@ -720,7 +720,7 @@ async def _request_record_transcode(
         base64_text = ''
     base64_text = re.sub(r'\s+', '', _text(base64_text))
     if not base64_text:
-        raise RuntimeError('SnowLuma get_record returned no transcoded payload')
+        raise RuntimeError('get_record returned no transcoded payload')
     if _base64_bytes_length(base64_text) > max_bytes:
         return None
     return {'format': out_format, 'base64': base64_text}
@@ -1626,7 +1626,7 @@ class ServiceChunk3(ServiceBase):
                 if vision_mode == 'sidecar' else None
             )
             images = loaded_images if vision_mode == 'native' else []
-            # 语音走原生音频通道：SnowLuma 服务端逐条转码，主模型以 input_audio 收到。
+            # 语音走原生音频通道：服务端（NapCat `get_record`）逐条转码，主模型以 input_audio 收到。
             # **私聊**这一路与上游 3413-3414 一致：批次内去重后按 `maxPerMessage` 取，
             # 不设群聊那套批次预算（那条在 `chunk1.flush_group_turn` 里）。
             audio_sources = _unique([

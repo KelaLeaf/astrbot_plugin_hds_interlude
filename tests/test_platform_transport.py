@@ -641,6 +641,13 @@ class PlatformCallMappingTests(PlatformTransportTestCase):
         )
 
     def test_qzone_actions(self):
+        """NapCat 原生只有发/删说说；其余空间动作在适配层**显式拒绝**。
+
+        `comment_qzone` / `like_qzone` / `get_qzone_feeds` / `get_qzone_msg_list` 在任何
+        后端的 API 清单里都不存在（真机上换回 `retcode 1404 不支持的Api`），所以它们
+        不再是平台出口——这几条目录动作由 `chunk12.CORE_HANDLED_ACTIONS` 收在本机，
+        走 `core/qzone_cgi.py` 的 QZone CGI。
+        """
         self.enter_session()
         result = self.run_action('publish_qzone_post', {'content': '今天天气不错'})
         self.assertTrue(result['ok'], result)
@@ -649,27 +656,23 @@ class PlatformCallMappingTests(PlatformTransportTestCase):
             self.client.params_of('send_qzone_msg'),
             {'content': '今天天气不错', 'ugc_right': 4},
         )
-        self.run_action('comment_qzone_post', {'tid': 't1', 'content': '好看'})
-        self.assertEqual(
-            self.client.params_of('comment_qzone'),
-            {'tid': 't1', 'content': '好看'},
-        )
-        self.run_action('like_qzone_post', {'tid': 't1', 'target_uin': '123'})
-        self.assertEqual(
-            self.client.params_of('like_qzone'), {'tid': 't1', 'target_uin': '123'},
-        )
-        self.run_action('list_qzone_posts', {'target_uin': '123', 'count': 5})
-        self.assertEqual(
-            self.client.params_of('get_qzone_msg_list'), {'target_uin': '123', 'num': 5},
-        )
-        # 没指归属 QQ = 看好友动态；`count` 在 feeds 上就叫 `count`。
-        result = self.run_action('list_qzone_posts', {'count': 5})
-        self.assertEqual(
-            self.client.params_of('get_qzone_feeds'), {'count': 5, 'page_num': 1},
-        )
-        self.assertTrue(any('get_qzone_feeds' in note for note in result.get('notes') or []))
         self.run_action('delete_qzone_post', {'tid': 't1'})
         self.assertEqual(self.client.params_of('delete_qzone_msg'), {'tid': 't1'})
+        calls_before = len(self.client.calls)
+        for action_id, params in (
+            ('comment_qzone_post', {'tid': 't1', 'content': '好看'}),
+            ('like_qzone_post', {'tid': 't1', 'target_uin': '123'}),
+            ('list_qzone_posts', {'target_uin': '123', 'count': 5}),
+            ('list_qzone_feeds', {'count': 5}),
+        ):
+            with self.subTest(action_id=action_id):
+                refused = self.run_action(action_id, params)
+                self.assertFalse(refused['ok'], refused)
+                self.assertIn('unsupported-platform-action', refused['error'])
+        self.assertEqual(
+            len(self.client.calls), calls_before,
+            '拒绝的动作**一个平台调用都不许发**（发了就是 1404）',
+        )
 
     def test_request_actions(self):
         self.enter_session()
@@ -1594,7 +1597,7 @@ class DegradationTests(PlatformTransportTestCase):
         self.assertWarned('没有可用的 OneBot 客户端')
 
     def test_get_fun_status_list_goes_through_and_reports_platform_message(self):
-        """NapCat / SnowLuma 的公开动作表里都没有这条：打过去、失败就把平台原话带回来。"""
+        """NapCat 的公开动作表里没有这条：打过去、失败就把平台原话带回来。"""
         self.enter_session()
         self.client.frames['get_fun_status_list'] = {
             'status': 'failed', 'retcode': 1404, 'message': '不支持的 API',

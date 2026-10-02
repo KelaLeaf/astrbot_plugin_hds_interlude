@@ -157,10 +157,16 @@ class PlatformAction:
     returns: str = ''
     aliases: tuple[str, ...] = field(default=())
     #: 能承载这条动作的后端，**顺序 = 优先级**。语义见 `BACKEND_LABELS`：
-    #: `onebot` = 任何 OneBot 实现都有的标准动作；`napcat` = 只有 NapCat 有
+    #: `onebot` = 任何 OneBot 实现都有的标准动作；`napcat` = 只有 NapCat 家族能做
     #: （含"用 NapCat 的 WebSocket 拿 cookie 再打 QZone CGI"这条路）。
-    #: 目录**只声明正式通道**：执行期若还有别的回退实现（见适配层
-    #: `_PLATFORM_CALLS` 里的历史动作名），那是运行期的兜底，不在这里承诺、也不在界面上显示。
+    #:
+    #: **为什么只剩两档还留着这套结构**（v1.7.10 复核）：它表达的是**现在真实存在**的
+    #: 能力差别——换成 Lagrange / LLOneBot / go-cqhttp 这些 OneBot 实现，`get_cookies`
+    #: 拿不到 cookie，靠它的 9 条动作（QQ 空间那一组 + `update_qq_status`）就做不了。
+    #: 控制台据此打「NapCat 专属」徽章、给「只看 NapCat 专属」筛选（前端 `actions-view.ts`
+    #: 与这里有对账用例），所以**不是**多后端脚手架的死代码。
+    #: 目录**只声明正式通道**：上游 Koishi 那套扩展动作名在任何后端上都不存在，
+    #: 已于 v1.7.10 从适配层删除（`_PLATFORM_CALLS` 里不再有任何"历史动作名"兜底）。
     backends: tuple[str, ...] = ('onebot',)
 
     @property

@@ -76,6 +76,7 @@ NOW = local(29, 15, 0)
 BASE_CONFIG = q.resolve_qzone_config({'enabled': True})
 
 
+
 def record(**overrides: Any) -> dict[str, Any]:
     row: dict[str, Any] = {
         'storyId': 's1', 'kind': 'post', 'tid': 't1', 'status': 'confirmed', 'createdAt': NOW,
@@ -468,11 +469,34 @@ class FeedFilterTests(unittest.TestCase):
 
 
 class _StubTransport:
-    """按契约的 `Transport`：`call_onebot(action, params) -> {'ok','error','data'}`。"""
+    """按契约的 `Transport`：`call_onebot(action, params) -> {'ok','error','data'}`。
 
-    def __init__(self, handler: Any = None) -> None:
+    `http` 可选：给了才**多一条** `request_text`（QZone CGI 的原始 HTTP）。
+    不给 = 这个传输层没有原始 HTTP 能力——v1.7.10 起空间动作只有 CGI 一条路，
+    所以要走通读通道的用例必须像真机一样给出 `http`（夹具不许比生产更宽容，坑 39）。
+    """
+
+    def __init__(self, handler: Any = None, http: Any = None) -> None:
         self.handler = handler
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.http_calls: list[dict[str, Any]] = []
+        if http is not None:
+            self.http_handler = http
+
+            async def request_text(method: str, url: str, headers: object = None,
+                                   data: object = None) -> object:
+                self.http_calls.append({
+                    'method': method, 'url': url,
+                    'headers': dict(headers or {}), 'data': dict(data or {}),
+                })
+                result = self.http_handler(method, url, headers, data)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+
+            self.request_text = request_text  # type: ignore[assignment]
 
     async def call_onebot(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((action, dict(params)))
@@ -883,33 +907,49 @@ class ServiceExecuteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any('已发表' in item[-1] for item in host.reports), '成功出口要有可见日志')
 
     async def test_successful_comment_targets_the_post_and_logs(self):
-        transport = _StubTransport(lambda a, p: {'ok': True, 'error': '', 'data': {}})
+        # 评论**只能**走 QZone CGI（平台侧没有这条动作）：夹具给出 `request_text`。
+        transport = _StubTransport(_sweep_handler(), http=lambda *a: '{"code":0}')
         host = _Host(transport=transport)
         result = await host.qzone_execute(
             STORY, 'comment', {'content': '哈哈哈', 'tid': '58a87a00', 'targetUin': '10002'},
         )
         self.assertEqual(result, {'ok': True, 'tid': '58a87a00', 'error': ''})
-        self.assertEqual(transport.calls, [('comment_qzone', {'tid': '58a87a00', 'content': '哈哈哈', 'target_uin': 10002})])
+        self.assertEqual(len(transport.http_calls), 1)
+        call = transport.http_calls[0]
+        self.assertIn('emotion_cgi_re_feeds', call['url'])
+        self.assertEqual(call['data']['topicId'], '58a87a00')
+        self.assertEqual(call['data']['content'], '哈哈哈')
+        self.assertEqual(call['data']['hostUin'], '10002')
+        self.assertEqual(
+            [name for name, _ in transport.calls
+             if name not in q.QZONE_COOKIE_APIS + ('get_login_info',)],
+            [], '一个空间平台动作都不许发出去',
+        )
         self.assertEqual(host.rows[0]['status'], 'confirmed')
         self.assertEqual(len(host.entries), 1)
         self.assertIn('[空间动态] 她评论了 QQ 10002的说说：哈哈哈', host.entries[0]['content'])
         self.assertEqual(host.entries[0]['metadata'], {'qzone_kind': 'comment', 'tid': '58a87a00'})
 
     async def test_like_confirms_without_a_script_entry(self):
-        transport = _StubTransport(lambda a, p: {'ok': True, 'error': '', 'data': {}})
+        transport = _StubTransport(_sweep_handler(), http=lambda *a: '{"code":0}')
         host = _Host(transport=transport)
         result = await host.qzone_execute(STORY, 'like', {'tid': '58a87a00', 'targetUin': '10002'})
         self.assertEqual(result, {'ok': True, 'tid': '58a87a00', 'error': ''})
-        self.assertEqual(transport.calls, [('like_qzone', {'tid': '58a87a00', 'target_uin': 10002})])
+        self.assertEqual(len(transport.http_calls), 1)
+        self.assertIn('internal_dolike_app', transport.http_calls[0]['url'])
         self.assertEqual(host.rows[0]['status'], 'confirmed')
         self.assertEqual(host.entries, [], '点赞成功不单独进剧本（过细）')
         self.assertTrue(any('点赞已发出' in item[-1] for item in host.reports), '静默的成功出口要补可见日志')
 
     async def test_non_numeric_target_uin_is_omitted(self):
-        transport = _StubTransport(lambda a, p: {'ok': True, 'error': '', 'data': {}})
+        transport = _StubTransport(_sweep_handler(), http=lambda *a: '{"code":0}')
         host = _Host(transport=transport)
         await host.qzone_execute(STORY, 'like', {'tid': '58a87a00', 'targetUin': 'not-a-number'})
-        self.assertEqual(transport.calls, [('like_qzone', {'tid': '58a87a00'})])
+        call = transport.http_calls[0]
+        self.assertIn('internal_dolike_app', call['url'])
+        # 非数字的 target_uin 直接**不带这个键**（`_target_uin_param`）：宁可少发一个
+        # 归属字段，也不把 `Number(NaN)` 发到腾讯那边去。
+        self.assertNotIn('not-a-number', json.dumps(call['data']))
 
     async def test_disabled_channel_returns_the_upstream_error_without_any_call(self):
         transport = _StubTransport()
@@ -1181,32 +1221,85 @@ def _feed(key: str, uin: str, minutes_ago: int = 20, appid: int = 311, nickname:
     }
 
 
-def _raw_feed(key: str, uin: str, seconds_ago: int = 1200, appid: int = 311, nickname: str = '') -> dict[str, Any]:
-    """SnowLuma 原始行（`time` 是秒级时间戳）。"""
-    return {
-        'key': key, 'uin': uin, 'nickname': nickname, 'appid': appid,
-        'time': NOW.timestamp() - seconds_ago,
-    }
+#: 编的 cookie（`p_skey` 是算 `g_tk` 的唯一输入）。
+SWEEP_COOKIES = 'uin=o010001; skey=@abc; p_skey=pin1n2x3'
+
+
+def _cgi_feed_text(key: str, uin: str, seconds_ago: int = 1200, appid: int = 311,
+                   nickname: str = '') -> str:
+    """QZone CGI 的**一页好友动态**：腾讯那页是 `{ver:` 伪分隔的 HTML 串。
+
+    字段用单引号、正文在 `html:'…'` 里——与 `core/qzone_cgi.py::parse_feed_item`
+    认的形状逐字一致（时间字段叫 `abstime` 不是 `time`）。
+    """
+    stamp = int(NOW.timestamp() - seconds_ago)
+    return (
+        "{ver:1,key:'%s',appid:%d,uin:%s,nickname:'%s',abstime:%d,html:'<div>正文</div>',}"
+        % (key, appid, uin, nickname, stamp)
+    )
+
+
+def _cgi_moods_text(rows: list[dict[str, Any]]) -> str:
+    """QZone CGI 的说说列表（JSONP，回调名与 `build_mood_list_request` 一致）。"""
+    return '_preloadCallback(%s);' % json.dumps({'code': 0, 'msglist': rows}, ensure_ascii=False)
 
 
 def _raw_msg(tid: str, content: str, seconds_ago: int = 1200) -> dict[str, Any]:
-    return {'tid': tid, 'content': content, 'time': NOW.timestamp() - seconds_ago, 'comment_num': 0, 'is_private': False}
+    """CGI 说说列表里的一条（`created_time` 是秒级时间戳）。"""
+    return {
+        'tid': tid, 'content': content, 'created_time': int(NOW.timestamp() - seconds_ago),
+        'cmtnum': 0,
+    }
+
+
+def _sweep_http(feed_text: str, moods_text: str) -> Any:
+    """CGI 的两个入口按 URL 分派（读好友动态 / 读某人说说）。"""
+    def http(method: str, url: str, headers: object, data: object) -> str:
+        if 'feeds3_html_more' in url:
+            return feed_text
+        if 'emotion_cgi_msglist_v6' in url:
+            return moods_text
+        return '{"code":0}'
+
+    return http
+
+
+def _sweep_handler(calls: Optional[list] = None) -> Any:
+    """NapCat 侧的 OneBot 直通：认**取登录态**的那几条（两个取凭据接口 + 登录信息）。
+
+    现代 NapCat 两个取凭据接口都有，主路是 `get_credentials`
+    （`core/qzone.QZONE_COOKIE_APIS`）；顺序由
+    `test_qzone_napcat_channel.CredentialApiOrderTests` 专门钉住。
+    """
+    def handler(action: str, params: dict) -> dict:
+        if calls is not None:
+            calls.append((action, dict(params)))
+        if action == 'get_credentials':
+            return {'ok': True, 'error': '', 'data': {'cookies': SWEEP_COOKIES, 'token': 1869525896}}
+        if action == 'get_cookies':
+            return {'ok': True, 'error': '', 'data': {'cookies': SWEEP_COOKIES, 'bkn': '1869525896'}}
+        if action == 'get_login_info':
+            return {'ok': True, 'error': '', 'data': {'user_id': 10001}}
+        return {'ok': False, 'error': 'NapCat 没有这个动作'}
+
+    return handler
 
 
 class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
-    def _sweep_transport(self, feeds: list[Any], msgs: Optional[list[Any]] = None) -> _StubTransport:
-        def handler(action: str, params: dict[str, Any]) -> dict[str, Any]:
-            if action == 'get_qzone_feeds':
-                return {'ok': True, 'error': '', 'data': {'feeds': feeds}}
-            if action == 'get_qzone_msg_list':
-                return {'ok': True, 'error': '', 'data': {'msglist': msgs or []}}
-            return {'ok': True, 'error': '', 'data': {}}
+    def _sweep_transport(self, feeds: list[str], msgs: Optional[list[dict]] = None) -> _StubTransport:
+        """好友动态轮询的传输层：CGI（`request_text`）+ 取登录态（`call_onebot`）。
 
-        return _StubTransport(handler)
+        v1.7.10 起空间动作**只有 CGI 一条路**，所以夹具必须同时给出这两样；
+        没给 `request_text` 的传输层连一条动态都读不到（见
+        `test_without_the_cgi_channel_the_sweep_reports_why_and_stays_empty`）。
+        """
+        return _StubTransport(
+            _sweep_handler(), http=_sweep_http(''.join(feeds), _cgi_moods_text(msgs or [])),
+        )
 
     async def test_fresh_feeds_become_entries_and_are_recorded_as_seen(self):
         msgs = [_raw_msg('k1', '今天去吃火锅了'), _raw_msg('other', '另一条')]
-        transport = self._sweep_transport([_raw_feed('k1', '10002', nickname='好友A')], msgs)
+        transport = self._sweep_transport([_cgi_feed_text('k1', '10002', nickname='好友A')], msgs)
         host = _Host(transport=transport)
         host.endpoint_rows = [{
             'id': 'ep-1', 'ownerKind': 'story-role', 'ownerId': STORY_ID, 'accountKey': 'onebot:10001',
@@ -1233,21 +1326,27 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[0]['endpointId'], 'ep-1')
         self.assertIs(seen[0]['storyId'], STORY_ID)
         self.assertTrue(any('好友动态已入账' in item[-1] for item in host.reports))
+        # **只走 CGI**：两个读动作都打 QZone 的 HTTP 接口，一个平台动作都没发出去
+        # （`comment_qzone` / `get_qzone_feeds` 这些名字在任何后端上都不存在）。
+        # 每个 CGI 动作各取一次登录态（`call_qzone_cgi` 不传 `auth` 时自己取）：
+        # 一轮轮询 = 两次 `get_credentials` + 两次 `get_login_info`，**零个**空间平台动作。
         self.assertEqual(
-            [action for action, _ in transport.calls], ['get_qzone_feeds', 'get_qzone_msg_list'],
+            [name for name, _ in transport.calls],
+            ['get_credentials', 'get_login_info', 'get_credentials', 'get_login_info'],
         )
-        # 这个桩没有 `request_text`（= 没有 NapCat WS 通道），所以走的是 SnowLuma 回退；
-        # 参数里不带下划线的那几个是给 CGI 通道准备的兄弟键（见 `_qzone_run_action`）。
-        self.assertEqual(transport.calls[0][1], {'page': 1, 'page_num': 1, 'count': 20})
-        self.assertEqual(
-            transport.calls[1][1],
-            {'target_uin': 10002, 'targetUin': 10002, 'num': 5, 'count': 5},
-        )
+        self.assertNotIn('get_qzone_feeds', [name for name, _ in transport.calls])
+        self.assertEqual(len(transport.http_calls), 2)
+        self.assertIn('feeds3_html_more', transport.http_calls[0]['url'])
+        self.assertEqual(transport.http_calls[0]['data']['pagenum'], '1')
+        self.assertEqual(transport.http_calls[0]['data']['count'], '20')
+        self.assertIn('emotion_cgi_msglist_v6', transport.http_calls[1]['url'])
+        self.assertEqual(transport.http_calls[1]['data']['uin'], '10002')
+        self.assertEqual(transport.http_calls[1]['data']['num'], '5')
 
     async def test_content_mismatch_keeps_metadata_only(self):
         """正文只认 tid 精确命中：拉不到就只记"某人发了说说"。"""
         transport = self._sweep_transport(
-            [_raw_feed('k1', '10002', nickname='好友A')], [_raw_msg('other', '别人的正文')],
+            [_cgi_feed_text('k1', '10002', nickname='好友A')], [_raw_msg('other', '别人的正文')],
         )
         host = _Host(transport=transport)
         await host.qzone_feed_sweep()
@@ -1255,26 +1354,27 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any('正文=无' in item[-1] for item in host.reports))
 
     async def test_msg_list_failure_falls_back_to_metadata_only(self):
-        def handler(action: str, params: dict[str, Any]) -> dict[str, Any]:
-            if action == 'get_qzone_feeds':
-                return {'ok': True, 'error': '', 'data': {'feeds': [_raw_feed('k1', '10002', nickname='好友A')]}}
-            return {'ok': False, 'error': 'request timeout'}
+        """正文那一次 CGI 失败（腾讯间歇抽风）→ 按"只有元数据"入账，不是整轮丢。"""
+        def http(method: str, url: str, headers: object, data: object) -> str:
+            if 'feeds3_html_more' in url:
+                return _cgi_feed_text('k1', '10002', nickname='好友A')
+            raise RuntimeError('request timeout')
 
-        host = _Host(transport=_StubTransport(handler))
+        host = _Host(transport=_StubTransport(_sweep_handler(), http=http))
         await host.qzone_feed_sweep()
         self.assertEqual(len(host.entries), 1)
         self.assertEqual(host.entries[0]['content'], '[好友动态] 好友A发布了说说')
         self.assertEqual(len(host.rows), 1, '正文拉不到也要记 feed-seen，避免下轮重复')
 
     async def test_nickname_is_optional_and_uin_is_the_fallback_owner(self):
-        transport = self._sweep_transport([_raw_feed('k1', '10002')])
+        transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
         host = _Host(transport=transport)
         await host.qzone_feed_sweep()
         self.assertEqual(host.entries[0]['content'], '[好友动态] QQ 10002发布了说说')
 
     async def test_seen_keys_within_seven_days_are_not_reingested(self):
         rows = [record(kind='feed-seen', tid='k1', status='confirmed', createdAt=NOW - timedelta(days=1))]
-        transport = self._sweep_transport([_raw_feed('k1', '10002')])
+        transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
         host = _Host(transport=transport, rows=rows)
         await host.qzone_feed_sweep()
         self.assertEqual(host.entries, [])
@@ -1282,19 +1382,19 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stale_seen_keys_beyond_seven_days_can_be_seen_again(self):
         rows = [record(kind='feed-seen', tid='k1', status='confirmed', createdAt=NOW - timedelta(days=8))]
-        transport = self._sweep_transport([_raw_feed('k1', '10002')])
+        transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
         host = _Host(transport=transport, rows=rows)
         await host.qzone_feed_sweep()
         self.assertEqual(len(host.entries), 1)
 
     async def test_at_most_two_candidates_per_round(self):
-        feeds = [_raw_feed('k1', '10001'), _raw_feed('k2', '10002'), _raw_feed('k3', '10003')]
+        feeds = [_cgi_feed_text('k1', '10001'), _cgi_feed_text('k2', '10002'), _cgi_feed_text('k3', '10003')]
         host = _Host(transport=self._sweep_transport(feeds))
         await host.qzone_feed_sweep()
         self.assertEqual(len(host.entries), 2)
 
     async def test_channel_gates_short_circuit_before_any_call(self):
-        transport = self._sweep_transport([_raw_feed('k1', '10002')])
+        transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
         disabled = _Host(transport=transport, config={'enabled': False})
         await disabled.qzone_feed_sweep()
         self.assertEqual(transport.calls, [])
@@ -1311,7 +1411,7 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(no_transport.entries, [])
 
     async def test_no_canonical_story_or_unhandled_story_skips_quietly(self):
-        transport = self._sweep_transport([_raw_feed('k1', '10002')])
+        transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
         without_story = _Host(transport=transport)
         without_story.canonical_story = None
         await without_story.qzone_feed_sweep()
@@ -1322,21 +1422,40 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.calls, [])
 
     async def test_single_flight_lock_prevents_a_second_concurrent_sweep(self):
-        transport = self._sweep_transport([_raw_feed('k1', '10002')])
+        transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
         host = _Host(transport=transport)
         host._qzone_feed_sweep_running = True
         await host.qzone_feed_sweep()
         self.assertEqual(transport.calls, [], '已在跑就不再进一轮')
         host._qzone_feed_sweep_running = False
 
-    async def test_feeds_failure_is_silent_but_unexpected_failure_is_a_warn(self):
-        failing = _Host(transport=_StubTransport(lambda a, p: {'ok': False, 'error': 'feeds cgi down'}))
+    async def test_without_the_cgi_channel_the_sweep_reports_why_and_stays_empty(self):
+        """传输层没有原始 HTTP 能力（拿不到 QZone CGI）= **通道缺失**，不是网络抖动。
+
+        这种"每轮都失败且每轮都一样"的原因必须**看得见**（按小时节流一条 warn 说清
+        下一步做什么）；早先它会掉进"feeds 间歇失败：静默跳过"，用户只看到
+        "开了自动浏览却永远没动静"。反过来，真正的间歇失败仍然静默（下一条用例）。
+        """
+        host = _Host(transport=_StubTransport(_sweep_handler()))
+        await host.qzone_feed_sweep()
+        self.assertEqual(host.entries, [])
+        warned = [text for level, text in host.standalone if level == 'warn']
+        self.assertTrue(warned, '通道缺失必须留下一条可见说明')
+        self.assertIn('需要 NapCat 通道', warned[0])
+        self.assertIn('get_qzone_feeds', warned[0])
+        self.assertEqual(host._qzone_feed_sweep_running, False)
+
+    async def test_an_intermittent_cgi_failure_is_silent_and_the_append_failure_is_a_warn(self):
+        def http(method: str, url: str, headers: object, data: object) -> str:
+            return None  # 这一轮 CGI 没回执（网络/平台拦截）
+
+        failing = _Host(transport=_StubTransport(_sweep_handler(), http=http))
         await failing.qzone_feed_sweep()
         self.assertEqual(failing.entries, [])
-        self.assertEqual(failing.standalone, [], 'feeds 间歇失败静默跳过，下轮再试')
+        self.assertEqual(failing.standalone, [], 'CGI 间歇失败静默跳过，下轮再试')
         self.assertEqual(failing._qzone_feed_sweep_running, False)
 
-        broken = _Host(transport=self._sweep_transport([_raw_feed('k1', '10002')]))
+        broken = _Host(transport=self._sweep_transport([_cgi_feed_text('k1', '10002')]))
 
         async def failing_append(story_id: str, entry: Any, now: Any, participant_id: str = '') -> dict[str, Any]:
             raise RuntimeError('append failed')
@@ -1348,10 +1467,10 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_feed_rows_are_dropped(self):
         transport = self._sweep_transport([
-            {'uin': '10002'},                       # 没有 key
-            {'key': 'k2'},                          # 没有 uin
+            "{ver:1,appid:311,uin:10002,}",          # 没有 key
+            "{ver:1,appid:311,key:'k2',}",           # 没有 uin
             'junk',
-            _raw_feed('k3', '10003'),
+            _cgi_feed_text('k3', '10003'),
         ])
         host = _Host(transport=transport)
         await host.qzone_feed_sweep()
@@ -1359,7 +1478,7 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(host.rows[0]['tid'], 'k3')
 
     async def test_auto_feed_off_skips_the_sweep_and_says_so_once_per_hour(self):
-        transport = self._sweep_transport([_raw_feed('k1', '10002')])
+        transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
         host = _Host(
             transport=transport,
             config=dict(BASE_CONFIG, auto_feed=False),
@@ -1382,8 +1501,8 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(host._qzone_feed_sweep_running, False, '被开关拦下不占单飞锁')
 
     async def test_auto_feed_on_sweeps_and_manual_actions_ignore_it(self):
-        transport = self._sweep_transport([_raw_feed('k1', '10002')])
-        host = _Host(transport=transport, config=dict(BASE_CONFIG, auto_feed=True))
+        transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
+        host = _Host(transport=transport)
         await host.qzone_feed_sweep()
         self.assertEqual(len(host.entries), 1)
         # 手动/意图触发的动作不受 auto_feed 影响
