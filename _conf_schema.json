@@ -1717,6 +1717,12 @@
         "default": true,
         "hint": "补描述时顺便从已有分组里挑一组，都不合适才新建（新建有数量与速率上限）。"
       },
+      "auto_disable": {
+        "type": "bool",
+        "description": "描述时判为非表情包就停用",
+        "default": true,
+        "hint": "只在模型明确说不是表情包（置信度达标）时停用，不删除；人改过的行不会被停用。"
+      },
       "provider_id": {
         "type": "string",
         "default": "",

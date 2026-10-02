@@ -1117,6 +1117,24 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body['messages'][1]['content'][0]['text'].endswith('animated: true.'))
         self.assertEqual(body['messages'][1]['content'][1]['image_url'], {'url': 'data:image/png;base64,AAA', 'detail': 'low'})
 
+    async def test_describe_sticker_passes_the_sticker_verdict_fields_through(self):
+        """§50：描述回执里的 `is_sticker` / `confidence` **原样**出去（判据不在这里）。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({
+            'description': '一张风景照', 'aliases': [],
+            'is_sticker': False, 'confidence': 0.93,
+        }, ensure_ascii=False)}}]}])
+        config = make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)])
+        describer = create_sticker_describer(http, config)
+        result = await describer.describe_sticker('data:image/png;base64,AAA', 'image/png', 'p.png', False)
+        self.assertIs(result['is_sticker'], False)
+        self.assertEqual(result['confidence'], 0.93)
+        # 提示词必须**问**这两个字段（问不出来就永远是"拿不准 = 不动"）。
+        system = http.posts[0]['body']['messages'][0]['content']
+        self.assertIn('"is_sticker"', system)
+        self.assertIn('"confidence"', system)
+        # 拿不准时鼓励答 true（停用是重手，判据那边还有置信度闸）。
+        self.assertIn('when unsure answer is_sticker:true', system)
+
     async def test_describe_sticker_carries_the_group_directory_and_returns_the_choice(self):
         """§48 乙：带上分组目录 → 提示词里多一段 + 回执里的 `group` 原样交出去。"""
         http = FakeHttpClient(responses=[{'choices': [{'message': {'content': json.dumps({

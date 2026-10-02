@@ -1060,6 +1060,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
             # v1.8.4（§48）：两级表情选择（先点名分组、再挑条目）与"整理时顺手归组"。
             # 两把闸都**默认开**，与 `auto_collect` 同一把尺子（只有显式 false 才关）。
             "group_selection", "auto_group",
+            # v1.8.4（§50）：描述时模型判"不是表情包"就停用那一行（可逆、不删）。
+            # 同一把尺子（默认开）；人改过的行（描述 / 归属 / 启用状态）一律不碰。
+            "auto_disable",
         },
         # v1.3.0 受控偏离：三张名单各自的"仅处理名单内"开关（上游只有一个总闸 `enabled`，
         # 本移植版删掉它、换成这三个正交开关）。见 `docs/PORTING_NOTES.md` §22。

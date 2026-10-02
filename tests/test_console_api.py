@@ -3148,13 +3148,18 @@ class ConsoleStickerGroupTests(unittest.TestCase):
         self.assertEqual(after['name'], '未整理', '内置组的显示名是常量，写描述不会改它')
 
     def test_sticker_items_expose_the_two_group_ownership_flags(self):
-        """§48：素材 item **只加**两个归属字段（`groupGuessed` / `groupManual`），旧字段一个没动。"""
+        """§48 / §50：素材 item **只加**三个字段（归属两枚 + `disabledBy`），旧字段一个没动。"""
         self._insert('a-1', group='collected')
         self.database.update('interlude_sticker', {'assetId': 'a-1'},
                              {'groupGuessed': True, 'groupManual': False})
         self._insert('a-2', group='g-1')
         self.database.update('interlude_sticker', {'assetId': 'a-2'},
                              {'groupGuessed': False, 'groupManual': True})
+        # §50：**启用状态是谁定的**（模型停的 / 人停过或启用的），如实带出去。
+        self.database.update('interlude_sticker', {'assetId': 'a-1'},
+                             {'status': 'disabled', 'disabledBy': 'model'})
+        self.database.update('interlude_sticker', {'assetId': 'a-2'},
+                             {'status': 'active', 'disabledBy': 'manual'})
         self._insert('a-3', group='g-1')
         listing = _run(self.api.stickers())
         by_id = {item['assetId']: item for item in listing['items']}
@@ -3162,9 +3167,14 @@ class ConsoleStickerGroupTests(unittest.TestCase):
         self.assertFalse(by_id['a-1']['groupManual'])
         self.assertTrue(by_id['a-2']['groupManual'])
         self.assertFalse(by_id['a-2']['groupGuessed'])
-        # 旧库补列前写入的行是 NULL → 两个都当 false（不是 None / 缺键）。
+        self.assertTrue(by_id['a-1']['disabled'])
+        self.assertEqual(by_id['a-1']['disabledBy'], 'model', '模型停的')
+        self.assertFalse(by_id['a-2']['disabled'])
+        self.assertEqual(by_id['a-2']['disabledBy'], 'manual', '人启用的（模型不许再停）')
+        # 旧库补列前写入的行是 NULL → 布尔当 false、字符串当空串（不是 None / 缺键）。
         self.assertIs(by_id['a-3']['groupGuessed'], False)
         self.assertIs(by_id['a-3']['groupManual'], False)
+        self.assertEqual(by_id['a-3']['disabledBy'], '')
         # 既有字段名一个都没动。
         for key in ('assetId', 'group', 'groupId', 'groupName', 'manual', 'guessed'):
             with self.subTest(key=key):

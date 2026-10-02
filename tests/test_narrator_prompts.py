@@ -503,6 +503,12 @@ class NarrativePromptTests(unittest.TestCase):
         self.assertRegex(with_groups, r'"new"')
         self.assertIn('猫猫', with_groups)
         self.assertIn('prefer an existing group', with_groups)
+        # §50：两个变体都要问"这到底是不是表情包"（判据在服务层，提示词只负责问出来）。
+        for text in (plain, with_groups):
+            with self.subTest(text=text[:40]):
+                self.assertIn('"is_sticker"', text)
+                self.assertIn('"confidence"', text)
+                self.assertIn('when unsure answer is_sticker:true', text)
 
     def test_selection_instruction_asks_for_one_asset_and_the_message(self) -> None:
         text = sticker_selection_instruction(0.7)

@@ -145,7 +145,10 @@ from .helpers import (
     should_supersede_narrative_request,
     stable_sticker_asset_id,
     sticker_guess_candidate,
+    sticker_disabled_by,
     sticker_guess_result,
+    sticker_media_signal,
+    sticker_not_sticker_verdict,
     sticker_group_directory,
     sticker_group_directory_ids,
     sticker_group_items,
@@ -157,6 +160,7 @@ from .helpers import (
 #: 上游 `normalizeVisibleMessageContent`（`src/service.ts:7649`，模块级导出函数）。
 #: `helpers.py` 把它实现成下划线私有（同文件里由 `normalizeGroupVisibleReply` 使用），
 #: 但 Chunk2 的流式早发路径同样需要它，这里按上游语义直接复用同一实现，避免两份漂移。
+from .helpers import STICKER_CANDIDATE_KIND
 from .helpers import _normalize_visible_message_content as normalize_visible_message_content
 from .transport import NullTransport, voice_kwargs
 
@@ -218,12 +222,12 @@ def _read_local_bytes(path: str) -> bytes:
     """读一个本地文件（`asyncio.to_thread` 的落地实现；失败由调用方 catch）。"""
     with open(path, 'rb') as handle:
         return handle.read()
-def _incoming_sticker_kinds(
+def _incoming_sticker_details(
     media: Any,
     sticker_rows: Any,
     media_by_source: Any = None,
-) -> dict[str, str]:
-    """入站附件的 `来源 → 种类` 查找表（三份来源合并，先到先得）。
+) -> dict[str, dict[str, str]]:
+    """入站附件的 `来源 → {kind, summary}` 查找表（三份来源合并，先到先得）。
 
     * `media`：`extract_session_media` 抽出来的 `[{source, kind, summary, label}]`；
     * `media_by_source`：调用方按来源去重后的同一张表（私聊缓冲回合已经做过一次）；
@@ -232,31 +236,64 @@ def _incoming_sticker_kinds(
 
     合并顺序固定（media → media_by_source → sticker_rows）：**先拿到的为准**，
     后面只补空位。同一个来源出现两种说法时不猜，按第一条落定。
+
+    为什么连 `summary` 一起带出来（§49.1）：候选档的判据要"名字"（`[中午好]`），
+    而名字就在媒体条目的 `summary` 里 —— 判据仍只有一处
+    （`helpers.sticker_media_signal`），这里只是把**同一次解析出来的**输入递给它，
+    绝不回正文里再抠一次。
     """
-    kinds: dict[str, str] = {}
+    details: dict[str, dict[str, str]] = {}
+
+    def push(source: Any, item: Any) -> None:
+        key = str(source if source is not None else '').strip()
+        if not key or not isinstance(item, dict) or key in details:
+            return
+        details[key] = {
+            'kind': _text_kind(item.get('kind')),
+            'summary': str(item.get('summary') if item.get('summary') is not None else '').strip(),
+        }
+
     for item in (media or []):
-        if not isinstance(item, dict):
-            continue
-        source = str(item.get('source') if item.get('source') is not None else '').strip()
-        if source:
-            kinds.setdefault(source, _text_kind(item.get('kind')))
+        if isinstance(item, dict):
+            push(item.get('source'), item)
     if isinstance(media_by_source, dict):
         for source, item in media_by_source.items():
-            key = str(source if source is not None else '').strip()
-            if key and isinstance(item, dict):
-                kinds.setdefault(key, _text_kind(item.get('kind')))
+            push(source, item)
     for item in (sticker_rows or []):
-        if not isinstance(item, dict):
-            continue
-        asset_id = pick(item, 'assetId', 'asset_id')
-        if asset_id:
-            kinds.setdefault(str(asset_id).strip(), _text_kind(pick(item, 'kind')))
-    return kinds
+        if isinstance(item, dict):
+            push(pick(item, 'assetId', 'asset_id'), item)
+    return details
+
+
+def _incoming_sticker_kinds(
+    media: Any,
+    sticker_rows: Any,
+    media_by_source: Any = None,
+) -> dict[str, str]:
+    """`来源 → 种类`（`_incoming_sticker_details()` 的薄视图，保留老形状）。"""
+    return {
+        source: detail['kind']
+        for source, detail in _incoming_sticker_details(media, sticker_rows, media_by_source).items()
+    }
 
 
 def _text_kind(value: Any) -> str:
     """种类的原样文本（不做白名单判断——白名单在 `collectible_sticker_kind` 一处）。"""
     return str(value if value is not None else '').strip().lower()
+
+
+def _candidate_sticker_kind(kind: str, summary: Any, mime_type: Any) -> str:
+    """候选档过了结构检查之后落库用的种类：会动的落 `animated`，其余 `sticker`。
+
+    判据（§49.1）：`summary` 含「动画」（NapCat 自己的占位口径 `[动画表情]`）或字节是 GIF。
+    它只影响落库时的 `assetId` 前缀（`store_collected_sticker` 另外按 MIME 自己判
+    `animated` 列），**不影响收不收** —— 收不收在结构信号那一处已经定了。
+    """
+    if '动画' in str(summary if summary is not None else ''):
+        return 'animated'
+    if _text_kind(mime_type) == 'image/gif':
+        return 'animated'
+    return 'sticker'
 
 
 def _has_collectible_media(media: Any, guess_enabled: bool = False) -> bool:
@@ -269,13 +306,17 @@ def _has_collectible_media(media: Any, guess_enabled: bool = False) -> bool:
     第二层判据（模型判定）只在 `kind == 'image'` 上有意义，而"这条消息里有没有普通图片"
     只有这里能同步判出来（下载、解析图片头、调模型都在任务里做）。开关关着时行为与今天
     逐字一致——纯文字 / 只有普通照片的消息**一个任务都不建**。
+
+    **候选档（`sticker-candidate`）与开关无关，永远算"值得建任务"**（§49.1 第二档）：
+    它的结构检查（GIF / alpha / 尺寸）要拿到字节才能做，而那正是任务里干的事。
     """
     for item in (media or []):
         if not isinstance(item, dict):
             continue
-        if collectible_sticker_kind(item.get('kind')):
+        kind = _text_kind(item.get('kind'))
+        if collectible_sticker_kind(kind) or kind == STICKER_CANDIDATE_KIND:
             return True
-        if guess_enabled and _text_kind(item.get('kind')) == GUESS_STICKER_KIND:
+        if guess_enabled and kind == GUESS_STICKER_KIND:
             return True
     return False
 
@@ -1333,6 +1374,11 @@ class ServiceChunk2(ServiceBase):
             'auto_group': _config_value(
                 configured, 'autoGroup', 'auto_group',
             ) is not False,
+            # 本移植版新增（受控偏离 §50）：描述时模型判"不是表情包"就**停用**这一行
+            # （可逆、不删）。**默认真**，`is not False` 与上面两把闸同一把尺子。
+            'auto_disable': _config_value(
+                configured, 'autoDisable', 'auto_disable',
+            ) is not False,
             'directory': str(directory if directory else 'data/hds-interlude/stickers').strip(),
             'max_file_size_mb': max(1.0, min(
                 30.0, _config_number(configured, 'maxFileSizeMB', 'max_file_size_mb', 10),
@@ -1555,10 +1601,15 @@ class ServiceChunk2(ServiceBase):
                 self.report_standalone(
                     'warn', '表情包库发现新素材，但没有配置 useForStickers 的视觉模型；已等待描述。',
                 )
+            disabled_by_model = 0
             for item in pending[:5]:
                 if not _provider_available(self.sticker_describer):
                     break
                 await self.describe_sticker_asset(item['asset'], item['bytes'], config)
+                if item['asset'].get('_modelDisabled'):
+                    disabled_by_model += 1
+            # 一批描述跑完只报**一条**汇总（§50）：判成照片是常见情况，不许一张一条刷屏。
+            self._report_model_disabled(disabled_by_model)
             await self.refresh_sticker_catalog()
             await self.backfill_sticker_embeddings()
             await self.refresh_sticker_catalog()
@@ -1631,12 +1682,29 @@ class ServiceChunk2(ServiceBase):
             )
             await self.db_set('interlude_sticker', {'id': item_id}, {'updatedAt': self.now()})
             return False
-        await self.db_set('interlude_sticker', {'id': item_id}, {
+        patch: dict[str, Any] = {
             'description': pick(description, 'description'),
             'aliases': pick(description, 'aliases'),
             'status': 'active',
             'updatedAt': self.now(),
-        })
+        }
+        if sticker_disabled_by(asset_row.get('disabledBy')) == 'manual':
+            # 人的启用状态决定：**描述可以更新，`status` 一个字都不许动**（§50）。
+            # 少了这一句，"人停用的行"会被描述顺手改回 `active` —— 那就是模型覆盖人。
+            patch.pop('status', None)
+        # 模型说"这不是表情包"？→ **停用**（不删：可逆，文件与描述都留着，§50）。
+        # 三道闸都在这里：开关（`auto_disable`）、判据（`sticker_not_sticker_verdict`，
+        # 拿不准=false）、以及"人不被模型覆盖"（人写过描述 / 人定过归属 / 人对启用状态
+        # 表过态 —— 任一为真就一个字都不动）。判据只有一处，见 `helpers`。
+        if self._model_may_disable(asset_row, settings, description):
+            patch['status'] = 'disabled'
+            patch['disabledBy'] = 'model'
+            asset_row['_modelDisabled'] = True
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '模型判定这不是表情包，已停用 素材=%s',
+                asset_row.get('assetId'),
+            )
+        await self.db_set('interlude_sticker', {'id': item_id}, patch)
         await self._index_sticker_description(
             item_id, pick(description, 'description'), pick(description, 'aliases') or [],
         )
@@ -1645,10 +1713,51 @@ class ServiceChunk2(ServiceBase):
         if groups is not None:
             await self.apply_sticker_auto_group(item_id, asset_row, description)
         self.report_standalone_operation(
-            'standard', 'info', '表情包描述完成 素材=%s 分组=%s',
+            'standard', 'info', '表情包描述完成 素材=%s 分组=%s%s',
             asset_row.get('assetId'), asset_row.get('group'),
+            '（模型判定不是表情包 → 已停用）' if asset_row.get('_modelDisabled') else '',
         )
         return True
+
+    def _model_may_disable(
+        self, asset_row: dict[str, Any], settings: dict[str, Any], receipt: Any,
+    ) -> bool:
+        """描述之后"能不能把这一行停用"？**四道闸，全过才动**（§50）。
+
+        1. 开关：`stickers.auto_disable` 关着 → 只写描述，启用状态一个字都不动；
+        2. 判据：`helpers.sticker_not_sticker_verdict()`（`is_sticker` 显式为 `False`
+           **且**置信度达标）—— 拿不准 / 回执坏 / 缺字段一律 false（"拿不准=不动"）；
+        3. 只动"模型自己正在整理"的素材：**人写过描述**（`descriptionManual`）不碰；
+        4. **人不被模型覆盖**：**人定过归属**（`groupManual`）不碰；
+           `disabledBy == 'manual'`（人停用过**或**人启用过）不碰 —— 后半条就是
+           "用户点「启用」之后它不许再停回去"。
+
+        停用**不是删除**：`status='disabled'` + `disabledBy='model'`，文件与描述都留着，
+        控制台点「启用」立刻回来（那一下会把 `disabledBy` 改成 `manual`）。
+        """
+        if settings.get('auto_disable') is False:
+            return False
+        if not sticker_not_sticker_verdict(receipt):
+            return False
+        if asset_row.get('descriptionManual') in (True, 1):
+            return False
+        if asset_row.get('groupManual') in (True, 1):
+            return False
+        return sticker_disabled_by(asset_row.get('disabledBy')) != 'manual'
+
+    def _report_model_disabled(self, count: int) -> None:
+        """一批描述跑完后**一条**汇总（§50）：`N` 张被判非表情包已停用。
+
+        为什么不一张一条：批量整理（扫描 / 一次收十几张）会把日志淹掉，而"判成照片"
+        本来就是常见情况。判据为真时的**单条**落在 debug（`describe_sticker_asset`），
+        这句汇总走 info —— 用户看得见"它自己收了一下摊子"，又不刷屏。
+        """
+        if count <= 0:
+            return
+        self.report_standalone_operation(
+            'standard', 'info',
+            '模型判定 %d 张不是表情包，已停用（可在控制台「表情库」里启用）', count,
+        )
 
     async def _index_sticker_description(
         self, item_id: Any, description: Any, aliases: Any = None,
@@ -1784,27 +1893,38 @@ class ServiceChunk2(ServiceBase):
     ) -> list[dict[str, Any]]:
         """把**确认是表情包**的入站附件收进本地表情库；返回新入库的资产行。
 
-        判据分**两层，互不越权**：
+        判据分**三档，互不越权**（§49.1 的三档表；第二/三档合起来仍叫"两层判据"）：
 
-        **第一层**（`helpers.collectible_sticker_kind()`，唯一入口，用户点名的红线）
+        **一档·确定**（`helpers.collectible_sticker_kind()`，唯一入口，用户点名的红线）
 
         1. **种类必须是观测到的**：只有 `sticker` / `animated` / `market` 才考虑收藏。
            种类来自适配层从 OneBot 原始段捞出来的 `sub_type` / `summary`（见
            `astrbot_bridge.raw_media_hints`），**结构化**地随 `SessionView.media`
            下来，经 `extract_session_media` 成了每条媒体的 `kind`（§46；core **不读**
            正文里的 `<img>` 文本）。**缺失 / 未知 / `image` / `card` 一律不收**，记 debug。
-           第一层认了的种类**直接收，永远不走模型**（行为与 v1.8.0 逐字一致）。
+           这一档认了的种类**直接收，永远不走模型**。
         2. **字节要真的验过是图片**：魔数嗅探（png/jpg/gif/webp）不过就跳过 + debug。
         3. **上限**：超过 `max_file_size_mb` 的字节在 `store_collected_sticker` 里被挡掉
            （字节已经拿到手才判，所以这一步不会因为"太大"而跳过下载）。
         4. **去重**：内容 sha256。同一个表情重复发、或者库里已经有同内容素材，都不再入库。
 
-        **第二层**（`_sticker_guess_enabled()` + `guess_sticker_like()`，`§45.7`）
+        **二档·候选**（`kind == STICKER_CANDIDATE_KIND`，`§49.1`）
+
+        平台标了"可能是表情"但语义没核实的那几个 `sub_type`（2/3/7）走这一档：
+        **先过结构检查才收**（`helpers.sticker_media_signal`，与第二层预筛同一把尺子）——
+        名字信号（`[中午好]`）在适配层入站时就判过并定成了 `sticker`，所以走到这里的
+        候选要拿字节再判 GIF / 带 alpha 的 PNG / 近方形小图。过了 → 收（GIF 或 summary
+        含「动画」落 `animated`）；不过 → 按普通图（开关开着时仍给它一次模型机会）。
+        **这一档与 `auto_collect_guess` 无关**：结构检查不是模型判定。
+
+        **三档·模型**（`_sticker_guess_enabled()` + `guess_sticker_like()`，`§45.7`）
 
         只处理 `kind == 'image'`，且**只在 `stickers.auto_collect_guess` 打开时**才可能
-        被调用——那些"被当成普通图片发过来"的表情包走这一层。**它永远不能否决第一层**，
-        第一层也永远不该走模型。判定顺序刻意从便宜到贵：来源自带的体积（不下载就排除）
-        → 图片头预筛（`sticker_guess_candidate`）→ 去重 → 节流 → 才调模型。
+        被调用——那些"被当成普通图片发过来"的表情包走这一层。**它永远不能否决前面两档**，
+        前面两档也永远不该为了"确认"去走模型。判定顺序刻意从便宜到贵：来源自带的体积
+        （不下载就排除）→ 图片头预筛（`sticker_guess_candidate`）→ 去重 → 节流 → 才调模型。
+        （二档落进这一档的例外：结构检查已经判过一遍且没命中，就不再重复预筛 ——
+        平台标的候选本身就是"值得花一次"的理由。）
 
         拿不到字节时：**一条节流 warn**（这是能力缺失，用户该看见），本批不再重复报。
 
@@ -1819,7 +1939,8 @@ class ServiceChunk2(ServiceBase):
             return []
         guess_enabled = config.get('auto_collect_guess') is True
         rows = [row for row in (sticker_rows or []) if isinstance(row, dict)]
-        kind_of = _incoming_sticker_kinds(media, rows, media_by_source)
+        detail_of = _incoming_sticker_details(media, rows, media_by_source)
+        kind_of = {source: detail['kind'] for source, detail in detail_of.items()}
 
         unique: list[str] = []
         seen: set[str] = set()
@@ -1834,9 +1955,11 @@ class ServiceChunk2(ServiceBase):
         guessed_calls = 0
         for source in unique:
             kind = kind_of.get(source, '')
+            summary = detail_of.get(source, {}).get('summary', '')
             first_layer = collectible_sticker_kind(kind)
+            candidate = not first_layer and kind == STICKER_CANDIDATE_KIND
             guessing = False
-            if not first_layer:
+            if not first_layer and not candidate:
                 # 第二层只处理普通图片；`kind == 'image'` 且开关打开时才可能走到这里。
                 # 走到这里就说明**第一层本来就不收**，所以第二层不可能否决第一层。
                 if guess_enabled and kind == GUESS_STICKER_KIND:
@@ -1854,10 +1977,17 @@ class ServiceChunk2(ServiceBase):
                         kind or 'unknown', clip(source, 120),
                     )
                     continue
+            if candidate and not self._sticker_guess_prefetch_ok(source, config):
+                # 候选档同样先过体积闸：超上限就不下载（拿不到字节 = 结构检查做不了）。
+                self.report_standalone_operation(
+                    'diagnostic', 'debug', '表情包候选超过体积上限，未下载也未判定 来源=%s',
+                    clip(source, 120),
+                )
+                continue
             payload = await self._sticker_source_bytes(source)
             if not payload:
-                # 种类确认是表情包、但字节拿不到 —— 这是**能力缺失**，按纪律用 warn
-                # （节流；见坑 25：需要用户看见的东西不许走 diagnostic）。
+                # 种类确认是表情包（或候选要字节做结构检查）、但字节拿不到 —— 这是
+                # **能力缺失**，按纪律用 warn（节流；见坑 25：需要用户看见的不许走 diagnostic）。
                 missing_bytes += 1
                 continue
             mime = verify_sticker_image_bytes(payload)
@@ -1867,8 +1997,33 @@ class ServiceChunk2(ServiceBase):
                     kind, clip(source, 120),
                 )
                 continue
+            if candidate:
+                # 候选档的第二半：**同一把尺子**（`sticker_media_signal`）拿字节再判一次
+                # —— 名字信号在入站时已经判过且没命中，这里看 GIF / 带 alpha 的 PNG /
+                # 近方形小图（§49.1 第二档）。
+                signal = sticker_media_signal(name=summary, mime_type=mime, data=payload)
+                if signal:
+                    asset = await self.store_collected_sticker(
+                        payload, _candidate_sticker_kind(kind, summary, mime),
+                    )
+                    if asset:
+                        collected.append(asset)
+                    continue
+                # 不像表情包 → 按普通图：用户开了识图判定时**仍给它一次机会**
+                # （候选是平台给的弱信号，值得多问一次；不开关照旧不收）。
+                self.report_standalone_operation(
+                    'diagnostic', 'debug',
+                    '表情包候选结构检查没过，按普通图处理 种类=%s 来源=%s',
+                    kind, clip(source, 120),
+                )
+                if not guess_enabled:
+                    continue
+                guessing = True
             if guessing:
-                if not sticker_guess_candidate(payload, mime):
+                # ⚠️ 候选档掉进这一支时**不再**过 `sticker_guess_candidate`：那把尺子
+                # 刚刚已经判过一遍且没命中（同一实现），重复判永远不会通过；
+                # 平台标了候选本身就是"值得花一次"的理由（§49.1）。
+                if not candidate and not sticker_guess_candidate(payload, mime):
                     # 记下尺寸：用户问"为什么这张没被判定"时，这一行就是答案
                     # （阈值是启发式，见 `helpers.GUESS_STICKER_*`）。
                     size = guess_image_dimensions(payload)
@@ -1907,11 +2062,15 @@ class ServiceChunk2(ServiceBase):
             self._warn_sticker_collect_unavailable(missing_bytes)
         if collected:
             await self.refresh_sticker_catalog()
+            disabled_by_model = 0
             for asset in collected:
                 if asset.get('_described'):
                     # 判定回执里已经带了描述（§45.7）：直接用它入库，**不再花第二次模型调用**。
                     continue
                 await self.describe_sticker_asset(asset, asset.get('_payload') or b'', config)
+                if asset.get('_modelDisabled'):
+                    disabled_by_model += 1
+            self._report_model_disabled(disabled_by_model)
             await self.refresh_sticker_catalog()
         return collected
 
@@ -2370,8 +2529,11 @@ class ServiceChunk2(ServiceBase):
             status = 'active'
         else:
             status = 'pending'
+        # `disabledBy = 'manual'` **两种方向都写**（§50）：停用是"人停的"，启用是
+        # "人启用的"——两句话都说的是同一件事"启用状态由人定"，模型从此不再改它
+        # （"用户点启用之后它不许再停回去"那条要求就靠这一格）。
         await self.db_set('interlude_sticker', {'id': row_id}, {
-            'status': status, 'updatedAt': self.now(),
+            'status': status, 'disabledBy': 'manual', 'updatedAt': self.now(),
         })
         await self.refresh_sticker_catalog()
         return await self.sticker_asset_row(row_id)
@@ -3183,7 +3345,8 @@ class ServiceChunk2(ServiceBase):
                 )
             # 没给描述就交给视觉模型（没配模型时它只回 False，行留在 pending，
             # 下一次「重扫表情库」会补上）；描述完再刷一次目录，下一回合就能选它。
-            await self.describe_sticker_asset(asset, payload, config)
+            described = await self.describe_sticker_asset(asset, payload, config)
+            self._report_model_disabled(1 if (described and asset.get('_modelDisabled')) else 0)
             await self.refresh_sticker_catalog()
         fresh = await self.sticker_asset_row(row_id) if row_id is not None else None
         return {

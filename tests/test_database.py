@@ -192,6 +192,8 @@ EXPECTED_COLUMNS = {
         # v1.8.4（§48）：归属是谁定的——`groupGuessed` = 模型读描述时定的，
         # `groupManual` = 人定的（控制台移动 / 上传指定 / 目录扫描带进来的）。
         'groupGuessed', 'groupManual',
+        # v1.8.4（§50）：**这一行的启用状态是谁定的**（'' / model / manual）。
+        'disabledBy',
         'createdAt', 'updatedAt',
     ],
     'interlude_sticker_groups': [

@@ -78,6 +78,9 @@ __all__ = [
     'collected_sticker_asset_id',
     'COLLECTED_STICKER_DIR',
     'COLLECTIBLE_STICKER_KINDS',
+    'STICKER_CANDIDATE_KIND',
+    'WIRE_MEDIA_KINDS',
+    'wire_media_kind',
     'STICKER_IMAGE_MIMES',
     'STICKER_FILE_SUFFIX',
     # ---- 表情库分组 / 上传（本移植版新增，§47）----
@@ -117,8 +120,19 @@ __all__ = [
     'GUESS_STICKER_MIN_CONFIDENCE',
     'STICKER_GUESS_KINDS',
     'guess_image_dimensions',
+    'sticker_media_signal',
     'sticker_guess_candidate',
     'sticker_guess_result',
+    'sticker_disabled_by',
+    'sticker_not_sticker_verdict',
+    'STICKER_NOT_A_STICKER',
+    'STICKER_NAME_RE',
+    'STICKER_NAME_PLACEHOLDERS',
+    'STICKER_SIGNAL_NONE',
+    'STICKER_SIGNAL_NAME',
+    'STICKER_SIGNAL_GIF',
+    'STICKER_SIGNAL_ALPHA',
+    'STICKER_SIGNAL_SHAPE',
     # ---- 用户自报时间 / 引用消息 ----
     'extract_user_reported_times',
     'describe_quoted_message',
@@ -339,6 +353,10 @@ def resolve_sticker_config(value: Any = None) -> dict[str, Any]:
         # 这两把闸的默认行为就是今天已经验收过的那套（关掉即回到平铺目录）。
         'group_selection': config_get(configured, 'group_selection', 'groupSelection') is not False,
         'auto_group': config_get(configured, 'auto_group', 'autoGroup') is not False,
+        # 描述时判"不是表情包"就停用（v1.8.4，§50）：**默认真**，只有显式 false 才关。
+        # 同一把尺子（`is not False`）：缺失 / NULL / 字符串一律按默认（开）走；
+        # 关掉它就只写描述、一个字的启用状态都不动。
+        'auto_disable': config_get(configured, 'auto_disable', 'autoDisable') is not False,
         'directory': str(directory if directory else 'data/hds-interlude/stickers').strip(),
         'max_file_size_mb': max(1.0, min(30.0, _config_number_or(
             configured, 'maxFileSizeMB', 'max_file_size_mb', 10,
@@ -656,6 +674,25 @@ def media_kind_label(kind: Any, summary: Any) -> str:
     return '[图片]'
 
 
+#: wire（`currentEvent.attachments[].kind` 与侧端视觉的 `mediaKind`）**只认**这几个值 ——
+#: 提示词就是按这份枚举教模型的。
+WIRE_MEDIA_KINDS = frozenset({'image', 'sticker', 'animated', 'market', 'card'})
+
+
+def wire_media_kind(kind: Any) -> str:
+    """内部媒体种类 → **wire 词汇表**：候选档对外就是普通图（§49.1）。
+
+    为什么必须收口：`sticker-candidate` 只说明"平台标了候选、结构检查还没做" ——
+    它既不是"观测到的表情"，也不是提示词教过的种类（提示词枚举的是
+    `image / sticker / animated / market / card`），漏出去等于让模型读一个没定义的词。
+    其余种类**原样透传**（`photo` 这种外部写法不许被悄悄改掉）。
+    """
+    text = _str(kind).strip().lower()
+    if not text or text == STICKER_CANDIDATE_KIND:
+        return GUESS_STICKER_KIND  # `image`
+    return text
+
+
 def describe_card_media(attributes: Any) -> str:
     """`<card>`（QQ 小程序 / 分享卡片）→ `[QQ小程序：标题]` / `[分享卡片：标题]`（文本入口）。
 
@@ -883,6 +920,11 @@ COLLECTED_STICKER_DIR = 'collected'
 #: 「值得收藏」的入站种类。**`image` 不在里面**（普通照片 / 截图一律不收），
 #: `card`（小程序 / 分享卡片）不在里面（它不是图片，也没有可下载的图片字节）。
 COLLECTIBLE_STICKER_KINDS = frozenset({'sticker', 'animated', 'market'})
+
+#: **只在内部流通**的媒体种类：平台标了"表情包候选"（OneBot `sub_type` 2/3/7），
+#: 但"像不像表情包"的结构检查还没做完（§49.1 的第二档）。
+#: 它**绝不能**出现在模型看得见的 wire 上 —— 出口统一走 `wire_media_kind()`。
+STICKER_CANDIDATE_KIND = 'sticker-candidate'
 
 #: 自动收藏接受的图片 MIME（校验用的魔数就在 `guess_image_mime` 里，一份实现两处用）。
 STICKER_IMAGE_MIMES = frozenset({'image/png', 'image/jpeg', 'image/gif', 'image/webp'})
@@ -1384,6 +1426,41 @@ GUESS_STICKER_MIN_CONFIDENCE = 0.6
 #: 模型回执里认得的 `kind`（提示词逐字要求这几档）；白名单外一律归 `other`。
 STICKER_GUESS_KINDS = ('meme', 'reaction', 'caption_photo', 'photo', 'screenshot', 'other')
 
+#: 描述回执里"这不是表情包"的判定名（§50）。与第二层共用同一个置信度门槛。
+STICKER_NOT_A_STICKER = 'not-a-sticker'
+
+
+def sticker_disabled_by(value: Any) -> str:
+    """归一新列 `disabledBy`：只认 `''` / `'model'` / `'manual'`，其余一律 `''`。
+
+    `'model'` = 模型读描述时判定它不是表情包而停用；`'manual'` = 人对启用状态表过态
+    （停用**或**启用都算）—— 见 `interlude_sticker` 的列注释与 §50。
+    """
+    text = _str(value).strip().lower()
+    return text if text in ('model', 'manual') else ''
+
+
+def sticker_not_sticker_verdict(value: Any) -> bool:
+    """描述回执 → "这行不是表情包，应当停用"？**拿不准一律 False（不动）**（§50）。
+
+    收的充要条件（都在这一处，别在服务层再判一遍）：
+
+    * 回执是对象，且 `is_sticker` **显式是布尔 `False`**（缺字段 / 字符串 / `None` 都不算）；
+    * `confidence` 是数字且 `>= GUESS_STICKER_MIN_CONFIDENCE`（与第二层同一把尺子）。
+
+    与 `sticker_guess_result()` 的分工：那个回答"**收不收**"（第二层），这个回答
+    "**要不要停用**"（描述之后）；两者共用同一个置信度常量，但方向相反、都不接受
+    "拿不准"。回执坏 / 超时 / 没配模型时调用方压根走不到这里，判据本身也回 `False`。
+    """
+    if not isinstance(value, dict):
+        return False
+    if value.get('is_sticker') is not False:
+        return False
+    confidence = value.get('confidence')
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return False
+    return float(confidence) >= GUESS_STICKER_MIN_CONFIDENCE
+
 #: JPEG 里带尺寸的段（`SOF0`…`SOF15`，跳过 `DHT`=0xC4 / `JPG`=0xC8 / `DAC`=0xCC）。
 _JPEG_SOF_MARKERS = frozenset(
     {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF},
@@ -1503,6 +1580,59 @@ def _webp_dimensions(data: Any) -> 'tuple[int, int] | None':
     return None
 
 
+#: 表情包的"名字"形状：平台给表情名时是**方括号包起来的**（`[中午好]`）。
+#: `[图片]` 是**普通图的占位**（NapCat `packet/message/element.ts:372` 对 `picSubType === 0`
+#: 写的就是它），所以它不算"名字" —— `sub_type=7 + summary=[图片]` 必须**不收**。
+STICKER_NAME_PLACEHOLDERS = frozenset({'[图片]'})
+STICKER_NAME_RE = re.compile(r'^\[[^\[\]]{1,32}\]$')
+
+#: 结构信号名（诊断用；也是"它为什么被当成表情包候选"的唯一解释）。
+STICKER_SIGNAL_NONE = ''
+STICKER_SIGNAL_NAME = 'name'
+STICKER_SIGNAL_GIF = 'gif'
+STICKER_SIGNAL_ALPHA = 'alpha'
+STICKER_SIGNAL_SHAPE = 'shape'
+
+
+def sticker_media_signal(name: Any = '', mime_type: Any = '', data: Any = None) -> str:
+    """这张图"像不像表情包"的**结构信号** → 命中的信号名（都不命中回空串）。
+
+    从便宜到贵，**字节是可选的** —— §49.1 的三档表正是靠这一点把"不用下载"与
+    "要下载"分开：
+
+    1. `name`：方括号包起来的平台命名（`[中午好]`）—— **入站就有，不用下载**；
+       `[图片]` 这种普通图占位不算（`STICKER_NAME_PLACEHOLDERS`）；
+    2. `mime_type` / `data`：GIF（聊天里几乎只有动图 / 表情用途）；
+    3. `data`：带 alpha 的 PNG（表情通常是透明底）；
+    4. `data`：近方形 + 两边都不大（表情包的典型尺寸）。
+
+    阈值与判据都是**启发式**（`GUESS_STICKER_*`），不是平台规则。这个函数是
+    "像不像表情包"的**唯一实现**，两处共用（§49.1）：
+
+    * 第一层·候选档：`astrbot_bridge._image_media_kind()` 先用**只有名字**的那一半
+      （入站、零下载）判一次；剩下的（GIF / alpha / 尺寸）在 `chunk2` 拿到字节后判；
+    * 第二层：`sticker_guess_candidate()` 是它在"值不值得花一次识图调用"上的薄包装。
+    """
+    text = _str(name).strip()
+    if text and text not in STICKER_NAME_PLACEHOLDERS and STICKER_NAME_RE.match(text):
+        return STICKER_SIGNAL_NAME
+    mime = _str(mime_type).strip().lower()
+    if mime == 'image/gif':
+        return STICKER_SIGNAL_GIF
+    if mime == 'image/png' and _png_has_alpha(data or b''):
+        return STICKER_SIGNAL_ALPHA
+    dimensions = guess_image_dimensions(data)
+    if dimensions is None:
+        return STICKER_SIGNAL_NONE
+    width, height = dimensions
+    if not width or not height:
+        return STICKER_SIGNAL_NONE
+    if max(width, height) > GUESS_STICKER_MAX_DIMENSION:
+        return STICKER_SIGNAL_NONE
+    longest, shortest = max(width, height), min(width, height)
+    return STICKER_SIGNAL_SHAPE if longest <= shortest * GUESS_STICKER_MAX_ASPECT else STICKER_SIGNAL_NONE
+
+
 def sticker_guess_candidate(data: Any, mime_type: Any = '') -> bool:
     """**便宜的预筛**：这张图值不值得花一次识图调用？
 
@@ -1513,22 +1643,11 @@ def sticker_guess_candidate(data: Any, mime_type: Any = '') -> bool:
 
     这些阈值都是**启发式**（见上面的常量），不是平台规则；真正的判定权在
     `sticker_guess_result()` 与用户开关手里。
+
+    ⚠️ 实现**委托** `sticker_media_signal()`（§49.1 收口）：候选档与这一层用的是
+    同一把尺子，改阈值只改一处；这里的入参没有"名字"，所以名字信号天然不参与。
     """
-    mime = _str(mime_type).strip().lower()
-    if mime == 'image/gif':
-        return True
-    if mime == 'image/png' and _png_has_alpha(data or b''):
-        return True
-    dimensions = guess_image_dimensions(data)
-    if dimensions is None:
-        return False
-    width, height = dimensions
-    if not width or not height:
-        return False
-    if max(width, height) > GUESS_STICKER_MAX_DIMENSION:
-        return False
-    longest, shortest = max(width, height), min(width, height)
-    return longest <= shortest * GUESS_STICKER_MAX_ASPECT
+    return bool(sticker_media_signal(mime_type=mime_type, data=data))
 
 
 def sticker_guess_result(value: Any) -> 'dict[str, Any] | None':

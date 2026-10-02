@@ -444,6 +444,14 @@ STICKER = TableSpec(
         'guessed': _spec('boolean'),
         'groupGuessed': _spec('boolean'),
         'groupManual': _spec('boolean'),
+        #: 本移植版新增（v1.8.4 描述时判非表情包就停用，§50）：**这一行的启用状态是谁定的**。
+        #: `''`（旧行 / 没人动过）/ `'model'`（模型读描述时判定它不是表情包，停用）/
+        #: `'manual'`（人停用过**或**人启用过 —— 人的决定，模型永不覆盖）。
+        #: 为什么一个字段能表示"谁停的"又能表示"人启用过"：两者问的是同一件事
+        #: ——**启用状态的决定权在谁手里**；`status == 'disabled'` 与它合起来看就知道
+        #: 是"模型停的"还是"人停的"，而 `status == 'active' + disabledBy == 'manual'`
+        #: 就是"人启用的，模型不许再停"。
+        'disabledBy': _spec('string(16)'),
         'createdAt': _spec('timestamp'),
         'updatedAt': _spec('timestamp'),
     },

@@ -594,6 +594,47 @@ class StickerGuessHelperTests(unittest.TestCase):
         # 不透明的大 PNG 仍然被挡（alpha 才放行）。
         self.assertFalse(h.sticker_guess_candidate(png(900, 900, color_type=2), 'image/png'))
 
+    def test_the_name_signal_is_the_platform_name_only(self):
+        """名字信号（§49.1）：**方括号包起来的平台命名**才算，`[图片]` 占位不算。
+
+        它是唯一"不用字节"的结构信号，也是候选档（`sub_type` 2/3/7）在入站时能判的那一半。
+        """
+        self.assertEqual(h.sticker_media_signal(name='[中午好]'), h.STICKER_SIGNAL_NAME)
+        self.assertEqual(h.sticker_media_signal(name='[动画表情]'), h.STICKER_SIGNAL_NAME)
+        # `[图片]` 是普通图占位（NapCat 对 picSubType=0 写的就是它）—— 不算名字。
+        self.assertEqual(h.sticker_media_signal(name='[图片]'), h.STICKER_SIGNAL_NONE)
+        for value in ('中午好', '[中午好', '中午好]', '[]', '', None, '[图片] x', 'x[图片]'):
+            with self.subTest(name=value):
+                self.assertEqual(h.sticker_media_signal(name=value), h.STICKER_SIGNAL_NONE)
+        # 名字与字节信号各自独立：缺名字时尺寸仍然照判。
+        self.assertEqual(h.sticker_media_signal(mime_type='image/gif', data=b''), h.STICKER_SIGNAL_GIF)
+
+    def test_the_prefilter_delegates_to_the_shared_signal(self):
+        """第二层预筛就是共享信号函数的薄包装（§49.1：一份实现两处用）。"""
+        for payload, mime in (
+            (png(120, 120), 'image/png'),
+            (gif(800, 600), 'image/gif'),
+            (png(2000, 1500, color_type=2), 'image/png'),
+            (png(900, 900, color_type=6), 'image/png'),
+        ):
+            with self.subTest(mime=mime):
+                self.assertEqual(
+                    h.sticker_guess_candidate(payload, mime),
+                    bool(h.sticker_media_signal(mime_type=mime, data=payload)),
+                )
+
+    def test_the_internal_candidate_kind_is_normalized_on_the_wire(self):
+        """候选档是**内部**状态：出 wire 一律变普通图，提示词只认那 5 个值（§49.1）。"""
+        self.assertEqual(h.wire_media_kind(h.STICKER_CANDIDATE_KIND), 'image')
+        for kind in ('image', 'sticker', 'animated', 'market', 'card'):
+            with self.subTest(kind=kind):
+                self.assertEqual(h.wire_media_kind(kind), kind)
+        # 外部写法原样透传（不许多管闲事），空值回落到普通图。
+        self.assertEqual(h.wire_media_kind('photo'), 'photo')
+        self.assertEqual(h.wire_media_kind(''), 'image')
+        self.assertEqual(h.wire_media_kind(None), 'image')
+        self.assertNotIn(h.STICKER_CANDIDATE_KIND, h.WIRE_MEDIA_KINDS)
+
     def test_acceptance_needs_a_confident_boolean_yes(self):
         accepted = h.sticker_guess_result({
             'is_sticker': True, 'kind': 'meme', 'confidence': 0.85, 'description': '  一只猫  ',

@@ -1901,6 +1901,13 @@ class OpenAICompatibleNarrator:
                 group = _get(parsed, 'group')
                 if groups and isinstance(group, dict):
                     result['group'] = group
+                # 顺带判"这到底是不是表情包"（§50）：字段**原样**出去，停用与否由
+                # `helpers.sticker_not_sticker_verdict()` + 服务层一处判，这里不预判
+                # （与 `group` 同一条纪律：适配层只搬运模型原话）。
+                for key in ('is_sticker', 'confidence'):
+                    value = _get(parsed, key)
+                    if value is not None:
+                        result[key] = value
                 return result if description else None
             except Exception:  # noqa: BLE001 - 描述失败只是没有目录条目（上游 catch 返回 undefined）
                 return None

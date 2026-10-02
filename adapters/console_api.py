@@ -46,6 +46,7 @@ from ..core.service.helpers import (
     STICKER_DESCRIPTION_MAX,
     STICKER_NAME_MAX,
     safe_sticker_group_name,
+    sticker_disabled_by,
     sticker_group_name_problem,
 )
 from ..core.token_stats import normalize_range, range_bounds, summarize_usage
@@ -220,7 +221,6 @@ def sticker_item(row: Any, group_names: Any = None) -> dict[str, Any]:
         'addedAt': _timestamp_text(record.get('createdAt')) or _timestamp_text(record.get('updatedAt')),
         'updatedAt': _timestamp_text(record.get('updatedAt')),
         'uses': _int(record.get('uses'), 0),
-        'disabled': _text(record.get('status')).lower() == STICKER_STATUS_DISABLED,
         #: 描述是不是**人写的**：前端据此显示"手工"徽章，并给出"恢复自动描述"按钮。
         'manual': _truthy_boolean(record.get('descriptionManual')),
         # 扩展字段（前端可以直接忽略）：状态、分组、体积、别名、MIME 都是列表里
@@ -244,6 +244,13 @@ def sticker_item(row: Any, group_names: Any = None) -> dict[str, Any]:
         #: 自动定组不碰这类素材。旧库补列前写入的行是 NULL → 都当 false。
         'groupGuessed': _truthy_boolean(record.get('groupGuessed')),
         'groupManual': _truthy_boolean(record.get('groupManual')),
+        #: v1.8.4（§50）新增：**这一行的启用状态是谁定的**（纯加字段）。
+        #: `'model'` = 模型读描述时判定它不是表情包而停用（界面可打"模型停的"并提示可启用）；
+        #: `'manual'` = 人停用过**或**人启用过（人的决定，模型不会再改它）；
+        #: `''` = 没人动过（旧库补列前写入的行也是 NULL → 空串）。读侧归一在
+        #: `helpers.sticker_disabled_by()` 一处，这里只如实带出去。
+        'disabled': _text(record.get('status')).lower() == STICKER_STATUS_DISABLED,
+        'disabledBy': sticker_disabled_by(record.get('disabledBy')),
         #: 前端可直接用的**相对**地址（宿主会把插件页请求拼到插件名下）。
         'file': file_name,
         'thumbnailUrl': 'console/sticker-file?assetId=%s' % asset_id if asset_id else '',

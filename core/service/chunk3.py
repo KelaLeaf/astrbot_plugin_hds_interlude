@@ -103,6 +103,7 @@ from .helpers import (
     narrative_cursor,
     normalize_participant_state,
     should_downscale_image,
+    wire_media_kind,
 )
 
 try:  # pragma: no cover - 取决于同批任务的落地顺序
@@ -1189,7 +1190,9 @@ class ServiceChunk3(ServiceBase):
                     entry = {'id': 'turn-image-%d' % (index + 1), **image}
                     found = kind_by_source.get(_text(source))
                     if found:
-                        entry['media_kind'] = _text(pick(found, 'kind')) or 'image'
+                        # 候选档（`sticker-candidate`）是**内部**状态：出 wire 前收口成普通图，
+                        # 提示词只认 `image / sticker / animated / market / card`（§49.1）。
+                        entry['media_kind'] = wire_media_kind(_text(pick(found, 'kind')) or 'image')
                         entry['media_label'] = _text(pick(found, 'label')) or '[图片]'
                         summary = _text(pick(found, 'summary'))
                         if summary:
@@ -1604,7 +1607,7 @@ class ServiceChunk3(ServiceBase):
             attachments = [
                 {
                     'index': index + 1,
-                    'kind': _text(pick(media_by_source.get(source), 'kind')) or 'image',
+                    'kind': wire_media_kind(_text(pick(media_by_source.get(source), 'kind')) or 'image'),
                     'label': _text(pick(media_by_source.get(source), 'label')) or '[图片]',
                     'summary': _text(pick(media_by_source.get(source), 'summary')),
                 }

@@ -408,6 +408,8 @@ _install_astrbot_stub()
 # 被测模块必须在桩装好之后再导入。
 from plugin.core import logging as interlude_logging  # noqa: E402
 from plugin.adapters import astrbot_bridge as bridge_module  # noqa: E402
+#: 候选档的种类名**从生产常量导入**（别在夹具里另写一个字面量 —— 坑 39/46）。
+from plugin.core.service.helpers import STICKER_CANDIDATE_KIND  # noqa: E402
 from plugin.adapters.astrbot_bridge import (  # noqa: E402
     AstrbotBridge,
     AstrbotTransport,
@@ -824,23 +826,64 @@ class IncomingMediaKindTests(unittest.TestCase):
             {'0': 'image', '1': 'sticker'},
             '映射只有 `0`/`1` 两格；其余非 0 值（含 4）一律"未知即不收"',
         )
-        for sub_type in ('2', '3', '4', '5', '6', '7', '', None):
+        for sub_type in ('4', '5', '6', '', None):
             with self.subTest(sub_type=sub_type):
                 kind, summary = bridge_module._image_media_kind({'sub_type': sub_type})
                 self.assertEqual(kind, 'image')
                 self.assertEqual(summary, '')
                 self.assertEqual(collectible_sticker_kind(kind), '', '第一层判据必须说不')
+        # —— 候选档（`2`/`3`/`7`）：平台标了候选，但没有名字就走"要字节的结构检查" ——
+        self.assertEqual(
+            bridge_module._ONEBOT_IMAGE_CANDIDATE_SUB_TYPES, frozenset({'2', '3', '7'}),
+            '候选集合只有这三个；改它要连文档三档表一起改（§49.1）',
+        )
+        for sub_type in ('2', '3', '7'):
+            with self.subTest(sub_type=sub_type):
+                kind, _summary = bridge_module._image_media_kind({'sub_type': sub_type})
+                self.assertEqual(kind, STICKER_CANDIDATE_KIND)
+                self.assertEqual(
+                    collectible_sticker_kind(kind), '',
+                    '候选**不是**"观测到的表情"：第一层不收，收不收由结构检查/第二层定',
+                )
+                # `[图片]` 是普通图占位，不是"名字"：候选档必须仍然停在候选。
+                self.assertEqual(
+                    bridge_module._image_media_kind({'sub_type': sub_type, 'summary': '[图片]'})[0],
+                    STICKER_CANDIDATE_KIND,
+                )
         # `kind` 词表里的 `market` 仍然收（别的来源可能这么标注），但**没有任何
-        # `sub_type` 再映射到它** —— 上面那条穷举就是这条不变量的守卫。
+        # `sub_type` 再映射到它** —— 上面的穷举就是这条不变量的守卫。
         self.assertEqual(collectible_sticker_kind('market'), 'market')
         self.assertNotIn('market', bridge_module._ONEBOT_IMAGE_SUB_TYPES.values())
 
-    def test_real_device_segment_sub_type_seven_is_not_a_sticker(self):
-        """真机那条（§49.2）：`sub_type=7` + `summary=[中午好]` 观测到的种类是 **image**。
+    def test_candidate_sub_types_with_a_bracketed_name_are_stickers(self):
+        """候选档的**零下载**那一半：方括号名字（`[中午好]`）在入站就够定成表情（§49.1）。
 
-        用户以为"被当成表情包了"，其实不是：7 不在映射表里，`[中午好]` 里也没有"动画"
-        （只有 NapCat 自己给的 `[动画表情]` 占位才升级成 animated）—— 收藏流程是被
-        **第二层识图模型**（`stickers.auto_collect_guess`）启起来的，`summary` 从来没当过判据。
+        真机那条就是这么发出来的：`sub_type=7` + `summary=[中午好]` —— 用表情搜索搜出来的
+        表情包。名字信号命中 → 直接 `sticker`（**不必等字节**），第一层判据也就收了；
+        其余信号（GIF / alpha / 近方形）要字节，留给 `chunk2` 拿到字节后再判。
+        """
+        from plugin.core.service.helpers import collectible_sticker_kind
+
+        for sub_type in ('2', '3', '7'):
+            with self.subTest(sub_type=sub_type):
+                kind, summary = bridge_module._image_media_kind(
+                    {'sub_type': sub_type, 'summary': '[中午好]'},
+                )
+                self.assertEqual((kind, summary), ('sticker', '[中午好]'))
+                self.assertEqual(collectible_sticker_kind(kind), 'sticker')
+        # 确定档不变：`sub_type=1` 就是 `sticker`，哪怕 summary 写的是 `[动画表情]`。
+        self.assertEqual(
+            bridge_module._image_media_kind({'sub_type': 1, 'summary': '[动画表情]'}),
+            ('sticker', '[动画表情]'),
+            '用户口径："1 → sticker（今天的行为不变）"',
+        )
+
+    def test_real_device_segment_sub_type_seven_is_now_a_sticker(self):
+        """★ 真机那条（§49.2）：`sub_type=7` + `summary=[中午好]` 现在是 **sticker**。
+
+        用户补的表：7 = `KRELATED`（关联图片），包括"用表情搜索搜出来的表情包" ——
+        他 11:03 那条就是这么发出来的。于是它进候选档，并被**方括号名字**当场定成表情：
+        第一层判据直接收，不再依赖识图模型（上一版把它当普通图，正是它收不进来的原因）。
         """
         from plugin.core.service.helpers import collectible_sticker_kind
 
@@ -852,17 +895,31 @@ class IncomingMediaKindTests(unittest.TestCase):
             file='E734AC389ADCCE0D94883AE67607170B.jpg', url=url)])
         view = bridge_module.session_view(event)
 
-        self.assertEqual([item['kind'] for item in view.media], ['image'])
+        self.assertEqual([item['kind'] for item in view.media], ['sticker'])
         self.assertEqual([item['source'] for item in view.media], [url])
         self.assertEqual(view.media[0]['raw']['sub_type'], 7)
-        self.assertEqual(collectible_sticker_kind(view.media[0]['kind']), '')
-        self.assertIn('summary="[中午好]"', view.content, '平台原文照留；它不参与判据')
+        self.assertEqual(collectible_sticker_kind(view.media[0]['kind']), 'sticker')
+        self.assertIn('kind="sticker"', view.content)
+        self.assertIn('summary="[中午好]"', view.content, '平台原文照留（它同时是"名字"信号）')
 
     def test_animated_still_comes_from_napcats_own_placeholder(self):
-        """`[动画表情]` → `animated` 的依据是 **NapCat 自己的占位**（不是我们猜的）。"""
+        """`[动画表情]` → `animated` 的依据是 **NapCat 自己的占位**（不是我们猜的）。
+
+        两处会升级：普通图（`image`，§29 起就有），以及**候选档命中名字**的那一种；
+        确定档 `sub_type=1` 保持 `sticker`（见上一条用例）。
+        """
         self.assertEqual(
             bridge_module._image_media_kind({'sub_type': '7', 'summary': '[动画表情]'}),
             ('animated', '[动画表情]'),
+        )
+        self.assertEqual(
+            bridge_module._image_media_kind({'sub_type': '0', 'summary': '[动画表情]'}),
+            ('animated', '[动画表情]'),
+        )
+        # 候选档但名字没命中（`[图片]` 是占位）→ 仍是候选，不许被"动画"两字提前放行。
+        self.assertEqual(
+            bridge_module._image_media_kind({'sub_type': '7', 'summary': '[图片]'}),
+            (STICKER_CANDIDATE_KIND, '[图片]'),
         )
 
     def test_host_local_file_wins_over_the_url_coordinate(self):

@@ -1934,6 +1934,50 @@ class ModelGuessedStickerCollectionTests(unittest.IsolatedAsyncioTestCase):
         host.image_bytes_to_native = image_bytes_to_native
         return host
 
+    async def test_candidate_kind_always_earns_a_task_even_with_the_switch_off(self):
+        """候选档（`sticker-candidate`）与识图开关**无关**：它要字节做结构检查（§49.1）。"""
+        media = [{'source': 'u', 'kind': 'sticker-candidate', 'summary': '[图片]'}]
+        self.assertTrue(chunk2_module._has_collectible_media(media))
+        self.assertTrue(chunk2_module._has_collectible_media(media, True))
+        # 普通图仍然只认开关；未知/缺种类一律不建任务。
+        self.assertFalse(chunk2_module._has_collectible_media([{'source': 'u', 'kind': 'image'}]))
+        self.assertTrue(chunk2_module._has_collectible_media([{'source': 'u', 'kind': 'image'}], True))
+        self.assertFalse(chunk2_module._has_collectible_media([{'source': 'u', 'kind': ''}], True))
+
+    async def test_a_candidate_that_fails_the_structural_check_is_collected_by_the_model(self):
+        """候选档结构检查没过 → 开关开着时**仍给它一次模型机会**（§49.1 第二档）。
+
+        平台标了候选（2/3/7）本身就是个弱信号：结构检查（尺寸/GIF/alpha）说"不像"时，
+        与其直接判死，不如花一次识图调用 —— 上限仍由每条消息/每分钟的预算夹住。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber()
+            host = self._guess_host(tmp, describer)
+            source = 'https://cdn.example.com/big-long.png'
+            host.transport.payloads[source] = _sized_png(2000, 1500)  # 大图长条 → 结构检查必过不了
+            media = [{
+                'source': source, 'kind': 'sticker-candidate', 'summary': '[图片]',
+                'raw': {'sub_type': '7', 'summary': '[图片]'},
+            }]
+            collected = await host.collect_incoming_stickers(media, [source])
+            self.assertEqual(len(collected), 1, '模型说 is_sticker=true → 收（走第二层）')
+            self.assertEqual(len(describer.guessed), 1, '候选结构不像时也要问一次')
+            rows = await host.db_get('interlude_sticker', {})
+            self.assertEqual(rows[0]['guessed'], 1, '这条是模型猜出来的')
+
+    async def test_a_candidate_that_fails_the_structural_check_is_dropped_without_the_switch(self):
+        """同一格、开关**关着**：候选结构检查没过就丢掉，一次模型都不问（§49.1）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            describer = _GuessingDescriber()
+            host = self._guess_host(tmp, describer, auto_collect_guess=False)
+            source = 'https://cdn.example.com/big-long.png'
+            host.transport.payloads[source] = _sized_png(2000, 1500)
+            media = [{'source': source, 'kind': 'sticker-candidate', 'summary': '[图片]'}]
+            self.assertEqual(await host.collect_incoming_stickers(media, [source]), [])
+            self.assertEqual(describer.guessed, [])
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
+            self.assertEqual(host.transport.fetched, [source], '候选要拿字节才能做结构检查')
+
     async def test_the_host_entry_is_tried_before_the_direct_download(self):
         """宿主入站通道优先（§49.3）：它拿到字节就不再走直链；回 `None` 才回退。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -2336,6 +2380,210 @@ def _sized_gif(width: int, height: int) -> bytes:
     return b'GIF89a' + width.to_bytes(2, 'little') + height.to_bytes(2, 'little') + b'\x00' * 8
 
 
+class _VerdictDescriber:
+    """描述桩：回一份**带判定字段**的回执（§50），并记下被问过几次。"""
+
+    def __init__(self, receipt: Any) -> None:
+        self.receipt = receipt
+        self.calls: list[Any] = []
+
+    def available(self) -> bool:
+        return True
+
+    async def describe_sticker(self, data_uri, mime_type, file_path, animated, *args, **kwargs):
+        self.calls.append((file_path, kwargs.get('groups')))
+        return self.receipt
+
+
+class ModelDisableAfterDescriptionTests(unittest.IsolatedAsyncioTestCase):
+    """§50：描述时模型判"不是表情包" → **停用**（可逆、不删），人不被覆盖。
+
+    判据只有一处（`helpers.sticker_not_sticker_verdict`：`is_sticker` 显式为 `False`
+    **且**置信度达标），"能不能动这一行"的闸在 `chunk2._model_may_disable()`。
+    """
+
+    def _verdict_host(self, tmp: str, receipt: Any, **stickers: Any) -> Any:
+        database = Database(':memory:')
+        database.register_tables()
+        self.addCleanup(database.close)
+        os.makedirs(os.path.join(tmp, 'stickers'), exist_ok=True)
+        host = _host(
+            ctx=InterludeContext(base_dir=tmp),
+            config={'stickers': {'enabled': True, 'directory': 'stickers', **stickers}},
+            db=database,
+            transport=_ByteTransport(),
+        )
+        host.sticker_describer = _VerdictDescriber(receipt)
+
+        async def image_bytes_to_native(data: bytes, mime_type: str) -> dict[str, Any]:
+            return {'mime_type': mime_type, 'data_uri': 'data:%s;base64,AA==' % mime_type}
+
+        async def embed_text(value: str) -> list[float]:
+            return []
+
+        host.image_bytes_to_native = image_bytes_to_native
+        host.embed_text = embed_text
+        return host
+
+    async def _row(self, host: Any, **overrides: Any) -> dict[str, Any]:
+        now = host.now()
+        data = {
+            'assetId': 'sticker-x', 'filePath': 'collected/x.png', 'group': 'collected',
+            'mimeType': 'image/png', 'animated': False, 'size': 40, 'hash': 'h' * 64,
+            'name': 'x', 'source': 'auto', 'description': '', 'descriptionManual': False,
+            'aliases': [], 'status': 'pending', 'guessed': False,
+            'groupGuessed': False, 'groupManual': False, 'disabledBy': '',
+            'createdAt': now, 'updatedAt': now,
+        }
+        data.update(overrides)
+        return await host.db_create('interlude_sticker', data)
+
+    async def _describe(self, host: Any, row: Any) -> dict[str, Any]:
+        asset = await host.sticker_asset_row(row['id'])
+        await host.describe_sticker_asset(asset, _png(b'x'), host.sticker_config)
+        return await host.sticker_asset_row(row['id'])
+
+    async def test_a_confident_not_a_sticker_verdict_disables_the_row(self):
+        """★ 回执 `is_sticker=false` + 置信度达标 → `status='disabled'`、`disabledBy='model'`。
+
+        描述照写（停用不是删除）、文件不动；`_modelDisabled` 这个**瞬时**标记供批量汇总计数。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._verdict_host(tmp, {
+                'description': '一张风景照', 'aliases': ['照片'],
+                'is_sticker': False, 'confidence': 0.9,
+            })
+            row = await self._row(host)
+            asset = await host.sticker_asset_row(row['id'])
+            self.assertTrue(await host.describe_sticker_asset(asset, _png(b'x'), host.sticker_config))
+            self.assertTrue(asset.get('_modelDisabled'), '批处理要知道这一张被停用了')
+
+            stored = await host.sticker_asset_row(row['id'])
+            self.assertEqual(stored['status'], 'disabled')
+            self.assertEqual(stored['disabledBy'], 'model')
+            self.assertEqual(stored['description'], '一张风景照', '描述照写：停用不是删除')
+
+    async def test_the_model_never_touches_a_row_the_human_decided(self):
+        """**人不被模型覆盖**：人写的描述 / 人定的归属 / 人停用或启用过 → 一个字都不动。"""
+        cases = (
+            ('人写过描述', {'descriptionManual': True, 'description': '人写的'}),
+            ('人定过归属', {'groupManual': True}),
+            ('人停用过', {'disabledBy': 'manual', 'status': 'disabled'}),
+            ('人启用过（模型停过又被启用）', {'disabledBy': 'manual', 'status': 'active'}),
+        )
+        # 期望：**不许出现 `disabledBy='model'`**；人停用的那行连 `status` 都不许被改动
+        # （描述可以更新，启用状态是人的决定）。
+        for label, overrides in cases:
+            with self.subTest(label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    host = self._verdict_host(tmp, {
+                        'description': '模型写的', 'aliases': [],
+                        'is_sticker': False, 'confidence': 0.95,
+                    })
+                    row = await self._row(host, **overrides)
+                    asset = await host.sticker_asset_row(row['id'])
+                    await host.describe_sticker_asset(asset, _png(b'x'), host.sticker_config)
+                    stored = await host.sticker_asset_row(row['id'])
+                    self.assertNotEqual(stored['disabledBy'], 'model', '模型不许给人动过的行盖章')
+                    self.assertEqual(stored['disabledBy'], overrides.get('disabledBy', ''))
+                    if overrides.get('disabledBy') == 'manual':
+                        self.assertEqual(stored['status'], overrides['status'],
+                                         '人的启用状态决定连 status 都不许动')
+                    else:
+                        self.assertNotEqual(stored['status'], 'disabled')
+                    if overrides.get('descriptionManual'):
+                        self.assertEqual(stored['description'], '人写的', '人写的描述也不许被覆盖')
+
+    async def test_a_row_the_human_enabled_is_never_disabled_again(self):
+        """★ 用户点「启用」之后**再描述也不许停它**（§50 点名的那条）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._verdict_host(tmp, {
+                'description': '一张风景照', 'aliases': [],
+                'is_sticker': False, 'confidence': 0.9,
+            })
+            row = await self._row(host, status='active', description='早就描述过')
+            # 人点「启用」：`set_sticker_disabled(False)` 写 `disabledBy='manual'`。
+            enabled = await host.set_sticker_disabled(row['id'], False)
+            self.assertEqual(enabled['disabledBy'], 'manual')
+            self.assertEqual(enabled['status'], 'active')
+
+            # 再描述一次（模型依旧说不是表情包）→ 不许停。
+            asset = await host.sticker_asset_row(row['id'])
+            await host.describe_sticker_asset(asset, _png(b'x'), host.sticker_config)
+            stored = await host.sticker_asset_row(row['id'])
+            self.assertEqual(stored['status'], 'active')
+            self.assertEqual(stored['disabledBy'], 'manual', '人的决定留着')
+
+    async def test_uncertain_receipts_never_disable_anything(self):
+        """**不确定就不动**：缺字段 / 字符串 / 置信度不足 / 不是对象 → 保持原状。"""
+        receipts = (
+            {'description': 'x', 'is_sticker': False},
+            {'description': 'x', 'is_sticker': False, 'confidence': 0.3},
+            {'description': 'x', 'is_sticker': False, 'confidence': 'high'},
+            {'description': 'x', 'is_sticker': False, 'confidence': True},
+            {'description': 'x', 'is_sticker': True, 'confidence': 0.99},
+            {'description': 'x', 'is_sticker': 'false', 'confidence': 0.99},
+            {'description': 'x', 'confidence': 0.99},
+            {'description': 'x'},
+        )
+        for receipt in receipts:
+            with self.subTest(receipt=receipt):
+                with tempfile.TemporaryDirectory() as tmp:
+                    host = self._verdict_host(tmp, receipt)
+                    row = await self._row(host)
+                    stored = await self._describe(host, row)
+                    self.assertEqual(stored['status'], 'active', '拿不准=不动（描述照写）')
+                    self.assertEqual(stored['disabledBy'], '')
+
+    async def test_the_switch_off_only_writes_the_description(self):
+        """`stickers.auto_disable=false` → 只写描述，启用状态一个字都不动。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._verdict_host(tmp, {
+                'description': '一张风景照', 'aliases': [], 'is_sticker': False, 'confidence': 0.99,
+            }, auto_disable=False)
+            row = await self._row(host)
+            stored = await self._describe(host, row)
+            self.assertEqual(stored['status'], 'active')
+            self.assertEqual(stored['disabledBy'], '')
+            self.assertEqual(stored['description'], '一张风景照')
+
+    async def test_a_batch_reports_one_aggregate_line(self):
+        """一批被判非表情包只报**一条** info（判成照片是常见情况，别一张一条刷屏）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._verdict_host(tmp, {
+                'description': '风景照', 'aliases': [], 'is_sticker': False, 'confidence': 0.9,
+            })
+            for index in range(3):
+                path = os.path.join(tmp, 'stickers', 'a%d.png' % index)
+                with open(path, 'wb') as handle:
+                    handle.write(_png(('a%d' % index).encode()))
+            host.sticker_scan_running = False
+            await host.scan_sticker_library()
+
+            rows = await host.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 3)
+            self.assertEqual({row['status'] for row in rows}, {'disabled'})
+            self.assertEqual({row['disabledBy'] for row in rows}, {'model'})
+            summaries = [
+                entry for entry in host.reports
+                if len(entry) > 2 and entry[0] == 'standard' and entry[1] == 'info'
+                and '不是表情包，已停用' in str(entry[2])
+            ]
+            self.assertEqual(len(summaries), 1, '一批只报一条汇总')
+
+    async def test_ensure_sticker_names_and_group_markers_stay_intact(self):
+        """回归护栏：停用那条路不改 `name` / 归属标记 / 描述的人写标记。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._verdict_host(tmp, {
+                'description': 'x', 'aliases': [], 'is_sticker': False, 'confidence': 0.9,
+            })
+            row = await self._row(host, name='我自己起的名字', groupGuessed=True)
+            stored = await self._describe(host, row)
+            self.assertEqual(stored['name'], '我自己起的名字')
+            self.assertEqual(stored['groupGuessed'], 1)
+            self.assertEqual(stored['groupManual'], 0)
+
+
 class _GuessingDescriber:
     """第二层判据的模型桩：只实现 `StickerDescriber` 协议里这一层要用的两个方法。
 
@@ -2402,8 +2650,8 @@ class ConfigGetterTests(unittest.TestCase):
         host = _host()
         self.assertEqual(host.sticker_config, {
             'enabled': False, 'auto_collect': True, 'auto_collect_guess': False,
-            # v1.8.4（§48）：两级选择与顺手归组**默认开**。
-            'group_selection': True, 'auto_group': True,
+            # v1.8.4（§48）：两级选择与顺手归组**默认开**；§50：描述判非表情包就停用也默认开。
+            'group_selection': True, 'auto_group': True, 'auto_disable': True,
             'directory': 'data/hds-interlude/stickers',
             'max_file_size_mb': 10, 'catalog_limit': 40,
             'description_max_tokens': 768, 'description_response_format': 'json-object',
@@ -2414,7 +2662,7 @@ class ConfigGetterTests(unittest.TestCase):
         }})
         self.assertEqual(configured.sticker_config, {
             'enabled': True, 'auto_collect': True, 'auto_collect_guess': False,
-            'group_selection': True, 'auto_group': True,
+            'group_selection': True, 'auto_group': True, 'auto_disable': True,
             'directory': 'my/stickers', 'max_file_size_mb': 30.0,
             'catalog_limit': 80, 'description_max_tokens': 256,
             'description_response_format': 'prompt-only',
@@ -2429,6 +2677,14 @@ class ConfigGetterTests(unittest.TestCase):
         )
         self.assertIs(
             _host(config={'stickers': {'auto_collect': False}}).sticker_config['auto_collect'], False,
+        )
+        # §50：描述后停用同样默认开，只有显式 false 才关（camelCase 旧名也认）。
+        self.assertIs(fallback.sticker_config['auto_disable'], True)
+        self.assertIs(
+            _host(config={'stickers': {'autoDisable': False}}).sticker_config['auto_disable'], False,
+        )
+        self.assertIs(
+            _host(config={'stickers': {'auto_disable': False}}).sticker_config['auto_disable'], False,
         )
         # 第二层（模型判定普通图片，§45.7）：**默认关**，只有显式 true 才开
         # （`is True` 是刻意的：缺失 / NULL / 字符串一律当关——多花 token 的开关不许"意外打开"）。

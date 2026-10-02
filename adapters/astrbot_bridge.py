@@ -92,6 +92,9 @@ from ..core.service import (
     log_fallback,
     pick,
 )
+#: 媒体种类与"像不像表情包"的**结构信号**都住在 core（§49.1）：适配层判 kind 时调
+#: 同一个 `sticker_media_signal`，第二层预筛 `sticker_guess_candidate` 也是它 —— 一份实现两处用。
+from ..core.service.helpers import STICKER_CANDIDATE_KIND, sticker_media_signal
 from ..core.time import format_log_time, format_story_display_time, iso as iso_time_value, utc_now
 
 __all__ = [
@@ -319,41 +322,43 @@ def _raw_segment_chain(event: Any) -> list[Any]:
 #: （AstrBot 的 `Image` 组件只留 `file`/`url`/`path`，`sub_type` 与 `summary` 在 pydantic
 #: 解析层就被丢掉，只能回原始段取）。
 #:
-#: 权威取值表（不许猜；来源逐条可核，快照见 `docs/PORTING_NOTES.md` §49.1）：
+#: **三档表**（不许猜；来源逐条可核，快照见 `docs/PORTING_NOTES.md` §49.1）：
 #:
-#: | sub_type | NapCat 枚举名 | 我们认的种类 | 依据 |
-#: | --- | --- | --- | --- |
-#: | 0 | `KNORMAL` | `image` | 名字自述（正常图） |
-#: | 1 | `KCUSTOM` | `sticker` | 名字自述（自定义表情 = QQ 收藏表情） |
-#: | 2 | `KHOT` | `image`（未知） | 语义**未核实** |
-#: | 3 | `KDIPPERCHART` | `image`（未知） | 语义**未核实** |
-#: | 4 | `KSMART` | `image`（未知） | 语义**未核实**；**v1.8.4 起撤回** v1.4.2 的 `4 → market` 猜测 |
-#: | 5 | `KSPACE` | `image`（未知） | 语义**未核实** |
-#: | 6 | `KUNKNOW` | `image`（未知） | 名字自述（未知） |
-#: | 7 | `KRELATED` | `image`（未知） | 语义**未核实** |
+#: | sub_type | NapCat 枚举名 | 语义 | 我们怎么用 | 依据 |
+#: | --- | --- | --- | --- | --- |
+#: | 0 | `KNORMAL` | 普通图 | `image`（不收） | 名字自述 |
+#: | 1 | `KCUSTOM` | 自定义图片（收藏表情等） | `sticker`（**确定档：观测到就是表情**） | 名字自述 |
+#: | 2 | `KHOT` | 热门图 / 平台推荐的热门表情 | **候选档**（`sticker-candidate`，过结构检查才收） | 用户给的表 |
+#: | 3 | `KDIPPERCHART` | 斗图 / 表情包相关 | **候选档** | 用户给的表 |
+#: | 4 | `KSMART` | 智能图片（智能裁剪 / 滤镜 / 以图搜图） | `image`（不收） | 用户给的表 |
+#: | 5 | `KSPACE` | QQ 空间图片（相册分享到聊天） | `image`（不收；**实拍照片，绝不能当表情收**） | 用户给的表 |
+#: | 6 | `KUNKNOW` | 未知 | `image`（不收） | 名字自述 |
+#: | 7 | `KRELATED` | 关联图片（输入文字时弹出的关联图 / **用表情搜索搜出来的表情包**） | **候选档** | 用户给的表 + 真机样本 |
 #:
 #: 枚举来源：NapCat 源码 `packages/napcat-core/types/msg.ts` 的 `enum PicSubType`
 #: （快照 commit `26d7533e0f5800fdff865ab2f2ad7692917e1076`，2026-09-29）；
 #: OneBot 段的取值点：`packages/napcat-onebot/api/msg.ts:142`（`sub_type: element.picSubType`）；
 #: 缺省与占位口径：`packages/napcat-core/packet/message/element.ts:369`
-#: （`picSubType ?? 0`）与 `:372`（summary 为空时 `picSubType === 0 ? '[图片]' : '[动画表情]'`）。
-#: NapCat 的接口文档只写「图片子类型 number」，**没有枚举表**：
-#: https://napcat.apifox.cn/246111200d0.md 。
+#: （`picSubType ?? 0`）与 `:372`（summary 为空时 `picSubType === 0 ? '[图片]' : '[动画表情]'`
+#: —— **平台自己把非 0 一律当表情**）。NapCat 接口文档只写「图片子类型 number」，
+#: **没有枚举表**：https://napcat.apifox.cn/246111200d0.md 。
 #:
-#: 映射纪律：**只有 1（KCUSTOM，自定义表情）能算"观测到是表情"**；其余非 0 值
-#: （2/3/4/5/6/7）一律按**未知**处理 —— 回 `image`，第一层判据
-#: （`collectible_sticker_kind`）不收，想收只能靠第二层识图模型确认
-#: （`stickers.auto_collect_guess`，§45.7）。
+#: 一档与二档的区别（一句话）：**一档是"观测到确实是表情"，二档是"平台标了候选、
+#: 但我们不认它的语义，必须再过一道结构检查"**（方括号名字 / GIF / alpha PNG /
+#: 近方形小图，唯一实现在 `helpers.sticker_media_signal`）。
 #:
-#: ⚠️ **`4 → market` 已在 v1.8.4 撤回**（§49.1）：权威枚举里 4 是 `KSMART`，不是"商城表情"，
-#: 那条映射自 v1.4.2 起就只是猜测，与"未知平台语义一律不收"的纪律冲突。真正的商城表情
-#: 走 `mface` 段（另一条链，§29），不在这里。**已经收进库的旧 `market` 素材不动**
-#: （那是既往事实，删它才是静默毁数据）；`kind` 词表里的 `market` 也保留 ——
-#: 别的来源（老适配器 / 桌面桥 / 手搓 media）仍可能这么标注，收藏判据不收窄。
+#: ⚠️ **`4 → market` 已在 v1.8.4 撤回**（§49.1）：它自 v1.4.2 起就只是猜测，与
+#: "未知平台语义一律不收"的纪律冲突。真正的商城表情走 `mface` 段（另一条链，§29）。
+#: **已经收进库的旧 `market` 素材不动**（那是既往事实，删它才是静默毁数据）；
+#: `kind` 词表里的 `market` 也保留 —— 别的来源（老适配器 / 桌面桥 / 手搓 media）
+#: 仍可能这么标注，收藏判据不收窄。
 _ONEBOT_IMAGE_SUB_TYPES = {'0': 'image', '1': 'sticker'}
 
+#: **候选档**：平台标了"可能是表情"，但没到"观测到确实是"的程度 —— 必须再过一道
+#: 结构检查（`helpers.sticker_media_signal`）才决定收不收（§49.1 的第二档）。
+_ONEBOT_IMAGE_CANDIDATE_SUB_TYPES = frozenset({'2', '3', '7'})
+
 #: `sub_type` → NapCat `PicSubType` 枚举名（**只用于文档 / 诊断**，不参与判据）。
-#: 真机日志里出现过的 7 = `KRELATED`：QQ 侧到底怎么用它**未核实**，所以不收（§49.1）。
 _ONEBOT_IMAGE_SUB_TYPE_NAMES = {
     '0': 'KNORMAL', '1': 'KCUSTOM', '2': 'KHOT', '3': 'KDIPPERCHART',
     '4': 'KSMART', '5': 'KSPACE', '6': 'KUNKNOW', '7': 'KRELATED',
@@ -370,22 +375,37 @@ _INCOMING_IMAGE_TIMEOUT_SECONDS = 20.0
 
 
 def _image_media_kind(data: Any) -> tuple[str, str]:
-    """从 OneBot 图片段的 data 里读出 `(kind, summary)`。
+    """从 OneBot 图片段的 data 里读出 `(kind, summary)`（三档表见上面那段注释）。
 
-    `kind` ∈ `image` / `sticker` / `animated`；**未知 / 缺失一律回 `image`**
-    （"拿不准=没有"，见 `_ONEBOT_IMAGE_SUB_TYPES` 的口径表 —— 4 从 v1.8.4 起也归未知）。
-    `summary` 是平台给的原文（`[图片]` / `[动画表情]`），只在有值时保留。
+    * **确定档**（`sub_type` 0 / 1）：直接定 `image` / `sticker`；
+    * **候选档**（`2` / `3` / `7`）：先用**只有名字**的那一半结构信号判一次
+      （方括号名字如 `[中午好]` —— **入站就有、不用下载**）：命中 → `sticker`；
+      不命中 → `sticker-candidate`，留给收藏路径拿到字节后过同一把尺子的其余信号
+      （GIF / 带 alpha 的 PNG / 近方形小图）。判据实现只有一处：
+      `helpers.sticker_media_signal`（第二层的 `sticker_guess_candidate` 也是它）；
+    * **不收档**（`4` / `5` / `6` / 未知 / 缺字段）：回 `image`（"拿不准=没有"）。
 
-    `summary` 含「动画」时升级成 `animated`：这是 **NapCat 自己的占位口径**
+    `summary` 含「动画」时升级 `animated`：这是 **NapCat 自己的占位口径**
     （`packet/message/element.ts:372` 把非 0 的 `picSubType` 一律写成 `[动画表情]`），
-    不是我们猜的。真机那条 `sub_type=7` + `summary='[中午好]'` 因此仍然是 `image`
-    （既没命中映射表、summary 里也没有「动画」两个字）—— 那正是它走第二层的原因（§49.2）。
+    不是我们猜的。升级只发生在两处：**普通图**（`image` → `animated`，§29 起就有的行为）
+    与**候选档命中名字的**那一种（`2/3/7` + `[动画表情]`）；确定档 `sub_type=1` 保持
+    `sticker` 不变（用户口径："1 → sticker，今天的行为不变"）。
+
+    真机那条 `sub_type=7` + `summary='[中午好]'` 因此是 `sticker`（候选档 + 名字信号命中）
+    —— 旧版本把它当成普通图，那正是它收不进来的原因（§49.2）。
     """
     payload = data if isinstance(data, dict) else {}
     summary = _text(payload.get('summary'))
     sub_type = _text(payload.get('sub_type'))
-    kind = _ONEBOT_IMAGE_SUB_TYPES.get(sub_type, 'image')
-    if kind == 'image' and '动画' in summary:
+    kind = _ONEBOT_IMAGE_SUB_TYPES.get(sub_type, '')
+    from_candidate = False
+    if not kind and sub_type in _ONEBOT_IMAGE_CANDIDATE_SUB_TYPES:
+        from_candidate = True
+        # 没有字节时唯一可能命中的信号就是"方括号名字"（GIF/alpha/尺寸都要字节）。
+        kind = 'sticker' if sticker_media_signal(name=summary) else STICKER_CANDIDATE_KIND
+    if not kind:
+        kind = 'image'
+    if '动画' in summary and (kind == 'image' or (from_candidate and kind == 'sticker')):
         kind = 'animated'
     return kind, summary
 
