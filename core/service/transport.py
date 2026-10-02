@@ -147,6 +147,23 @@ class Transport(Protocol):
         """下载图片原始字节。上游 `this.ctx.http.get(url, {responseType: 'arraybuffer'})`（`:2698`/`:2806`）。"""
         ...
 
+    async def fetch_incoming_image(self, source: str) -> Optional[bytes]:
+        """按**入站媒体坐标**取图片字节（**可选能力**；普通实现可以回 `None`）。
+
+        `source` 就是适配层写进结构化媒体表的那个字符串（`SessionView.media[].source`，
+        见 `docs/PORTING_NOTES.md` §46/§49）。与 `fetch_image()` 的分工：
+
+        * `fetch_image(url)` 只管"把这个 URL 下回来"，**任何实现**都该有；
+        * `fetch_incoming_image(source)` 回答"这次入站事件里那张图，宿主还能怎么把字节
+          给我" —— 宿主手上的本地文件、宿主自己的下载器、OneBot 侧的 `get_image`
+          都属于这一类，这些**只有适配层知道**，而它们可能省掉一次网络请求、
+          也可能在 `rkey` 短效链接失效时仍然拿得到字节。
+
+        契约：拿不到一律回 `None`，**绝不抛**；不认识这个坐标 / 没这项能力就回 `None`
+        （调用方会退回 `fetch_image()`，所以**不实现它不会破坏任何既有行为**）。
+        """
+        return None
+
     async def fetch_audio(self, url: str) -> Optional[bytes]:
         """下载音频原始字节。上游原生音频通道（Chunk2）。"""
         ...
@@ -296,6 +313,10 @@ class NullTransport:
         return ''
 
     async def fetch_image(self, url: str) -> Optional[bytes]:
+        return None
+
+    async def fetch_incoming_image(self, source: str) -> Optional[bytes]:
+        # 空传输层没有"宿主通道"这回事：回 `None`，调用方自然退回 `fetch_image()`。
         return None
 
     async def fetch_audio(self, url: str) -> Optional[bytes]:

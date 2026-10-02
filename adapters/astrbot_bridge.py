@@ -315,25 +315,76 @@ def _raw_segment_chain(event: Any) -> list[Any]:
     return chain
 
 
-#: OneBot `image` 段的 `sub_type` → 媒体种类。0 普通图（照片/截图/网图）、
-#: 1 自定义表情（收藏的表情包）、4 商城表情。这是**唯一的机器可读信号**：
-#: AstrBot 的 `Image` 组件只留 `file`/`url`/`path`，`sub_type` 与 `summary` 都在
-#: pydantic 的 extra 里被丢掉，只能回原始段取。
-_ONEBOT_IMAGE_SUB_TYPES = {'0': 'image', '1': 'sticker', '4': 'market'}
+#: OneBot `image` 段的 `sub_type`：**QQ 的 `picSubType` 原值**，这是唯一的机器可读信号
+#: （AstrBot 的 `Image` 组件只留 `file`/`url`/`path`，`sub_type` 与 `summary` 在 pydantic
+#: 解析层就被丢掉，只能回原始段取）。
+#:
+#: 权威取值表（不许猜；来源逐条可核，快照见 `docs/PORTING_NOTES.md` §49.1）：
+#:
+#: | sub_type | NapCat 枚举名 | 我们认的种类 | 依据 |
+#: | --- | --- | --- | --- |
+#: | 0 | `KNORMAL` | `image` | 名字自述（正常图） |
+#: | 1 | `KCUSTOM` | `sticker` | 名字自述（自定义表情 = QQ 收藏表情） |
+#: | 2 | `KHOT` | `image`（未知） | 语义**未核实** |
+#: | 3 | `KDIPPERCHART` | `image`（未知） | 语义**未核实** |
+#: | 4 | `KSMART` | `image`（未知） | 语义**未核实**；**v1.8.4 起撤回** v1.4.2 的 `4 → market` 猜测 |
+#: | 5 | `KSPACE` | `image`（未知） | 语义**未核实** |
+#: | 6 | `KUNKNOW` | `image`（未知） | 名字自述（未知） |
+#: | 7 | `KRELATED` | `image`（未知） | 语义**未核实** |
+#:
+#: 枚举来源：NapCat 源码 `packages/napcat-core/types/msg.ts` 的 `enum PicSubType`
+#: （快照 commit `26d7533e0f5800fdff865ab2f2ad7692917e1076`，2026-09-29）；
+#: OneBot 段的取值点：`packages/napcat-onebot/api/msg.ts:142`（`sub_type: element.picSubType`）；
+#: 缺省与占位口径：`packages/napcat-core/packet/message/element.ts:369`
+#: （`picSubType ?? 0`）与 `:372`（summary 为空时 `picSubType === 0 ? '[图片]' : '[动画表情]'`）。
+#: NapCat 的接口文档只写「图片子类型 number」，**没有枚举表**：
+#: https://napcat.apifox.cn/246111200d0.md 。
+#:
+#: 映射纪律：**只有 1（KCUSTOM，自定义表情）能算"观测到是表情"**；其余非 0 值
+#: （2/3/4/5/6/7）一律按**未知**处理 —— 回 `image`，第一层判据
+#: （`collectible_sticker_kind`）不收，想收只能靠第二层识图模型确认
+#: （`stickers.auto_collect_guess`，§45.7）。
+#:
+#: ⚠️ **`4 → market` 已在 v1.8.4 撤回**（§49.1）：权威枚举里 4 是 `KSMART`，不是"商城表情"，
+#: 那条映射自 v1.4.2 起就只是猜测，与"未知平台语义一律不收"的纪律冲突。真正的商城表情
+#: 走 `mface` 段（另一条链，§29），不在这里。**已经收进库的旧 `market` 素材不动**
+#: （那是既往事实，删它才是静默毁数据）；`kind` 词表里的 `market` 也保留 ——
+#: 别的来源（老适配器 / 桌面桥 / 手搓 media）仍可能这么标注，收藏判据不收窄。
+_ONEBOT_IMAGE_SUB_TYPES = {'0': 'image', '1': 'sticker'}
+
+#: `sub_type` → NapCat `PicSubType` 枚举名（**只用于文档 / 诊断**，不参与判据）。
+#: 真机日志里出现过的 7 = `KRELATED`：QQ 侧到底怎么用它**未核实**，所以不收（§49.1）。
+_ONEBOT_IMAGE_SUB_TYPE_NAMES = {
+    '0': 'KNORMAL', '1': 'KCUSTOM', '2': 'KHOT', '3': 'KDIPPERCHART',
+    '4': 'KSMART', '5': 'KSPACE', '6': 'KUNKNOW', '7': 'KRELATED',
+}
+
+#: 入站媒体"再取一次字节"登记表的容量（§49.3）。收藏只在入站当次发生，所以不需要
+#: 记很久：64 条足够覆盖"一次翻出十几张表情"的连发，又不会把事件对象长期留住。
+_INCOMING_MEDIA_LIMIT = 64
+
+#: 单次"按入站坐标取图片字节"的超时。比 `Transport.fetch_image` 宽松：这条路上
+#: 要做的事更多（宿主下载器 / OneBot 动作），但**必须**有上限 —— 收藏是旁路，
+#: 不许把事件循环挂住（core 侧还有一层 `STICKER_FETCH_TIMEOUT_SECONDS`）。
+_INCOMING_IMAGE_TIMEOUT_SECONDS = 20.0
 
 
 def _image_media_kind(data: Any) -> tuple[str, str]:
     """从 OneBot 图片段的 data 里读出 `(kind, summary)`。
 
-    `kind` ∈ `image` / `sticker` / `market` / `animated`；取不到一律回 `image`。
+    `kind` ∈ `image` / `sticker` / `animated`；**未知 / 缺失一律回 `image`**
+    （"拿不准=没有"，见 `_ONEBOT_IMAGE_SUB_TYPES` 的口径表 —— 4 从 v1.8.4 起也归未知）。
     `summary` 是平台给的原文（`[图片]` / `[动画表情]`），只在有值时保留。
+
+    `summary` 含「动画」时升级成 `animated`：这是 **NapCat 自己的占位口径**
+    （`packet/message/element.ts:372` 把非 0 的 `picSubType` 一律写成 `[动画表情]`），
+    不是我们猜的。真机那条 `sub_type=7` + `summary='[中午好]'` 因此仍然是 `image`
+    （既没命中映射表、summary 里也没有「动画」两个字）—— 那正是它走第二层的原因（§49.2）。
     """
     payload = data if isinstance(data, dict) else {}
     summary = _text(payload.get('summary'))
     sub_type = _text(payload.get('sub_type'))
     kind = _ONEBOT_IMAGE_SUB_TYPES.get(sub_type, 'image')
-    # NapCat 对动图给 `[动画表情]`：即便 sub_type 缺失也据此判成动图，
-    # 否则会把会动的表情包说成一张静止的照片。
     if kind == 'image' and '动画' in summary:
         kind = 'animated'
     return kind, summary
@@ -526,6 +577,119 @@ def _media_source_kind(source: str) -> str:
     return 'url'
 
 
+def _local_image_path(value: Any) -> str:
+    """把一个坐标归一成**此刻确实可读的本地图片路径**；不是本地文件就回空串。
+
+    只认三类（其余一律回空串，**不去 CWD 里撞运气**）：
+
+    * `onebot-file:<路径>` / 裸 `file://` URI（`%20` 之类要解码）；
+    * 绝对路径（`/…` 或 `C:\\…`）**且文件真的在**；
+    * 上面两类解出来的路径 `os.path.isfile()` 为真。
+
+    为什么要它（§49.3）：入站图片的 URL 里带的是短效 `rkey`，而宿主（AstrBot 的
+    `Image(path=…)` / 别的适配器落盘）手上可能**已经有本地文件** —— 那是最稳的字节
+    来源：不发网络请求、也不受 `rkey` 过期影响。判断"到底是不是本地文件"只能靠
+    这里一次 `isfile()`，别让下游各自猜前缀。
+    """
+    text = _text(value).strip()
+    if not text:
+        return ''
+    if text.startswith('onebot-file:'):
+        text = text[len('onebot-file:'):]
+    if text.lower().startswith('file://'):
+        try:
+            text = unquote(urlparse(text).path)
+        except Exception:  # noqa: BLE001 - 解不开就按原文试
+            text = text[len('file://'):]
+    # Windows 的 `file:///C:/x.png` 会解出 `/C:/x.png`：把多出来的前导斜杠去掉。
+    if re.match(r'^/[A-Za-z]:[\\/]', text):
+        text = text[1:]
+    if not (os.path.isabs(text) or re.match(r'^[A-Za-z]:[\\/]', text)):
+        return ''
+    try:
+        return os.path.abspath(text) if os.path.isfile(text) else ''
+    except OSError:  # pragma: no cover - 路径里有非法字符（Windows）
+        return ''
+
+
+def _decode_inline_image(value: Any) -> Optional[bytes]:
+    """解出内联载荷（`data:image/…;base64,…` / AstrBot 的 `base64://…`）；否则 `None`。
+
+    AstrBot 的 `Image.fromBase64()` 写的就是 `base64://…`（组件 `file` 字段），
+    而 `Image.fromBytes` / 别的平台适配器可能给 `data:` URI —— 两种都在这里认掉。
+    """
+    text = _text(value).strip()
+    if not text:
+        return None
+    prefix = 'data:' if text.lower().startswith('data:') else ('base64://' if text.startswith('base64://') else '')
+    if not prefix:
+        return None
+    payload = text.partition(',')[2] if prefix == 'data:' else text[len('base64://'):]
+    if not payload:
+        return None
+    try:
+        return base64.b64decode(payload)
+    except Exception:  # noqa: BLE001 - 坏 base64 按拿不到字节处理
+        return None
+
+
+#: 下载用的 `User-Agent`。**不是** httpx 默认的 `python-httpx/x.y`：图床/CDN 把
+#: 非客户端 UA 当爬虫挡掉是常态。这是**预防性补齐**（见 `AstrbotBridge.http_get_bytes`
+#: 的口径说明：没有有效 `rkey` 就没法在真机外核实"加了就一定下得来"）。
+_DOWNLOAD_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+)
+
+#: 下载超时（秒）。httpx 的默认值是 **5 秒**（实测 `httpx.AsyncClient().timeout`
+#: = `Timeout(timeout=5.0)`）—— QQ 图床握手 + 17KB 图在慢网络上完全可能超过它，
+#: 而超时在旧代码里只会变成一句 debug。
+_DOWNLOAD_TIMEOUT_SECONDS = 20.0
+
+#: 腾讯系的图床链带一个来源页（`multimedia.nt.qq.com.cn` / `gchat.qpic.cn` 之类）。
+_DOWNLOAD_REFERER = 'https://im.qq.com/'
+
+#: 认哪些域名要带 `Referer`（后缀匹配，含子域）。
+_DOWNLOAD_REFERER_SUFFIXES = ('.qq.com', '.qq.com.cn', '.qpic.cn', '.gtimg.cn')
+
+
+def _download_headers(url: str) -> dict[str, str]:
+    """下载请求头：常见客户端 UA；腾讯图床链另带 `Referer`（§49.2）。"""
+    headers = {'User-Agent': _DOWNLOAD_USER_AGENT, 'Accept': '*/*'}
+    try:
+        host = (urlparse(_text(url)).hostname or '').lower()
+    except Exception:  # noqa: BLE001 - 解不出域名就当普通地址
+        host = ''
+    if any(host.endswith(suffix) or host == suffix[1:] for suffix in _DOWNLOAD_REFERER_SUFFIXES):
+        headers['Referer'] = _DOWNLOAD_REFERER
+    return headers
+
+
+def _image_component_for_raw(event: Any, raw: Any) -> Any:
+    """按 `file` / `url` 把原始图段对回 AstrBot 的 `Image` 组件（对不上回 `None`）。
+
+    对上了就能用宿主**官方**的取字节方法（`Image.convert_to_file_path()` /
+    `convert_to_base64()`，见 §49.3）—— 它自带 certifi 根证书、SSL 失败降级与
+    长超时，比我们自己发请求稳。对不上**不猜**：按文件 / URL 字面量相等匹配，
+    这也正是媒体表与原始段的链接方式（`raw_media_hints` 的键同源）。
+    """
+    if event is None or not isinstance(raw, dict):
+        return None
+    file_token = _text(raw.get('file')).strip()
+    url = _text(raw.get('url')).strip()
+    if not file_token and not url:
+        return None
+    chain = _call(event, 'get_messages', []) or []
+    for component in chain:
+        if _component_kind(component) not in ('image', 'img'):
+            continue
+        if file_token and _text(_attr(component, 'file', 'file_')).strip() == file_token:
+            return component
+        if url and _text(_attr(component, 'url')).strip() == url:
+            return component
+    return None
+
+
 
 def _sole_image_hint(chain: list[Any], hints: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """「只有一个图段、也只有一个图片组件」时那个原始段条目（否则 `None`）。
@@ -617,6 +781,12 @@ def serialize_component(
             attrs['summary'] = summary
         if media is not None:
             source = _media_source_from_attrs(attrs, path)
+            # 宿主手上**已经有本地文件**时，字节坐标优先用它（§49.3）：URL 里的 `rkey`
+            # 会过期、还要再发一次网络请求，而本地文件读一次就完事。只改结构化这一侧 ——
+            # 正文标签（`<img src=…>`，给模型看的文本）与既有坐标字面量都不动。
+            local = _local_image_path(path) or _local_image_path(file_value)
+            if local and not source.startswith('onebot-file:'):
+                source = 'onebot-file:%s' % local
             if source:
                 media.append({
                     'kind': media_kind or 'image',
@@ -2118,9 +2288,124 @@ class AstrbotTransport:
 
         支持 `http(s)` / `data:` / `file:` 与 Koishi 语义的 `onebot-file:` /
         `onebot-url:` / `file-url:` 前缀。裸 OneBot file token 需要机器人账号
-        调用 `get_image`，本适配层拿不到该通道，按降级返回 `None` 并记日志。
+        调用 `get_image`（那条路在 `fetch_incoming_image()` 里，见下）。
         """
         return await self._fetch_bytes(url, '图片')
+
+    async def fetch_incoming_image(self, source: str) -> Optional[bytes]:
+        """按**入站媒体坐标**取图片字节（宿主通道优先；取不到回 `None`）。**可选能力。**
+
+        与 `fetch_image()`（只管把 URL 下回来）的分工：这条回答的是"这次入站事件里那张图，
+        宿主还能怎么把字节给我"。坐标由适配层在 `session_view()` 时写进 `SessionView.media`
+        （`{'source': …, 'raw': {…}}`），事件引用由 `remember_event()` 登记；`source` 之外
+        不额外要求调用方知道任何平台细节。
+
+        顺序（每条都有理由，`docs/PORTING_NOTES.md` §49.3）：
+
+        1. **本地文件**（`onebot-file:` / `file://` / 绝对路径且真的在）→ 读盘；
+        2. **内联载荷**（`data:` / AstrBot 的 `base64://`）→ 解码，不发请求；
+        3. **宿主官方方法** `AstrBot Image.convert_to_file_path()`：URL 交给宿主的下载器
+           （自带 certifi 根证书、SSL 校验失败降级、长超时），本地文件直接回路径；
+        4. **OneBot 侧** `get_image`：平台自己下载，字节经 `base64` 回来（条件见 §49.4）。
+
+        直链下载**不在这里**做：那是 `fetch_image()` 的活，core 侧按"宿主通道 → 直链"
+        的顺序各试一次。任何一步失败都继续下一步，最后回 `None` —— **绝不抛**
+        （core 那边按"拿不到字节"记一条可见 warn）。
+        """
+        value = _text(source).strip()
+        if not value:
+            return None
+        event, raw = self.bridge.incoming_media_handle(value)
+        candidates = (value, raw.get('file'))
+        for candidate in candidates:
+            local = _local_image_path(candidate)
+            if local:
+                data = await self._read_local_image(local)
+                if data:
+                    return data
+        for candidate in candidates:
+            inline = _decode_inline_image(candidate)
+            if inline:
+                return inline
+        data = await self._host_image_bytes(_image_component_for_raw(event, raw))
+        if data:
+            return data
+        return await self._onebot_image_bytes(event, raw)
+
+    async def _read_local_image(self, path: str) -> Optional[bytes]:
+        """读一个本地图片文件（放到线程里，别阻塞事件循环）；失败回 `None`。"""
+        try:
+            return await asyncio.to_thread(Path(path).read_bytes)
+        except Exception as error:  # noqa: BLE001 - 文件没了 / 权限不够都算拿不到
+            log_fallback('debug', '入站图片本地文件读取失败 路径=%s 错误=%s', path, error)
+            return None
+
+    async def _host_image_bytes(self, component: Any) -> Optional[bytes]:
+        """宿主官方取字节路：`AstrBot Image.convert_to_file_path()`（§49.3 第 3 条）。
+
+        为什么优先它：这个方法把"URL 下载 / `file:///` 本地读 / `base64://` 解码"三种
+        形态归一成一个本地路径，而且用的是宿主自己的下载器（aiohttp + certifi；
+        证书校验失败时它会降级到不校验证书再试一次），比插件自己发请求稳。
+        组件不在场（链接不上 / 老宿主）或方法不存在时回 `None`，由调用方继续走后面的通道。
+        """
+        if component is None:
+            return None
+        converter = getattr(component, 'convert_to_file_path', None)
+        if not callable(converter):
+            return None
+        try:
+            result = converter()
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, timeout=_INCOMING_IMAGE_TIMEOUT_SECONDS)
+        except Exception as error:  # noqa: BLE001 - 宿主取不到就换下一条通道
+            log_fallback('debug', '宿主取图失败（继续走后面的通道） 错误=%s', error)
+            return None
+        path = _text(result).strip()
+        return await self._read_local_image(path) if path else None
+
+    async def _onebot_image_bytes(self, event: Any, raw: Any) -> Optional[bytes]:
+        """OneBot 侧取图：`get_image`（NapCat）。**条件性可用**，见 `docs/PORTING_NOTES.md` §49.4。
+
+        能用的两个前提（源码核对，不是猜）：
+
+        * `file` 得能解析成 NapCat 的 file-id 令牌，或者**按文件名**在它的缓存里搜到
+          （`packages/napcat-onebot/action/file/GetFile.ts` 的三段模式：UUID 解码 →
+          modelId → `searchForFile`）；入站图片段给的 `file` 是 `fileName`，所以通常
+          走"按名字搜"那一段；
+        * `base64` **只在 NapCat 开了 `enableLocalFile2Url` 时**才回；没开就只有一个
+          在 **NapCat 主机**上的本地路径 —— 那台机器不是我们这台时读不到。
+
+        所以这条是**兜底**，不是主路：拿不到就回 `None`，由 core 记那条可见 warn。
+        动作失败**不打日志**（`fire_and_forget=True`）：它只是降级链的一环，
+        刷屏的是 core 那条按会话节流的 warn。
+        """
+        token = _text(raw.get('file') if isinstance(raw, dict) else '').strip()
+        if not token or event is None:
+            return None
+        endpoint = endpoint_for_event(event)
+        client = self.bridge.onebot_client(endpoint.platform, endpoint.self_id)
+        if client is None:
+            return None
+        try:
+            result = await asyncio.wait_for(
+                self._call_onebot_on(client, 'get_image', {'file': token}, fire_and_forget=True),
+                timeout=_INCOMING_IMAGE_TIMEOUT_SECONDS,
+            )
+        except Exception as error:  # noqa: BLE001 - 超时 / 断连都按拿不到
+            log_fallback('debug', 'OneBot 取图失败 错误=%s', error)
+            return None
+        payload = result.get('data') if isinstance(result, dict) else None
+        data = payload if isinstance(payload, Mapping) else {}
+        inline = _text(data.get('base64')).strip()
+        if inline:
+            try:
+                return base64.b64decode(inline)
+            except Exception as error:  # noqa: BLE001 - 坏 base64 按拿不到
+                log_fallback('debug', 'OneBot 取图 base64 解码失败 错误=%s', error)
+        local = _local_image_path(data.get('file'))
+        if local:
+            return await self._read_local_image(local)
+        return None
 
     async def fetch_audio(self, url: str) -> Optional[bytes]:
         """下载音频原始字节。上游原生音频通道（Chunk2）。
@@ -2141,13 +2426,9 @@ class AstrbotTransport:
         source = source.split('#', 1)[0] if source.startswith('file-url:') else source
         if not source:
             return None
-        if source.startswith('data:'):
-            try:
-                _, _, payload = source.partition(',')
-                return base64.b64decode(payload)
-            except Exception as error:  # noqa: BLE001
-                log_fallback('debug', '%s data: URL 解析失败 错误=%s', label, error)
-                return None
+        inline = _decode_inline_image(source)
+        if inline is not None:
+            return inline
         if source.startswith('file://'):
             path = unquote(urlparse(source).path)
             try:
@@ -3969,6 +4250,12 @@ class AstrbotBridge:
         self._group_endpoints: dict[str, AstrbotEndpoint] = {}
         self._channel_events: dict[str, Any] = {}
         self._message_events: dict[str, Any] = {}
+        #: 入站媒体的"再取一次字节"登记表：`source` → `(event, 原始段 data)`（§49.3）。
+        #: 为什么要登记：URL 里的 `rkey` 是短效的，字节**必须在入站当次**取；而"怎么取"
+        #: （宿主的本地文件 / 宿主官方下载器 / NapCat 的 `get_image`）只有适配层知道。
+        #: 有界 FIFO（`_INCOMING_MEDIA_LIMIT` 条）：只用于本次入站回合，过期条目自然被挤掉，
+        #: **不落盘、不进库、不进正文**。
+        self._incoming_media: dict[str, tuple[Any, dict[str, Any]]] = {}
         self._current_umo = ''
         #: 最近一次入站事件的坐标：`platform_action` 的「本回合对话对象」读它。
         self._current_endpoint: Optional[AstrbotEndpoint] = None
@@ -4686,7 +4973,44 @@ class AstrbotBridge:
             self._private_endpoints[(endpoint.platform, endpoint.self_id, endpoint.user_id)] = endpoint
         if endpoint.message_id:
             self._message_events[endpoint.message_id] = event
+        self._remember_incoming_media(event, session)
         self._persist_endpoint(endpoint)
+
+    def incoming_media_handle(self, source: str) -> tuple[Any, dict[str, Any]]:
+        """按入站媒体坐标取"那个原始段 + 它来自的事件"（没登记过回 `(None, {})`）。
+
+        给 `Transport.fetch_incoming_image()` 用：只有知道是哪条消息、哪个原始段，
+        才谈得上"宿主的本地文件 / 官方下载器 / NapCat 的 `get_image`"（§49.3）。
+        """
+        handle = self._incoming_media.get(_text(source).strip())
+        if handle is None:
+            return None, {}
+        return handle
+
+    def _remember_incoming_media(self, event: Any, session: Any) -> None:
+        """登记这条消息里每个媒体条的"坐标 → 事件 + 原始段"（§49.3）。
+
+        `session.media` 是适配层刚写下的结构化媒体表（JSON 安全的字符串 / dict），这里
+        只把条目与**事件引用**记进有界 FIFO：收藏流程稍后（同一次入站回合内）要取字节时，
+        得知道是哪条消息、哪个原始段 —— 只存 URL 是不够的（`rkey` 短效，且 NapCat 的
+        `get_image` 要的是文件 token，不是 URL）。
+        """
+        media = getattr(session, 'media', None)
+        if isinstance(session, Mapping):
+            media = session.get('media')
+        if not isinstance(media, list):
+            return
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            source = _text(item.get('source')).strip()
+            if not source:
+                continue
+            raw = item.get('raw') if isinstance(item.get('raw'), dict) else {}
+            self._incoming_media.pop(source, None)
+            self._incoming_media[source] = (event, dict(raw))
+        while len(self._incoming_media) > _INCOMING_MEDIA_LIMIT:
+            self._incoming_media.pop(next(iter(self._incoming_media)), None)
 
     def _persist_endpoint(self, endpoint: AstrbotEndpoint) -> None:
         """把这条会话的投递坐标记进落盘表（只在出现新键时写文件）。"""
@@ -5072,13 +5396,37 @@ class AstrbotBridge:
         return self._httpx_client
 
     async def http_get_bytes(self, url: str) -> Optional[bytes]:
-        """下载原始字节（图片 / 语音共用）。失败返回 `None` 并记日志。"""
+        """下载原始字节（图片 / 语音共用）。失败返回 `None` 并记**一条 debug**。
+
+        真机暴露过一个洞（`docs/PORTING_NOTES.md` §49.2）：这里原本是**裸 get** ——
+        httpx 的默认超时只有 **5 秒**、`User-Agent` 是 `python-httpx/<版本>`、没有
+        `Referer`；而失败只写 debug，于是"下载失败"在那条 warn 里被说成
+        "fetch_image 不可用"，谁都看不出到底是超时、是 403、还是证书。现在：
+
+        * 显式超时（`_DOWNLOAD_TIMEOUT_SECONDS`）：QQ 图床的握手 + 下载经常超过 5 秒；
+        * 常见客户端 UA：默认的 `python-httpx/x.y` 不是浏览器/QQ 客户端；
+        * 腾讯域名带 `Referer`：图床链（`multimedia.nt.qq.com.cn` 之类）按来源校验；
+        * 失败日志带上状态码 / 异常类型（仍然是 debug，不刷屏），并且**真的会**进
+          `log_fallback`，排查时能看到是哪一种失败。
+
+        ⚠️ 口径（不许写成结论）：UA / Referer 是**预防性补齐** —— 没有有效的 `rkey`
+        就没法在真机外复现腾讯图床，所以"加了就一定成功"**未核实**；能核实的是
+        "不加的时候请求长什么样"（默认 5 秒超时 + `python-httpx` UA，实测）。
+        """
+        request_url = _text(url)
         try:
-            response = await self._client().get(url)
+            response = await self._client().get(
+                request_url,
+                headers=_download_headers(request_url),
+                timeout=_DOWNLOAD_TIMEOUT_SECONDS,
+            )
             response.raise_for_status()
             return response.content
         except Exception as error:  # noqa: BLE001
-            log_fallback('debug', '下载失败 URL=%s 错误=%s', _text(url)[:120], error)
+            log_fallback(
+                'debug', '下载失败 URL=%s 类型=%s 错误=%s',
+                request_url[:120], type(error).__name__, error,
+            )
             return None
 
     async def request_text(

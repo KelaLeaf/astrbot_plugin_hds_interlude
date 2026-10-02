@@ -1346,6 +1346,72 @@ class _GroupByteTransport:
         return self.payloads.get(url)
 
 
+class _IncomingByteTransport(_GroupByteTransport):
+    """多了**宿主入站通道**（`fetch_incoming_image`）的传输桩（v1.8.6，§49.3）。
+
+    生产上这条通道是适配层实现的（本地文件 / 宿主官方下载器 / OneBot 侧 `get_image`）；
+    这里只按坐标回字节，并把两条通道各自被叫过几次记下来 —— "宿主通道拿到了就不该再
+    走直链"这条断言全靠 `fetched` 为空。
+    """
+
+    def __init__(self, payloads: Optional[dict[str, bytes]] = None) -> None:
+        super().__init__(payloads)
+        self.host_calls: list[str] = []
+
+    async def fetch_incoming_image(self, source: str) -> Optional[bytes]:
+        self.host_calls.append(source)
+        return self.payloads.get(source)
+
+
+class _IncomingGuessDescriber:
+    """第二层判据（"这张普通图是不是表情包"）的模型桩：只有这一层要用的方法。"""
+
+    def __init__(self, verdict: Any = None) -> None:
+        self.verdict = {
+            'is_sticker': True, 'kind': 'meme', 'confidence': 0.9, 'description': '一只猫',
+        } if verdict is None else verdict
+        self.guessed: list[tuple[str, str, str]] = []
+
+    def available(self) -> bool:
+        return False
+
+    def guess_sticker_available(self) -> bool:
+        return True
+
+    async def guess_sticker(self, data_uri: str, mime_type: str, file_name: str = '') -> Any:
+        self.guessed.append((data_uri, mime_type, file_name))
+        return self.verdict
+
+    async def describe_sticker(
+        self, data_uri: str, mime_type: str, file_name: str, *args: Any, **kwargs: Any,
+    ) -> Any:
+        return {'description': '模型后来补的描述', 'aliases': []}
+
+
+#: 真机那条入站段（用户贴的日志，逐字）：`sub_type=7` + `summary=[中午好]` + **只有 URL**
+#: （`file` 是 NapCat 的 fileName，不是本地路径）。7 不在映射表里、summary 里也没有"动画"，
+#: 所以观测到的种类是 `image` —— 第一层不收，只能靠第二层识图模型确认（§49.2）。
+REAL_STICKER_URL = 'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=abc&rkey=CAMSMMtwVq2'
+REAL_STICKER_FILE = 'E734AC389ADCCE0D94883AE67607170B.jpg'
+
+
+def real_sticker_session() -> Any:
+    """用**适配层**写出一条真机形状的会话（不手拼字面量：夹具必须走生产写入方）。"""
+    from plugin.tests.test_astrbot_bridge import IncomingMediaKindTests  # noqa: F401 - 装 astrbot 桩
+    from plugin.adapters import astrbot_bridge as bridge
+
+    event = IncomingMediaKindTests._event(
+        [{'type': 'image', 'data': {
+            'summary': '[中午好]', 'file': REAL_STICKER_FILE, 'sub_type': 7,
+            'url': REAL_STICKER_URL, 'file_size': '17097',
+        }}],
+        components=[bridge.Image(file=REAL_STICKER_FILE, url=REAL_STICKER_URL)],
+    )
+    event.get_self_id = lambda: '1'
+    event.get_sender_id = lambda: '2'
+    return bridge.session_view(event)
+
+
 class GroupStickerCollectionTests(ServiceHarness):
     """群聊入站的自动收藏。
 
@@ -1925,17 +1991,21 @@ class ReceiveTests(ServiceHarness):
             cases = (
                 ('image（sub_type=0，实拍照片）', 'image', 0, 0),
                 ('sticker（sub_type=1，收藏表情）', 'sticker', 1, 1),
-                ('market（sub_type=4，商城表情）', 'market', 4, 2),
+                # v1.8.6 撤回 `4 → market`（§49.1）：4 现在是未知 → 回 image → **不收**。
+                ('image（sub_type=4，KSMART 语义未核实 → 不收）', 'image', 4, 1),
             )
             self.make_story()
             for label, kind, sub_type, expected_total in cases:
                 with self.subTest(label):
-                    local = os.path.join(tmp, '%s.png' % kind)
+                    # 每格用不同的文件名与内容：同内容会被 sha256 去重掉，累计计数就失真。
+                    local = os.path.join(tmp, 'case-%d.png' % sub_type)
                     with open(local, 'wb') as handle:
-                        handle.write(_png(('local-%s' % kind).encode()))
+                        handle.write(_png(('local-%d' % sub_type).encode()))
                     coordinate = 'onebot-file:%s' % local
                     event = IncomingMediaKindTests._event(
-                        [{'type': 'image', 'data': {'file': '%s.png' % kind, 'sub_type': sub_type}}],
+                        [{'type': 'image', 'data': {
+                            'file': 'case-%d.png' % sub_type, 'sub_type': sub_type,
+                        }}],
                         components=[bridge.Image(path=local)],
                     )
                     # 让适配层写出来的会话落在夹具的剧本/参与者坐标上（id 与 `_session` 一致）。
@@ -1973,6 +2043,127 @@ class ReceiveTests(ServiceHarness):
                     rows = await service.db_get('interlude_sticker', {})
                     self.assertEqual(len(rows), expected_total, '只有表情包该入库')
                     self.assertEqual(transport.fetched, [], '本地文件不该走网络')
+
+    @needs('receive', 'describe_vision_event', 'collect_incoming_stickers')
+    async def test_sub_type_four_is_not_collected_and_never_downloaded(self) -> None:
+        """**反向用例**（§49.1）：`sub_type=4` 撤回 `market` 猜测后，**零入库、零下载**。
+
+        4 在权威枚举里是 `KSMART`（语义未核实），所以它与 2/3/5/6/7 同格：观测种类是
+        `image` → 第一层不收；`auto_collect_guess` 关着（默认）时**连候选都不是**，
+        因此宿主通道与直链**一次都不该被叫**（夹具特意把字节放在两条通道里，谁被叫了都会露）。
+        真正的商城表情走 `mface` 段（§29），不受这条影响。
+        """
+        from plugin.tests.test_astrbot_bridge import IncomingMediaKindTests  # noqa: F401 - 装 astrbot 桩
+        from plugin.adapters import astrbot_bridge as bridge
+
+        url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=4&rkey=CAMS4'
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = _IncomingByteTransport({url: _sized_png(64, 64)})
+            service = self._sticker_service(tmp, transport)
+            self.make_story()
+            event = IncomingMediaKindTests._event(
+                [{'type': 'image', 'data': {
+                    'summary': '[图片]', 'file': 'sub4.jpg', 'sub_type': 4, 'url': url,
+                }}],
+                components=[bridge.Image(file='sub4.jpg', url=url)],
+            )
+            event.get_self_id = lambda: '1'
+            event.get_sender_id = lambda: '2'
+            session = bridge.session_view(event)
+            self.assertEqual([item['kind'] for item in session.media], ['image'])
+            self.assertNotIn('kind=', session.content, '不再标成 kind="market"')
+
+            participant = {'id': 'onebot:1:2', 'status': 'active', 'personId': '2'}
+            self._stub_private_dependencies(service, participant)
+            service.signal_incoming_interruption = lambda _story, _participant: None
+
+            self.assertTrue(await service.receive(session, STORY_TIME))
+            await self._drain_sticker_tasks()
+
+            self.assertEqual(await service.db_get('interlude_sticker', {}), [], '零入库')
+            self.assertEqual(transport.host_calls, [], '连宿主通道都不该问')
+            self.assertEqual(transport.fetched, [], '更不该去下载')
+
+    def _real_sticker_service(self, tmp: str, transport: Any, describer: Any) -> Any:
+        """真机那条表情包的宿主：第二层判据开着、字节只能从宿主通道拿（§49）。"""
+        os.makedirs(os.path.join(tmp, 'stickers'), exist_ok=True)
+        service = self.make_service(
+            {
+                **self._config(),
+                'stickers': {
+                    'enabled': True, 'directory': 'stickers', 'autoCollectGuess': True,
+                },
+            },
+            transport=transport,
+        )
+        # 库里开着时 `__init__` 会顺手挂一个目录扫描任务（与"还挂着哪些收藏任务"的
+        # 断言相互干扰）；收藏钩子不依赖后台调度（与既有两个贴纸夹具同一条）。
+        service.background_started = True
+        service.ctx.base_dir = tmp
+        service.sticker_describer = describer
+        participant = {'id': 'onebot:1:2', 'status': 'active', 'personId': '2'}
+        self._stub_private_dependencies(service, participant)
+        service.signal_incoming_interruption = lambda _story, _participant: None
+        return service
+
+    @needs('receive', 'describe_vision_event', 'collect_incoming_stickers')
+    async def test_real_device_sub_type_seven_sticker_needs_the_host_bytes(self) -> None:
+        """★ 真机复现（§49.2）：`sub_type=7` + `summary=[中午好]` + **只有 URL** 的私聊。
+
+        这条就是用户贴的那三行日志。种类观测到的是 `image` —— 7 不在映射表里（未知即不收），
+        summary 里也没有"动画"，所以**第一层不收**；能不能收藏，全看第二层识图模型，
+        而第二层的前提是**入站当次拿得到字节**。两条分支都要钉死：
+
+        * 宿主能按坐标取到字节 → 入库（走模型判定，不是"看着像就收"）；
+        * 宿主取不到 → **零入库 + 恰好一条 warn**（能力缺失不许静默，坑 25）。
+        """
+        from plugin.core.service.helpers import collectible_sticker_kind
+
+        session = real_sticker_session()
+        self.assertEqual(
+            [item['kind'] for item in session.media], ['image'],
+            'sub_type=7 是未核实的值 → 观测种类就是普通图（第一层的"未知即不收"）',
+        )
+        self.assertFalse(collectible_sticker_kind(session.media[0]['kind']))
+        self.assertEqual([item['source'] for item in session.media], [REAL_STICKER_URL])
+        self.assertIn('[中午好]', session.content, '平台给的 summary 原样留着（它不参与判据）')
+
+        # ---- 甲：宿主拿得到字节 → 入库 ----
+        self.make_story()
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = _IncomingByteTransport({REAL_STICKER_URL: _sized_png(64, 64)})
+            describer = _IncomingGuessDescriber()
+            service = self._real_sticker_service(tmp, transport, describer)
+
+            self.assertTrue(await service.receive(session, STORY_TIME))
+            await self._drain_sticker_tasks()
+
+            rows = await service.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 1, '宿主拿到字节 + 模型确认是表情包 → 入库')
+            self.assertEqual(rows[0]['guessed'], 1, '这条是模型猜出来的（第二层）')
+            self.assertEqual(len(describer.guessed), 1, '恰好问一次模型')
+            self.assertEqual(transport.host_calls, [REAL_STICKER_URL], '走的是宿主入站通道')
+            self.assertEqual(transport.fetched, [], '宿主通道拿到了就不该再走直链')
+
+        # ---- 乙：宿主也拿不到 → 零入库 + 一条 warn ----
+        # 清掉甲那条资产：同一个内存库跨分支，不清就分不出"这一批到底收了没有"。
+        await service.db_remove('interlude_sticker', {})
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = _IncomingByteTransport({})
+            service = self._real_sticker_service(tmp, transport, _IncomingGuessDescriber())
+
+            self.assertTrue(await service.receive(session, STORY_TIME))
+            await self._drain_sticker_tasks()
+
+            self.assertEqual(await service.db_get('interlude_sticker', {}), [], '零入库')
+            warns = [
+                text for level, text in self.sink.records
+                if level == 'warn' and '拿不到图片字节' in text
+            ]
+            self.assertEqual(len(warns), 1, '能力缺失必须看得见，且同一批只报一条')
+            self.assertIn('enableLocalFile2Url', warns[0], '文案要告诉用户下一步能做什么')
+            self.assertEqual(transport.host_calls, [REAL_STICKER_URL], '先试宿主通道')
+            self.assertEqual(transport.fetched, [REAL_STICKER_URL], '再回退到直链下载')
 
     @needs('receive', 'describe_vision_event', 'collect_incoming_stickers')
     async def test_hand_typed_img_tags_in_a_private_message_are_never_media(self) -> None:

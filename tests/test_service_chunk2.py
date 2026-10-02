@@ -227,6 +227,22 @@ class _ByteTransport:
         return self.payloads.get(url)
 
 
+class _IncomingByteTransport(_ByteTransport):
+    """多了宿主入站通道（`fetch_incoming_image`）的传输桩（v1.8.6，§49.3）。
+
+    记两条通道各自被叫过哪些坐标："宿主拿到就不再走直链"与"宿主回 None 就回退直链"
+    两条断言全靠它。
+    """
+
+    def __init__(self, payloads: Optional[dict[str, bytes]] = None) -> None:
+        super().__init__(payloads)
+        self.host_calls: list[str] = []
+
+    async def fetch_incoming_image(self, source: str) -> Optional[bytes]:
+        self.host_calls.append(source)
+        return self.payloads.get(source)
+
+
 async def _noop_ensure_history_vectors(story_id: str) -> None:
     """上游测试里 `ensureHistoryVectors: async () => {}` 的等价 stub。"""
 
@@ -1738,6 +1754,22 @@ class AutomaticStickerCollectionTests(unittest.IsolatedAsyncioTestCase):
                 os.path.join(tmp, 'stickers', collected[0]['filePath']),
             ))
 
+    async def test_a_local_coordinate_that_is_really_a_token_still_tries_the_host(self):
+        """`onebot-file:` 里可能装的是宿主给的**别名**（OneBot file token / `base64://`）。
+
+        真机上 NapCat 给的 `file` 就是这种裸文件名：读盘必然失败。读盘失败后必须继续问
+        宿主通道（它认得 token 与内联载荷），否则这一类又变成"拿不到字节"（§49.3）。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            source = 'onebot-file:E734AC389ADCCE0D94883AE67607170B.jpg'
+            host.transport = _IncomingByteTransport({source: _png(b'token')})
+            media = [{'source': source, 'kind': 'sticker'}]
+            collected = await host.collect_incoming_stickers(media, [source])
+            self.assertEqual(len(collected), 1, '宿主通道能从别名救回来')
+            self.assertEqual(host.transport.host_calls, [source])
+            self.assertEqual(host.transport.fetched, [], '宿主通道拿到了就不该再走直链')
+
     async def test_auto_collect_respects_the_master_switch_and_its_own(self):
         """`enabled=false`（总闸）与 `auto_collect=false` 都必须一个都不收。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1878,7 +1910,9 @@ class ModelGuessedStickerCollectionTests(unittest.IsolatedAsyncioTestCase):
       经过模型，开关关着时连候选都不产生。
     """
 
-    def _guess_host(self, tmp: str, describer: Any = None, **stickers: Any) -> Any:
+    def _guess_host(
+        self, tmp: str, describer: Any = None, transport: Any = None, **stickers: Any,
+    ) -> Any:
         """一个开着第二层判据的宿主（默认的 `auto_collect_guess` 由用例显式给）。"""
         database = Database(':memory:')
         database.register_tables()
@@ -1890,7 +1924,7 @@ class ModelGuessedStickerCollectionTests(unittest.IsolatedAsyncioTestCase):
                 'enabled': True, 'directory': 'stickers', 'auto_collect_guess': True, **stickers,
             }},
             db=database,
-            transport=_ByteTransport(),
+            transport=transport if transport is not None else _ByteTransport(),
         )
         host.sticker_describer = describer if describer is not None else _GuessingDescriber()
 
@@ -1899,6 +1933,63 @@ class ModelGuessedStickerCollectionTests(unittest.IsolatedAsyncioTestCase):
 
         host.image_bytes_to_native = image_bytes_to_native
         return host
+
+    async def test_the_host_entry_is_tried_before_the_direct_download(self):
+        """宿主入站通道优先（§49.3）：它拿到字节就不再走直链；回 `None` 才回退。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=x'
+            payload = _sized_png(64, 64)
+            host = self._guess_host(tmp, transport=_IncomingByteTransport({source: payload}))
+            media = [{'source': source, 'kind': 'image', 'raw': {'sub_type': '7'}}]
+            collected = await host.collect_incoming_stickers(media, [source])
+            self.assertEqual(len(collected), 1, '宿主通道拿到字节就该入库')
+            self.assertEqual(host.transport.host_calls, [source])
+            self.assertEqual(host.transport.fetched, [], '宿主通道拿到了就不该再走直链')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=y'
+            # 老传输实现**只有** `fetch_image`（没有宿主通道）：行为必须与从前逐字一致。
+            host = self._guess_host(tmp, transport=_ByteTransport({source: _sized_png(64, 64)}))
+            media = [{'source': source, 'kind': 'image', 'raw': {'sub_type': '7'}}]
+            collected = await host.collect_incoming_stickers(media, [source])
+            self.assertEqual(len(collected), 1, '没有宿主通道时照旧走直链')
+            self.assertEqual(host.transport.fetched, [source])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=w'
+
+            class _HostBlind(_IncomingByteTransport):
+                """有宿主通道但这条拿不到（本地没文件 / 宿主下载器也失败）。"""
+
+                async def fetch_incoming_image(self, source: str) -> Optional[bytes]:
+                    self.host_calls.append(source)
+                    return None
+
+            host = self._guess_host(tmp, transport=_HostBlind({source: _sized_png(64, 64)}))
+            media = [{'source': source, 'kind': 'image', 'raw': {'sub_type': '7'}}]
+            collected = await host.collect_incoming_stickers(media, [source])
+            self.assertEqual(len(collected), 1, '宿主回 None 必须回退到直链')
+            self.assertEqual(host.transport.host_calls, [source])
+            self.assertEqual(host.transport.fetched, [source])
+
+    async def test_unknown_sub_type_is_never_collected_while_the_guess_switch_is_off(self):
+        """未知 `sub_type` 的**核心侧**：`kind='image'` + 第二层开关关着 → 零入库、零下载。
+
+        `kind='image'` 就是适配层对未知 `sub_type`（真机的 7、现在的 4）的映射结果 ——
+        映射本身由 `test_astrbot_bridge...test_sub_type_*` 与 chunk1 的 ★ 端到端钉住，
+        这里钉的是"到了 core 之后一个字节都不许取"。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._guess_host(tmp, auto_collect_guess=False)
+            source = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=z'
+            host.transport.payloads[source] = _sized_png(64, 64)
+            media = [{
+                'source': source, 'kind': 'image', 'summary': '[中午好]',
+                'raw': {'sub_type': '7', 'summary': '[中午好]', 'file': 'E734AC.jpg'},
+            }]
+            self.assertEqual(await host.collect_incoming_stickers(media, [source]), [])
+            self.assertEqual(host.transport.fetched, [], '拿不准的种类不该去下载')
+            self.assertEqual(await host.db_get('interlude_sticker', {}), [])
 
     async def test_a_small_square_image_the_model_calls_a_sticker_is_collected_with_its_description(self):
         """`image` + 近方形小图 + 模型说 is_sticker=true → 入库、guessed=true、用回执描述。"""

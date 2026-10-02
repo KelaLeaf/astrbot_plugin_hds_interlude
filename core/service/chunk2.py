@@ -2166,12 +2166,19 @@ class ServiceChunk2(ServiceBase):
         return verdict
 
     async def _sticker_source_bytes(self, source: str) -> Optional[bytes]:
-        """按入站来源取原始字节：本地文件 → 适配器解析 → 远程抓取。
+        """按入站来源取原始字节：本地文件 → **宿主入站通道** → 直链下载。
 
         读本地文件的口子**只对适配器给出来的来源开放**（`onebot-file:` / `file://`），
-        与 `chunk3.fetch_native_image` 的信任边界同源；`onebot-url:` / `http(s)` 走
-        `Transport.fetch_image`（`ctx.http_get` 是它的回退，由 `chunk3` 提供）。
+        与 `chunk3.fetch_native_image` 的信任边界同源。`http(s)` 走
+        `_fetch_sticker_remote()`：**宿主入站通道优先**（`Transport.fetch_incoming_image`
+        可选钩子：宿主的本地文件 / 官方下载器 / OneBot 侧 `get_image`），再退到
+        `Transport.fetch_image`（我们自己的 HTTP）。`onebot-file:` / `file://` 先读盘，
+        读不到再交给同一条宿主通道（前缀里可能是 OneBot 的 file token，不是真路径）。
         `text:`（正文里读出来的坐标，§46.8）一律不认：既不下载也不读盘。
+
+        字节**必须在入站当次**取（§49.3）：QQ 图床 URL 里的 `rkey` 是短效的，
+        "先把 URL 存起来，以后再取"是必然失败的设计 —— 所以这里只有"现在就取"一条路，
+        库里、缓冲回合里都不留 URL 等着以后下载。
         """
         value = source.strip()
         if not value:
@@ -2189,23 +2196,47 @@ class ServiceChunk2(ServiceBase):
                 return _base64.b64decode(match.group(2))
             except Exception:  # noqa: BLE001 - 坏 base64 按拿不到字节处理
                 return None
-        if value.startswith('onebot-file:'):
-            return await self._read_sticker_local_file(_local_sticker_path(value[len('onebot-file:'):]))
-        if value.lower().startswith('file://'):
-            return await self._read_sticker_local_file(_local_sticker_path(value))
+        if value.startswith('onebot-file:') or value.lower().startswith('file://'):
+            prefix = 'onebot-file:' if value.startswith('onebot-file:') else None
+            raw_path = value[len(prefix):] if prefix else value
+            payload = await self._read_sticker_local_file(_local_sticker_path(raw_path))
+            if payload:
+                return payload
+            # 前缀是"本地坐标"，但内容可能只是宿主给的别名（OneBot file token、
+            # `base64://…`），或者宿主的本地文件已经不在了 —— 交给宿主通道再试一次
+            # （它认得 token / 内联载荷 / 宿主自己的下载器，§49.3）。仍然拿不到就回 `None`。
+            return await self._fetch_sticker_remote(value)
         if re.match(r'^https?://', value, re.IGNORECASE):
-            fetcher = getattr(self.transport, 'fetch_image', None)
-            if not callable(fetcher):
-                return None
-            try:
-                data = await asyncio.wait_for(fetcher(value), STICKER_FETCH_TIMEOUT_SECONDS)
-            except Exception as error:  # noqa: BLE001 - 网络失败 = 拿不到字节
-                self.report_standalone_operation(
-                    'diagnostic', 'debug', '入站表情包下载失败 错误=%s', error,
-                )
-                return None
-            return bytes(data) if data else None
+            return await self._fetch_sticker_remote(value)
         # 既不是本地路径也不是 http —— 不猜（`onebot-file` 之外的自造前缀一律跳过）。
+        return None
+
+    async def _fetch_sticker_remote(self, source: str) -> Optional[bytes]:
+        """远程来源取字节：**宿主入站通道优先**，取不到再自己下载（§49.3）。
+
+        顺序与理由：
+
+        1. `Transport.fetch_incoming_image`（**可选**钩子，普通实现可以没有 / 回 `None`）：
+           只有适配层知道"这次入站那张图"宿主手上有没有本地文件、能不能用官方下载器、
+           能不能让 NapCat 自己下一份 —— 这条越靠前越省一次网络请求；
+        2. `Transport.fetch_image`：老的直链路，所有既有实现（含测试桩）都有它。
+
+        两条都**绝不抛**（拿不到就回 `None`，由调用方记一条可见 warn）；每条各自
+        限时 `STICKER_FETCH_TIMEOUT_SECONDS`，收藏是旁路，不许把回合挂住。
+        """
+        for name in ('fetch_incoming_image', 'fetch_image'):
+            fetcher = getattr(self.transport, name, None)
+            if not callable(fetcher):
+                continue
+            try:
+                data = await asyncio.wait_for(fetcher(source), STICKER_FETCH_TIMEOUT_SECONDS)
+            except Exception as error:  # noqa: BLE001 - 网络/平台失败 = 拿不到字节
+                self.report_standalone_operation(
+                    'diagnostic', 'debug', '入站表情包取字节失败 通道=%s 错误=%s', name, error,
+                )
+                continue
+            if data:
+                return bytes(data)
         return None
 
     async def _read_sticker_local_file(self, path: str) -> Optional[bytes]:
@@ -2221,10 +2252,15 @@ class ServiceChunk2(ServiceBase):
             return None
 
     def _warn_sticker_collect_unavailable(self, count: int) -> None:
-        """节流 warn：一批里有表情包但一个字节都没拿到。
+        """节流 warn：一批里有表情包（或待判定的图片）但一个字节都没拿到。
 
-        为什么不静默：这是**能力缺失**（没配 vision 之外的另一种缺失——拿不到字节），
-        用户看不到就会以为"她怎么不收表情包"。但同一批十个表情包不能打十条。
+        为什么不静默：这是**能力缺失**（拿不到字节），用户看不到就会以为"她怎么不收
+        表情包"。但同一批十个表情包不能打十条。
+
+        文案要说三件事（§49.5）：**什么事实**（有 N 个待收的图，字节拿不到、已跳过）、
+        **不是哪一步的锅**（本地文件 / 宿主取图 / 直链下载都试过了）、**下一步能做什么**
+        （查网络与证书；或让 NapCat 回 base64）。数的是"没拿到字节的那些附件"，
+        包括第二层待判定的普通图 —— 所以措辞是"待收藏的图片"，不再自称"表情包"。
         """
         now = self.now_ms()
         last = getattr(self, '_sticker_collect_warn_at', 0) or 0
@@ -2232,7 +2268,10 @@ class ServiceChunk2(ServiceBase):
             return
         self._sticker_collect_warn_at = now
         self.report_standalone(
-            'warn', '收到 %d 个表情包，但拿不到图片字节（本地路径与 fetch_image 都不可用），已跳过收藏。',
+            'warn',
+            '收到 %d 个待收藏的图片，但拿不到图片字节（本地文件、宿主取图、直链下载都不可用），'
+            '已跳过收藏；请检查插件主机到 QQ 图床的网络与证书，或在 NapCat 打开 '
+            'enableLocalFile2Url 让 get_image 直接回 base64。',
             count,
         )
 
@@ -2363,7 +2402,7 @@ class ServiceChunk2(ServiceBase):
         return True
 
     # ------------------------------------------------------------------ #
-    # 表情库分组（本移植版新增 v1.8.3，v1.8.5 改成"目录即分组"；§47）
+    # 表情库分组（本移植版新增 v1.8.3，v1.8.4 改成"目录即分组"；§47）
     #
     # **磁盘目录结构是分组的唯一事实来源**：`interlude_sticker.group` 存的就是一级
     # 子目录名（上游 `database.ts:164` 本来就有这一列），表 `interlude_sticker_groups`

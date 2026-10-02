@@ -700,13 +700,29 @@ class IncomingMediaKindTests(unittest.TestCase):
 
     def test_raw_media_hints_indexes_by_file_and_url(self):
         event = self._event([{'type': 'image', 'data': {
-            'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': '4',
+            'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': '1',
         }}])
         hints = bridge_module.raw_media_hints(event)
-        self.assertEqual(hints['images']['file:a.jpg']['kind'], 'market')
-        self.assertEqual(hints['images']['url:https://x/a.jpg']['kind'], 'market')
+        self.assertEqual(hints['images']['file:a.jpg']['kind'], 'sticker')
+        self.assertEqual(hints['images']['url:https://x/a.jpg']['kind'], 'sticker')
         # 结构化媒体表要用的**原始判据**也一并带出来（`session.media[].raw`）。
-        self.assertEqual(hints['images']['file:a.jpg']['raw']['sub_type'], '4')
+        self.assertEqual(hints['images']['file:a.jpg']['raw']['sub_type'], '1')
+
+    def test_sub_type_four_is_no_longer_a_market_sticker(self):
+        """v1.8.6 撤回 `4 → market`（§49.1）：4 现在是**未知**，观测种类回 `image`。
+
+        依据：权威枚举里 4 是 `KSMART`，语义未核实；"商城表情"是 v1.4.2 起的猜测，
+        与「未知平台语义一律不收」的纪律冲突。真正的商城表情走 `mface` 段（§29）。
+        """
+        event = self._event([{'type': 'image', 'data': {
+            'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': 4,
+        }}], components=[bridge_module.Image(file='a.jpg', url='https://x/a.jpg')])
+        hints = bridge_module.raw_media_hints(event)
+        self.assertEqual(hints['images']['file:a.jpg']['kind'], 'image')
+        self.assertEqual(hints['images']['file:a.jpg']['raw']['sub_type'], 4)
+        view = bridge_module.session_view(event)
+        self.assertEqual([item['kind'] for item in view.media], ['image'])
+        self.assertNotIn('kind=', view.content, '正文标签里也不该再出现 kind="market"')
 
     # ---- 结构化媒体表（§46）：core 只读这一份，判据不许再从正文文本里来 ----
 
@@ -788,6 +804,99 @@ class IncomingMediaKindTests(unittest.TestCase):
         view = bridge_module.session_view(file_only)
         self.assertEqual(_extract_session_image_sources(view), ['onebot-file:a.jpg'])
         self.assertEqual([item['source'] for item in view.media], ['onebot-file:a.jpg'])
+
+    def test_sub_type_table_is_the_napcat_pic_sub_type_enum(self):
+        """`sub_type` 口径（§49.1）：只有 1（KCUSTOM）算表情，其余非 0 一律未知。
+
+        权威来源是 NapCat 源码里的 `enum PicSubType`（见 `_ONEBOT_IMAGE_SUB_TYPE_NAMES`
+        的注释与 `docs/PORTING_NOTES.md` §49.1）；NapCat 的 apifox 文档只写
+        「图片子类型 number」，**没有枚举表** —— 所以谁都不能"看着像"就补一格。
+        v1.8.6 起 `4 → market` 的历史猜测也已撤回（4 归未知）。
+        """
+        from plugin.core.service.helpers import collectible_sticker_kind
+
+        self.assertEqual(bridge_module._ONEBOT_IMAGE_SUB_TYPE_NAMES, {
+            '0': 'KNORMAL', '1': 'KCUSTOM', '2': 'KHOT', '3': 'KDIPPERCHART',
+            '4': 'KSMART', '5': 'KSPACE', '6': 'KUNKNOW', '7': 'KRELATED',
+        })
+        self.assertEqual(
+            bridge_module._ONEBOT_IMAGE_SUB_TYPES,
+            {'0': 'image', '1': 'sticker'},
+            '映射只有 `0`/`1` 两格；其余非 0 值（含 4）一律"未知即不收"',
+        )
+        for sub_type in ('2', '3', '4', '5', '6', '7', '', None):
+            with self.subTest(sub_type=sub_type):
+                kind, summary = bridge_module._image_media_kind({'sub_type': sub_type})
+                self.assertEqual(kind, 'image')
+                self.assertEqual(summary, '')
+                self.assertEqual(collectible_sticker_kind(kind), '', '第一层判据必须说不')
+        # `kind` 词表里的 `market` 仍然收（别的来源可能这么标注），但**没有任何
+        # `sub_type` 再映射到它** —— 上面那条穷举就是这条不变量的守卫。
+        self.assertEqual(collectible_sticker_kind('market'), 'market')
+        self.assertNotIn('market', bridge_module._ONEBOT_IMAGE_SUB_TYPES.values())
+
+    def test_real_device_segment_sub_type_seven_is_not_a_sticker(self):
+        """真机那条（§49.2）：`sub_type=7` + `summary=[中午好]` 观测到的种类是 **image**。
+
+        用户以为"被当成表情包了"，其实不是：7 不在映射表里，`[中午好]` 里也没有"动画"
+        （只有 NapCat 自己给的 `[动画表情]` 占位才升级成 animated）—— 收藏流程是被
+        **第二层识图模型**（`stickers.auto_collect_guess`）启起来的，`summary` 从来没当过判据。
+        """
+        from plugin.core.service.helpers import collectible_sticker_kind
+
+        url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=abc&rkey=CAMSMMtwVq2'
+        event = self._event([{'type': 'image', 'data': {
+            'summary': '[中午好]', 'file': 'E734AC389ADCCE0D94883AE67607170B.jpg', 'sub_type': 7,
+            'url': url, 'file_size': '17097',
+        }}], components=[bridge_module.Image(
+            file='E734AC389ADCCE0D94883AE67607170B.jpg', url=url)])
+        view = bridge_module.session_view(event)
+
+        self.assertEqual([item['kind'] for item in view.media], ['image'])
+        self.assertEqual([item['source'] for item in view.media], [url])
+        self.assertEqual(view.media[0]['raw']['sub_type'], 7)
+        self.assertEqual(collectible_sticker_kind(view.media[0]['kind']), '')
+        self.assertIn('summary="[中午好]"', view.content, '平台原文照留；它不参与判据')
+
+    def test_animated_still_comes_from_napcats_own_placeholder(self):
+        """`[动画表情]` → `animated` 的依据是 **NapCat 自己的占位**（不是我们猜的）。"""
+        self.assertEqual(
+            bridge_module._image_media_kind({'sub_type': '7', 'summary': '[动画表情]'}),
+            ('animated', '[动画表情]'),
+        )
+
+    def test_host_local_file_wins_over_the_url_coordinate(self):
+        """宿主已经落盘时，**字节坐标**优先用本地文件（§49.3 第 1 条）。
+
+        正文标签（给模型看的文本）保持 URL 不变；只有结构化那一侧的 `source` 换成
+        `onebot-file:<路径>` —— 而且必须与 `extract_session_image_sources()` **逐字相等**，
+        否则"按 source 对齐种类"又会像 §46.9 那样对不上。
+        """
+        from plugin.core.service.chunk3 import _extract_session_image_sources
+
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, 'inbound.png')
+            with open(local, 'wb') as handle:
+                handle.write(b'\x89PNG\r\n\x1a\n')
+            url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=abc'
+            event = self._event([{'type': 'image', 'data': {
+                'file': 'a.jpg', 'url': url, 'sub_type': 1,
+            }}], components=[bridge_module.Image(file='a.jpg', url=url, path=local)])
+            view = bridge_module.session_view(event)
+
+            self.assertEqual([item['source'] for item in view.media], ['onebot-file:%s' % local])
+            self.assertEqual(view.media[0]['source_kind'], 'file')
+            self.assertEqual(_extract_session_image_sources(view), ['onebot-file:%s' % local])
+            self.assertIn(
+                'src="https://multimedia.nt.qq.com.cn/download?appid=1406&amp;rkey=abc"', view.content,
+                '正文标签仍写 URL（人读文本不变；`&` 按 mini-xml 转义）',
+            )
+
+    def test_a_nonexistent_local_path_is_not_a_local_file(self):
+        """路径字段指向一个**不存在**的文件 / 只是相对名 → 不算本地文件（不猜）。"""
+        self.assertEqual(bridge_module._local_image_path('/definitely/not/here.png'), '')
+        self.assertEqual(bridge_module._local_image_path('E734AC389ADCCE0D94883AE67607170B.jpg'), '')
+        self.assertEqual(bridge_module._local_image_path(None), '')
 
     def test_pure_text_chain_hands_over_an_empty_media_table(self):
         """结构化链在（哪怕是纯文本）→ `media == []`：**观测到零媒体**，core 不回退文本。"""
@@ -1350,6 +1459,8 @@ class TransportDegradationTests(unittest.TestCase):
             'list_sticker_files', 'search_web', 'visit_web', 'deliver_background',
             # v1.7.1：QQ 空间的 NapCat WebSocket 方案要自带 Cookie/Referer 的原始 HTTP。
             'request_text',
+            # v1.8.6：按入站媒体坐标取字节（宿主本地文件 / 官方下载器 / OneBot get_image）。
+            'fetch_incoming_image',
         ):
             with self.subTest(method=name):
                 self.assertTrue(callable(getattr(self.transport, name, None)))
@@ -1399,6 +1510,156 @@ class TransportDegradationTests(unittest.TestCase):
         import asyncio
 
         return asyncio.run(awaitable)
+
+
+# =========================================================================== #
+# 3b. 入站取字节（§49）：宿主通道与直链下载
+# =========================================================================== #
+
+class _HostImageStub:
+    """宿主的 `Image` 组件桩：只提供 `convert_to_file_path()`（官方取字节方法）。
+
+    真组件的这个方法会把 URL / `file:///` / `base64://` 归一成一个本地路径
+    （`astrbot/core/message/components.py` 的 `Image.convert_to_file_path`）；
+    这里直接回一个真文件，好把"宿主通道拿到了就不该走网络"钉住。
+    """
+
+    def __init__(self, file, url, path, downloaded=None):
+        self._hdsi_kind = 'image'
+        self.file = file
+        self.url = url
+        self.path = path
+        #: `convert_to_file_path()` 的返回值：与组件上的 `path` 字段**不是一回事** ——
+        #: 前者是"取字节之后得到的本地路径"（可能要下载），后者是宿主手上**已经有**的文件。
+        self.downloaded = downloaded
+
+    async def convert_to_file_path(self):
+        return self.downloaded or self.path
+
+
+class _GetImageBot:
+    """`aiocqhttp` 客户端桩：只回 `get_image` 的帧，并把调用记下来。"""
+
+    def __init__(self, frame):
+        self.frame = frame
+        self.calls = []
+
+    async def call_action(self, action, **params):
+        self.calls.append((action, dict(params)))
+        return self.frame
+
+
+class IncomingImageByteTests(unittest.TestCase):
+    """`Transport.fetch_incoming_image`：宿主通道优先，拿不到才由 core 回退直链（§49.3）。"""
+
+    def setUp(self):
+        self.context = FakeContext()
+        self.bridge = _make_bridge(context=self.context)
+        self.transport = AstrbotTransport(self.bridge)
+
+    @staticmethod
+    def _run(awaitable):
+        return asyncio.run(awaitable)
+
+    def test_local_file_source_is_read_without_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'inbound.png')
+            with open(path, 'wb') as handle:
+                handle.write(b'\x89PNG-local')
+            self.assertEqual(
+                self._run(self.transport.fetch_incoming_image('onebot-file:%s' % path)),
+                b'\x89PNG-local',
+            )
+
+    def test_inline_payloads_are_decoded(self):
+        import base64
+
+        encoded = base64.b64encode(b'hello').decode('ascii')
+        self.assertEqual(self._run(self.transport.fetch_incoming_image('base64://%s' % encoded)), b'hello')
+        self.assertEqual(
+            self._run(self.transport.fetch_incoming_image('data:image/png;base64,%s' % encoded)), b'hello',
+        )
+
+    def test_host_downloader_is_used_for_the_recorded_segment(self):
+        """登记过入站事件时走宿主官方方法（`Image.convert_to_file_path()`）。"""
+        url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=CAMSMMtwVq2'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'host.png')
+            with open(path, 'wb') as handle:
+                handle.write(b'\x89PNG-host')
+            event = IncomingMediaKindTests._event(
+                [{'type': 'image', 'data': {'file': 'a.jpg', 'url': url, 'sub_type': 7}}],
+                # `path=None`：宿主**还没**落盘，字节只能靠它自己的下载器现取 —— 这正是
+                # 真机那条的形状（组件只有 file token + rkey URL）。
+                components=[_HostImageStub('a.jpg', url, None, downloaded=path)],
+            )
+            view = bridge_module.session_view(event)
+            self.bridge.remember_event(event, view, bridge_module.endpoint_for_event(event))
+            source = view.media[0]['source']
+            self.assertEqual(source, url)
+            self.assertEqual(self._run(self.transport.fetch_incoming_image(source)), b'\x89PNG-host')
+
+    def test_onebot_get_image_road_returns_bytes(self):
+        """NapCat 那条路：`get_image` 的 `base64` 直接变成字节（§49.4）。"""
+        import base64
+
+        url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=xyz'
+        bot = _GetImageBot({'status': 'ok', 'retcode': 0, 'data': {
+            'base64': base64.b64encode(b'\x89PNG-onebot').decode('ascii'),
+        }})
+        bridge = _bridge_with_bot({}, bot)
+        transport = AstrbotTransport(bridge)
+        event = FakeMessageEvent(raw_message={'message': [{
+            'type': 'image',
+            'data': {'file': 'E734AC389ADCCE0D94883AE67607170B.jpg', 'url': url, 'sub_type': 7},
+        }]})
+        view = bridge_module.session_view(event)
+        bridge.remember_event(event, view, bridge_module.endpoint_for_event(event))
+        source = view.media[0]['source']
+
+        self.assertEqual(self._run(transport.fetch_incoming_image(source)), b'\x89PNG-onebot')
+        self.assertEqual(bot.calls, [('get_image', {'file': 'E734AC389ADCCE0D94883AE67607170B.jpg'})])
+
+    def test_unknown_source_without_a_recorded_event_degrades_quietly(self):
+        """没登记过、也不是本地/内联 → 回 `None`（**绝不抛**、绝不联网）。"""
+        self.assertIsNone(
+            self._run(self.transport.fetch_incoming_image('https://cdn.example.com/never-seen.png')),
+        )
+        self.assertIsNone(self._run(self.transport.fetch_incoming_image('')))
+
+    def test_direct_download_carries_user_agent_timeout_and_qq_referer(self):
+        """直链下载的请求形状（§49.2）：不再是裸 `httpx.get`。
+
+        真机暴露的正是这里：httpx 默认 **5 秒**超时 + `python-httpx/x.y` UA +
+        没有 Referer，而且失败只写 debug。差异本身是可测的（这里用假客户端把
+        出站请求抓下来）：UA / 超时 / 腾讯域名的 Referer 必须都在。
+        """
+        calls = []
+
+        class _Response:
+            content = b'\x89PNG-net'
+
+            def raise_for_status(self):
+                return None
+
+        class _Client:
+            async def get(self, url, **kwargs):
+                calls.append((url, kwargs))
+                return _Response()
+
+        self.bridge._httpx_client = _Client()
+        qq_url = 'https://multimedia.nt.qq.com.cn/download?appid=1406&rkey=a'
+        self.assertEqual(self._run(self.bridge.http_get_bytes(qq_url)), b'\x89PNG-net')
+        _url, kwargs = calls[0]
+        self.assertNotIn('python-httpx', kwargs['headers']['User-Agent'])
+        self.assertEqual(kwargs['headers']['Referer'], bridge_module._DOWNLOAD_REFERER)
+        self.assertEqual(kwargs['timeout'], bridge_module._DOWNLOAD_TIMEOUT_SECONDS)
+        self.assertGreater(kwargs['timeout'], 5.0, 'httpx 默认 5 秒太短，必须显式放大')
+
+        other_url = 'https://cdn.example.com/a.png'
+        self.assertEqual(self._run(self.bridge.http_get_bytes(other_url)), b'\x89PNG-net')
+        _url, kwargs = calls[1]
+        self.assertNotIn('Referer', kwargs['headers'], '非腾讯域名不带来源页')
 
 
 # =========================================================================== #

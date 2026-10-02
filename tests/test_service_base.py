@@ -470,8 +470,8 @@ class SessionViewTests(unittest.TestCase):
 
 TRANSPORT_METHODS = (
     'send_private', 'send_group', 'send_session', 'send_image', 'send_sticker',
-    'send_native_face', 'react', 'fetch_member_name', 'fetch_image', 'fetch_audio',
-    'list_sticker_files', 'search_web', 'visit_web', 'deliver_background',
+    'send_native_face', 'react', 'fetch_member_name', 'fetch_image', 'fetch_incoming_image',
+    'fetch_audio', 'list_sticker_files', 'search_web', 'visit_web', 'deliver_background',
 )
 
 
@@ -508,6 +508,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await transport.react('msg-1', 'like'))
         self.assertEqual(await transport.fetch_member_name('c', 'u'), '')
         self.assertIsNone(await transport.fetch_image('https://example.com/a.png'))
+        # 可选能力：空传输层没有"宿主通道"，回 `None`（调用方自然退回 `fetch_image`）。
+        self.assertIsNone(await transport.fetch_incoming_image('https://example.com/a.png'))
         self.assertIsNone(await transport.fetch_audio('https://example.com/a.mp3'))
         self.assertEqual(await transport.list_sticker_files('/root'), [])
 
