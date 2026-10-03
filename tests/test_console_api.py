@@ -35,11 +35,35 @@ from plugin.core.database import Database
 from plugin.core.service import helpers as helpers_module
 from plugin.core.service.base import InterludeContext
 from plugin.core.service.chunk2 import ServiceChunk2
+from plugin.core.service.chunk2 import _list_sticker_files
+from plugin.core.service.helpers import STICKER_DEFAULT_DIRECTORY, sticker_root_from
 from plugin.core.service.transport import NullTransport
 
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+#: 仓库根（`plugin/tests/x.py` → `tests` → `plugin` → 仓库根）。发布仓布局里没有 `docs/`。
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+#: 「对象行列表」在宿主配置页的那句提示：**三处逐字一致**（`_conf_schema.json` 的 5 处
+#: hint / `console_api.HOST_LIST_DEGRADED_NOTE` / 两份 docs）。初版写的是「⚠️此配置项不
+#: 生效…」——那是个**没在真机上点过**的断言（依据见 `docs/PORTING_NOTES.md` §54.4），
+#: v1.9.1 改成"不下断言 + 给出路 + 怎么验证"。
+HOST_LIST_NOTE = (
+    '这一项在宿主配置页可查看；若改不动、或保存后没生效，'
+    '请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。'
+)
+
+#: 五处对象行列表（`type: list` + 行内字段映射）在 schema 里的路径。
+HOST_LIST_PATHS = (
+    ('model_center', 'providers'),
+    ('qq_access', 'bot_accounts'),
+    ('qq_access', 'user_accounts'),
+    ('qq_access', 'group_chats'),
+    ('runtime', 'rest_windows'),
+)
 
 
 #: 一张最小合法 PNG（魔数正确即可，内容不参与判据）。
@@ -343,6 +367,68 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertTrue(groups['actions_interaction']['invisible'],
                         '旧组下发的数据仍带 invisible 标记（宿主配置页据此隐藏）')
         self.assertTrue(groups['input_status']['invisible'])
+
+    def test_a_field_that_only_has_a_schema_default_is_not_reported_as_unset(self):
+        """用户点名的误导（v1.9.1 修）：磁盘上没写过的键，显示的是**生效值**而不是"未设置"。
+
+        真机现场：宿主按 schema 重建配置，新版本新增的键在用户去过宿主配置页之前
+        根本不在文件里（整个 `model_center.video` 组就是这样）。旧口径会把这一项报成
+        `present=False` + `value=None`，界面上就是「未设置」+「—」，而运行期明明跑的是
+        默认值——界面与行为相反。现在：值 = schema 默认值，来源 = `default`。
+        """
+        # 夹具的磁盘配置里没有 `video` 组（= 用户从没在宿主配置页动过它）。
+        payload = _run(self.api.config_schema())
+        groups = {group['key']: group for group in payload['groups']}
+        video = next(item for item in groups['model_center']['fields'] if item['key'] == 'video')
+        self.assertEqual(video['value'], console_module.effective_field_value(
+            'video', video['node'], {},
+        )[0])
+        self.assertEqual(video['value']['enabled'], False)
+        self.assertEqual(video['value']['timeout_seconds'], 20)
+        self.assertEqual(video['value_source'], 'default', '用的是默认值')
+        self.assertTrue(video['present'], '「有生效值」——界面不该再挂"未设置"')
+        # 对象节点递归填默认值：嵌套表单的每个子项都要有值。
+        failover = next(item for item in groups['model_center']['fields'] if item['key'] == 'failover')
+        self.assertEqual(failover['value']['strategy'], 'priority')
+
+    def test_the_value_source_tells_explicit_from_default(self):
+        """`explicit` = 磁盘上写过；`default` = 用 schema 默认值；`missing` = 真没有值。"""
+        self.bridge.raw_config = lambda: {
+            'model_center': {'vision': {'enabled': True}},
+            'runtime': {},
+        }
+        payload = _run(self.api.config_schema())
+        groups = {group['key']: group for group in payload['groups']}
+        fields = {item['key']: item for item in groups['model_center']['fields']}
+        self.assertEqual(fields['vision']['value_source'], 'explicit')
+        self.assertTrue(fields['vision']['value']['enabled'])
+        self.assertEqual(fields['video']['value_source'], 'default')
+        # schema 里没有默认值的项（提示词组那几个 text 有默认值；这里挑一个真的没有的）。
+        self.assertEqual(
+            console_module.effective_field_value('not_a_key', {'type': 'string'}, {}),
+            (None, 'missing'),
+        )
+        self.assertFalse(
+            bool(console_module.effective_field_value('not_a_key', {'type': 'string'}, {})[1] != 'missing'),
+        )
+
+    def test_connection_task_badges_cover_every_use_for_flag(self):
+        """勾了的用途**必须**在连接行上显示出来（含 world_seeding / works / video）。
+
+        旧实现拿路由任务表（`CONSOLE_TASKS`）拼 `use_for_<key>`：`timeline` 没有独立
+        开关（永远读不到），而 world_seeding / works / video 三个键不在那张表里
+        （勾了也看不见）——正是用户点名的"指明了却不生效"那类误导。
+        """
+        # `normalize_config` 把 schema 分组名搬成了上游段名，直接改那一份才是运行期读的。
+        self.bridge.config['model'] = {'providers': [{
+            'label': '全部用途', 'enabled': True, 'model': 'demo',
+            'endpoint': 'https://gw.example.com/v1/chat/completions',
+            'use_for_main': True, 'use_for_world_seeding': True,
+            'use_for_works': True, 'use_for_video': True,
+        }]}
+        row = _run(self.api.models())['connections'][0]
+        self.assertEqual(row['tasks'], ['主叙事', '世界播种', '共同作品写手', '视频理解'])
+        self.assertNotIn('时间导演', row['tasks'], 'timeline 没有独立开关，不许拿它去拼键')
 
     def test_permission_write_round_trips_to_the_temp_data_dir(self):
         path = self._temp_permissions()
@@ -1225,6 +1311,39 @@ class ConfigNoteTests(unittest.TestCase):
         from plugin.adapters import console_api
         for key in ('user_accounts', 'bot_accounts', 'group_chats'):
             self.assertIn('qq_access.%s' % key, console_api.FIELD_NOTES, key)
+
+
+class HostListNoteWordingTests(unittest.TestCase):
+    """宿主配置页那句提示的**文案对账**（变异保护：写回「不生效」→ 红）。
+
+    三处必须逐字一致：`_conf_schema.json` 的 5 处对象行列表 `hint`、
+    `console_api.HOST_LIST_DEGRADED_NOTE`、`docs/PORTING_NOTES.md` §54.4 与
+    `docs/CONFIG_MAP.md`。只改一处 → 红；改回旧断言 → 红。
+    """
+
+    def test_the_console_constant_is_the_agreed_sentence(self) -> None:
+        self.assertEqual(console_module.HOST_LIST_DEGRADED_NOTE, HOST_LIST_NOTE)
+        # 旧断言是"没在真机上点过"的结论，不许回来。
+        self.assertNotIn('不生效', console_module.HOST_LIST_DEGRADED_NOTE)
+        # 控制台前端按「幕间控制台」这个词过滤这类 hint，措辞里必须留着它。
+        self.assertIn('幕间控制台', console_module.HOST_LIST_DEGRADED_NOTE)
+
+    def test_every_object_row_list_hint_is_the_same_sentence(self) -> None:
+        schema = console_module.load_config_schema()
+        self.assertTrue(schema, '_conf_schema.json 读不到')
+        for group, field in HOST_LIST_PATHS:
+            node = schema[group]['items'][field]
+            self.assertEqual(node.get('hint'), HOST_LIST_NOTE, '%s.%s' % (group, field))
+        # 宿主对 `obvious_hint` 自己加 ‼️（文案里别再写一个）。
+        self.assertIs(schema['model_center']['items']['providers'].get('obvious_hint'), True)
+
+    def test_the_docs_quote_the_same_sentence(self) -> None:
+        for name in ('PORTING_NOTES.md', 'CONFIG_MAP.md'):
+            path = os.path.join(REPO_ROOT, 'docs', name)
+            if not os.path.exists(path):
+                self.skipTest('发布仓布局没有 docs/%s' % name)
+            with open(path, encoding='utf-8') as handle:
+                self.assertIn(HOST_LIST_NOTE, handle.read(), '%s 缺那句逐字文案' % name)
 
 
 class ConfigEditorTests(unittest.TestCase):
@@ -2512,8 +2631,14 @@ class _FilesystemStickerTransport(NullTransport):
 
     生产里这一步走适配器的同一个实现；`NullTransport` 的桩实现**故意回空**
     （没有平台连接器时的降级），拿它跑扫描会把库里每一行都标成 missing。
+
+    ⚠️ `staticmethod` 不是装饰性写法：直接把模块级函数塞进类体，它就变成了方法，
+    `self._lister(root)` 会多传一个 `self` → `TypeError`；而扫描把任何异常都收成一条
+    `表情包库扫描失败` 的 warn（**静默**），于是夹具坏了、用例照样"全绿"——v1.9.1
+    实测踩到：控制台那几条扫描用例其实一张图都没进过库。
     """
-    from plugin.core.service.chunk2 import _list_sticker_files as _lister  # noqa: PLC0415
+
+    _lister = staticmethod(_list_sticker_files)
 
     async def list_sticker_files(self, root: str) -> list:
         return self._lister(root)
@@ -2594,6 +2719,11 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
     def _insert(self, asset_id, body: bytes = _PNG_BYTES, **patch):
         with open(os.path.join(self.root, '%s.png' % asset_id), 'wb') as handle:
             handle.write(body)
+        # `hash` 必须是**文件内容**的 sha256（生产的写入方就是这么写的）：
+        # 夹具曾经把它设成 assetId，于是"重扫"看到的永远是"文件变了"，
+        # 而扫描又恰好被夹具的 `list_sticker_files` 缺陷静默掉——两边一起错，
+        # 用例全绿而实际一张图都没进过库（v1.9.1 实测踩到）。
+        patch.setdefault('hash', hashlib.sha256(body).hexdigest())
         row = self._row(asset_id, **patch)
         row['id'] = self.database.insert('interlude_sticker', row)
         return row
@@ -3039,6 +3169,170 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
         payload = _run(self.api.stickers())
         self.assertEqual(payload['items'], [])
         self.assertTrue(payload['root'].endswith('stickers'))
+
+    # ---- v1.9.1 §54：收藏 / 扫盘 / 读图**同一个根**，且落盘失败不许建档 ----
+
+    def _collected_row(self, asset_id: str) -> dict[str, Any]:
+        rows = self.database.all('interlude_sticker', {'assetId': asset_id})
+        self.assertEqual(len(rows), 1, '库里应当正好有一行')
+        return rows[0]
+
+    def _set_directory(self, directory: str) -> None:
+        """把服务与 bridge 的 `stickers.directory` 同时换掉（生产里两处读同一份配置）。"""
+        section = {'enabled': True, 'directory': directory}
+        self.service.config = {'stickers': dict(section)}
+        self.service.cached_sticker_config = None
+        self.bridge.config = {'stickers': dict(section)}
+
+    def test_a_collected_sticker_is_on_disk_and_comes_back_through_the_console(self):
+        """**端到端**：真字节 → 收藏 → 控制台取图拿到同样的字节。
+
+        这条钉的是真机的那个症结：库里有档、缩略图 404。三步缺一不可——
+        ① 文件真的在盘上（写出后 `isfile` 且字节数相等）；
+        ② DB 行的 `filePath` 指向它；③ 控制台按**同一个根**把它读出来。
+        """
+        asset = _run(self.service.store_collected_sticker(_PNG_BYTES, 'sticker'))
+        self.assertIsNotNone(asset, '落盘与建档都成功才回资产行')
+        asset_id = asset['assetId']
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        row = self._collected_row(asset_id)
+        # ① 文件在盘上，大小 > 0 且**逐字节相等**
+        target = os.path.join(self.root, row['filePath'].replace('/', os.sep))
+        self.assertTrue(os.path.isfile(target), '收藏必须真的落盘')
+        self.assertEqual(os.path.getsize(target), len(_PNG_BYTES))
+        # ② 行的 filePath 指向它（相对根的路径，不是 basename）
+        self.assertEqual(row['filePath'], 'collected/%s.png' % digest[:32])
+        # ③ 控制台取图入口拿到同样的字节（路径分支 + inline 信封分支）
+        path = _run(self.api.sticker_file(asset_id))
+        self.assertEqual(os.path.abspath(path), os.path.abspath(target))
+        with open(path, 'rb') as handle:
+            self.assertEqual(handle.read(), _PNG_BYTES)
+        envelope = _run(self.api.sticker_file_inline(asset_id))
+        self.assertEqual(base64.b64decode(envelope['data']), _PNG_BYTES)
+        self.assertEqual(envelope['size'], len(_PNG_BYTES))
+
+    def test_a_collected_sticker_in_a_subdirectory_is_not_read_as_a_basename(self):
+        """反向：把相对路径削成 basename 就取不到图——这正是真机 404 的写法。
+
+        `collected/x.png` 落在 `root/collected/x.png`；按 basename 拼成 `root/x.png`
+        必然不存在。这条同时钉住"分组目录不许被削掉"。
+        """
+        asset = _run(self.service.store_collected_sticker(_PNG_BYTES, 'sticker'))
+        row = self._collected_row(asset['assetId'])
+        self.assertIn('/', row['filePath'], '自动收藏落在 collected/ 子目录里')
+        self.assertFalse(
+            os.path.exists(os.path.join(self.root, os.path.basename(row['filePath']))),
+            '根目录下没有这个文件——basename 拼法必然 404',
+        )
+        self.assertTrue(os.path.isfile(_run(self.api.sticker_file(asset['assetId']))))
+
+    def test_a_failed_write_never_creates_a_lookalike_row(self):
+        """落盘失败 → **不建档** + 一条可行动 warn（不许出现"库里有、盘上没有"）。"""
+        blocker = os.path.join(self.tmp, 'blocker')
+        with open(blocker, 'w', encoding='utf-8') as handle:
+            handle.write('not a directory')
+        # `blocker/stickers` 的父级是普通文件 → `makedirs` 必失败（跨平台确定，不靠权限位）。
+        self._set_directory('blocker/stickers')
+        asset = _run(self.service.store_collected_sticker(_PNG_BYTES, 'sticker'))
+        self.assertIsNone(asset)
+        self.assertEqual(self.database.count('interlude_sticker'), 0, '失败即不许建档')
+        warnings = [
+            entry for entry in self.service.reports
+            if '表情包收藏落盘失败' in str(entry[2] if len(entry) > 2 else entry)
+        ]
+        self.assertEqual(len(warnings), 1, '失败必须留一条 warn')
+        message = warnings[0][2] % warnings[0][3:]
+        self.assertIn('未建档', message)
+        self.assertIn('collected/', message, '要说清是哪个文件')
+        self.assertTrue('错误=' in message and len(message) > 20, '要带可行动的错误原文')
+
+    def test_a_partial_write_is_treated_as_a_failure(self):
+        """写了但字节数不对（配额 / 同步盘截断）也**不算成功**：不建档 + warn。"""
+        real_getsize = os.path.getsize
+        with mock.patch('os.path.getsize', lambda path: 1):
+            asset = _run(self.service.store_collected_sticker(_PNG_BYTES, 'sticker'))
+        self.assertIsNone(asset)
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
+        self.assertTrue(
+            any('落盘不完整' in str(entry[2] if len(entry) > 2 else entry)
+                for entry in self.service.reports),
+            '字节数不符要明说，不许静默成功',
+        )
+        self.assertEqual(real_getsize, os.path.getsize, '补丁必须还原')
+
+    def test_a_missing_library_directory_is_created_on_write(self):
+        """目录不存在时自建（`parents=True` 的那一层）：收藏写完仍然可读。"""
+        self._set_directory('deep/nested/stickers')
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, 'deep')))
+        asset = _run(self.service.store_collected_sticker(_PNG_BYTES, 'sticker'))
+        self.assertIsNotNone(asset)
+        row = self._collected_row(asset['assetId'])
+        target = os.path.join(self.tmp, 'deep', 'nested', 'stickers', row['filePath'])
+        self.assertTrue(os.path.isfile(target), '不存在的目录要被建出来')
+        self.assertEqual(_run(self.api.sticker_file(asset['assetId'])), os.path.abspath(target))
+
+    def test_purging_a_collected_sticker_really_removes_the_file(self):
+        """同一个路径判据的另一半：`purge` 删的必须是**子目录里那个真文件**。
+
+        按 basename 拼的话，`os.path.isfile(root/<name>)` 恒为假 → `deletedFile=False`
+        ——"删了、其实没删"（又一次静默）。
+        """
+        asset = _run(self.service.store_collected_sticker(_PNG_BYTES, 'sticker'))
+        row = self._collected_row(asset['assetId'])
+        target = os.path.join(self.root, row['filePath'].replace('/', os.sep))
+        self.assertTrue(os.path.isfile(target))
+        payload = _run(self.api.delete_sticker({'assetId': asset['assetId'], 'purge': True}))
+        self.assertTrue(payload['deletedFile'], '子目录里的文件也要真的删掉')
+        self.assertFalse(os.path.isfile(target))
+        self.assertEqual(self._collected_row(asset['assetId'])['status'], 'missing', '行留着留痕')
+
+    def test_a_scanned_file_in_a_group_directory_is_readable_by_the_console(self):
+        """扫盘（`scan_sticker_library`）收进来的图，控制台按**同一个根**读得到。"""
+        os.makedirs(os.path.join(self.root, 'Cat'), exist_ok=True)
+        scanned = os.path.join(self.root, 'Cat', 'paw.png')
+        with open(scanned, 'wb') as handle:
+            handle.write(_PNG_BYTES)
+        _run(self.service.scan_sticker_library())
+        rows = {row['filePath']: row for row in self.database.all('interlude_sticker', {})}
+        self.assertIn('Cat/paw.png', rows, '分组目录里的图要能收进库')
+        asset_id = rows['Cat/paw.png']['assetId']
+        path = _run(self.api.sticker_file(asset_id))
+        self.assertEqual(os.path.abspath(path), os.path.abspath(scanned))
+        envelope = _run(self.api.sticker_file_inline(asset_id))
+        self.assertEqual(base64.b64decode(envelope['data']), _PNG_BYTES)
+
+    def test_collect_scan_and_console_read_compute_one_root(self):
+        """三处（收藏写入 / 扫盘 / 控制台取图）的根**相等**，而且只由一处判据算出。
+
+        断言的是"与 `helpers.sticker_root_from()` 算出来的**同一个值**"，不是两处
+        字面量互相比较——两处一起写错时，比较相等是抓不到的。
+        """
+        expected = sticker_root_from(self.tmp, 'stickers')
+        self.assertEqual(self.service.sticker_library_root(), expected)
+        self.assertEqual(self.api._sticker_root(), expected)
+        self.assertEqual(_run(self.api.stickers())['root'], expected)
+        # 默认目录也只有一个字面量（schema / CONFIG_DEFAULTS / 两侧回落都照它读）。
+        self.assertEqual(STICKER_DEFAULT_DIRECTORY, 'data/hds-interlude/stickers')
+        self.service.config = {}
+        self.service.cached_sticker_config = None
+        self.assertEqual(
+            self.service.sticker_library_root(),
+            sticker_root_from(self.tmp, STICKER_DEFAULT_DIRECTORY),
+        )
+
+    def test_an_unresolvable_data_directory_is_visible_and_never_writes(self):
+        """拿不到插件数据目录 → 可见 warn，**不写盘、不建档**（不许静默回落到 cwd）。"""
+        self.service.ctx = InterludeContext()
+        self.assertEqual(getattr(self.service.ctx, 'base_dir', ''), '', '夹具：空的 ctx')
+        self.assertEqual(self.service.sticker_library_root(), '')
+        self.assertTrue(
+            any('表情库根目录不可用' in str(entry[2] if len(entry) > 2 else entry)
+                for entry in self.service.reports),
+            '这是能力缺失，必须可见',
+        )
+        asset = _run(self.service.store_collected_sticker(_PNG_BYTES, 'sticker'))
+        self.assertIsNone(asset)
+        self.assertEqual(self.database.count('interlude_sticker'), 0)
 
 
 class ConsoleStickerGroupTests(unittest.TestCase):
@@ -3624,7 +3918,11 @@ class ConsoleStickerGroupTests(unittest.TestCase):
         self.assertEqual(item['groupName'], '未整理')
         self.assertFalse(item['manual'])
         # 落盘名 = 内容哈希 + 嗅探出来的扩展名（文件名参数根本不在路径里）。
-        self.assertEqual(item['file'], '%s.png' % digest)
+        # v1.9.1（§54）：`file` 是**相对根的路径**（与 `filePath` 逐字相同）——
+        # 曾经它被削成 basename，而取图也按 basename 拼，于是带分组目录的素材
+        # （自动收藏的 `collected/…`、扫盘的 `Cat/…`）**库里有行、缩略图 404**。
+        # 前端 `fileLabel()` 自己取 basename 显示，界面文案因此一个字没变。
+        self.assertEqual(item['file'], 'collected/%s.png' % digest)
         stored = self._stored(payload['assetId'])
         self.assertEqual(stored['hash'], digest)
         self.assertEqual(stored['filePath'], 'collected/%s.png' % digest)
@@ -3905,3 +4203,48 @@ class ConsoleStickerGroupTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('不是图片', response.payload['message'])
         self.assertEqual(self.database.count('interlude_sticker'), 0)
+
+    # ---- 根目录不可知：动盘的操作必须当场拒绝（§54） ----
+
+    def _unavailable_root(self):
+        """把数据目录变成"不可知"（`ctx.base_dir` 空）并给一个假的 cwd 沙箱。
+
+        返回沙箱路径。断言"什么都没写"时看它——真跑起来 cwd 就是仓库根目录，
+        修复前的实现会在这里建目录 / 写文件，测试反而会污染工作区。
+        """
+        sandbox = tempfile.TemporaryDirectory(prefix='hdsi_sticker_cwd_')
+        self.addCleanup(sandbox.cleanup)
+        self.service.ctx = InterludeContext()  # 数据目录不可知
+        self.assertEqual(self.service.sticker_library_root(), '')
+        return sandbox.name
+
+    def test_an_unavailable_root_refuses_to_create_a_group_in_the_cwd(self):
+        """根不可知 → 新建分组**当场拒绝**，绝不落到进程当前目录。
+
+        反向：修复前这里是 `os.path.abspath('')` = cwd，于是目录真的建出来了、
+        返回值还说成功，而用户在数据目录里永远找不到它（同族：§54 的
+        "收藏写进了 A 目录、扫描看的是 B 目录"）。
+        """
+        sandbox = self._unavailable_root()
+        with mock.patch('os.getcwd', return_value=sandbox):
+            with self.assertRaises(ValueError) as caught:
+                _run(self.service.save_sticker_group(name='ProbeGroup'))
+        message = str(caught.exception)
+        self.assertIn('表情库根目录不可用', message)
+        self.assertIn('下一步', message, '拒绝文案必须可行动')
+        self.assertEqual(os.listdir(sandbox), [], '一个字节都不许落到进程当前目录')
+
+    def test_an_unavailable_root_refuses_an_upload_before_writing_anything(self):
+        """同一道闸的另一半：上传素材也不许把字节写进 cwd，而且**不许建档**。"""
+        sandbox = self._unavailable_root()
+        with mock.patch('os.getcwd', return_value=sandbox):
+            with self.assertRaises(ValueError) as caught:
+                _run(self.service.upload_sticker_asset(_PNG_BYTES))
+        self.assertIn('表情库根目录不可用', str(caught.exception))
+        self.assertEqual(os.listdir(sandbox), [])
+        self.assertEqual(self.database.count('interlude_sticker'), 0, '拒绝即不许建档')
+
+    def test_an_unavailable_root_keeps_read_only_views_empty(self):
+        """闸只装在**动盘**那一侧：只读视图照旧回空列表，不抛、也不写。"""
+        self._unavailable_root()
+        self.assertEqual(_run(self.service.sticker_group_directories()), [])

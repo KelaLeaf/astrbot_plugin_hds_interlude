@@ -56,9 +56,14 @@
    而且第二次拿到的可能已经是过期的 `rkey`。这一个入口**只取一次页**，同时产出正文与
    媒体条目（`ForwardMediaRead`）。`forward_read_ids` / `forward_read_content` 保持原
    签名与返回值不变（老调用方与逐字断言都不动）。
-9. **媒体预算（第四道预算，v1.8.7）**：上游根本没有这一层（上游只读正文）。规则与
-   取值见下面的「媒体预算」一节。**超出预算只截断 + 在正文里留可数线索**，绝不因为
-   预算丢正文、也绝不因为取媒体失败丢正文。
+9. **媒体预算（第四道 = 图片 v1.8.7 / 第五道 = 视频 v1.9.1）**：上游根本没有这一层
+   （上游只读正文）。规则与取值见下面的「媒体预算」一节。**超出预算只截断 + 在正文里
+   留可数线索**，绝不因为预算丢正文、也绝不因为取媒体失败丢正文。视频那一道默认是
+   **0（不读）**：读一段视频要跑 ffmpeg 抽帧 + 占视觉预算，属于"用户明确要了才做"。
+10. **视频条目也进 `media`（v1.9.1）**：图片与视频坐标走**同一张** `SessionView.media`
+   表（`kind='video'`），下游 `core/video_understanding.py` 的
+   `extract_session_video_sources()` 从那张表里认视频坐标——**不另造第二套媒体链路**
+   （与 §46 的"结构化媒体表是唯一链路"同一条纪律）。
 
 **字符预算与层级语义（与上游逐字一致，别顺手"优化"）**：
 
@@ -87,35 +92,38 @@
 `[收到一条合并转发消息，但暂时无法读取内容]`、
 `[嵌套合并转发读取失败｜资源 <id>]`。
 
-## 媒体预算（v1.8.7，上游没有这一层）
+## 媒体预算（v1.8.7 图片 / v1.9.1 视频，上游没有这一层）
 
 真机现场：一条 17 节点的转发里 15 张图，模型只看到 15 个 `[图片]`——`imageCount=0`、
 `visualEvidenceMode=none`，视觉观察 / `attachments` / 表情包收藏**一样都拿不到**。
 修法是"把节点里的图片坐标也交出去"，但**不能全交**：一条转发里十几张图如果全塞进
 原生视觉输入，就是一个 token / 延迟 / 成本的黑洞。所以在上游那三重预算（节点数 /
-字符数 / 深度）之外，**再加一道媒体预算**：
+字符数 / 深度）之外，**再加两道媒体预算**：
 
 | 预算 | 位置 | 默认 | 区间 | 理由 |
 | --- | --- | --- | --- | --- |
 | `maxImages`（单条转发最多取几张图） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_images` | **3** | 0~10 | 与直发消息的视觉预算**同一个数量级**（`chunk3` 的 `sources[:3]`）：她一次能"看"的图就是这么多。取 3 而不是 15，省的是每回合的原生图 token 与下载时间；取 0 就等于关掉"转发也看图"，是个**合法**配置（用例钉着） |
+| `maxVideos`（单条转发最多读取几段视频） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_videos` | **1**（一张卡最多看一段） | 0~10 | 视频比图贵一个量级：每读一段就是一次 ffmpeg（抽帧 + 抽音轨）加一次视觉预算占用。默认**1**＝**配了就生效**，同时把单卡的额外成本封在一次以内（用户口径是"可配置单条转发最多读取的视频数"——配了却默认永不生效不算配置）；显式配成 **0** 才是 v1.8.7 的老行为"转发里的视频一段都不读"。取到的坐标交给 `model_center.video` 那条链，受它自己的总开关 / 群聊开关管 |
 | `FORWARD_MEDIA_MAX_PER_TURN`（整条消息的转发媒体总数上限） | 本模块常量（**不暴露配置**） | **6** | — | 一条消息里可能有多张转发卡片，单卡上限管不住总量。6 = 两张卡的默认值之和，够用又封顶；真正的视觉输入上限仍是 `chunk3` 的 3 |
 | 单张体积上限 | **不加新键**：复用 `stickers.max_file_size_mb`（默认 10MB） | 视觉路径 `chunk3.MAX_NATIVE_IMAGE_BYTES`（4MB）、收藏路径 `store_collected_sticker` 的 `max_file_size_mb` | — | "一张图多大算大"在这个仓库里已经有答案，再写一份就是第二个真相 |
 | 只取前面的 | 节点顺序（含嵌套展开顺序） | — | — | 与三重预算同一条纪律：**排在前面的先拿**，后面的只留线索 |
-| 去重 | 坐标字面量（这里）与内容 sha256（`store_collected_sticker`） | — | — | 同一张图在节点里出现两次只算一次；字节到手的路径上仍按内容哈希去重（那条判据只有一处） |
+| 去重 | 坐标字面量（这里）与内容 sha256（`store_collected_sticker`） | — | — | 同一张图 / 同一段视频在节点里出现两次只算一次；字节到手的路径上仍按内容哈希去重（那条判据只有一处） |
 
 **取不到就什么都不做**：节点取不到 / 字段缺失 / 坐标不是可取回的那几类，一律连媒体
 条目都不产生——正文照旧（`[图片]` 占位一个不少），**绝不因为媒体失败吞正文**。
 
-**超预算的可见线索**（短、可数，写在图片那一行上）：
+**超预算的可见线索**（短、可数，写在那一行上）：
 
 ```
 [图片×15，仅取前 3 张]      # 按预算取了 3 张
 [图片×15，仅取前 0 张]      # 上限配成 0：一张都不取，但仍然数得出来有几张
-[视频×2，未取]              # 没有抽帧能力：只标注，不假装能看
+[视频×2，仅取前 1 段]        # 默认 1：只读排在最前面的那一段
+[视频×2，未取]              # 显式配成 max_videos=0：一段都不读，只标注
+[视频×5，仅取前 2 段]        # 配成 2：读了 2 段（能不能真看到画面由 model_center.video 决定）
 ```
 
-数值取自**平台响应里的图片段数**（不是"成功取回的字节数"）：字节要等下游下载才知道，
-而"她少看了 12 张"这件事必须现在就说得出来。
+数值取自**平台响应里的图片 / 视频段数**（不是"成功取回的字节数"）：字节要等下游下载
+才知道，而"她少看了 12 张 / 3 段视频"这件事必须现在就说得出来。
 """
 
 from __future__ import annotations
@@ -130,6 +138,7 @@ __all__ = [
     'FORWARD_FETCH_TIMEOUT_MS',
     'FORWARD_MEDIA_MAX_PER_FORWARD',
     'FORWARD_MEDIA_MAX_PER_TURN',
+    'FORWARD_VIDEO_MAX_PER_FORWARD',
     'ForwardMedia',
     'ForwardMediaBudget',
     'ForwardMediaRead',
@@ -168,12 +177,19 @@ class ForwardReadLimits:
 
     `max_images`（v1.8.7）是**第四道预算**：单条合并转发最多取几张图的坐标。
     默认 3（与直发消息的视觉预算同量级）、区间 0~10，理由见模块 docstring。
+
+    `max_videos`（v1.9.1）是**第五道预算**：单条合并转发最多读取几段视频。默认
+    **1**（一张卡最多看一段）：配了就生效，同时把单卡的额外成本封在一次以内；
+    区间 0~10，显式配 0 才是 v1.8.7 之前的"一段都不读"。
+    取到的视频坐标随 `SessionView.media`（`kind='video'`）流给
+    `core/video_understanding.py`，由那里的抽帧识别真正"看"（受总开关与群聊开关管）。
     """
 
     max_nodes: int = 30
     max_characters: int = 8_000
     max_depth: int = 3
     max_images: int = 3
+    max_videos: int = 1
 
 
 #: 上游 `DEFAULT_LIMITS`（`forward-message.ts:73`）+ 本移植版的媒体上限。
@@ -181,6 +197,12 @@ DEFAULT_LIMITS = ForwardReadLimits()
 
 #: 单条转发最多取几张图（`ForwardReadLimits.max_images` 的默认值）。
 FORWARD_MEDIA_MAX_PER_FORWARD = DEFAULT_LIMITS.max_images
+
+#: 单条转发最多读取几段视频（`ForwardReadLimits.max_videos` 的默认值）。
+#: **1 = 一张卡最多看一段**：转发里的视频要真的抽帧才看得见，那是 ffmpeg + 视觉预算的
+#: 实打实成本，所以把它封在一次以内（与 `max_images` 默认 3 的差别就在这里：图片本来就
+#: 常在转发的正文里）。显式配 0 = 关掉"转发也看视频"。
+FORWARD_VIDEO_MAX_PER_FORWARD = DEFAULT_LIMITS.max_videos
 
 #: **整条消息**里所有合并转发的媒体条目总数上限（v1.8.7）。
 #:
@@ -237,13 +259,13 @@ def failure_result() -> ForwardReadResult:
 
 
 def forward_read_limits(value: Any = None) -> ForwardReadLimits:
-    """夹取读取预算（上游 `forwardReadLimits` + 本移植版的 `maxImages`）。
+    """夹取读取预算（上游 `forwardReadLimits` + 本移植版的 `maxImages` / `maxVideos`）。
 
     逐条对齐上游的区间：`maxNodes` 1~100（默认 30）、`maxCharacters` 500~32000
     （默认 8000）、`maxDepth` **0**~8（默认 3）；本移植版追加 `maxImages` **0**~10
-    （默认 3，理由见模块 docstring）。两种拼写都认（优先 camelCase）；传一个已经
-    夹取过的 `ForwardReadLimits` 时原样返回（内部递归会这么用，见
-    `_fetch_forward_nodes` 的第二层预算）。
+    （默认 3）与 `maxVideos` **0**~10（默认 **1**，理由见模块 docstring）。
+    两种拼写都认（优先 camelCase）；传一个已经夹取过的 `ForwardReadLimits` 时原样
+    返回（内部递归会这么用，见 `_fetch_forward_nodes` 的第二层预算）。
     """
     if isinstance(value, ForwardReadLimits):
         return value
@@ -258,6 +280,11 @@ def forward_read_limits(value: Any = None) -> ForwardReadLimits:
         # 与 `maxDepth` 的下限是 0 同一种语义。写成 1 就把"关掉"这件事说死了。
         max_images=_limit_value(
             source, 'maxImages', 'max_images', 0, 10, DEFAULT_LIMITS.max_images,
+        ),
+        # 视频同理：**默认就是 1**（一张卡最多看一段）——预设成"配了就生效"，
+        # 同时封住单卡的额外成本；显式配 0 才是"转发里的视频一段都不读"。
+        max_videos=_limit_value(
+            source, 'maxVideos', 'max_videos', 0, 10, DEFAULT_LIMITS.max_videos,
         ),
     )
 
@@ -366,9 +393,11 @@ class ForwardMedia:
 
     * `kind`：`image` / `animated` / `sticker` / `sticker-candidate`，由平台响应里的段字段
       （`sub_type` / `summary`）**观测**得到，取值口径与适配层 `_image_media_kind` 一致
-      （三档判据仍然只有那一处实现）。**视频不在这里**：本移植版的抽帧识别只接了直发
-      视频（`model_center.video`，v1.9.0），转发节点的视频没有那条链，所以它只留下
-      `[视频×K，未取]` 这条正文线索（见 `ForwardMediaBudget.video_count`）；
+      （三档判据仍然只有那一处实现）。**视频也走这张表**（v1.9.1）：`kind='video'` 的条目
+      只有坐标与段类型，不带画面——真正"看"它的是抽帧识别（`model_center.video` /
+      `core/video_understanding.py`，坐标经 `SessionView.media` 流过去）。读不读由
+      `ForwardReadLimits.max_videos` 决定（默认 1：一张卡最多读一段；配 0 则一段都不读，
+      只留 `[视频×K，未取]`）；
     * `source`：可取回的坐标（`https://…` / `file://…` / 裸路径）；
     * `summary`：平台原文（`[动画表情]` 之类）。
     """
@@ -389,15 +418,19 @@ class ForwardMediaBudget:
     """
 
     max_images: int = FORWARD_MEDIA_MAX_PER_FORWARD
+    #: 单条转发最多读取几段视频（默认 1 = 一张卡最多看一段；见 `ForwardReadLimits.max_videos`）。
+    max_videos: int = FORWARD_VIDEO_MAX_PER_FORWARD
     #: 平台那一侧**见到**的可取回图片数（含超预算没取的）——线索里的那个 N。
     image_count: int = 0
-    #: 真正收下的条目（≤ `max_images`；由 `_collect_forward_media` 追加）。
+    #: 真正收下的条目（≤ `max_images` 张图 + ≤ `max_videos` 段视频）。
     collected: list[ForwardMedia] = field(default_factory=list)
-    #: 真正收下的条目数（≤ `max_images`）。
+    #: 真正收下的**图片**条目数（≤ `max_images`）。
     taken: int = 0
-    #: 见到的视频段数（只标注、不取帧）。
+    #: 见到的视频段数（含超预算与重复坐标没取的）。
     video_count: int = 0
-    #: 已经出现过的坐标字面量（同一张图在节点里出现两次只算一次）。
+    #: 真正收下的**视频**条目数（≤ `max_videos`）。
+    video_taken: int = 0
+    #: 已经出现过的坐标字面量（同一张图 / 同一段视频在节点里出现两次只算一次）。
     seen: set[str] = field(default_factory=set)
     #: 「超预算线索」是否已经写进正文（每条转发只写一次，短）。
     noted: bool = False
@@ -411,14 +444,16 @@ class ForwardMediaRead:
     media: tuple[ForwardMedia, ...] = ()
     #: 平台见到但**没取**的图片数（`image_count - taken`）。
     skipped_images: int = 0
-    #: 见到的视频段数（只标注）。
+    #: 见到的视频段数（含没读的那些）。
     video_count: int = 0
+    #: 真正读取（收下坐标）的视频段数（≤ `max_videos`）。
+    video_taken: int = 0
 
 
 def forward_media_budget(limits: Any = None) -> ForwardMediaBudget:
     """从预算里取出媒体那一份（`ForwardReadLimits` / 字典都认）。"""
     resolved = forward_read_limits(limits)
-    return ForwardMediaBudget(max_images=resolved.max_images)
+    return ForwardMediaBudget(max_images=resolved.max_images, max_videos=resolved.max_videos)
 
 
 def forward_media_note(budget: ForwardMediaBudget) -> str:
@@ -441,15 +476,18 @@ def extract_forward_media(node: Any, budget: ForwardMediaBudget) -> list[Forward
 
     * 图片：`url` → `file` → `path`（与适配层 `_media_source_from_attrs` 同一条
       优先级），三条都没有 → 不算（数都不数：那不是"没取"，是"拿不到"）；
-    * 视频：只 `video_count += 1`，**不产生条目**——抽帧识别（v1.9.0）只接了
-      **直发**视频（`model_center.video` / `core/video_understanding.py`），转发节点里的
-      视频没有走那条链，这里**别假装有**；
+    * 视频（v1.9.1）：**数**所有视频段（`video_count`，含超预算的），但只在
+      `max_videos` 之内**收坐标**（`kind='video'` 的条目）——要不要真抽帧由
+      `model_center.video` 那边的总开关与模式决定。默认 `max_videos=1` 时收下排在最
+      前面的那一段（线索写 `[视频×K，仅取前 1 段]`）；显式配 `max_videos=0` 才与
+      v1.8.7 行为逐字一致：只留 `[视频×K，未取]` 这条线索；
     * 其它段（`json` / `face` / `mface` / 文件 / 嵌套转发…）不看——本移植版没有
       它们的"取回"路径，乱认只会让下游多一次必然失败的取字节。
 
     `kind` 的口径与适配层的三档表**同一套字段**（`sub_type` 0/1 → `image`/`sticker`、
     2/3/7 → 候选档、`summary` 含「动画」→ `animated`）；这里只是不 import 适配层
     （`core` 不得依赖 `astrbot_bridge`），值由 `_forward_image_kind` 按同一张表算。
+    视频条目的 `kind` 是字面量 `'video'`：它是**段类型**，不是那张三档表里的档位。
     """
     record = as_record(node)
     segments = record.get('message')
@@ -476,6 +514,14 @@ def extract_forward_media(node: Any, budget: ForwardMediaBudget) -> list[Forward
             ))
         elif segment_type == 'video':
             budget.video_count += 1
+            source = _forward_media_source(data)
+            if not source or source in budget.seen or budget.video_taken >= budget.max_videos:
+                continue
+            budget.seen.add(source)
+            budget.video_taken += 1
+            collected.append(ForwardMedia(
+                source=source, kind='video', summary=str(data.get('summary') or '').strip(),
+            ))
     return collected
 
 
@@ -486,9 +532,13 @@ def extract_forward_media(node: Any, budget: ForwardMediaBudget) -> list[Forward
 _SEGMENT_MEDIA_NOTE = '_hdsiForwardMediaNote'
 
 #: 段上的「视频段数」私有键（同一个 `_fetch_forward_nodes` 写、`normalize_forward_segments`
-#: 读）。转发里的视频**不产生媒体条目**（抽帧识别只接了直发视频，v1.9.0），
-#: 所以它的"可数线索"只能走这条路。
+#: 读）。视频条目（`kind='video'`）走 `SessionView.media` 那条链路，而"见过几段视频 /
+#: 读了几段"这两个可数线索是**正文那一行**的旁注，只能随段走。
 _SEGMENT_VIDEO_COUNT = '_hdsiForwardVideoCount'
+
+#: 段上的「真正读取的视频段数」私有键（v1.9.1）。0 表示一段都没读（默认配置），
+#: 正文里就写 `[视频×K，未取]`——与 v1.8.7 的措辞逐字一致。
+_SEGMENT_VIDEO_TAKEN = '_hdsiForwardVideoTaken'
 
 
 def _collect_forward_media(node: dict[str, Any], budget: ForwardMediaBudget) -> list[ForwardMedia]:
@@ -497,7 +547,9 @@ def _collect_forward_media(node: dict[str, Any], budget: ForwardMediaBudget) -> 
     线索只挂一次、且只挂在对应类型的段上（它是**那一行**的旁注，不是整段转发的旁注）：
 
     * 图片超预算 → 第一张图片段上写 `[图片×N，仅取前 M 张]`；
-    * 视频 → 每一段视频上写"到目前为止见过几段"（末位那段最后会被写成总数）。
+    * 视频 → 每一段视频上写"到目前为止见过几段 / 读了几段"（末位那段最后会被写成
+      总数）。默认 `max_videos=1` 时读数是 1，正文里就是 `[视频×K，仅取前 1 段]`；
+      显式配成 0 时读数是 0，正文里就是 `[视频×K，未取]`（与 v1.8.7 逐字一致）。
       一张图 / 一段视频都没有时一个字都不加。
     """
     collected = extract_forward_media(node, budget)
@@ -523,6 +575,9 @@ def _collect_forward_media(node: dict[str, Any], budget: ForwardMediaBudget) -> 
             prior = _int_text(segment.get(_SEGMENT_VIDEO_COUNT))
             if budget.video_count > prior:
                 segment[_SEGMENT_VIDEO_COUNT] = budget.video_count
+            taken = _int_text(segment.get(_SEGMENT_VIDEO_TAKEN))
+            if budget.video_taken > taken:
+                segment[_SEGMENT_VIDEO_TAKEN] = budget.video_taken
     return collected
 
 
@@ -801,13 +856,17 @@ async def forward_read_with_media(
         return ForwardMediaRead(result=failure_result())
     # 正文与媒体来自**同一份节点**：媒体是在 `_fetch_forward_nodes` 走页面时就地收进
     # `media_budget.collected` 的（连同段上的线索键），这里只读不写。
-    collected = media_budget.collected[:budget.max_images]
+    # 上限是**图片 + 视频两份预算之和**：两类的截断各自在 `extract_forward_media`
+    # 里按 `max_images` / `max_videos` 做好了，这里再按图片那一份切会把视频条目整段砍掉。
+    limit = max(0, budget.max_images) + max(0, budget.max_videos)
+    collected = media_budget.collected[:limit] if limit else []
     result = normalize_forward_messages(nodes, budget)
     return ForwardMediaRead(
         result=result,
         media=tuple(collected),
-        skipped_images=max(0, media_budget.image_count - len(collected)),
+        skipped_images=max(0, media_budget.image_count - media_budget.taken),
         video_count=media_budget.video_count,
+        video_taken=media_budget.video_taken,
     )
 
 
@@ -1089,9 +1148,20 @@ def normalize_forward_segments(segments: Any, limits: Any, depth: int) -> dict[s
         elif segment_type in ('record', 'audio'):
             lines.append('[语音]')
         elif segment_type == 'video':
-            # 没有抽帧能力：只标注"这几段视频一段都没取"（可数，且不假装能看）。
+            # 视频（v1.9.1）：见过几段 / 真读了几段都写在段上（见 `_collect_forward_media`）。
+            # 一段都没读（显式配成 `max_videos=0`；默认是 1，会读到 `[视频×K，仅取前 1 段]`）
+            # → `[视频×K，未取]`：**与 v1.8.7 逐字一致**，因为"读不了"与"用户配成不读"
+            # 在这条线索上必须是同一句话（正文不该暴露配置差异）。
             count = _int_text(segment.get(_SEGMENT_VIDEO_COUNT))
-            lines.append('[视频×%d，未取]' % count if count > 0 else '[视频]')
+            taken = _int_text(segment.get(_SEGMENT_VIDEO_TAKEN))
+            if count <= 0:
+                lines.append('[视频]')
+            elif taken <= 0:
+                lines.append('[视频×%d，未取]' % count)
+            elif taken >= count:
+                lines.append('[视频×%d]' % count)
+            else:
+                lines.append('[视频×%d，仅取前 %d 段]' % (count, taken))
         elif segment_type == 'file':
             detail = str(data.get('name') or data.get('file') or '').strip()
             lines.append('[文件：%s]' % detail if detail else '[文件]')

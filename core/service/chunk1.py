@@ -95,6 +95,9 @@ from .helpers import (
 # `_extract_session_media` 同源：群聊入站的自动收藏要**与私聊同一份**结构化媒体表
 # （`SessionView.media` → `[{source, kind, summary, label}]`），不能另外推一份（见 §45.6/§46）。
 from .chunk3 import _extract_session_media, _load_group_batch_audio
+# 视频理解（v1.9.1）：群回合**只有音轨有通道**的那条接线（判据在
+# `video_understanding.collect_group_video_media`，本文件只做群回合这一跳）。
+from ..video_understanding import collect_group_video_media
 
 __all__ = ['ServiceChunk1']
 
@@ -355,6 +358,49 @@ def _chat_capabilities_wire(capabilities: Any) -> Any:
             wire[camel] = value
         wire.pop(snake, None)
     return wire
+
+
+async def _group_video_audio(
+    service: Any, story: Any, session: Any, group_id: Any = '', offset: int = 0,
+) -> tuple[list[Any], str]:
+    """群回合的视频：帧没有视觉通道，音轨并进群音频批次。
+
+    判据**只有一处**：`video_understanding.collect_group_video_media`（它自己复用
+    `collect_video_sources`），这里只做群回合特有的三件事——把音轨交给**同一条**
+    `load_native_audio`（与群里语音、私聊语音完全同一条通道）、临时目录收尾、
+    以及"附加能力失败不许带崩回合、也绝不静默"的兜底（坑 25）。
+
+    返回 `(音轨附件, 要并进正文的视频事实)`；群开关关着 / 没有视频 / 总开关关着时
+    两个都是空的，**一个 ffmpeg 都不调**。
+    """
+    try:
+        media = await collect_group_video_media(service, story, session)
+    except Exception as error:  # noqa: BLE001 - 视频理解绝不许带崩群回合
+        service.report_standalone(
+            'warn', '群聊视频理解失败，本回合按"没有视频"继续 群=%s 错误=%s', group_id, error,
+        )
+        return [], ''
+    try:
+        note = media.note
+        if not media.audio_sources:
+            return [], note
+        loaded = await service.load_native_audio(story, list(media.audio_sources), session)
+        # 与群语音批次同一套附件编号（`group-audio-N`），序列接在批次后面。
+        return (
+            [
+                {**item, 'id': 'group-audio-%d' % (offset + index + 1)}
+                for index, item in enumerate(loaded)
+            ],
+            note,
+        )
+    except Exception as error:  # noqa: BLE001 - 音轨取不到不该吞掉那条视频事实
+        service.report_standalone(
+            'warn', '群聊视频音轨读取失败，本回合只保留视频事实 群=%s 错误=%s', group_id, error,
+        )
+        return [], media.note
+    finally:
+        # 音轨是 `data:` URI，不依赖临时目录；帧也没进任何通道 → 现在就能删。
+        media.cleanup()
 
 
 # =========================================================================== #
@@ -1574,6 +1620,19 @@ class ServiceChunk1(ServiceBase):
             group_audio = await _load_group_batch_audio(
                 self, snapshot['story'], batch, turn.get('latest_session'),
             )
+            # 视频理解（v1.9.1）：群聊**没有视觉通道**（下面 `try_decide` 的图片位恒为
+            # `[]`，群消息也不带 `imageSources`），但**音频通道是通的**——`group_audio`
+            # 就是它。所以复用同一个判据 `collect_group_video_media`：抽出的帧没有去处
+            # 时**节流明说一次**，音轨并进这批音频，**至少让声音进去**。
+            # 这是"群聊开关打开后到底发生什么"的答案——不许开着却静默什么都不做（坑 25）。
+            video_audio, video_note = await _group_video_audio(
+                self, snapshot['story'], turn.get('latest_session'),
+                group_id, len(group_audio),
+            )
+            group_audio = list(group_audio) + list(video_audio)
+            if video_note:
+                # 视频事实进**当前事件**（与私聊 `chunk3.flush_buffered_narrative` 同一处）。
+                user_message = '%s\n%s' % (user_message, video_note)
             decision_result = await self.try_decide(
                 snapshot['story'], None, 'user-message', snapshot['from'], snapshot['now'],
                 user_message, [], [], group_context, [], group_audio, chat_capabilities, [],

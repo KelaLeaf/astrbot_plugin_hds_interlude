@@ -100,6 +100,8 @@ QZONE_VISIBILITY_LOOKUP_COUNT = 30
 QZONE_VISIBILITY_GUARD_FILE = 'qzone_visibility_guard.json'
 #: 回读校验比对附件时，附件 = 图片 + 视频（`parse_mood` 的 `pic` / `video`）。
 QZONE_COMMENT_SUMMARY_CHARS = 80
+#: 「好友动态只拿到元数据、正文没取到」这条说明的节流间隔（毫秒，§55）。
+QZONE_FEED_CONTENT_NOTE_INTERVAL_MS = 30 * 60 * 1000
 
 _MILLISECONDS_PER_MINUTE = 60_000
 
@@ -181,6 +183,32 @@ def _target_uin_param(value: Any) -> Any:
     if not math.isfinite(number) or number != int(number):
         return None
     return int(number)
+
+
+def _qzone_feed_observation(owner: Any, content: Any, published_at: Any = '') -> str:
+    """一条好友动态进剧本时的**观察措辞**（唯一实现，§55）。
+
+    这一条要同时满足两件事，所以措辞不能随便改：
+
+    1. **她确实看到的**内容要写成观察（"她刷到了…：<正文>"）——系统提示词把
+       `actor=system` 的条目解释成"插件记账"，光写"某好友发布了说说"，模型就不会
+       把它当成她的见闻（真机症状：动态抓到了、正文也有，剧本里却完全没有
+       "她看到了什么"）。
+    2. **没看到就别声称看到**：正文没取到（`正文: 无` / 拉取失败）时只记"有这么
+       一条说说"，一个字的正文都不许编，也不许写成"她看到了内容"。
+
+    `published_at` 是说说**自己的**发布时间：它不再当条目的 `occurredAt`
+    （见 `qzone_feed_sweep` 的说明），所以放在正文里保留这一条事实。
+    """
+    name = str(owner if owner is not None else '').strip() or '一位好友'
+    published = str(published_at if published_at is not None else '').strip()
+    stamp = '（发布 %s）' % published if published else ''
+    text = str(content if content is not None else '').strip()
+    if text:
+        return '[好友动态] 她刷到了 %s 的说说%s：%s' % (
+            name, stamp, clip(text, QZONE_COMMENT_SUMMARY_CHARS),
+        )
+    return '[好友动态] 她刷到了 %s 的一条说说%s，但正文没取到' % (name, stamp)
 
 
 def _qzone_feed_row(raw: Any) -> dict[str, Any]:
@@ -1088,6 +1116,7 @@ class ServiceChunk13(ServiceBase):
                     seen_keys.add(key)
             for feed in qzone_feed_candidates(feeds, seen_keys, runtime, now):
                 content = ''
+                content_error: Any = None
                 try:
                     # 同一条口径：正文对齐也走 CGI 优先的读通道（NapCat 没有
                     # `get_qzone_msg_list` 这条原生动作）。参数名两个通道各取所需：
@@ -1105,21 +1134,40 @@ class ServiceChunk13(ServiceBase):
                         ) if entry
                     ]
                     content = match_qzone_feed_content(entries, feed)
-                except Exception:  # noqa: BLE001 - 正文拉取失败按元数据处理
+                except Exception as error:  # noqa: BLE001 - 正文拉取失败按元数据处理
+                    # **不许静默**（§55）：正文拉不到是"她只看到有这条动态、没看到内容"，
+                    # 这件事必须可见——下面按条给一条可行动的 warn，措辞里也不许声称她看到了。
                     content = ''
+                    content_error = error
                 owner = pick(feed, 'nickname') or 'QQ %s' % pick(feed, 'uin')
+                published_at = iso(pick(feed, 'time'))
                 await self.append_entry(story_id, {
                     'kind': 'friend-feed', 'actor': 'system',
-                    'content': '[好友动态] %s发布了说说%s' % (
-                        owner, '：%s' % clip(content, QZONE_COMMENT_SUMMARY_CHARS) if content else '',
-                    ),
-                    'occurredAt': iso(pick(feed, 'time')),
+                    # 措辞判据只有一处（`_qzone_feed_observation`）：有正文 = 她确实看到了
+                    # 什么；没正文 = 只记"有这么一条说说"，一个字的正文都不编。
+                    'content': _qzone_feed_observation(owner, content, published_at),
+                    # ⚠️ `occurredAt` 是**她刷到这条动态的时刻**，不是说说自己的发布时间（§55）。
+                    # 上游写的是 `feed.time`，而本插件按"故事时间"倒序的两处消费方都会因此
+                    # 把它排到旧位置：模型侧的 `recent_entries_for_prompt`（前 50 条 + 60 分钟窗）
+                    # 取不到它 → 她压根不知道刷到过；控制台 `console/script` 首页（60 条）
+                    # 也看不到 → 用户以为"动态没进剧本"。说说的发布时间改放正文与 metadata。
+                    'occurredAt': iso(now),
                     'metadata': {
                         'qzone_feed_key': pick(feed, 'key'),
                         'qzone_feed_uin': pick(feed, 'uin'),
                         'qzone_feed_nickname': pick(feed, 'nickname'),
+                        'qzone_feed_time': published_at,
                     },
                 }, now)
+                if not content:
+                    self.note_access_skip(
+                        'qzone-feed-content-missing', QZONE_FEED_CONTENT_NOTE_INTERVAL_MS,
+                        '好友动态只拿到「谁发了说说」，正文没取到（%s）：她已经知道%s有这条动态，'
+                        '但**没看到内容**，剧本里也不会写成"她看到了"。下一步：确认 NapCat 登录态与 '
+                        'QZone 读通道（get_qzone_msg_list / emotion_cgi_msglist_v6）能返回该好友的'
+                        '说说列表；同一原因 30 分钟内只报一次。',
+                        content_error if content_error is not None else '说说不含这条 tid', owner,
+                    )
                 seen_row: dict[str, Any] = {
                     'storyId': story_id,
                     'kind': 'feed-seen',

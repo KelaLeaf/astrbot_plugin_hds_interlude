@@ -1255,6 +1255,10 @@ def _forward_section_keys(section: dict[str, Any]) -> dict[str, Any]:
         'maxNodes': ('maxNodes', 'max_nodes'),
         'maxCharacters': ('maxCharacters', 'max_characters'),
         'maxDepth': ('maxDepth', 'max_depth'),
+        # v1.9.1：两道媒体预算（图片 v1.8.7 / 视频 v1.9.1）也要两种拼写都带上，
+        # 否则控制台写 snake、core 读 camel 那半边会静默失效（坑 41 / 65）。
+        'maxImages': ('maxImages', 'max_images'),
+        'maxVideos': ('maxVideos', 'max_videos'),
     }
     normalized: dict[str, Any] = {}
     for target, names in keys.items():
@@ -1270,13 +1274,15 @@ def _forward_section_keys(section: dict[str, Any]) -> dict[str, Any]:
 
 def _limits_payload(limits: Any) -> dict[str, Any]:
     """`ForwardReadLimits`（或字典）→ core 认的 camelCase 字典。"""
+    names = ('maxNodes', 'maxCharacters', 'maxDepth', 'maxImages', 'maxVideos')
     if isinstance(limits, Mapping):
-        return {key: limits.get(key) for key in ('maxNodes', 'maxCharacters', 'maxDepth', 'maxImages')}
+        return {key: limits.get(key) for key in names}
     return {
         'maxNodes': getattr(limits, 'max_nodes', FORWARD_DEFAULT_LIMITS.max_nodes),
         'maxCharacters': getattr(limits, 'max_characters', FORWARD_DEFAULT_LIMITS.max_characters),
         'maxDepth': getattr(limits, 'max_depth', FORWARD_DEFAULT_LIMITS.max_depth),
         'maxImages': getattr(limits, 'max_images', FORWARD_DEFAULT_LIMITS.max_images),
+        'maxVideos': getattr(limits, 'max_videos', FORWARD_DEFAULT_LIMITS.max_videos),
     }
 
 

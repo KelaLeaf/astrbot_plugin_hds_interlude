@@ -41,6 +41,7 @@ import asyncio
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -48,8 +49,12 @@ from typing import Any, Optional
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from plugin.core import qzone as q  # noqa: E402
-from plugin.core.service.base import ServiceChunk0  # noqa: E402
+from plugin.core.database import Database  # noqa: E402
+from plugin.core.narrator_prompts import to_prompt_payload  # noqa: E402
+from plugin.core.service import InterludeService  # noqa: E402
+from plugin.core.service.base import InterludeContext, ServiceChunk0  # noqa: E402
 from plugin.core.service.chunk13 import ServiceChunk13  # noqa: E402
+from plugin.core.time import iso, parse_dt  # noqa: E402
 from plugin.core.token_stats import day_key  # noqa: E402
 
 #: 夹具用的**通用**地址/账号（绝不是谁的机器/QQ 号）。
@@ -1314,10 +1319,21 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         entry = host.entries[0]
         self.assertEqual(entry['kind'], 'friend-feed')
         self.assertEqual(entry['actor'], 'system')
-        self.assertEqual(entry['content'], '[好友动态] 好友A发布了说说：今天去吃火锅了')
+        # v1.9.1（§55）：正文到手 → 写成**她的观察**（"她刷到了…"），而不是"插件记账"。
+        # 说说自己的发布时间改挂在正文括号里（它不再是条目的 occurredAt，事实不能丢）。
+        self.assertEqual(
+            entry['content'],
+            '[好友动态] 她刷到了 好友A 的说说（发布 %s）：今天去吃火锅了'
+            % iso(NOW - timedelta(seconds=1200)),
+        )
         self.assertEqual(entry['metadata'], {
             'qzone_feed_key': 'k1', 'qzone_feed_uin': '10002', 'qzone_feed_nickname': '好友A',
+            'qzone_feed_time': iso(NOW - timedelta(seconds=1200)),
         })
+        # ⚠️ 条目时间是**她刷到动态的时刻**（NOW），不是说说自己的发布时间（§55）：
+        # 按故事时间倒序的两个消费方（模型窗口 / 控制台首页）都会把旧时间戳排到后面，
+        # 于是"抓到了、正文也有"却哪边都看不见。
+        self.assertEqual(entry['occurredAt'], iso(NOW))
         seen = [row for row in host.rows if row['kind'] == 'feed-seen']
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0]['tid'], 'k1')
@@ -1344,14 +1360,26 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.http_calls[1]['data']['num'], '5')
 
     async def test_content_mismatch_keeps_metadata_only(self):
-        """正文只认 tid 精确命中：拉不到就只记"某人发了说说"。"""
+        """正文只认 tid 精确命中：拉不到就只记"某人发了说说"。
+
+        §55 的硬要求：**没看到就别声称看到**——正文没到手时不许写成
+        "她刷到了…：<内容>"，只许说"她刷到了某人的一条说说，但正文没取到"，
+        并留一条可行动的 warn。
+        """
         transport = self._sweep_transport(
             [_cgi_feed_text('k1', '10002', nickname='好友A')], [_raw_msg('other', '别人的正文')],
         )
         host = _Host(transport=transport)
         await host.qzone_feed_sweep()
-        self.assertEqual(host.entries[0]['content'], '[好友动态] 好友A发布了说说')
+        content = host.entries[0]['content']
+        self.assertIn('[好友动态] 她刷到了 好友A 的一条说说', content)
+        self.assertIn('正文没取到', content)
+        self.assertNotIn('别人的正文', content, '对不上 tid 的正文一个字都不许写进去')
         self.assertTrue(any('正文=无' in item[-1] for item in host.reports))
+        self.assertTrue(
+            any('没看到内容' in message for _level, message in host.standalone),
+            '正文没取到是能力缺失，必须有一条可行动的 warn',
+        )
 
     async def test_msg_list_failure_falls_back_to_metadata_only(self):
         """正文那一次 CGI 失败（腾讯间歇抽风）→ 按"只有元数据"入账，不是整轮丢。"""
@@ -1363,14 +1391,19 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         host = _Host(transport=_StubTransport(_sweep_handler(), http=http))
         await host.qzone_feed_sweep()
         self.assertEqual(len(host.entries), 1)
-        self.assertEqual(host.entries[0]['content'], '[好友动态] 好友A发布了说说')
+        self.assertIn('正文没取到', host.entries[0]['content'])
+        self.assertNotIn('她刷到了 好友A 的说说：', host.entries[0]['content'])
         self.assertEqual(len(host.rows), 1, '正文拉不到也要记 feed-seen，避免下轮重复')
+        self.assertTrue(
+            any('没看到内容' in message for _level, message in host.standalone),
+            '异常原文要跟着可见 warn 一起出来（不许静默吞掉）',
+        )
 
     async def test_nickname_is_optional_and_uin_is_the_fallback_owner(self):
         transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
         host = _Host(transport=transport)
         await host.qzone_feed_sweep()
-        self.assertEqual(host.entries[0]['content'], '[好友动态] QQ 10002发布了说说')
+        self.assertIn('[好友动态] 她刷到了 QQ 10002 的一条说说', host.entries[0]['content'])
 
     async def test_seen_keys_within_seven_days_are_not_reingested(self):
         rows = [record(kind='feed-seen', tid='k1', status='confirmed', createdAt=NOW - timedelta(days=1))]
@@ -1522,6 +1555,187 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(window=window):
                 host.config['qzone']['feed_window_minutes'] = window
                 self.assertEqual(host.qzone_feed_poll_minutes(), minutes)
+
+
+def _feed_text_at(now: datetime, key: str, uin: str, *, nickname: str = '',
+                  seconds_ago: int = 600) -> str:
+    """相对**给定时刻**的一页好友动态（`_cgi_feed_text` 绑的是模块级 `NOW`）。"""
+    return (
+        "{ver:1,key:'%s',appid:311,uin:%s,nickname:'%s',abstime:%d,html:'<div>正文</div>',}"
+        % (key, uin, nickname, int(now.timestamp() - seconds_ago))
+    )
+
+
+def _moods_text_at(now: datetime, rows: list[dict[str, Any]]) -> str:
+    """相对给定时刻的说说列表（JSONP，形状与 `core/qzone_cgi.py` 认的一致）。"""
+    return '_preloadCallback(%s);' % json.dumps({'code': 0, 'msglist': rows}, ensure_ascii=False)
+
+
+def _mood_at(now: datetime, tid: str, content: str, *, seconds_ago: int = 600) -> dict[str, Any]:
+    return {
+        'tid': tid, 'content': content,
+        'created_time': int(now.timestamp() - seconds_ago), 'cmtnum': 0,
+    }
+
+
+class ServiceFeedObservationPipelineTests(unittest.IsolatedAsyncioTestCase):
+    """§55：刷到的好友动态必须**真的进到模型 payload**，不是只落库。
+
+    真机症状是"日志说已入账、正文也有，剧本里却完全没有她看到了什么"。这条链有四跳：
+
+    1. **取回**：`chunk13.qzone_feed_sweep` 打 QZone CGI（transport 是唯一替身）；
+    2. **落库**：`append_entry`（`chunk5.py`）写 `interlude_script_entry`；
+    3. **选择**：`recent_entries_for_prompt`（`chunk1.py:371`）按**故事时间倒序**取窗口；
+    4. **组装**：`narrator_prompts.to_prompt_payload` → `recentScript`。
+
+    这里跑的是**真实 `InterludeService`**（真 sqlite + 真实写入方），所以第 2–4 跳一个桩
+    都没有；正因如此它才抓得到第 3 跳那个"时间戳用的是说说的发布时间、条目却是现在入账"
+    的排序陷阱（§55 的根因）。
+    """
+
+    def _service(self, **qzone: Any) -> tuple[Any, Any, datetime]:
+        tmp = tempfile.TemporaryDirectory(prefix='hdsi_qzone_feed_')
+        self.addCleanup(tmp.cleanup)
+        database = Database(':memory:')
+        self.addCleanup(database.close)
+        database.register_tables()
+        config = {'qzone': {
+            'enabled': True, 'auto_feed': True, 'feed_window_minutes': 120,
+            'daily_post_cap': 3, 'daily_comment_cap': 6, 'daily_like_cap': 12,
+            'min_interval_minutes': 90, **qzone,
+        }}
+        service = InterludeService(
+            InterludeContext(base_dir=tmp.name, database=database), config, database, None,
+        )
+        now = service.now()
+        database.insert('interlude_story', {
+            'id': STORY['id'], 'platform': 'onebot', 'selfId': '10001', 'userId': '',
+            'channelId': '', 'status': 'active',
+            'setting': {'timezone': 'Asia/Shanghai'}, 'state': {},
+            'cursorAt': now, 'createdAt': now, 'updatedAt': now,
+        })
+        return service, database, now
+
+    async def _busy_story(self, service: Any, now: datetime, count: int = 55) -> None:
+        """先垫一屏**更近**的对话条目：没有它，排序陷阱抓不出来。
+
+        默认 `contextEntryLimit=20` → `recent_entries_for_prompt` 至少取 50 条，
+        时间窗 60 分钟。一条"现在入账、时间戳却是 20 分钟前"的动态要挤进这 50 条，
+        就得看它跟这些条目的相对顺序——这正是真机上"抓到了却看不到"的现场。
+        """
+        for index in range(count):
+            await service.append_entry(STORY['id'], {
+                'kind': 'user-message', 'actor': 'user', 'content': '第 %d 条' % index,
+                'occurredAt': iso(now - timedelta(seconds=5 * index)), 'metadata': {},
+            }, now)
+
+    #: 动态自身的发布时间：**90 分钟前**。它落在配置的 120 分钟新鲜度窗内（会被收），
+    #: 却在 `recent_entries_for_prompt` 的 **60 分钟**时间窗之外——这正是真机那个
+    #: "抓到了、正文也有，就是哪边都看不到"的现场（见每个用例的注释）。
+    FEED_AGE_SECONDS = 90 * 60
+
+    def _sweep_transport(self, now: datetime, feeds: list[tuple[str, str, str]],
+                         moods: list[dict[str, Any]]) -> _StubTransport:
+        text = ''.join(
+            _feed_text_at(now, key, uin, nickname=nick, seconds_ago=self.FEED_AGE_SECONDS)
+            for key, uin, nick in feeds
+        )
+        body = _moods_text_at(now, [
+            dict(row, created_time=int(now.timestamp() - self.FEED_AGE_SECONDS))
+            for row in moods
+        ])
+        return _StubTransport(_sweep_handler(), http=_sweep_http(text, body))
+
+    async def _recent_script(self, service: Any, database: Any, now: datetime) -> list[Any]:
+        """第 3+4 跳：选择 → 组装，拿到模型真正看得见的 `recentScript`。"""
+        recent = await service.recent_entries_for_prompt(STORY['id'], now)
+        story = database.get('interlude_story', {'id': STORY['id']})
+        payload = to_prompt_payload({
+            'story': story, 'from': now, 'now': now, 'phase': 'advance',
+            'recentEntries': recent,
+        })
+        return payload['relevantEstablishedEpisodes']['recentScript']
+
+    async def test_a_fetched_feed_reaches_the_model_payload_with_its_content(self):
+        """**端到端**：两条带正文的动态 → 正文真的出现在给模型的 payload 里。
+
+        这两条动态发布在 90 分钟前（窗内、会被收），而她**现在**才刷到：如果条目的
+        时间戳写的是发布时刻，它就会掉出 `recent_entries_for_prompt` 的 50 条窗口与
+        60 分钟窗——把 `occurredAt` 改回发布时刻，这条用例当场红（§55 的根因）。
+        """
+        service, database, now = self._service()
+        service.transport = self._sweep_transport(
+            now,
+            [('k1', '10002', '青屿'), ('k2', '10003', '孤岛')],
+            [_mood_at(now, 'k1', '今天天气不错，去公园走了走'),
+             _mood_at(now, 'k2', '新买的相机到了')],
+        )
+        await self._busy_story(service, now)
+        await service.qzone_feed_sweep()
+        # 落库那一跳：两条都在库里（这一步以前也是对的）
+        stored = [row for row in database.all('interlude_script_entry', {'storyId': STORY['id']})
+                  if row['kind'] == 'friend-feed']
+        self.assertEqual(len(stored), 2)
+        # 选择 + 组装那两跳：正文必须原样进 payload，而且写成"她看到了"
+        script = await self._recent_script(service, database, now)
+        feed_items = [item for item in script if item['kind'] == 'friend-feed']
+        self.assertEqual(len(feed_items), 2, '被挤掉的动态 = 她压根不知道刷到过什么')
+        contents = [item['content'] for item in feed_items]
+        self.assertTrue(any('青屿' in text and '今天天气不错，去公园走了走' in text
+                            for text in contents), contents)
+        self.assertTrue(any('孤岛' in text and '新买的相机到了' in text
+                            for text in contents), contents)
+        self.assertTrue(all('她刷到了' in text for text in contents), contents)
+
+    async def test_the_model_payload_never_claims_she_saw_content_that_never_arrived(self):
+        """反向：正文对不上 tid → payload 里只有"有这条说说"，一个字的正文都不许有。"""
+        service, database, now = self._service()
+        warned: list[str] = []
+        service.note_access_skip = lambda key, interval, message, *args, **kwargs: (  # type: ignore[assignment]
+            warned.append(message % args if args else message) or True
+        )
+        service.transport = self._sweep_transport(
+            now, [('k1', '10002', '青屿')], [_mood_at(now, 'other', '别人的正文')],
+        )
+        await self._busy_story(service, now)
+        await service.qzone_feed_sweep()
+        script = await self._recent_script(service, database, now)
+        feed_items = [item for item in script if item['kind'] == 'friend-feed']
+        self.assertEqual(len(feed_items), 1)
+        content = feed_items[0]['content']
+        self.assertIn('她刷到了 青屿 的一条说说', content)
+        self.assertIn('正文没取到', content)
+        self.assertNotIn('别人的正文', content, '没看到就别声称看到')
+        self.assertNotIn('：', content.split('正文没取到')[0], '没有正文就不许出现冒号正文段')
+        self.assertTrue(warned, '能力缺失要留一条可行动 warn')
+        self.assertIn('没看到内容', warned[0])
+        self.assertIn('下一步', warned[0])
+
+    async def test_the_feed_entry_is_not_buried_behind_its_publish_time(self):
+        """排序陷阱的**反向**用例：条目时间必须是"她刷到的时刻"。
+
+        如果把它写回说说的发布时间（90 分钟前），在 55 条更近的条目之后它既出不了
+        50 条窗口、也进不了 60 分钟窗——上面那条端到端用例当场红。这里把判据本身钉住，
+        失败时的输出直接指出是时间戳错了（而不是让人去猜排序）。
+        """
+        service, database, now = self._service()
+        service.transport = self._sweep_transport(
+            now, [('k1', '10002', '青屿')], [_mood_at(now, 'k1', '正文')],
+        )
+        await self._busy_story(service, now)
+        await service.qzone_feed_sweep()
+        row = [item for item in database.all('interlude_script_entry', {'storyId': STORY['id']})
+               if item['kind'] == 'friend-feed'][0]
+        occurred = parse_dt(row['occurredAt'])
+        self.assertLess(abs((occurred - now).total_seconds()), 5,
+                        '条目时间 = 她刷到动态的时刻（不是说说的发布时间）')
+        self.assertGreater(occurred, parse_dt(row['metadata']['qzone_feed_time']),
+                           '刷到的时刻必须晚于说说发布时间')
+        self.assertEqual(
+            row['metadata']['qzone_feed_time'],
+            iso((now - timedelta(seconds=self.FEED_AGE_SECONDS)).replace(microsecond=0)),
+            '说说自己的时间进 metadata',
+        )
 
 
 if __name__ == '__main__':

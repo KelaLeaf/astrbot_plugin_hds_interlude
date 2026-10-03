@@ -3919,6 +3919,59 @@ class StickerScanKeepsGuessedGroupsTests(unittest.IsolatedAsyncioTestCase):
             database.close()
 
 
+class StickerRootUnavailableTests(unittest.IsolatedAsyncioTestCase):
+    """§54：拿不到插件数据目录时**可见地失败**，绝不静默回落成 cwd 相对路径。
+
+    真机症状是"库里有档、盘上没文件、控制台 404"。这类故障的共性是**静默**：
+    路径推不出来就 `abspath('')` → 文件写到进程当前目录；扫描枚举不到就把库里
+    每一行都标成 missing。两条都不许再发生。
+    """
+
+    def _host(self) -> Any:
+        database = Database(':memory:')
+        self.addCleanup(database.close)
+        database.register_tables()
+        # 刻意**不给** base_dir：ctx 存在但没有数据目录（生产里不该出现，但必须可见）。
+        return _host(
+            ctx=InterludeContext(),
+            config={'stickers': {'enabled': True, 'directory': 'stickers'}},
+            db=database,
+            transport=_BareTransport(),
+        )
+
+    async def test_no_data_dir_means_no_root_and_a_visible_warning(self):
+        host = self._host()
+        self.assertEqual(host.sticker_library_root(), '', '空数据目录不许算出 cwd 相对路径')
+        self.assertTrue(
+            any('表情库根目录不可用' in str(entry) for entry in host.reports),
+            '能力缺失必须有一条可见 warn（含下一步做什么）',
+        )
+        # 同一个原因只报一次（节流），不是每回合刷屏。
+        before = len(host.reports)
+        self.assertEqual(host.sticker_library_root(), '')
+        self.assertEqual(len(host.reports), before, '同一原因只 warn 一次')
+
+    async def test_a_scan_without_a_root_never_marks_the_library_missing(self):
+        host = self._host()
+        host.db.insert('interlude_sticker', {
+            'assetId': 'sticker-x', 'filePath': 'collected/a.png', 'group': 'collected',
+            'mimeType': 'image/png', 'animated': False, 'size': 40,
+            'hash': hashlib.sha256(_png()).hexdigest(), 'name': '', 'source': 'auto',
+            'uses': 0, 'description': '一只猫', 'descriptionManual': False, 'guessed': False,
+            'groupGuessed': False, 'groupManual': False, 'status': 'active', 'aliases': [],
+            'createdAt': iso(utc_now()), 'updatedAt': iso(utc_now()),
+        })
+        await host.scan_sticker_library()
+        rows = await host.db_get('interlude_sticker', {})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['status'], 'active', '根目录不可知 ≠ 文件都没了')
+
+    async def test_a_collection_without_a_root_creates_no_row(self):
+        host = self._host()
+        self.assertIsNone(await host.store_collected_sticker(_png(), 'sticker'))
+        self.assertEqual(await host.db_get('interlude_sticker', {}), [], '不许建"看起来成功"的档')
+
+
 # --------------------------------------------------------------------------- #
 # 小工具
 # --------------------------------------------------------------------------- #

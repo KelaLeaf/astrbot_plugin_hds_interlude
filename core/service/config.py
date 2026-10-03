@@ -41,6 +41,9 @@ import re
 from typing import Any, Literal, TypedDict
 
 from ..time import dt_ms, iso, parse_dt, utc_now
+#: 视频理解的默认值（v1.9.1：预算可配之后，那份默认值只住在
+#: `core/video_understanding.py` 一处，这里与 schema 都照它抄）。
+from ..video_understanding import VIDEO_CONFIG_DEFAULTS
 
 __all__ = [
     # ---- 1–258 行：常量与桌面投影纯函数 ----
@@ -1800,7 +1803,10 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         },
         # v1.9.0：视频理解（`model_center.video`）。默认**省成本那侧**：关着、
         # 抽帧识别、不指名任何模型。段位与 vision / audio 一样在 `model` 下。
-        'video': {'enabled': False, 'mode': 'frames', 'model_id': ''},
+        # v1.9.1：预算全部可配（抽帧模式 / 帧间隔 / 平均帧数 / 音轨格式 / 音轨时长 /
+        # 超时 / 群聊开关）。默认值**只有一处**：`video_understanding.VIDEO_CONFIG_DEFAULTS`
+        # ——schema 的 `default` 与这里都照它抄，用例三方对账。
+        'video': dict(VIDEO_CONFIG_DEFAULTS),
         'providers': [],
         'main_temperature': 0.8,
         'main_top_p': 1.0,

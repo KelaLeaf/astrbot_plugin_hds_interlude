@@ -220,6 +220,100 @@
           }
         }
       },
+      "video": {
+        "type": "object",
+        "description": "视频理解设置",
+        "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用视频理解",
+            "default": false,
+            "hint": "视频理解的总开关（默认关）。关闭时视频只留一条「收到了一段视频」的事实。"
+          },
+          "mode": {
+            "type": "string",
+            "description": "视频识别模式：抽帧 / 原生 / 外挂",
+            "default": "frames",
+            "options": [
+              "frames",
+              "native",
+              "external"
+            ],
+            "hint": "需要启用语音原生理解与启用图片理解后抽帧模式才会生效。"
+          },
+          "model_id": {
+            "type": "string",
+            "default": "",
+            "_special": "select_provider",
+            "description": "外挂视频理解模型",
+            "hint": "只有「识别模式」选外挂识别时才会用上：指名一个能吃视频的模型；留空或指名了却找不到都会明确失败，**不回落**到抽帧或主模型。识别模式是抽帧 / 原生时本项不生效。"
+          },
+          "frame_mode": {
+            "type": "string",
+            "description": "抽帧模式：连续抽帧或平均抽帧",
+            "default": "sequence",
+            "options": [
+              "sequence",
+              "average"
+            ],
+            "hint": "连续抽帧＝每 N 秒取 1 帧（最省）；平均抽帧＝整段均分 N 帧（长视频看得更全，要对视频多跑一次时长探测）。下面两项各自只在对应模式下生效。"
+          },
+          "frame_interval_seconds": {
+            "type": "int",
+            "description": "连续抽帧：每几秒 1 帧",
+            "default": 4,
+            "hint": "只在抽帧模式是连续抽帧时生效。"
+          },
+          "frame_average_count": {
+            "type": "int",
+            "description": "平均抽帧：整段抽几帧",
+            "default": 3,
+            "hint": "只在抽帧模式是平均抽帧时生效；上限 3 帧——帧与直发图片共用同一个视觉预算，多抽的进不了模型。"
+          },
+          "out_format": {
+            "type": "string",
+            "description": "音轨转码输出格式",
+            "default": "mp3",
+            "options": [
+              "mp3",
+              "wav",
+              "ogg",
+              "m4a",
+              "flac",
+              "amr"
+            ],
+            "hint": "抽出的音轨转成这个格式交给语音理解模型；mp3 兼容性最好、体积最小。与「语音 / 音频理解设置」里的同名项互不影响。"
+          },
+          "audio_duration": {
+            "type": "string",
+            "description": "音轨时长：自定义或不限制",
+            "default": "custom",
+            "options": [
+              "custom",
+              "unlimited"
+            ],
+            "hint": "自定义＝只取下面那个秒数；不限制＝整段都要（音量上限与抽帧超时仍然兜底）。"
+          },
+          "audio_duration_seconds": {
+            "type": "int",
+            "description": "音轨取前几秒",
+            "default": 60,
+            "hint": "只在音轨时长是「自定义」时生效。"
+          },
+          "timeout_seconds": {
+            "type": "int",
+            "description": "抽帧超时秒数",
+            "default": 20,
+            "hint": "单条 ffmpeg 命令的超时；超时后**已经抽到的帧照常交出去**，没抽完的不再等。长视频抽不完就把这里调大。"
+          },
+          "group_enabled": {
+            "type": "bool",
+            "description": "群聊也做视频理解",
+            "default": false,
+            "hint": "默认关：群里连 ffmpeg 都不调（群聊视频刷屏最费 ffmpeg 与模型调用）。开启后群回合会为这段视频跑一次 ffmpeg，**音轨**作为音频证据交给模型（还要「语音 / 音频理解」总开关也开着）；群回合没有视觉通道，抽出的画面帧进不去，每次会有一条节流说明。私聊不受这一项管。"
+          }
+        }
+      },
       "providers": {
         "type": "list",
         "description": "模型连接：填 Key 与模型名，再勾选用途",
@@ -255,7 +349,7 @@
             "type": "string",
             "description": "完整地址（Chat Completions）",
             "default": "",
-            "hint": "如 https://host/v1/chat/completions；Anthropic Messages 协议本移植版暂未实现"
+            "hint": "如 https://host/v1/chat/completions 或 https://host/v1/messages；协议选 Anthropic Messages 时两种标准路径自动匹配"
           },
           "protocol": {
             "type": "string",
@@ -265,13 +359,13 @@
               "chat-completions",
               "anthropic-messages"
             ],
-            "hint": "上游 1.0.1-rc28 新增；本移植版只支持 Chat Completions，设成 Anthropic Messages 会记一条 warn 并按不可用处理"
+            "hint": "Chat Completions 或 Anthropic Messages；旧配置缺这一项时按 Chat Completions 处理。切换协议时地址要对应换成 …/chat/completions 或 …/messages"
           },
           "anthropic_cache": {
             "type": "bool",
             "description": "Anthropic 缓存标记",
             "default": false,
-            "hint": "上游 1.0.1-rc28 新增；本移植版暂未实现"
+            "hint": "服务端支持时缓存 system（cache-first 时同时标记历史前缀）；关闭仍保留 cache-first 的内容顺序"
           },
           "api_key": {
             "type": "string",
@@ -402,11 +496,22 @@
             "description": "用于侧端识图",
             "default": false
           },
+          "use_for_video": {
+            "type": "bool",
+            "description": "用于视频理解（外挂识别）",
+            "default": false,
+            "hint": "只有视频识别模式选「外挂识别」时才会用上：勾了它的连接行才会拿到视频直链。也可以在上面「外挂视频理解模型」里直接指名 AstrBot 的模型（那条优先）。"
+          },
+          "use_for_works": {
+            "type": "bool",
+            "description": "用于共同作品写手",
+            "default": false,
+            "hint": "只有「共同作品」的写作模式选「另起写手」时才会用上；上面「写手模型」指了名就按指名那条走。"
+          },
           "use_for_world_seeding": {
             "type": "bool",
             "description": "用于世界播种",
-            "default": false,
-            "hint": "勾了它才让这条连接参与世界事件播种；也可以在上面的「世界播种模型」里直接指名 AstrBot 的模型（那条优先）。"
+            "default": false
           },
           "price_input": {
             "type": "float",
@@ -430,8 +535,15 @@
             "enabled": true,
             "mode": "openai-compatible",
             "endpoint": "",
+            "protocol": "chat-completions",
+            "anthropic_cache": false,
             "api_key": "",
             "model": "",
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "max_tokens": 4096,
+            "timeout": 60000,
+            "response_format": "json-object",
             "reasoning_effort": "high",
             "deepseek_thinking": "disabled",
             "deepseek_reasoning_effort": "low",
@@ -444,43 +556,16 @@
             "use_for_embedding": false,
             "use_for_stickers": false,
             "use_for_vision": false,
+            "use_for_video": false,
+            "use_for_works": false,
+            "use_for_world_seeding": false,
             "price_input": 0.0,
             "price_output": 0.0,
             "price_cached_input": 0.0
           }
         ],
-        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
         "obvious_hint": true
-      },
-      "video": {
-        "type": "object",
-        "description": "视频理解设置",
-        "items": {
-          "enabled": {
-            "type": "bool",
-            "description": "启用视频理解",
-            "default": false,
-            "hint": "视频理解的总开关（默认关）。关着时视频只留一条「收到了一段视频」的事实：不抽帧、不抽音轨、也不调用任何模型。"
-          },
-          "mode": {
-            "type": "string",
-            "description": "视频识别模式：抽帧 / 原生 / 外挂",
-            "default": "frames",
-            "options": [
-              "frames",
-              "native",
-              "external"
-            ],
-            "hint": "抽帧识别需要系统装有 FFmpeg（命令行里能执行 ffmpeg -version）：按每 4 秒 1 帧、最多 3 帧抽画面，并单独抽前 60 秒音轨，分别交给图片理解与语音理解模型。原生识别在当前宿主没有通路（出站内容部件只有图片与音频、模态表里也没有 video），会明确降级而不是假装成功。外挂识别把视频直链交给下面指名的模型。"
-          },
-          "model_id": {
-            "type": "string",
-            "default": "",
-            "_special": "select_provider",
-            "description": "外挂视频理解模型",
-            "hint": "只有「识别模式」选外挂识别时才会用上：指名一个能吃视频的模型；留空或指名了却找不到都会明确失败，**不回落**到抽帧或主模型。识别模式是抽帧 / 原生时本项不生效。"
-          }
-        }
       },
       "main_provider_id": {
         "type": "string",
@@ -822,7 +907,7 @@
           }
         },
         "default": [],
-        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
         "obvious_hint": true
       },
       "bot_accounts_only": {
@@ -869,7 +954,7 @@
           }
         },
         "default": [],
-        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
         "obvious_hint": true
       },
       "user_accounts_only": {
@@ -1055,7 +1140,7 @@
           }
         },
         "default": [],
-        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
         "obvious_hint": true
       },
       "group_chats_only": {
@@ -1332,7 +1417,7 @@
             "max_interval_minutes": 240
           }
         ],
-        "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
+        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
         "obvious_hint": true
       },
       "input_status": {
@@ -2866,6 +2951,12 @@
         "description": "单条转发最多读取的图片数",
         "default": 3,
         "hint": "转发里的图会作为视觉输入交给模型，每多一张就多一份 token 与下载时间；超出的只留数量线索。"
+      },
+      "max_videos": {
+        "type": "int",
+        "description": "单条转发最多读取的视频数",
+        "default": 1,
+        "hint": "默认 1＝一张卡最多看一段（配了就生效，读一段要跑一次 ffmpeg 抽帧，还要占视觉预算）；配 0 才是「转发里的视频一段都不读」。读到的视频交给「模型中心 → 视频理解」那条链，受它自己的总开关与群聊开关管。"
       }
     }
   },

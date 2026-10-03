@@ -714,7 +714,9 @@ class FeedSweepChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(feed_call['data']['count'], '20')
         self.assertEqual(host.transport.http_calls[1]['data']['num'], '5')
         self.assertEqual(len(host.entries), 1)
-        self.assertEqual(host.entries[0]['content'], '[好友动态] 某人发布了说说：今天天气很好')
+        # v1.9.1（§55）：正文到手就写成**她的观察**（措辞与排序判据都在 chunk13）。
+        self.assertIn('[好友动态] 她刷到了 某人 的说说', host.entries[0]['content'])
+        self.assertIn('今天天气很好', host.entries[0]['content'])
 
     async def test_the_sweep_still_records_the_dedupe_ledger_over_the_cgi(self):
         """换通道不许把去重账本弄丢：`feed-seen` 行照旧落，且 tid 就是动态的 `key`。"""

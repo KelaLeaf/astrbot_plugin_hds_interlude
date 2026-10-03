@@ -34,6 +34,7 @@ from plugin.core.forward_message import (
     FORWARD_FETCH_TIMEOUT_MS,
     FORWARD_MEDIA_MAX_PER_FORWARD,
     FORWARD_MEDIA_MAX_PER_TURN,
+    FORWARD_VIDEO_MAX_PER_FORWARD,
     ForwardMediaBudget,
     ForwardReadLimits,
     ForwardReadResult,
@@ -729,8 +730,14 @@ class ForwardMediaBudgetTests(unittest.TestCase):
             ('image', ''),
         ])
 
-    def test_videos_are_counted_but_never_taken(self):
-        """视频只标注不取帧：不产生媒体条目，但数得出来。"""
+    def test_the_default_max_videos_is_one_so_one_video_is_read(self):
+        """默认（`max_videos=1`）：一张卡最多读一段——**配了就生效**（用户口径）。
+
+        v1.9.1 的初版默认是 0，等于"配置项存在但默认永不生效"；用户原话是"可配置单条
+        转发最多读取的视频数"，所以默认取 1：既读得动，又把单卡的额外成本封在一次以内。
+        """
+        self.assertEqual(DEFAULT_LIMITS.max_videos, 1)
+        self.assertEqual(FORWARD_VIDEO_MAX_PER_FORWARD, 1)
         node = _node(message=[
             {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
             _image_segment('https://gchat.qpic.cn/a/1'),
@@ -738,8 +745,57 @@ class ForwardMediaBudgetTests(unittest.TestCase):
         ])
         budget = ForwardMediaBudget(max_images=5)
         media = extract_forward_media(node, budget)
+        self.assertEqual([(item.kind, item.source) for item in media],
+                         [('video', 'https://gchat.qpic.cn/v/1'),
+                          ('image', 'https://gchat.qpic.cn/a/1')])
+        self.assertEqual(budget.video_count, 2)
+        self.assertEqual(budget.video_taken, 1)
+
+    def test_explicitly_setting_max_videos_to_zero_only_counts(self):
+        """**反向**：显式配 0（不是默认）才回到 v1.8.7 的老行为——视频只标注不读。"""
+        node = _node(message=[
+            {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
+            _image_segment('https://gchat.qpic.cn/a/1'),
+            {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/2'}},
+        ])
+        budget = ForwardMediaBudget(max_images=5, max_videos=0)
+        media = extract_forward_media(node, budget)
         self.assertEqual([item.source for item in media], ['https://gchat.qpic.cn/a/1'])
         self.assertEqual(budget.video_count, 2)
+        self.assertEqual(budget.video_taken, 0)
+
+    def test_the_video_budget_takes_exactly_the_limit_and_counts_the_rest(self):
+        """**变异保护**：配了几段就读几段（忽略上限 = 全读 → 红）。"""
+        node = _node(message=[
+            {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/%d' % index}}
+            for index in range(1, 4)
+        ])
+        budget = ForwardMediaBudget(max_images=3, max_videos=1)
+        media = extract_forward_media(node, budget)
+        self.assertEqual([(item.kind, item.source) for item in media],
+                         [('video', 'https://gchat.qpic.cn/v/1')], '只取排在前面的那一段')
+        self.assertEqual(budget.video_count, 3, '见到几段要数满')
+        self.assertEqual(budget.video_taken, 1)
+
+    def test_video_budget_range_and_spellings(self):
+        self.assertEqual(forward_read_limits({'maxVideos': 2}).max_videos, 2)
+        self.assertEqual(forward_read_limits({'max_videos': 2}).max_videos, 2, '两种拼写都认')
+        self.assertEqual(forward_read_limits({'maxVideos': -5}).max_videos, 0, '夹到下限 0')
+        self.assertEqual(forward_read_limits({'maxVideos': 99}).max_videos, 10, '夹到上限 10')
+        # "没写"回默认 1（一张卡最多读一段）；`null` 是 Number(null)=0 → 夹成 0（两种都合法，语义不同）。
+        self.assertEqual(forward_read_limits({}).max_videos, 1)
+        self.assertEqual(forward_read_limits({'maxVideos': None}).max_videos, 0)
+
+    def test_the_same_video_twice_is_read_once(self):
+        node = _node(message=[
+            {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
+            {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
+        ])
+        budget = ForwardMediaBudget(max_images=3, max_videos=10)
+        media = extract_forward_media(node, budget)
+        self.assertEqual([item.source for item in media], ['https://gchat.qpic.cn/v/1'])
+        self.assertEqual(budget.video_count, 2, '重复的段照样数（那是"见过几段"）')
+        self.assertEqual(budget.video_taken, 1)
 
 
 class ForwardMediaReadTests(unittest.TestCase):
@@ -787,7 +843,11 @@ class ForwardMediaReadTests(unittest.TestCase):
         lines = read.result.content.split('\n')
         self.assertEqual(lines[-2:], ['[图片×2，仅取前 1 张]', '[图片]'])
 
-    def test_videos_are_annotated_but_never_taken(self):
+    def test_videos_are_taken_by_default_one_per_forward(self):
+        """**默认（1）**：正文写"仅取前 1 段"，媒体条目里带上那一段视频坐标。
+
+        初版默认 0（配了也不生效）已被用户裁决改掉；这里钉住"默认真的读一段"。
+        """
         fetch = self._fetch({'a': {'data': {'messages': [
             _node(message=[
                 {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
@@ -795,9 +855,68 @@ class ForwardMediaReadTests(unittest.TestCase):
             ]),
         ]}}})
         read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxImages': 3}))
+        self.assertEqual([(item.kind, item.source) for item in read.media],
+                         [('video', 'https://gchat.qpic.cn/v/1')])
+        self.assertEqual(read.video_count, 2)
+        self.assertEqual(read.video_taken, 1)
+        self.assertIn('[视频×2，仅取前 1 段]', read.result.content)
+
+    def test_videos_are_annotated_and_not_taken_when_the_budget_is_zero(self):
+        """**反向**：显式配 `maxVideos=0` → 只标注不读，措辞与 v1.8.7 逐字一致。"""
+        fetch = self._fetch({'a': {'data': {'messages': [
+            _node(message=[
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/2'}},
+            ]),
+        ]}}})
+        read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxImages': 3, 'maxVideos': 0}))
         self.assertEqual(read.media, ())
         self.assertEqual(read.video_count, 2)
-        self.assertIn('[视频×2，未取]', read.result.content)
+        self.assertEqual(read.video_taken, 0)
+        self.assertIn('[视频×2，未取]', read.result.content, '显式 0 时措辞逐字不变')
+
+    def test_videos_are_taken_when_the_budget_allows_and_the_note_says_how_many(self):
+        """**变异保护**：上限配成 1、节点里有 3 段 → 只读 1 段，正文写"仅取前 1 段"。"""
+        fetch = self._fetch({'a': {'data': {'messages': [
+            _node(message=[
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/2'}},
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/3'}},
+            ]),
+        ]}}})
+        read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxImages': 3, 'maxVideos': 1}))
+        self.assertEqual([item.kind for item in read.media], ['video'])
+        self.assertEqual([item.source for item in read.media], ['https://gchat.qpic.cn/v/1'])
+        self.assertEqual(read.video_count, 3)
+        self.assertEqual(read.video_taken, 1)
+        self.assertIn('[视频×3，仅取前 1 段]', read.result.content)
+
+    def test_taking_every_video_says_only_how_many_there_were(self):
+        fetch = self._fetch({'a': {'data': {'messages': [
+            _node(message=[
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/2'}},
+            ]),
+        ]}}})
+        read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxVideos': 5}))
+        self.assertEqual(len(read.media), 2)
+        self.assertIn('[视频×2]', read.result.content)
+        self.assertNotIn('未取', read.result.content)
+
+    def test_video_entries_do_not_eat_the_image_budget(self):
+        """图片与视频是**两份**预算：视频条目混在 `collected` 里，不许把图片挤掉。"""
+        fetch = self._fetch({'a': {'data': {'messages': [
+            _node(message=[
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
+                _image_segment('https://gchat.qpic.cn/a/1'),
+                _image_segment('https://gchat.qpic.cn/a/2'),
+            ]),
+        ]}}})
+        read = asyncio.run(forward_read_with_media(
+            ['a'], fetch, {'maxImages': 2, 'maxVideos': 1},
+        ))
+        self.assertEqual([item.kind for item in read.media], ['video', 'image', 'image'])
+        self.assertEqual(read.skipped_images, 0)
 
     def test_unknown_segment_types_keep_their_current_text(self):
         fetch = self._fetch({'a': {'data': {'messages': [
