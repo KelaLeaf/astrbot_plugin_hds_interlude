@@ -1255,6 +1255,44 @@ class LocalImageSourceTests(unittest.TestCase):
         )
 
 
+class ForwardedMediaPipelineTests(unittest.TestCase):
+    """转发媒体（v1.8.7）走到 core 这一侧的三个出口：来源 / 附件 / 收藏原料。
+
+    适配层把转发节点的图并进 `SessionView.media` 之后，**下游一行代码都没改**：
+    这里钉的就是"同一份数据真的贯通了"，而不是新造一条链路（§46/§52）。
+    """
+
+    #: 15 张转发来的图（与真机那条 17 节点 / 15 图同形）。
+    MEDIA = [
+        {'kind': 'image' if index else 'sticker', 'source': 'https://gchat.qpic.cn/ft/%d' % index,
+         'source_kind': 'url', 'summary': '[中午好]' if not index else '', 'raw': {}}
+        for index in range(15)
+    ]
+
+    def _session(self, media):
+        return SessionView(platform='onebot', self_id='1', user_id='2',
+                           content='<forward id="res-1"/>', media=media)
+
+    def test_forwarded_images_become_visual_sources(self):
+        """视觉来源表 = 媒体表的规范化形式；`currentEvent.imageCount` 取的就是它。"""
+        sources = chunk3._extract_session_image_sources(self._session(self.MEDIA))
+        self.assertEqual(sources, [item['source'] for item in self.MEDIA])
+        self.assertEqual(len(sources), 15, '预算在**上游**（适配层）就截断了，这里如实透传')
+
+    def test_empty_forward_media_keeps_the_session_media_table(self):
+        """转发里没有图：表照旧是 `[]`（观测到零媒体），一行的行为都不变。"""
+        self.assertEqual(chunk3._extract_session_media(self._session([])), [])
+        self.assertEqual(chunk3._extract_session_image_sources(self._session([])), [])
+
+    def test_forwarded_stickers_keep_their_kind_and_label(self):
+        """转发来的收藏表情走**同一套**判据：种类照旧、标签照旧（判据只有一处）。"""
+        media = chunk3._extract_session_media(self._session(self.MEDIA))
+        self.assertEqual(media[0]['kind'], 'sticker')
+        self.assertEqual(media[0]['label'], '[表情包]')
+        self.assertEqual(media[1]['kind'], 'image')
+        self.assertEqual(media[1]['label'], '[图片]')
+
+
 class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
 
     def test_describe_vision_event_strips_attachment_markup_and_keeps_sources(self) -> None:

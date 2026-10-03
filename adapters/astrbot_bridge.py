@@ -76,11 +76,13 @@ from ..core import platform_actions as platform_action_catalog
 from ..core.database import Database
 from ..core.forward_message import (
     DEFAULT_LIMITS as FORWARD_DEFAULT_LIMITS,
+    FORWARD_MEDIA_MAX_PER_TURN,
+    ForwardMediaRead,
     ForwardReadResult,
     extract_forward_ids,
     failure_result as forward_failure_result,
-    forward_read_ids,
     forward_read_limits,
+    forward_read_with_media,
 )
 from ..core.model_routing import match_usable_connection_row
 from ..core.narrator import HttpxHttpClient
@@ -106,8 +108,10 @@ __all__ = [
     'ONEBOT_ADAPTER_NAMES',
     'PLUGIN_NAME',
     'build_bridge',
+    'forward_media_entries',
     'forward_read_context',
     'looks_like_management_command',
+    'merge_forward_media',
     'plugin_data_dir',
     'serialize_message_chain',
     'session_view',
@@ -1109,6 +1113,7 @@ def session_view(
     event: AstrMessageEvent,
     endpoint: Optional[AstrbotEndpoint] = None,
     forward_read: Optional[ForwardReadResult] = None,
+    forward_media: Any = None,
 ) -> SessionView:
     """把 `AstrMessageEvent` 翻成 `SessionView`（`plugin/core/service/session.py`）。
 
@@ -1133,6 +1138,11 @@ def session_view(
     `forward_read` 是 `AstrbotBridge.read_forward_for_event()` 已经读回来的合并转发正文
     （读不到就别传 `None`，见那条路径的失败分支）：**只由它决定注入形态**，本函数
     不做任何 await、也不自己发请求。
+
+    `forward_media`（v1.8.7）是**同一次读取**顺手收下来的转发媒体条目
+    （`forward_message.ForwardMedia` 的序列）：并进 `SessionView.media` 的末位，
+    直发媒体保持在前。这样 `currentEvent.attachments`、视觉 `sources` 与表情包收藏
+    **共用同一条结构化媒体链路**（§46），不必再新造第二套。
     """
     resolved = endpoint if endpoint is not None else endpoint_for_event(event)
     hints = raw_media_hints(event)
@@ -1175,6 +1185,9 @@ def session_view(
         content = forward_read_context(content, forward_read)
         if not elements:
             elements = [{'type': 'text', 'attrs': {'content': content}, 'children': []}]
+    # 转发媒体（v1.8.7）：与直发媒体**同一条链路**（`SessionView.media`），只是排在末位。
+    # 读不到正文 / 一条媒体都没收到时这里什么都不做——`media` 的取值（含 `None`）不变。
+    media = merge_forward_media(media, forward_media)
     return SessionView(
         platform=resolved.platform,
         self_id=resolved.self_id,
@@ -1250,12 +1263,102 @@ def _forward_section_keys(section: dict[str, Any]) -> dict[str, Any]:
 def _limits_payload(limits: Any) -> dict[str, Any]:
     """`ForwardReadLimits`（或字典）→ core 认的 camelCase 字典。"""
     if isinstance(limits, Mapping):
-        return {key: limits.get(key) for key in ('maxNodes', 'maxCharacters', 'maxDepth')}
+        return {key: limits.get(key) for key in ('maxNodes', 'maxCharacters', 'maxDepth', 'maxImages')}
     return {
         'maxNodes': getattr(limits, 'max_nodes', FORWARD_DEFAULT_LIMITS.max_nodes),
         'maxCharacters': getattr(limits, 'max_characters', FORWARD_DEFAULT_LIMITS.max_characters),
         'maxDepth': getattr(limits, 'max_depth', FORWARD_DEFAULT_LIMITS.max_depth),
+        'maxImages': getattr(limits, 'max_images', FORWARD_DEFAULT_LIMITS.max_images),
     }
+
+
+#: wire 词汇表里的**图片**种类（与 `helpers.WIRE_MEDIA_KINDS` 的图片那半边一致）。
+#: `card` 不算图（它没有可下载来源）；`sticker-candidate` 是内部档位、出 wire 前收口成
+#: `image`（§49.1），这里按收口**之后**的语义数。
+_FORWARD_IMAGE_KINDS = frozenset({'image', 'animated', 'sticker', 'market'})
+
+
+def forward_media_entries(media: Any) -> list[dict[str, Any]]:
+    """`ForwardMedia` 条目 → `SessionView.media` 的那种字典（**同一条链路的形状**）。
+
+    只翻译形状，**不判种类**：`kind` 来自 core 按平台段字段（`sub_type` / `summary`）
+    算出来的那一份，判据仍然只有适配层 `_image_media_kind` / `helpers` 那一处
+    （core 里那份是同一张表的镜像，见 `forward_message._forward_image_kind`）。
+    """
+    entries: list[dict[str, Any]] = []
+    for item in media or []:
+        source = _text(getattr(item, 'source', '') or (item.get('source') if isinstance(item, dict) else ''))
+        if not source:
+            continue
+        kind = _text(getattr(item, 'kind', '') or (item.get('kind') if isinstance(item, dict) else '')) or 'image'
+        summary = _text(getattr(item, 'summary', '') or (item.get('summary') if isinstance(item, dict) else ''))
+        entries.append({
+            'kind': kind,
+            'source': source,
+            'source_kind': _media_source_kind(source),
+            'summary': summary,
+            'raw': {},
+        })
+    return entries
+
+
+def merge_forward_media(
+    media: Any,
+    forward_media: Any,
+    max_per_turn: int = FORWARD_MEDIA_MAX_PER_TURN,
+) -> list[dict[str, Any]]:
+    """把转发媒体并进本回合的结构化媒体表（`SessionView.media`），**有界**。
+
+    规则（每条都有用例钉着）：
+
+    1. **直发媒体原样在前**：`sources[:3]`（视觉路径）与 `attachments` 都按顺序取，
+       所以直发的图先占位——转发来的图**不许挤掉**她本来就在看的那几张；
+    2. 转发条目的额度 = `max_per_turn`（整条消息上限，默认 6）**减去**直发里已有的图片
+       条数，余额为 0 或负数就一条都不加（配成 `max_images=0` 时这里天然是空）；
+    3. 按**坐标去重**（与直发媒体同一个字面量就跳过）——同一张图既直发又在转发里出现
+       只算一次；
+    4. 卡片（`kind == 'card'`）不占图片额度（它没有可下载来源，也不花视觉 token）。
+
+    `media` 是 `None`（宿主没有观测通道、正文只给了 `message_str`）时：**只放转发这一份**
+    —— 转发媒体是适配层亲眼看到的原始段，比正文可靠；直发那一半仍走原来的惰性文本
+    回退（`text:` 前缀、永不取回），不会因为这里变成"有观测通道"而多出取回口子。
+
+    受控偏离（一处，写在明处）：这样会让 core 的 `media` 从 `None` 变成 `[]`，于是
+    **`media-observability` 那条节流 warn 在这条消息上不再出**。判定它可接受的理由：
+    * 那条 warn 说的是"这个宿主拿不到原生图片输入，图片只会以 `[图片]` 告知模型"；
+    * 这里恰恰相反——**图片真的进去了**（转发来的至少进了这条链路），所以"她瞎了"
+      这个告警在这一条消息上是**不成立**的；
+    * warn 是**按会话节流 10 分钟**的，只在"只给 `message_str` 的宿主 + 恰好这条消息
+      有合并转发"这一个交集里少一次，且下一次没有转发的图片消息照样会报。
+    """
+    forwarded = forward_media_entries(forward_media)
+    if not forwarded:
+        # **一条转发媒体都没有时原样返回**：`None`（宿主没有观测通道）与 `[]`
+        # （观测到零媒体）在 core 里是两件事（前者要打一条节流 warn、且图片来源走
+        # 惰性文本回退），这里绝不能把它们归一成一个值。
+        return media
+    existing = list(media) if isinstance(media, list) else []
+    known = {
+        _text(item.get('source'))
+        for item in existing
+        if isinstance(item, dict) and _text(item.get('source'))
+    }
+    used = sum(
+        1 for item in existing
+        if isinstance(item, dict) and _text(item.get('kind')) in _FORWARD_IMAGE_KINDS
+    )
+    merged = list(existing)
+    for entry in forwarded:
+        if used >= max_per_turn:
+            break
+        source = entry['source']
+        if source in known:
+            continue
+        known.add(source)
+        merged.append(entry)
+        if entry['kind'] in _FORWARD_IMAGE_KINDS:
+            used += 1
+    return merged
 
 
 def _onebot_forward_fetcher(client: Any) -> Callable[[str], Any]:
@@ -5594,6 +5697,12 @@ class AstrbotBridge:
     #: （与 QQ 空间转正时同一条路子，见 `AGENTS.md` 坑 66）。
     FORWARD_SECTION_NAMES: tuple[str, ...] = ('forward_message', 'forwardMessage', 'forward_message_compat')
 
+    #: **本回合**从合并转发节点里收下来的媒体条目（`forward_message.ForwardMedia`）。
+    #: `read_forward_for_event()` 写、`handle_event()` 紧接着读一次就交给
+    #: `session_view()`。刻意只在内存里活一条事件：图床坐标带短效 `rkey`，
+    #: 落库 / 缓存 = 以后必然取不到（§49.3 同一条纪律）。
+    _forward_media: list[Any] = []
+
     def forward_section(self) -> dict[str, Any]:
         """读合并转发读取的配置段（新名优先，旧隐藏位兜底，读不到就回空字典）。"""
         for name in self.FORWARD_SECTION_NAMES:
@@ -5662,6 +5771,7 @@ class AstrbotBridge:
                 '消息里有合并转发（资源 %s），但当前平台不是 OneBot 家族，不读取正文',
                 ids[0][:64],
             )
+            self._forward_media = []
             return None
         endpoint = self._current_endpoint
         client = self.onebot_client(
@@ -5674,22 +5784,32 @@ class AstrbotBridge:
                 '（不是 aiocqhttp/NapCat，或机器人连接未就绪），只保留"这是一条合并转发"的线索',
                 ids[0][:64],
             )
+            self._forward_media = []
             return forward_failure_result()
         limits = forward_read_limits(section)
         try:
-            result = await forward_read_ids(ids, _onebot_forward_fetcher(client), _limits_payload(limits))
+            read = await forward_read_with_media(
+                ids, _onebot_forward_fetcher(client), _limits_payload(limits),
+            )
         except Exception as error:  # noqa: BLE001 - 读取绝不允许打断消息消费
             log_fallback('warn', '合并转发读取异常（资源 %s）：%s', ids[0][:64], error)
+            self._forward_media = []
             return forward_failure_result()
-        if result is None:
+        if read is None:
+            self._forward_media = []
             return None
+        result = read.result
+        # 媒体只在**入站当次**留在内存里（图床 URL 的 `rkey` 是短效的，绝不落库等着以后取；
+        # §49.3 同一条纪律）。`handle_event` 紧接着把它交给 `session_view()`。
+        self._forward_media = list(read.media)
         if result.failed:
             log_fallback('warn', '合并转发内容读取失败（资源 %s），只保留"这是一条合并转发"的线索', ids[0][:64])
         else:
             log_fallback(
                 'debug',
-                '合并转发已读取：资源=%s 节点=%s 嵌套=%s 截断=%s 字符=%s',
-                ids[0][:64], result.node_count, result.forward_count, result.truncated, len(result.content),
+                '合并转发已读取：资源=%s 节点=%s 嵌套=%s 截断=%s 字符=%s 媒体=%s(未取=%s 视频=%s)',
+                ids[0][:64], result.node_count, result.forward_count, result.truncated,
+                len(result.content), len(read.media), read.skipped_images, read.video_count,
             )
         return result
 
@@ -5721,6 +5841,9 @@ class AstrbotBridge:
         # 本回合的回复缓冲从零开始：早退的分支（通知 / 命令 / 空事件）不进 `begin_capture`，
         # 留上一回合那份会让 `main.py` 把上一条回复**再发一遍**。
         self._last_capture = None
+        # 转发媒体同理：早退的分支（非消息事件 / 重复事件 / 管理命令）不清空的话，
+        # 下一回合 `session_view()` 会把上一条转发的图挂到这条消息上。
+        self._forward_media = []
         endpoint = endpoint_for_event(event)
         non_message, kind_label = is_non_message_event(event)
         if non_message:
@@ -5742,7 +5865,7 @@ class AstrbotBridge:
         # 带上注入内容。两次构建只差那几个字段，比让登记与读取互相依赖划算。
         self.remember_event(event, session_view(event, endpoint), endpoint)
         forward_read = await self.read_forward_for_event(event)
-        session = session_view(event, endpoint, forward_read)
+        session = session_view(event, endpoint, forward_read, self._forward_media)
         content = session.content
 
         if not content.strip() and not self._has_voice(session):
