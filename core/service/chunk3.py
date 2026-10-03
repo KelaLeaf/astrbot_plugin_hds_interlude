@@ -86,6 +86,7 @@ from ..script.delivery_ledger import platform_action_reference
 from ..script.intent_lifecycle import consumed_live_intent_ids, live_narrative_intents
 from ..story_state import decode_story_state, encode_story_state
 from ..time import dt_ms, format_log_time, iso, parse_dt
+from ..video_understanding import VideoMedia, collect_video_sources
 from .base import ServiceBase, pick
 from .config import RECALLABLE_ENTRY_KINDS, is_trusted_image_host
 from .helpers import (
@@ -1159,6 +1160,12 @@ class ServiceChunk3(ServiceBase):
         text = re.sub(r'</(?:img|image|audio|record|file)>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'<(?:audio|record|file)\b[^>]*/?>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'\[CQ:(?:image|record|file),[^\]]*\]', '', text, flags=re.IGNORECASE)
+        # 视频（v1.9.0）：**不删**，换成一句 `[视频]` 占位。两个理由：
+        # ① 画面的真假由视频理解那条链决定（`collect_video_sources`），但"他发了一段
+        #    视频"这条事实必须留下 —— 视频理解关着时模型也要知道有这么个东西；
+        # ② 原来的 `<video src="https://…rkey=…"/>` 会把短效直链原样漏进提示词。
+        text = re.sub(r'<video\b[^>]*/?>(?:</video>)?', '[视频]', text, flags=re.IGNORECASE)
+        text = re.sub(r'\[CQ:video,[^\]]*\]', '[视频]', text, flags=re.IGNORECASE)
         return {'content': text.strip(), 'sources': sources, 'media': media}
 
     async def load_native_images(
@@ -1591,6 +1598,22 @@ class ServiceChunk3(ServiceBase):
                 source for message in batch
                 for source in (_turn_get(message, 'imageSources', 'image_sources') or [])
             ])[:3]
+            # 视频理解（v1.9.0，`model_center.video`）：抽帧识别把帧与音轨的**来源**
+            # 算出来，下面并进**本来就有的**那两条来源表 —— 帧走 `load_native_images`、
+            # 音轨走 `load_native_audio`，一条判据、一套实现，这里不另造通道。
+            # 模式为 `native` / `external` 或 `enabled=False` 时它只回一句话（或什么都不回），
+            # 且**一个 ffmpeg、一个模型都不调**。
+            try:
+                video_media = await collect_video_sources(self, snapshot['story'], latest_session)
+            except Exception as error:  # noqa: BLE001 - 视频理解绝不许带崩回合
+                # 与 `chunk14` 的侧任务同一条纪律：回合主链不因为"附加能力"失败而回滚。
+                # 这里用 `report(..., 'warn')` 而**不是** `report_operation('diagnostic')`
+                # ——后者按项目口径等于"没有报告"（坑 25）。
+                video_media = VideoMedia()
+                self.report(
+                    'warn', snapshot['story'], 'user-message',
+                    '视频理解失败，已按"没有视频"继续处理本回合 错误=%s', error,
+                )
             # 媒体种类按来源对齐（`extract_session_media` 与来源抽取同一套归一化），
             # 对不上的按普通图片处理——宁可不区分，也不乱认。
             media_by_source: dict[str, dict[str, Any]] = {}
@@ -1604,6 +1627,8 @@ class ServiceChunk3(ServiceBase):
                         media_by_source.setdefault(source, item)
                     else:
                         media_cards.append(item)
+            # `attachments` 描述的是"这条消息带了什么"：派生出来的帧不算消息自带的媒体，
+            # 所以它在**并进来源表之前**就用完了（否则三帧会被标成三张 `[图片]`）。
             attachments = [
                 {
                     'index': index + 1,
@@ -1617,9 +1642,15 @@ class ServiceChunk3(ServiceBase):
                 {'index': 0, 'kind': 'card', 'label': _text(pick(card, 'label')) or '[分享卡片]', 'summary': ''}
                 for card in media_cards
             )
-            loaded_images = await self.load_native_images(
-                snapshot['story'], image_sources, latest_session, list(media_by_source.values()),
-            )
+            image_sources = _unique(list(image_sources) + list(video_media.image_sources))
+            try:
+                loaded_images = await self.load_native_images(
+                    snapshot['story'], image_sources, latest_session, list(media_by_source.values()),
+                )
+            finally:
+                # 帧字节已经在 `load_native_images` 里读进内存，临时目录现在就能删
+                # （音轨是 `data:` URI，也不依赖它）。放 finally：那一跳抛异常也不留垃圾。
+                video_media.cleanup()
             vision_mode = _value(_vision_config(self), 'mode', 'native') or 'native'
             visual_observations = (
                 await self.describe_current_images(snapshot['story'], loaded_images, user_message)
@@ -1632,8 +1663,12 @@ class ServiceChunk3(ServiceBase):
             audio_sources = _unique([
                 source for message in batch
                 for source in (_turn_get(message, 'audioSources', 'audio_sources') or [])
-            ])
+            ] + list(video_media.audio_sources))
             audio = await self.load_native_audio(snapshot['story'], audio_sources, latest_session)
+            if video_media.note:
+                # 视频事实进**当前事件**（与 `visual_observations` 同一处叙事观察）：
+                # 顺带带上"抽了几帧 / 有没有截断"这些可数线索。
+                user_message = '%s\n%s' % (user_message, video_media.note)
             # 图片下载期间又来了新消息：把本批次放回去，让更新的 revision 合成一个事件。
             if _turn_get(turn, 'nextRevision', 'next_revision') != revision:
                 pending[0:0] = batch
