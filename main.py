@@ -33,8 +33,26 @@ from .adapters.astrbot_bridge import (
 )
 from .adapters.console_api import ConsoleApi
 from .core.health import format_health_lines
+from .core.video_understanding import apply_ffmpeg_status_hint, resolve_video_config
 
 __all__ = ['COMMANDS', 'COMMAND_HANDLERS', 'HDSInterludePlugin', 'MANAGEMENT_COMMANDS']
+
+
+def video_mode_label(config: Any) -> str:
+    """启动日志里那句"当前视频识别模式"（`enabled=false` 时明说关着）。
+
+    段位与 core 一致：schema 分组名是 `model_center`，core 读的仍是 `model`，
+    两处都认（见 `core/video_understanding.video_config`）。
+    """
+    section = config.get('model') if isinstance(config, dict) else None
+    if not isinstance(section, dict):
+        section = config.get('model_center') if isinstance(config, dict) else None
+    resolved = resolve_video_config(
+        section.get('video') if isinstance(section, dict) else None,
+    )
+    if not resolved['enabled']:
+        return '关闭（识别模式 %s 只在开启后生效）' % resolved['mode']
+    return '开启（识别模式 %s）' % resolved['mode']
 
 
 # =========================================================================== #
@@ -443,6 +461,17 @@ class HDSInterludePlugin(Star):
         #: 控制台（WebUI 插件页面）的取数入口；逻辑在 `adapters/console_api.py`。
         self._console = ConsoleApi(self.bridge)
         self._register_config_page_apis(context)
+        #: 视频抽帧识别的 FFmpeg 状态（v1.9.0）：同时写进**内存里的** schema，
+        #: 让配置页「识别模式」旁边显示「FFmpeg 已识别 / 未检查到 FFmpeg」。
+        #: 宿主每打开一次配置页都现取 `config.schema` 这个活对象
+        #: （`astrbot/dashboard/services/config_service.py:866`），而
+        #: `AstrbotConfig.save_config()` 只写配置值、**schema 从不落盘**
+        #: （`astrbot/core/config/astrbot_config.py:262-272`）——所以仓库里的
+        #: `_conf_schema.json` 一个字都不改。详见 `core/video_understanding.py`。
+        #: 拿不到 schema（测试 / 极旧宿主）时它只回一个状态串，不抛异常。
+        self.video_ffmpeg_status: str = apply_ffmpeg_status_hint(
+            getattr(self.config, 'schema', None),
+        )
         #: 盲区模式（上游 `blindMode.enabled`，兼容旧键 `blackBox.enabled`）。
         self.blind_mode: bool = self.bridge.blind_mode_enabled
         #: 被摘除的管理命令方法名（盲区模式下非空）。
@@ -451,6 +480,12 @@ class HDSInterludePlugin(Star):
         self._confirmations: dict[str, asyncio.Future] = {}
         #: 启动自检的后台任务（`initialize()` 里创建，`terminate()` 里取消）。
         self._capability_task: asyncio.Task | None = None
+        # 一条节流日志（每次加载一条；视频理解真跑起来时缺 FFmpeg 会有可行动的 warn，
+        # 那条走 `bridge.video_capability_note()` 的启动自检）。
+        logger.info(
+            'hds-interlude：视频抽帧识别 %s（%s）'
+            % (self.video_ffmpeg_status, video_mode_label(self.config))
+        )
         if self.blind_mode:
             self.suppressed_commands = self._suppress_management_commands()
             logger.info(

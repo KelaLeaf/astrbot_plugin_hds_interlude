@@ -539,9 +539,12 @@ class ChatRequestOverrides(TypedDict, total=False):
 #: `'作品创作'`（共同作品的独立写手，v1.7.9）有自己的一条：适配层为"指名了 AstrBot
 #: Provider"合成的那条连接行挂着 `use_for_works`，而**落到哪个 Provider 就靠这个键**
 #: ——没有它，请求会带着 `compaction` 的键走回会话默认模型。
+#: `'视频理解'`（外挂视频理解模型，v1.9.0）同理：适配层合成的那条连接行挂
+#: `use_for_video`，落到哪个 Provider 靠这个键。
 SIDE_TASK_ROUTES: dict[str, str] = {
     '世界播种': 'world_seeding',
     '作品创作': 'works',
+    '视频理解': 'video',
     '压缩': 'compaction',
     '时间导演': 'compaction',
     '日程预排': 'compaction',

@@ -452,6 +452,36 @@
         "hint": "⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置",
         "obvious_hint": true
       },
+      "video": {
+        "type": "object",
+        "description": "视频理解设置",
+        "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用视频理解",
+            "default": false,
+            "hint": "视频理解的总开关（默认关）。关着时视频只留一条「收到了一段视频」的事实：不抽帧、不抽音轨、也不调用任何模型。"
+          },
+          "mode": {
+            "type": "string",
+            "description": "视频识别模式：抽帧 / 原生 / 外挂",
+            "default": "frames",
+            "options": [
+              "frames",
+              "native",
+              "external"
+            ],
+            "hint": "抽帧识别需要系统装有 FFmpeg（命令行里能执行 ffmpeg -version）：按每 4 秒 1 帧、最多 3 帧抽画面，并单独抽前 60 秒音轨，分别交给图片理解与语音理解模型。原生识别在当前宿主没有通路（出站内容部件只有图片与音频、模态表里也没有 video），会明确降级而不是假装成功。外挂识别把视频直链交给下面指名的模型。"
+          },
+          "model_id": {
+            "type": "string",
+            "default": "",
+            "_special": "select_provider",
+            "description": "外挂视频理解模型",
+            "hint": "只有「识别模式」选外挂识别时才会用上：指名一个能吃视频的模型；留空或指名了却找不到都会明确失败，**不回落**到抽帧或主模型。识别模式是抽帧 / 原生时本项不生效。"
+          }
+        }
+      },
       "main_provider_id": {
         "type": "string",
         "default": "",

@@ -286,6 +286,10 @@ DEEP_DEFAULTS = [
     (("model_center", "audio"), "out_format", "mp3"),
     (("model_center", "audio"), "max_file_size_mb", 10),
     (("model_center", "audio"), "max_per_message", 1),
+    # v1.9.0：视频理解。三个键的默认值一律取**省成本那侧**（关着 / 抽帧 / 不指名）。
+    (("model_center", "video"), "enabled", False),
+    (("model_center", "video"), "mode", "frames"),
+    (("model_center", "video"), "model_id", ""),
     (("model_center", "failover"), "enabled", True),
     (("model_center", "failover"), "strategy", "priority"),
     (("model_center", "failover"), "max_attempts_per_provider", 1),
@@ -1047,6 +1051,10 @@ class ConfigurationSchemaTest(unittest.TestCase):
     LOCAL_ONLY_FIELDS = {
         "story_defaults": {"persona_id", "extra_setting"},
         "model_center": {
+            # v1.9.0：视频理解是整组新增（上游没有这一层），父组的 items 因此多出一个
+            # 对象键（`test_upstream_field_count_matches` 按 items 数一遍）。组内部的
+            # 三个键由 `DEEP_DEFAULTS` 与 `VideoUnderstandingConfigTest` 盯着。
+            "video",
             "main_provider_id", "compaction_provider_id", "alter_provider_id",
             # v1.5.0：世界播种器的「指名 AstrBot 模型」（上游只有连接行的用途勾选）。
             "world_seeding_provider_id",

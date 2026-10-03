@@ -291,6 +291,10 @@ def is_assigned_to(provider: ProviderConfig, task: str) -> bool:
         # v1.7.9（本移植版）：共同作品的独立写手也是一类旁路任务，
         # 适配层为「指名 AstrBot Provider」合成的那条连接行只挂这个标志。
         return provider.get('use_for_works') is True
+    if task == 'video':
+        # v1.9.0（本移植版）：外挂视频理解模型。**必须显式判**——下面的三元链
+        # 兜底是 `use_for_vision`，视频任务不该被"用于侧端识图"的连接认领。
+        return provider.get('use_for_video') is True
     return provider.get('use_for_vision') is True
 
 
@@ -413,6 +417,8 @@ def is_exclusively_non_chat(provider: ProviderConfig) -> bool:
     # v1.7.9（本移植版）：只指派给"共同作品写手"的连接行同样是旁路连接——它必须
     # **不能**被当成主叙事/紧凑化的兜底候选，否则用户给写手选个模型会把叙事也换掉。
     sidecar = sidecar or _truthy(provider.get('use_for_works'))
+    # v1.9.0（本移植版）：外挂视频理解模型同理（同样是适配层合成行挂的旁路标志）。
+    sidecar = sidecar or _truthy(provider.get('use_for_video'))
     return bool(sidecar and not chat)
 
 
@@ -469,6 +475,8 @@ def normalize_provider(provider: ProviderConfig) -> ProviderConfig:
         # v1.7.9（本移植版）：共同作品写手（只有适配层合成的那条指名连接行会挂它，
         # 用户的连接编辑器里没有这个勾选——它不是一个用户可配的用途）。
         'use_for_works': provider.get('use_for_works') is True,
+        # v1.9.0（本移植版）：外挂视频理解模型，同上一类（合成行的旁路标志）。
+        'use_for_video': provider.get('use_for_video') is True,
     })
     return normalized
 

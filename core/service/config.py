@@ -1798,6 +1798,9 @@ CONFIG_DEFAULTS: dict[str, Any] = {
             # 读它的是 `ServiceBase.voice_reply_enabled`。
             'tts_enabled': True,
         },
+        # v1.9.0：视频理解（`model_center.video`）。默认**省成本那侧**：关着、
+        # 抽帧识别、不指名任何模型。段位与 vision / audio 一样在 `model` 下。
+        'video': {'enabled': False, 'mode': 'frames', 'model_id': ''},
         'providers': [],
         'main_temperature': 0.8,
         'main_top_p': 1.0,

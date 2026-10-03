@@ -98,6 +98,14 @@ from ..core.service import (
 #: 同一个 `sticker_media_signal`，第二层预筛 `sticker_guess_candidate` 也是它 —— 一份实现两处用。
 from ..core.service.helpers import STICKER_CANDIDATE_KIND, sticker_media_signal
 from ..core.time import format_log_time, format_story_display_time, iso as iso_time_value, utc_now
+from ..core.video_understanding import (
+    EXTERNAL_MISSING_MODEL_REASON,
+    EXTERNAL_NO_MODEL_REASON,
+    FFMPEG_MISSING_REASON,
+    NATIVE_UNSUPPORTED_REASON,
+    ffmpeg_available,
+    resolve_video_config,
+)
 
 __all__ = [
     'AstrbotBridge',
@@ -4739,6 +4747,9 @@ class AstrbotBridge:
         # 中心里的一条连接行"，所以它在 `routing_config()` 里要先过
         # `works_writer_named_provider()` 的双读判定，不无条件合成指名连接行。
         'works': ('works', 'model_id'),
+        # v1.9.0：外挂视频理解模型（`model.video.model_id`）。**新键**，没有老口径，
+        # 一律按 AstrBot Provider id 解释（配置页渲染的就是模型选择器）。
+        'video': ('model', 'video', 'model_id'),
     }
 
     def task_model_id(self, task: Optional[str]) -> str:
@@ -4793,6 +4804,8 @@ class AstrbotBridge:
             'use_for_world_seeding': task == 'world_seeding',
             # v1.7.9：共同作品写手（core 的 `is_assigned_to(provider, 'works')` 认它）。
             'use_for_works': task == 'works',
+            # v1.9.0：外挂视频理解（core 的 `is_assigned_to(provider, 'video')` 认它）。
+            'use_for_video': task == 'video',
         }
 
     def works_writer_named_provider(self) -> str:
@@ -4816,7 +4829,24 @@ class AstrbotBridge:
         同时是连接行名与已加载 Provider id 时按 Provider 解释（第 1 步）：那正是用户在
         选择器里能选到的东西，改道才符合"指名 → 生效"。
         """
-        value = self.task_model_id('works')
+        return self.named_provider_value('works', allow_connection_row=True)
+
+    def named_provider_value(self, task: str, *, allow_connection_row: bool) -> str:
+        """`<task>.model_id` 该不该按「AstrBot Provider id」解释；是就返回它，否则空串。
+
+        这是 `works_writer_named_provider()` 与 `video_named_provider()` 的**同一份实现**
+        （两处各写一遍必然漂移，见 `model_routing.connection_row_names` 的同类教训）：
+
+        1. 命中宿主的某个已加载 Provider → 按 Provider id 解释；
+        2. `allow_connection_row` 且点到当前可用的某条连接行 → 返回 `''`
+           （交给 core 按连接行解析，老口径逐字不变）；
+        3. 两条判据都够不着、而宿主的 Provider 列表**还没装好**（AstrBot 4.28 里
+           插件先、模型后，见 AGENTS 坑 23）→ 按 Provider id 处理：否则用户在选择器里
+           选好的模型要等到下次保存配置才生效（重启后一直不生效）；
+        4. 已就绪却没有这个 Provider、也不是连接行 → `''`（core 那边会明确失败，
+           **不回落**）。
+        """
+        value = self.task_model_id(task)
         if not value:
             return ''
         ids = self.loaded_chat_provider_ids()
@@ -4825,11 +4855,20 @@ class AstrbotBridge:
         hit = value in ids if ids else (loaded and self.provider_by_id(value) is not None)
         if hit:
             return value
-        if self._names_usable_connection_row(value):
+        if allow_connection_row and self._names_usable_connection_row(value):
             return ''
         if not loaded:
             return value
         return ''
+
+    def video_named_provider(self) -> str:
+        """`model.video.model_id` 该不该按「AstrBot Provider id」解释（v1.9.0）。
+
+        与 `works` 不同，这个键是**全新的**：没有"点名连接行"的老口径要兜，
+        所以 `allow_connection_row=False` —— 值不是已加载的 Provider 就返回空串，
+        core 据此**明确失败、不回落**（外挂识别配错了必须说出来，不能悄悄退回抽帧）。
+        """
+        return self.named_provider_value('video', allow_connection_row=False)
 
     def loaded_chat_provider_ids(self) -> set[str]:
         """宿主当前装好的**聊天** Provider id 集合（拿不到返回空集合）。
@@ -4882,13 +4921,16 @@ class AstrbotBridge:
         if not isinstance(base, dict):
             return base if isinstance(base, dict) else {}
         rows = []
-        for task in ('main', 'compaction', 'alter', 'vision', 'stickers', 'embedding', 'world_seeding', 'works'):
+        for task in ('main', 'compaction', 'alter', 'vision', 'stickers', 'embedding', 'world_seeding', 'works', 'video'):
             provider_id = self.task_model_id(task)
             if not provider_id:
                 continue
             # `works.model_id` 还有一套"点名连接行"的老口径：那种值不合成指名行，
             # 交给 core 按连接行解析（逐字保留老行为）。
             if task == 'works' and not self.works_writer_named_provider():
+                continue
+            # 外挂视频理解（v1.9.0）同理：值认不出是已加载的 Provider 时不合成指名行。
+            if task == 'video' and not self.video_named_provider():
                 continue
             rows.append(self._binding_row(task, provider_id))
         if not rows:
@@ -4983,9 +5025,40 @@ class AstrbotBridge:
         works_bound = self.works_writer_named_provider()
         if works_bound:
             log_fallback('info', '模型来源：works → AstrBot Provider %s', works_bound)
-        for note in (self.image_capability_note(), self.audio_capability_note()):
+        # 外挂视频理解模型（v1.9.0）同样是"指名 Provider"那一套。
+        video_bound = self.video_named_provider()
+        if video_bound:
+            log_fallback('info', '模型来源：video → AstrBot Provider %s', video_bound)
+        for note in (
+            self.image_capability_note(), self.audio_capability_note(),
+            self.video_capability_note(),
+        ):
             if note:
                 log_fallback('warn', '%s', note)
+
+    def video_capability_note(self) -> str:
+        """视频理解当前能不能跑；不能时返回一句**可行动**的话，否则空串（v1.9.0）。
+
+        `hdsi_status` 与启动自检共用它。只在**确定**有问题时说话：
+        `enabled=false`（默认）时一个字都不说——那是用户的选择，不是能力缺失。
+        """
+        section = self.section('model').get('video')
+        config = resolve_video_config(section)
+        if not config['enabled']:
+            return ''
+        mode = config['mode']
+        if mode == 'native':
+            return NATIVE_UNSUPPORTED_REASON + '。'
+        if mode == 'external':
+            if not config['model_id']:
+                return EXTERNAL_NO_MODEL_REASON + '。'
+            if not self.video_named_provider():
+                return EXTERNAL_MISSING_MODEL_REASON + '。'
+            return ''
+        # frames（默认）
+        if not ffmpeg_available():
+            return FFMPEG_MISSING_REASON + '。'
+        return ''
 
     def audio_understanding_enabled(self) -> bool:
         """`model_center.audio.enabled`：「语音 / 音频理解」的**总开关**（上游 `audioConfig.enabled`）。

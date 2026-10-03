@@ -366,7 +366,8 @@ class ForwardMedia:
 
     * `kind`：`image` / `animated` / `sticker` / `sticker-candidate`，由平台响应里的段字段
       （`sub_type` / `summary`）**观测**得到，取值口径与适配层 `_image_media_kind` 一致
-      （三档判据仍然只有那一处实现）。**视频不在这里**：没有抽帧能力，所以它只留下
+      （三档判据仍然只有那一处实现）。**视频不在这里**：本移植版的抽帧识别只接了直发
+      视频（`model_center.video`，v1.9.0），转发节点的视频没有那条链，所以它只留下
       `[视频×K，未取]` 这条正文线索（见 `ForwardMediaBudget.video_count`）；
     * `source`：可取回的坐标（`https://…` / `file://…` / 裸路径）；
     * `summary`：平台原文（`[动画表情]` 之类）。
@@ -440,7 +441,9 @@ def extract_forward_media(node: Any, budget: ForwardMediaBudget) -> list[Forward
 
     * 图片：`url` → `file` → `path`（与适配层 `_media_source_from_attrs` 同一条
       优先级），三条都没有 → 不算（数都不数：那不是"没取"，是"拿不到"）；
-    * 视频：只 `video_count += 1`，**不产生条目**（没有抽帧能力，别假装有）；
+    * 视频：只 `video_count += 1`，**不产生条目**——抽帧识别（v1.9.0）只接了
+      **直发**视频（`model_center.video` / `core/video_understanding.py`），转发节点里的
+      视频没有走那条链，这里**别假装有**；
     * 其它段（`json` / `face` / `mface` / 文件 / 嵌套转发…）不看——本移植版没有
       它们的"取回"路径，乱认只会让下游多一次必然失败的取字节。
 
@@ -483,7 +486,8 @@ def extract_forward_media(node: Any, budget: ForwardMediaBudget) -> list[Forward
 _SEGMENT_MEDIA_NOTE = '_hdsiForwardMediaNote'
 
 #: 段上的「视频段数」私有键（同一个 `_fetch_forward_nodes` 写、`normalize_forward_segments`
-#: 读）。视频**不产生媒体条目**（没有抽帧能力），所以它的"可数线索"只能走这条路。
+#: 读）。转发里的视频**不产生媒体条目**（抽帧识别只接了直发视频，v1.9.0），
+#: 所以它的"可数线索"只能走这条路。
 _SEGMENT_VIDEO_COUNT = '_hdsiForwardVideoCount'
 
 
