@@ -46,9 +46,14 @@ from ..core.service.helpers import (
     COLLECTED_STICKER_GROUP_NAME,
     STICKER_DESCRIPTION_MAX,
     STICKER_NAME_MAX,
+    #: 行里的 `filePath` 与盘上文件对不上时的兜底（§56）：按内容哈希在库根下找回。
+    #: 候选路径的拼法也在这里（三条写法都要能读），控制台不另写一套。
+    find_sticker_by_hash,
     safe_sticker_group_name,
     sticker_disabled_by,
     sticker_group_name_problem,
+    sticker_path_candidates,
+    sticker_path_inside,
     #: 表情库根目录的唯一判据（§54）：控制台的回落与服务层算出的是**同一个根**。
     sticker_root_from,
 )
@@ -69,11 +74,17 @@ from .astrbot_bridge import (
     NESTED_MODEL_SECTIONS,
     PLUGIN_NAME,
     _plugin_version,
+    #: 无实例上下文处的降级日志（`core/service/base.py` 的实现，桥接层转出）。
+    #: 控制台自己也要留痕（"按哈希找回"必须**可见**），所以从桥接层引入同一份实现，
+    #: 而不是在本模块再包一层 `logging`（两份 sink = 一半日志进不了控制台缓冲）。
+    log_fallback,
 )
 
 __all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'CONNECTION_TASK_LABELS',
-           'CONTEXT_SECTION_LABELS', 'INTERNAL_INTENT_TYPES', 'mask_endpoint',
-           'load_config_schema', 'coerce_schema_value', 'effective_field_value']
+           'CONTEXT_SECTION_LABELS', 'INTERNAL_INTENT_TYPES', 'StickerFileMissing',
+           'mask_endpoint', 'load_config_schema', 'coerce_schema_value',
+           'effective_field_value', 'shorten_path', 'sticker_file_diagnostics',
+           'sticker_path_candidates', 'sticker_relative_file', 'STICKER_PATH_KEEP']
 
 #: 控制台「模型」页展示的任务顺序与中文名（与 `model_routing` 的任务键一致）。
 #: ⚠️ 这是**路由任务表**（谁在跑哪个任务），不是连接行的「用途」徽章表——
@@ -211,7 +222,7 @@ def sticker_relative_file(row: Any) -> str:
     （缩略图 404，真机症状）。这里与其余消费方对齐。
 
     安全性没有降低：逐段丢掉空段 / `.` / `..` 与盘符（任何 `../` 都被结构性消掉），
-    再由调用方的 `os.path.commonpath([target, root]) == root` 兜底归属。
+    再由调用方的归属判定（`helpers.sticker_path_inside`）兜底。
     空串 = 这条素材没有可用的文件坐标。
     """
     value = _text(_record(row).get('filePath')).replace('\\', '/')
@@ -222,6 +233,96 @@ def sticker_relative_file(row: Any) -> str:
             continue
         parts.append(piece)
     return '/'.join(parts)
+
+
+#: 取图失败的诊断里**保留的路径段数**（`…/a/b/c`）。
+#:
+#: 控制台是登录后的管理页：完整绝对路径**可以**给它（诊断字段 `root` / `tried` 里就是
+#: 完整的），但日志与面板那句短提示只留末尾几段——整条磁盘结构（用户名、部署目录）
+#: 对排查没用，写进日志只是多一份泄漏面。6 段的用意：真机最常见的两种根
+#: （`…/plugin_data/astrbot_plugin_hds_interlude/data/hds-interlude/stickers` 与
+#: "回落到了 cwd"的 `…/<cwd 尾段>/data/hds-interlude/stickers`）正好在这一段上分得开。
+STICKER_PATH_KEEP = 6
+
+
+def shorten_path(path: Any, keep: int = STICKER_PATH_KEEP) -> str:
+    """路径 → 只留末尾 `keep` 段（前面用 `…/` 顶掉）。段数不够就原样回。
+
+    给**日志**与**面板短提示**用（绝对路径进诊断字段，不进日志）。
+    """
+    text = _text(path).strip()
+    if not text:
+        return ''
+    parts = [piece for piece in text.replace('\\', '/').split('/') if piece]
+    if len(parts) <= max(1, int(keep)):
+        return text
+    return '…/' + '/'.join(parts[-max(1, int(keep)):])
+
+
+class StickerFileMissing(FileNotFoundError):
+    """取不到图：`FileNotFoundError` + **它找过哪儿**的结构化诊断。
+
+    为什么要单独一个类型：宿主 bridge 只把响应的 `message` 透给面板（`data` 在
+    `plugin_page_bridge` 那一层丢掉了，实测），所以"找的是哪儿"必须**进 message**；
+    完整路径、两个来源（配置 `stickers.directory` / 插件数据目录）与 `isfile` 结果进
+    `diagnostics`，由 `main.py` 放进 `error_response(..., data=...)`，供面板工具提示、
+    curl 与用例断言。
+
+    路径纪律：`diagnostics` 只给**判据用到的那几个值**（根、目标、两个来源），
+    不列目录、不带环境变量、不带堆栈——用户要的是"它找的是哪儿"，不是整个磁盘结构。
+    """
+
+    def __init__(self, message: str, diagnostics: Any = None) -> None:
+        super().__init__(message)
+        self.diagnostics: dict[str, Any] = dict(diagnostics) if isinstance(
+            diagnostics, dict,
+        ) else {}
+
+
+def _sticker_file_size(path: Any) -> Any:
+    """文件字节数；拿不到（权限 / 竞态）回 `None`——诊断字段宁可有洞也不许抛。"""
+    try:
+        return os.path.getsize(_text(path))
+    except OSError:
+        return None
+
+
+def sticker_file_diagnostics(
+    asset_id: Any,
+    row: Any,
+    root: Any,
+    directory: Any,
+    data_dir: Any,
+) -> dict[str, Any]:
+    """取图失败时要暴露的**诊断字段**（wire camelCase，与列表项同一套拼写）。
+
+    `tried` 是**依次真的尝试过的绝对路径**（相对根 / 绝对 / 相对数据目录三条写法，
+    外加"按哈希找回"命中的那一个）；`isfile` / `size` 是最后一次尝试的结果。
+    `directory` / `dataDir` 是**两个来源的当前值**——"写成 A、读成 B"一眼可见。
+    """
+    record = _record(row)
+    raw = _text(record.get('filePath'))
+    return {
+        'assetId': _text(asset_id).strip(),
+        #: 行里记的**原样**值（绝对还是相对，看这一条）。
+        'filePath': raw,
+        #: 归一化后的相对路径（控制台实际拿去拼的那一段）。
+        'relative': sticker_relative_file(record),
+        #: 解析出来的库根（绝对路径）。
+        'root': _text(root),
+        #: 配置 `stickers.directory` 的原值（可能与默认值不同）。
+        'directory': _text(directory),
+        #: 插件数据目录（`bridge.data_dir`）——与根拼起来就是 `root`。
+        'dataDir': _text(data_dir),
+        'tried': [],
+        'isfile': False,
+        'size': None,
+        #: 行里记的内容哈希（"按哈希找回"就是拿它去扫库根）。
+        'hash': _text(record.get('hash')),
+        #: None / `filePath`（行里那条路径就有）/ `hash`（靠内容哈希找回的）。
+        'found': None,
+        'reason': '',
+    }
 
 
 def sticker_group_display_name(names: Any, raw: Any) -> str:
@@ -2547,19 +2648,85 @@ class ConsoleApi:
     async def sticker_file(self, asset_id: Any) -> str:
         """按 `assetId` 解析图片的**绝对路径**（调用方用 `file_response` 回字节）。
 
-        只认库里那一行记着的 `filePath` 的 basename，并且再确认一次解析结果确实落在
-        表情库根目录里——`filePath` 是继承来的数据，不能让一个被改坏的值读任意文件。
-        非法 `assetId` 一律 `ConsoleError`（400），文件不在就是 404。
+        唯一实现是 `_sticker_file_detail()`：`filePath` 是继承来的数据，所以先用**归属
+        判定**（`helpers.sticker_path_inside`）确认解析结果落在表情库根目录里，任何越界
+        值都不读（被改坏的 `../secret.txt` 仍然是 404）；行里那条路径不存在时，再按
+        内容哈希在库根下**兜底找回**（§56），两边都没有才报带诊断的 404。
+
+        非法 `assetId` 一律 `ConsoleError`（400）；行里连文件名都没有（且没有哈希）
+        也是 400——那是**数据坏了**，不是"文件不在"，两者不能混成同一个回应。
+        """
+        path, _diagnostics = await self._sticker_file_detail(asset_id)
+        return path
+
+    async def _sticker_file_detail(self, asset_id: Any) -> tuple[str, dict[str, Any]]:
+        """`assetId` → `(绝对路径, 诊断字典)`：**取图逻辑的唯一实现**（两条分支共用）。
+
+        步骤与判据：
+
+        1. 取行（非法 / 不存在 → 400）；
+        2. `filePath` → 候选绝对路径（相对根 / 绝对 / 相对数据目录三种写法，
+           `helpers.sticker_path_candidates`）；
+        3. 逐个候选判 **落在根里 + `isfile`**；命中就回（诊断里记下 `tried`）；
+        4. 都不在 → **按内容哈希在库根下找回**（`helpers.find_sticker_by_hash`），
+           命中记一条**可见 info**（"按哈希找回"）并回；
+        5. 仍然没有 → 抛 `StickerFileMissing`：message 里带上"找的是哪儿"（面板只有
+           message 可看），诊断字典里带根 / 两个来源 / 完整尝试路径。
+
+        根**仍然只有一处**：`self._sticker_root()`（服务层 → `helpers.sticker_root_from`）。
         """
         row = self._sticker_row_for_write(asset_id)
         name = sticker_relative_file(row)
-        if not name:
-            raise ConsoleError('这条素材没有记录文件名')
         root = self._sticker_root()
-        target = os.path.abspath(os.path.join(root, name))
-        if os.path.commonpath([target, root]) != root or not os.path.isfile(target):
-            raise FileNotFoundError('表情包文件不存在')
-        return target
+        directory = self._sticker_directory_config()
+        data_dir = _text(getattr(self.bridge, 'data_dir', ''))
+        diagnostics = sticker_file_diagnostics(asset_id, row, root, directory, data_dir)
+        if not root:
+            # 根拿不到（数据目录未知）：**绝不**拿空根去拼相对路径（那会退化成读 cwd）。
+            diagnostics['reason'] = 'root-unknown'
+            message = '表情包文件不存在：库根不可知（拿不到插件数据目录）'
+            log_fallback(
+                'warn', '表情包取图失败：库根不可知 素材=%s 数据目录=%s',
+                diagnostics['assetId'], shorten_path(data_dir, 2),
+            )
+            raise StickerFileMissing(message, diagnostics)
+        candidates = sticker_path_candidates(root, data_dir, name, row.get('filePath'))
+        if not candidates:
+            raise ConsoleError('这条素材没有记录文件名')
+        for candidate in candidates:
+            diagnostics['tried'].append(candidate)
+            if sticker_path_inside(root, candidate) and os.path.isfile(candidate):
+                diagnostics.update({
+                    'isfile': True,
+                    'size': _sticker_file_size(candidate),
+                    'found': 'filePath',
+                    'reason': '',
+                })
+                return candidate, diagnostics
+        recovered = find_sticker_by_hash(root, row.get('hash'), row.get('filePath'))
+        if recovered and sticker_path_inside(root, recovered) and os.path.isfile(recovered):
+            diagnostics['tried'].append(recovered)
+            diagnostics.update({
+                'isfile': True,
+                'size': _sticker_file_size(recovered),
+                'found': 'hash',
+                'reason': 'hash-recovered',
+            })
+            # **可见 info**：库里记的路径与盘上对不上，但按内容哈希找回来了。
+            # 这条必须让人看见（否则"素材好好的、只是换了位置"会变成一次静默的自我修复）。
+            log_fallback(
+                'info', '按哈希找回表情包文件 素材=%s 记录路径=%s 实际文件=%s',
+                diagnostics['assetId'], diagnostics['relative'] or '(空)',
+                shorten_path(recovered),
+            )
+            return recovered, diagnostics
+        diagnostics['reason'] = 'missing'
+        message = '表情包文件不存在：已找过 %s' % shorten_path(candidates[0])
+        log_fallback(
+            'warn', '表情包取图失败：已找过 %s（库根 %s）',
+            shorten_path(candidates[0]), shorten_path(root),
+        )
+        raise StickerFileMissing(message, diagnostics)
 
     async def sticker_file_inline(self, asset_id: Any) -> dict[str, Any]:
         """同一张图，改成回 **base64 JSON 信封**（`sticker-file?inline=1` 分支）。
@@ -2570,17 +2737,21 @@ class ConsoleApi:
         所以图片必须由后端包成 JSON 里的一串 base64（形状冻结在 `docs/PORTING_NOTES.md`
         §45.8，前端 `src/sticker-images.ts` 按这个形状接）。
 
-        纪律：**取文件逻辑只有一条**——先走 `sticker_file()` 那套（白名单 / basename 收敛 /
-        库外文件不许读 / 缺失即 404），这里只把读出来的字节包一层，不另写一份校验；
-        错误措辞因此与字节分支逐字一致（同一批异常、调用方同一批 `except`）。
+        纪律：**取文件逻辑只有一条**——与字节分支同一个 `_sticker_file_detail()`
+        （归属判定 / 兜底找回 / 缺失即带诊断的 404），这里只把读出来的字节包一层，
+        不另写一份校验；错误措辞因此与字节分支逐字一致（同一批异常、调用方同一批
+        `except`）。
         超过 `STICKER_INLINE_MAX_BYTES` 直接 400（防轰挂控制台，见该常量的注释）。
         """
         row = self._sticker_row_for_write(asset_id)
-        path = await self.sticker_file(asset_id)
+        path, diagnostics = await self._sticker_file_detail(asset_id)
         try:
             size = os.path.getsize(path)
         except OSError as error:  # 拿到路径后文件被删了：与"文件不在"同一种结果
-            raise FileNotFoundError('表情包文件不存在') from error
+            raise StickerFileMissing(
+                '表情包文件不存在：已找过 %s' % shorten_path(path),
+                {**diagnostics, 'isfile': False, 'size': None, 'reason': 'vanished'},
+            ) from error
         # 先看体积再读字节：超限时**一个字节都不读进内存**（大 GIF 就不该走 JSON 通道）。
         if size > STICKER_INLINE_MAX_BYTES:
             raise ConsoleError(
@@ -2591,14 +2762,25 @@ class ConsoleApi:
             with open(path, 'rb') as handle:
                 data = handle.read()
         except OSError as error:
-            raise FileNotFoundError('表情包文件不存在') from error
+            raise StickerFileMissing(
+                '表情包文件不存在：已找过 %s' % shorten_path(path),
+                {**diagnostics, 'isfile': False, 'size': None, 'reason': 'vanished'},
+            ) from error
         return {
             # 回显归一化后的 assetId（客户端用它把并发回来的信封对回自己那张图）。
             'assetId': _text(asset_id).strip(),
             # MIME 与字节分支同源：库里记的 `mimeType` 优先，没有才按魔数嗅探。
             'mimeType': guess_image_mime(data, row.get('mimeType')) or 'image/png',
             'size': len(data),
-            'data': base64.b64encode(data).decode('ascii'),
+            # ⚠️ 这个键**必须**叫 `base64`，不许叫 `data`（真机踩过，见 §45.8「宿主的
+            # `data` 解包」）：宿主父页面 bridge 递进 iframe 的值是
+            # `response.data?.data ?? response.data`（`PluginPagePage-*.js` 的 `api:get`
+            # 分支），而 `json_response()` 是**扁平**的（`astrbot/api/web.py` 不套
+            # `{status,data}`）——信封里那个叫 `data` 的键正好被它当成"整包"取走，
+            # iframe 收到一条裸 base64 字符串，前端解析器（只认对象信封 / `data:` URL）
+            # 判 `null` → 整屏缩略图全变成"取不到图"，而后端是 200、日志干干净净。
+            # 叫 `base64` 时那一跳取不到 `.data` → 原样递整个信封 → 前端认 `record.base64`。
+            'base64': base64.b64encode(data).decode('ascii'),
         }
 
     async def update_sticker(self, payload: Any) -> dict[str, Any]:
@@ -3089,6 +3271,18 @@ class ConsoleApi:
         if callable(refresh):
             await refresh()
 
+    def _sticker_directory_config(self) -> str:
+        """配置里 `stickers.directory` 的**原值**（读不出来回空串 → 走默认目录）。
+
+        单独一个方法：`_sticker_root()` 与取图失败的诊断都要读它。**同一份读取**，
+        否则诊断里报的"配置值"可能与真正用来拼根的那个值不是同一个（那正是最误导人的
+        一种诊断）。
+        """
+        try:
+            return _text(self.bridge.section('stickers').get('directory'))
+        except Exception:  # noqa: BLE001 - 配置读不出来就按默认目录
+            return ''
+
     def _sticker_root(self) -> str:
         """表情库根目录的绝对路径（**控制台里唯一的那一处推导**）。
 
@@ -3110,11 +3304,7 @@ class ConsoleApi:
                     return os.path.abspath(root)
             except Exception:  # noqa: BLE001 - 回落
                 pass
-        try:
-            directory = _text(self.bridge.section('stickers').get('directory'))
-        except Exception:  # noqa: BLE001 - 配置读不出来就按默认目录
-            directory = ''
-        return sticker_root_from(_text(self.bridge.data_dir), directory)
+        return sticker_root_from(_text(self.bridge.data_dir), self._sticker_directory_config())
 
     def _sticker_row(self, asset_id: Any) -> Optional[dict[str, Any]]:
         """按 `assetId` 取一行（取不到回 `None`）。"""

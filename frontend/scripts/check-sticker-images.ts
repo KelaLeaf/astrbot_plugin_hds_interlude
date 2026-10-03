@@ -61,7 +61,7 @@ function envelope(n = 1): { mimeType: string; base64: string } {
   return { mimeType: 'image/png', base64: bytesToBase64(new Uint8Array([n, n, n])) }
 }
 
-function harness(options: { fail?: (assetId: string) => boolean; unsupported?: (assetId: string) => boolean; hold?: number } = {}) {
+function harness(options: { fail?: (assetId: string) => boolean; unsupported?: (assetId: string) => boolean; hold?: number; failMessage?: (assetId: string) => string } = {}) {
   const loads: string[] = []
   const released: string[] = []
   let live = 0
@@ -76,7 +76,11 @@ function harness(options: { fail?: (assetId: string) => boolean; unsupported?: (
       try {
         await new Promise((resolve) => setTimeout(resolve, options.hold ?? 1))
         if (options.unsupported?.(assetId)) throw new UnsupportedStickerImage()
-        if (options.fail?.(assetId)) throw new Error('网络抖了一下')
+        // 后端 404 的错误消息由宿主桥接层压成一个 `Error(message)`（`data` 那一层会被
+        // 丢掉），所以"它找的是哪儿"全在这条 message 里——harness 要能造出这条形状。
+        if (options.fail?.(assetId)) {
+          throw new Error(options.failMessage?.(assetId) ?? '网络抖了一下')
+        }
         return envelope(loads.length)
       } finally {
         live -= 1
@@ -192,6 +196,31 @@ function harness(options: { fail?: (assetId: string) => boolean; unsupported?: (
   assert.deepEqual(loads, [])
 }
 
+/* --------------------------------- 失败理由（面板那句"取不到图"靠它说清找的是哪儿） */
+
+{
+  const reason = '表情包文件不存在：已找过 …/stickers/collected/e6f0f8cae70cbd897bad1f538ed92585.jpg'
+  const { cache } = harness({ fail: (id) => id === 'bad', failMessage: () => reason })
+  assert.equal(await cache.get('bad'), null)
+  assert.equal(cache.reason('bad'), reason, '后端的 message 要原样留住')
+  assert.equal(cache.reason('never-asked'), '', '没问过就回空串（不是 undefined）')
+  const ok = await cache.get('good')
+  assert.ok(ok)
+  assert.equal(cache.reason('good'), '', '成功那条不许留理由')
+  cache.dispose()
+  assert.equal(cache.reason('bad'), '', 'dispose 之后理由也清掉（不留上一轮的残渣）')
+}
+
+// 老后端 / 没理由的失败：**不编原因**（面板照旧显示那句状态词）。
+{
+  const { cache } = harness({ unsupported: () => true })
+  assert.equal(await cache.get('x'), null)
+  assert.equal(cache.reason('x'), '', '没有后端消息就没有理由')
+  const netFail = harness({ fail: () => true, failMessage: () => '   ' })
+  assert.equal(await netFail.cache.get('y'), null)
+  assert.equal(netFail.cache.reason('y'), '', '空消息等于没有理由')
+}
+
 /* ------------------------------------------------- 生产金样（真后端取下来的那份） */
 
 // fixtures/sticker-inline-response.json 是**真实后端** `console/sticker-file?inline=1` 的
@@ -201,21 +230,32 @@ const goldenRaw = readFileSync(join(here, 'fixtures', 'sticker-inline-response.j
 const golden = JSON.parse(goldenRaw) as Record<string, unknown>
 assert.deepEqual(
   Object.keys(golden).sort(),
-  ['assetId', 'data', 'mimeType', 'size'],
+  ['assetId', 'base64', 'mimeType', 'size'],
   '金样的四键集合变了（后端形状漂了？先看 fixtures/README.md）',
 )
+// ⚠️ 键名必须叫 `base64`：宿主父页面递进 iframe 的是 `response.data?.data ?? response.data`，
+// 信封里叫 `data` 的那个键会被它当成"整包"取走，iframe 只拿到一条裸 base64 字符串
+// （`parseImageEnvelope` 判 null → 整屏"取不到图"，后端却是 200）。见 §45.8。
 assert.equal(typeof golden.assetId, 'string')
 assert.equal(typeof golden.size, 'number')
+
+// **宿主那一跳**（逐字照 `PluginPagePage-*.js` 的 `api:get` 分支）：金样喂进解析器之前，
+// 先过一次解包——少了这一步，"后端形状对不对"与"客户端收得到什么"就是两件事。
+const delivered = (golden as { data?: unknown }).data ?? golden
+assert.ok(
+  parseImageEnvelope(delivered),
+  '金样经过宿主 bridge 的 data 解包之后仍要能被解析（收不到 = 真机就是取不到图）',
+)
 
 const goldenPayload = parseImageEnvelope(golden)
 assert.ok(goldenPayload, '金样必须能被前端解析器认出来（认不出 = 夹具过期或解析器漏了形状）')
 assert.equal(goldenPayload?.mimeType, 'image/png', 'MIME 要原样接受，别自己改成别的')
 const goldenBytes = base64ToBytes(goldenPayload!.base64)
-assert.equal(goldenBytes.length, golden.size, 'data 解出来的字节数必须等于 size')
+assert.equal(goldenBytes.length, golden.size, 'base64 解出来的字节数必须等于 size')
 assert.deepEqual(
   [...goldenBytes.slice(0, 8)],
   [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
-  'data 得是真 PNG 字节',
+  'base64 得是真 PNG 字节',
 )
 // Blob / objectURL 链路：Node 没有 createObjectURL，注入假工厂看它拿到什么。
 let seen: Blob | null = null
@@ -234,4 +274,4 @@ if (typeof URL.createObjectURL === 'function') {
   URL.revokeObjectURL(realUrl)
 }
 
-console.log('sticker-images ok（含生产金样：四键齐 / 真 PNG 字节 / Blob 链路）')
+console.log('sticker-images ok（含生产金样：四键齐 / 过宿主那一跳 / 真 PNG 字节 / Blob 链路）')

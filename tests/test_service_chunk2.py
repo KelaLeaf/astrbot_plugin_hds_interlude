@@ -75,12 +75,17 @@ from plugin.core.service.helpers import (
     extract_session_audio_sources,
     extract_session_file_facts,
     extract_session_voice_count,
+    #: 取图路径的候选 / 归属判定 / 内容哈希兜底（§56）：与生产同一份纯函数。
+    find_sticker_by_hash,
     guess_audio_format,
     history_lexical_score,
     normalize_interaction,
     rank_sticker_catalog,
     should_downscale_image,
     stable_sticker_asset_id,
+    sticker_hash_prefixes,
+    sticker_path_candidates,
+    sticker_path_inside,
 )
 from plugin.core.service.transport import NullTransport
 from plugin.core.time import iso, utc_now
@@ -3970,6 +3975,100 @@ class StickerRootUnavailableTests(unittest.IsolatedAsyncioTestCase):
         host = self._host()
         self.assertIsNone(await host.store_collected_sticker(_png(), 'sticker'))
         self.assertEqual(await host.db_get('interlude_sticker', {}), [], '不许建"看起来成功"的档')
+
+
+class StickerPathResolutionTests(unittest.TestCase):
+    """§56：`filePath` 的三种写法都要能读 + 按内容哈希在库根下兜底找回。
+
+    这些是**纯函数**（不碰 AstrBot、不碰服务层）：控制台取图与将来别的消费方都从这一份
+    取候选。真机教训：行里记的路径与盘上的位置可以合法地差一截（旧版本削过分组目录、
+    旧写方记的是绝对路径 / 相对数据目录那一条），差一截就该按**内容哈希**找回，
+    而不是一路 404 到底。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = self._tmp.name
+        self.data_dir = os.path.join(self.tmp, 'plugin_data')
+        self.root = os.path.join(self.data_dir, 'data/hds-interlude/stickers')
+        os.makedirs(os.path.join(self.root, 'collected'), exist_ok=True)
+        self.digest = hashlib.sha256(_png()).hexdigest()
+
+    # ---- 候选路径（三种写法）----
+
+    def test_candidates_cover_relative_absolute_and_data_dir_writings(self):
+        inside = os.path.join(self.root, 'collected/a.png')
+        self.assertEqual(
+            sticker_path_candidates(self.root, self.data_dir, 'collected/a.png'), (inside,),
+        )
+        self.assertIn(
+            inside,
+            sticker_path_candidates(self.root, self.data_dir, 'a.png', inside),
+            '绝对路径（继承来的旧数据）也要算一个候选',
+        )
+        nested = sticker_path_candidates(
+            self.root, self.data_dir, 'data/hds-interlude/stickers/collected/a.png',
+        )
+        self.assertIn(inside, nested, '相对插件数据目录的写法要能收敛回同一个目标')
+        self.assertEqual(nested[-1], inside, '收敛出来的那个目标排在最后（先试原样的拼法）')
+        # 空文件名 / 空根不许拼出一个"看起来像路径"的东西出来。
+        self.assertEqual(sticker_path_candidates(self.root, self.data_dir, ''), ())
+        self.assertEqual(sticker_path_candidates('', self.data_dir, 'collected/a.png'), (),
+                         '没有根就一个候选都不给（空根拼出来的是 cwd）')
+
+    def test_an_escaped_relative_path_never_lands_inside_the_root(self):
+        """`../` 拼出来的候选**必须**被判在库外（归属判定是最后一道闸）。"""
+        candidates = sticker_path_candidates(self.root, self.data_dir, '../secret.txt')
+        self.assertTrue(candidates, '候选照拼——拦住它的是归属判定，不是这里假装没有')
+        for candidate in candidates:
+            self.assertFalse(sticker_path_inside(self.root, candidate), candidate)
+
+    def test_path_inside_is_a_boolean_and_never_raises(self):
+        """空根 / 相对路径 / 库外路径一律 `False`——`commonpath` 的 `ValueError` 不许漏出去。"""
+        self.assertFalse(sticker_path_inside('', os.path.join(self.root, 'a.png')))
+        self.assertFalse(sticker_path_inside(self.root, ''))
+        self.assertFalse(sticker_path_inside(self.root, 'a.png'), '相对路径不等于"在根里"')
+        self.assertFalse(sticker_path_inside(self.root, os.path.join(self.tmp, 'a.png')))
+        self.assertTrue(sticker_path_inside(self.root, os.path.join(self.root, 'a.png')))
+
+    # ---- 内容哈希前缀 + 兜底找回 ----
+
+    def test_hash_prefixes_take_the_columns_digest_and_a_hashed_file_name(self):
+        self.assertEqual(sticker_hash_prefixes(self.digest), (self.digest[:32],))
+        self.assertEqual(
+            sticker_hash_prefixes('', 'collected/%s.jpg' % self.digest[:32]),
+            (self.digest[:32],),
+        )
+        self.assertEqual(
+            sticker_hash_prefixes(self.digest, '%s.jpg' % self.digest[:32]),
+            (self.digest[:32],),
+            '两条来源同一个前缀时只留一个',
+        )
+        self.assertEqual(sticker_hash_prefixes('sticker-abc-1', 'paw.png'), (),
+                         '不是十六进制就不参与（那是文件名，不是哈希）')
+        self.assertEqual(sticker_hash_prefixes('abcdef'), (), '太短的前缀不参与')
+
+    def test_find_by_hash_searches_the_root_and_its_groups_and_wildcards_the_suffix(self):
+        on_disk = os.path.join(self.root, 'collected', '%s.jpg' % self.digest[:32])
+        with open(on_disk, 'wb') as handle:
+            handle.write(_png())
+        self.assertEqual(find_sticker_by_hash(self.root, self.digest), on_disk)
+        # 扩展名不确定：行里记的是 `.png`、盘上是 `.jpg`，按"前缀 + 任意后缀"照样找到。
+        self.assertEqual(
+            find_sticker_by_hash(self.root, self.digest, 'collected/whatever.png'), on_disk,
+        )
+        # 根目录这一层也要找（旧版本把文件直接落在根下）。
+        os.remove(on_disk)
+        flat = os.path.join(self.root, '%s.webp' % self.digest[:32])
+        with open(flat, 'wb') as handle:
+            handle.write(_png())
+        self.assertEqual(find_sticker_by_hash(self.root, self.digest), flat)
+        # 找不到就回空串：不抛、也不瞎猜一个路径出来。
+        self.assertEqual(
+            find_sticker_by_hash(self.root, hashlib.sha256(b'other').hexdigest()), '',
+        )
+        self.assertEqual(find_sticker_by_hash('', self.digest), '', '没有根就没有兜底')
 
 
 # --------------------------------------------------------------------------- #

@@ -868,10 +868,16 @@ class HDSInterludePlugin(Star):
 
         `file_response` 之外还要给下载文件名：素材的 `filePath` basename 就是它在
         表情库里的名字，直接拿来当 `filename` 最直观（前端也可以不下载、只显示）。
+
+        取不到图时**不许回一个空壳 404**（§56）：`message` 里带上"已找过哪儿"
+        （宿主 bridge 只把 message 透给面板，所以位置必须进 message），完整诊断
+        （库根 / 两个来源 / 完整尝试路径 / `isfile`）走 `error_response(data=...)`。
+        控制台是**登录后的管理页**，给完整绝对路径没问题；日志里只留末尾几段
+        （`console_api.shorten_path`），不把整条磁盘结构写进日志。
         """
         from astrbot.api.web import error_response, file_response, json_response
 
-        from .adapters.console_api import ConsoleError
+        from .adapters.console_api import ConsoleError, StickerFileMissing
 
         asset_id = ''
         inline = False
@@ -890,8 +896,14 @@ class HDSInterludePlugin(Star):
             path = await self._console.sticker_file(asset_id)
         except ConsoleError as error:
             return error_response(str(error), status_code=400)
-        except FileNotFoundError:
-            return error_response('表情包文件不存在（可能已被删除）', status_code=404)
+        except StickerFileMissing as error:
+            return error_response(str(error), status_code=404, data=error.diagnostics)
+        except FileNotFoundError as error:
+            # 兜底分支：路径解析之外的 `FileNotFoundError`（不该发生）。**不静默**——
+            # 没有诊断时至少把原文带出去，别退化成一句"文件不存在"。
+            return error_response(
+                str(error) or '表情包文件不存在（可能已被删除）', status_code=404,
+            )
         except Exception as error:  # noqa: BLE001
             logger.warning('hds-interlude：读取表情包失败：%s' % error)
             return error_response('读取表情包失败：%s' % error, status_code=500)

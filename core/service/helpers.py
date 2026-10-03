@@ -88,6 +88,13 @@ __all__ = [
     'STICKER_DEFAULT_DIRECTORY',
     'host_data_dir',
     'sticker_root_from',
+    #: 行里的 `filePath` 与盘上文件对不上时的三条候选路径 / 按哈希兜底（§56）。
+    'sticker_path_inside',
+    'sticker_path_candidates',
+    'sticker_hash_prefixes',
+    'find_sticker_by_hash',
+    'STICKER_HASH_PREFIX_LENGTH',
+    'STICKER_HASH_MIN_LENGTH',
     # ---- 表情库分组 / 上传（本移植版新增，§47）----
     'COLLECTED_STICKER_GROUP_ID',
     'COLLECTED_STICKER_GROUP_NAME',
@@ -958,6 +965,139 @@ def sticker_root_from(data_dir: Any, directory: Any = '') -> str:
         return ''
     relative = _str(directory).strip() or STICKER_DEFAULT_DIRECTORY
     return os.path.abspath(os.path.join(base, relative))
+
+
+def sticker_path_inside(root: Any, path: Any) -> bool:
+    """`path` 是不是**落在库根里**（跨盘 / 空根 / 相对根一律 `False`，**绝不抛**）。
+
+    `os.path.commonpath` 在"绝对 + 相对混用"与"不同盘符"时抛 `ValueError`——库根拿不到
+    （空串）时它就是这么炸的，而那正是最需要给出诊断的时刻（真机：取图 500，前端只看到
+    "取不到图"）。所以这里把它压成布尔：**越界 / 判不出来 = 不许读**。
+    """
+    base = _str(root).strip()
+    target = _str(path).strip()
+    if not base or not target:
+        return False
+    try:
+        return os.path.commonpath(
+            [os.path.abspath(target), os.path.abspath(base)],
+        ) == os.path.abspath(base)
+    except ValueError:
+        return False
+
+
+def sticker_path_candidates(root: Any, data_dir: Any, name: Any, raw: Any = '') -> tuple[str, ...]:
+    """`filePath` → 依次尝试的绝对路径（去重、保序）。**根仍然只有调用方给的那一个**。
+
+    三种写法都要能读——"库里有行、取不到图"的成因就在这三种之间：
+
+    1. **相对库根**：当前唯一写入方（`chunk2.store_collected_sticker` 的
+       `collected/<hash>.jpg`）与扫盘（`Cat/a.png`）用的写法；
+    2. **绝对路径**：继承来的旧数据（别的版本 / 手工塞进库的行）；
+    3. **相对插件数据目录**：多带了一截库根前缀的写法
+       （`data/hds-interlude/stickers/collected/x.jpg`），旧版本或手工写入可能是这一种。
+
+    这里只拼候选，**归属判定与"哪个真实存在"由调用方做**（`sticker_path_inside` +
+    `os.path.isfile`）：拼出来的绝对路径不等于可以读。
+    """
+    base = _str(root).strip()
+    if not base:
+        # 没有根就**一个候选都不给**：空根拼出来的相对路径是"进程当前目录"，
+        # 那正是本工程反复踩过的那口井（调用方按"根不可知"显式失败）。
+        return ()
+    relative = _str(name).strip().replace('\\', '/').lstrip('/')
+    candidates: list[str] = []
+
+    def add(value: Any) -> None:
+        text = _str(value).strip()
+        if not text:
+            return
+        absolute = os.path.abspath(text)
+        if absolute not in candidates:
+            candidates.append(absolute)
+
+    if relative:
+        add(os.path.join(base, relative))
+    raw_text = _str(raw).strip()
+    if raw_text and os.path.isabs(raw_text):
+        add(raw_text)
+    base_dir = _str(data_dir).strip()
+    if relative and base and base_dir:
+        prefix = os.path.relpath(base, base_dir).replace('\\', '/').strip('/')
+        if prefix and prefix != '.' and relative.startswith(prefix + '/'):
+            add(os.path.join(base, relative[len(prefix) + 1:]))
+    return tuple(candidates)
+
+
+#: "按内容哈希找回"认的十六进制前缀长度（= 自动收藏落地名里那一段 `digest[:32]`）。
+STICKER_HASH_PREFIX_LENGTH = 32
+
+#: 十六进制哈希的判定（大小写都认）。长度不足 `STICKER_HASH_MIN_LENGTH` 的一律不参与。
+_HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
+
+#: "按哈希找回"接受的最短前缀。低于这个长度多半是**文件名**而不是哈希，
+#: 拿它去扫全库会撞出一堆别人的素材。
+STICKER_HASH_MIN_LENGTH = 16
+
+
+def sticker_hash_prefixes(hash_value: Any, file_path: Any = '') -> tuple[str, ...]:
+    """`hash` 列 / `filePath` → 可用于"按哈希找回"的文件名前缀（去重、保序）。
+
+    自动收藏的落地名是 `<内容哈希前 32 位><扩展名>`，而 `hash` 列记的是**整条** sha256，
+    所以前缀取 `hash[:32]`；`filePath` 的 basename 往往就是那个名字（旧版本把分组目录
+    削掉过、写方也可能只记了文件名），所以它自己也算一个候选。
+    """
+    out: list[str] = []
+    raw_names = (
+        _str(hash_value).strip(),
+        os.path.splitext(os.path.basename(_str(file_path).replace('\\', '/')))[0].strip(),
+    )
+    for raw in raw_names:
+        text = raw.lower()
+        if len(text) < STICKER_HASH_MIN_LENGTH or not _HEX_RE.match(text):
+            continue
+        prefix = text[:STICKER_HASH_PREFIX_LENGTH]
+        if prefix not in out:
+            out.append(prefix)
+    return tuple(out)
+
+
+def find_sticker_by_hash(root: Any, hash_value: Any, file_path: Any = '') -> str:
+    """在库根下按**内容哈希前缀**找回文件：找到回绝对路径，没有回空串。
+
+    只在 `<根>` 与 `<根>/<一级子目录>` 里找（分组就是一级子目录，扫盘也只收一级），
+    扩展名按"同名前缀 + 任意后缀"匹配——行里记的扩展名可能是错的 / 被改过的。
+    这是"行与盘对不上"的**兜底**：根仍然只由 `sticker_root_from()` 给出，这里不另算根。
+    """
+    base = _str(root).strip()
+    if not base or not os.path.isdir(base):
+        return ''
+    prefixes = sticker_hash_prefixes(hash_value, file_path)
+    if not prefixes:
+        return ''
+    directories = [base]
+    try:
+        with os.scandir(base) as entries:
+            subdirs = sorted(
+                entry.path for entry in entries
+                if entry.is_dir(follow_symlinks=False)
+            )
+    except OSError:
+        subdirs = []
+    directories.extend(subdirs)
+    for directory in directories:
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for name in names:
+            stem, extension = os.path.splitext(name)
+            if not extension or stem.lower() not in prefixes:
+                continue
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+    return ''
 
 
 # =========================================================================== #

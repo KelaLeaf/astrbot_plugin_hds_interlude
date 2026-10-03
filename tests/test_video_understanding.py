@@ -1387,6 +1387,146 @@ class BudgetConfigTests(VideoTestCase):
 
 
 # =========================================================================== #
+# 4.5.6 群聊 = 同一套设置（v1.9.2）：命令行逐项同款，画面进不去只说一次
+# =========================================================================== #
+
+class _TimeoutRecordingFfmpeg(FakeFfmpeg):
+    """`FakeFfmpeg` + 记下每条命令拿到的 `timeout`。
+
+    超时也是配置项（`timeout_seconds`），只在 `_run_ffmpeg(binary, args, timeout)` 这个
+    **调用参数**里，argv 上看不见——所以"群里有没有沿用超时设置"必须有地方能断言。
+    """
+
+    def __init__(self, **fields: Any) -> None:
+        super().__init__(**fields)
+        self.timeouts: list[float] = []
+
+    def __call__(self, binary: str, args: list[str], timeout: float) -> tuple[int, str, str]:
+        self.timeouts.append(timeout)
+        return super().__call__(binary, args, timeout)
+
+
+class GroupVideoParityTests(VideoTestCase):
+    """群回合沿用**同一份设置**：抽帧模式 / 帧数 / 音轨格式 / 音轨时长 / 超时逐项同款。
+
+    用户口径（`group_enabled` 的 hint）："群里沿用上面同一套设置；群回合没有视觉通道，
+    画面进不去会说明一次。" 所以这里断言的**不是"差不多"**，而是两条 ffmpeg 命令行
+    逐字相同（只有临时目录不同），外加"画面进不去"那条说明同一原因只说一次。
+
+    变异保护：在群路径上给任何一项写死（例如群里恒用 `sequence` / 恒抽默认 3 帧 /
+    恒按 60 秒截音轨 / 恒用 20 秒超时），`test_every_item_reaches_the_group_unchanged`
+    必红——它与私聊跑同一份配置，逐字对比 argv 与 timeout。
+    """
+
+    async def _run(
+        self, host: Host, session: SessionView, ffmpeg: FakeFfmpeg, *, group: bool,
+    ) -> video.VideoMedia:
+        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
+                mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg):
+            if group:
+                return await video.collect_group_video_media(host, {'id': 's'}, session)
+            return await video.collect_video_sources(host, {'id': 's'}, session)
+
+    @staticmethod
+    def _argvs(ffmpeg: FakeFfmpeg, media: video.VideoMedia) -> dict[str, list[list[str]]]:
+        """三条命令各自的 argv，临时目录路径换成 `<dir>`（两次运行必然不同）。"""
+        def fix(argv: list[str]) -> list[str]:
+            return [arg.replace(media.workdir, '<dir>') if media.workdir else arg for arg in argv]
+        return {
+            kind: [fix(argv) for argv in ffmpeg.argvs(kind)]
+            for kind in ('probe', 'frames', 'audio')
+        }
+
+    def _config(self, **video_keys: Any) -> dict[str, Any]:
+        config = video_config()
+        config['model']['video'].update(video_keys)
+        return config
+
+    async def test_every_item_reaches_the_group_unchanged(self) -> None:
+        """群开关开 + 平均抽帧 2 帧 + `audio_duration=unlimited`：与私聊**逐项同款**。
+
+        一项一项钉：`frame_mode` / `frame_average_count` / `frame_interval_seconds` /
+        `out_format` / `audio_duration`（`unlimited` = 没有 `-t`）/ `timeout_seconds`。
+        """
+        config = self._config(
+            group_enabled=True, frame_mode='average', frame_average_count=2,
+            frame_interval_seconds=10, out_format='ogg',
+            audio_duration='unlimited', timeout_seconds=7,
+        )
+        private_ffmpeg = _TimeoutRecordingFfmpeg()
+        private = await self._run(
+            Host(config=config), video_session(is_direct=True), private_ffmpeg, group=False,
+        )
+        group_ffmpeg = _TimeoutRecordingFfmpeg()
+        group_host = Host(config=config)
+        group = await self._run(
+            group_host, video_session(is_direct=False), group_ffmpeg, group=True,
+        )
+
+        # ① 命令行逐字相同：探测 / 抽帧 / 音轨三条，一条都不许走另一套。
+        self.assertEqual(
+            self._argvs(group_ffmpeg, group), self._argvs(private_ffmpeg, private),
+            '群里的 ffmpeg 命令行必须与私聊逐项同款（只有临时目录不同）',
+        )
+        self.assertEqual(group_ffmpeg.timeouts, private_ffmpeg.timeouts, '超时秒数也是同一份配置')
+        self.assertEqual(group_ffmpeg.timeouts, [7.0, 7.0, 7.0])
+
+        # ② 每一项**真的**落在群那条命令行上（写死哪一项，这里就指得出是它）。
+        frames = group_ffmpeg.argvs('frames')[0]
+        self.assertIn('fps=%.6f' % (2 / 12), frames, '平均抽帧 2 帧 / 12 秒')
+        self.assertEqual(frames[frames.index('-frames:v') + 1], '2')
+        self.assertEqual(frames[frames.index('-t') + 1], str(video.VIDEO_MAX_DURATION_SECONDS))
+        audio = group_ffmpeg.argvs('audio')[0]
+        self.assertNotIn('-t', audio, 'unlimited = 不给 ffmpeg 传 -t')
+        self.assertEqual(audio[audio.index('-f') + 1], 'ogg')
+        self.assertTrue(audio[-1].endswith('audio.ogg'), audio[-1])
+
+        # ③ 唯一的差别：画面帧丢弃、音轨照常交出去。
+        self.assertTrue(private.image_sources, '私聊照常交帧')
+        self.assertEqual(group.image_sources, [], '群回合没有视觉通道 → 帧不进任何通道')
+        self.assertTrue(group.audio_sources, '音轨走既有语音通道')
+
+        # ④ 正文事实写实：说清"帧没进去"，不谎称"抽了 N 帧画面"。
+        self.assertIn(video.GROUP_NO_VISION_REASON, group.note)
+        self.assertIn('已单独抽出整段音轨', group.note)
+        self.assertNotIn('帧画面', group.note)
+
+    async def test_the_frames_are_lost_exactly_once_per_reason(self) -> None:
+        """**说明一次**：同故事同原因 10 分钟内只说一条 warn（节流口 `note_access_skip`）。"""
+        config = self._config(group_enabled=True)
+        host = Host(config=config)
+        await self._run(
+            host, video_session(is_direct=False), _TimeoutRecordingFfmpeg(), group=True,
+        )
+        self.assertEqual(len(host.warns()), 1)
+        self.assertIn('群回合没有视觉通道', host.warns()[0])
+        # 同一分钟内的第二条视频：正文事实照旧，但不再刷同一条说明。
+        await self._run(
+            host, video_session(is_direct=False), _TimeoutRecordingFfmpeg(), group=True,
+        )
+        self.assertEqual(len(host.warns()), 1, '同原因只明说一次')
+
+    def test_the_group_judgement_lives_in_exactly_one_place(self) -> None:
+        """判据一处：模块里只有 `group_enabled` 那一道闸读会话是不是群聊。
+
+        群里**不许**有第二处特判（"群里就不抽帧了" / "群里固定抽 3 帧"那类）：出现第二处
+        `_is_group_session(...)` 调用，或者它跑到抽帧路径上去，这一条就红。
+        """
+        source = _read('core/video_understanding.py')
+        code = _code_only(source)
+        self.assertEqual(code.count('_is_group_session('), 2, '一处定义 + 一处调用')
+        gate = "if _is_group_session(session) and not config['group_enabled']:"
+        self.assertIn(gate, source)
+        # 抽帧那一段（`extract_video` 调用点）里不许再出现群判据。
+        extract = source.split('extraction = await asyncio.to_thread(', 1)[1].split(
+            'result.workdir = extraction.workdir', 1,
+        )[0]
+        self.assertNotIn('_is_group_session', extract)
+        self.assertIn("frame_mode=config['frame_mode']", extract)
+        self.assertIn("average_frames=config['frame_average_count']", extract)
+
+
+# =========================================================================== #
 # 7. 适配层接线：指名 Provider 那一套（任务键、合成行、能力自检）
 # =========================================================================== #
 

@@ -5,8 +5,13 @@
 ## `sticker-inline-response.json`
 
 `console/sticker-file?assetId=…&inline=1` 的真实响应（`ConsoleApi.sticker_file_inline()`
-经宿主路由 `main.page_console_sticker_file` 出来的那份 JSON）：`{assetId, mimeType, size, data}`，
-`data` 是一张**真 96×96 PNG** 的 base64（真机 harness 会回放它并断言 `<img>.naturalWidth === 96`）。
+经宿主路由 `main.page_console_sticker_file` 出来的那份 JSON）：
+`{assetId, mimeType, size, base64}`，`base64` 是一张**真 96×96 PNG** 的 base64
+（真机 harness 会回放它并断言 `<img>.naturalWidth === 96`）。
+
+> ⚠️ 键名是 `base64`，**不是 `data`**：宿主父页面递进 iframe 的是
+> `response.data?.data ?? response.data`，叫 `data` 的那个键会被当成"整包"取走，
+> iframe 只收到一条裸 base64 字符串 → 整屏「取不到图」。见 `docs/PORTING_NOTES.md` §45.8.1。
 
 > 为什么必须有它：前端曾经"对着自己写的桩后端"验证缩略图能不能出来 —— 桩比生产更宽或更窄
 > 都不算验证（`docs/PORTING_NOTES.md` §45.8、施工坑汇编里"夹具不许造生产不存在的东西"）。
@@ -19,7 +24,7 @@ python3 plugin/frontend/scripts/fixtures/regenerate-sticker-inline-fixture.py
 ```
 
 它跑的是真实路由（底层 `ConsoleApi.sticker_file_inline`，用仓库自己的真内存库 + 真文件夹具），
-写完会自检"四键齐、`data` 逐字节等于原文件、确实是 PNG"。
+写完会自检"四键齐、`base64` 逐字节等于原文件、确实是 PNG"。
 
 ### 什么时候该重跑
 
