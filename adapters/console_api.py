@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import inspect
 import json
 import os
@@ -48,6 +49,8 @@ from ..core.service.helpers import (
     safe_sticker_group_name,
     sticker_disabled_by,
     sticker_group_name_problem,
+    #: 表情库根目录的唯一判据（§54）：控制台的回落与服务层算出的是**同一个根**。
+    sticker_root_from,
 )
 from ..core.token_stats import normalize_range, range_bounds, summarize_usage
 from ..core.story_state import decode_story_state
@@ -68,10 +71,14 @@ from .astrbot_bridge import (
     _plugin_version,
 )
 
-__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'CONTEXT_SECTION_LABELS', 'INTERNAL_INTENT_TYPES', 'mask_endpoint',
-           'load_config_schema', 'coerce_schema_value']
+__all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'CONNECTION_TASK_LABELS',
+           'CONTEXT_SECTION_LABELS', 'INTERNAL_INTENT_TYPES', 'mask_endpoint',
+           'load_config_schema', 'coerce_schema_value', 'effective_field_value']
 
 #: 控制台「模型」页展示的任务顺序与中文名（与 `model_routing` 的任务键一致）。
+#: ⚠️ 这是**路由任务表**（谁在跑哪个任务），不是连接行的「用途」徽章表——
+#: `timeline` 没有独立的 `use_for_*` 开关（它跟随 compaction），见下面的
+#: `CONNECTION_TASK_LABELS`。
 CONSOLE_TASKS: tuple[tuple[str, str], ...] = (
     ('main', '主叙事'),
     ('compaction', '压缩与总结'),
@@ -80,6 +87,23 @@ CONSOLE_TASKS: tuple[tuple[str, str], ...] = (
     ('embedding', 'Embedding'),
     ('stickers', '表情包描述'),
     ('vision', '侧端识图'),
+)
+
+#: 连接行「用途」徽章：**逐字等于** `use_for_*` 键（`model_routing.is_assigned_to` 认的
+#: 那九个任务）。为什么与 `CONSOLE_TASKS` 分开：那张表里有 `timeline`（它没有独立开关，
+#: 跟随 compaction），拿它去拼 `use_for_timeline` 会永远读不到——勾了的用途在界面上
+#: 一个都显示不出来（用户点名的"指明了却不生效"那类误导）；反过来 `world_seeding` /
+#: `works` / `video` 三个键**不在**那张表里，于是勾了也看不见。
+CONNECTION_TASK_LABELS: tuple[tuple[str, str], ...] = (
+    ('main', '主叙事'),
+    ('compaction', '后台压缩'),
+    ('alter', 'Alter 分析'),
+    ('embedding', 'Embedding'),
+    ('stickers', '表情包描述'),
+    ('vision', '侧端识图'),
+    ('world_seeding', '世界播种'),
+    ('works', '共同作品写手'),
+    ('video', '视频理解'),
 )
 
 #: 纯宿主调度的 intent 类型：不是"她答应了什么"，用户看它只会困惑。
@@ -177,13 +201,27 @@ def sticker_kind(row: Any) -> str:
 
 
 def sticker_relative_file(row: Any) -> str:
-    """相对表情库根目录的文件名（**只取 basename**）。
+    """相对表情库根目录的**相对路径**（保留分组目录；`..` 被结构性地消掉）。
 
-    `filePath` 在库里理应就是相对名，但它是可从旧版本继承的数据，
-    不能让一个被改坏的 `filePath` 变成"读任意文件"。取 basename 之后，
-    任何 `../` 都被结构性地消掉了。
+    为什么不是 basename：本移植版的自动收藏把文件落在 `collected/<hash>.png`
+    （`chunk2.store_collected_sticker`），扫盘把一级子目录当分组
+    （`filePath = 'Cat/a.png'`），出站发送（`chunk2.send_sticker`）与删组搬迁
+    （`chunk2._plan_sticker_relocation`）全都按"**相对根目录的路径**"拼。控制台取图
+    曾经在这条链上取 basename——于是**凡是带分组目录的素材全都"库里有行、取不到图"**
+    （缩略图 404，真机症状）。这里与其余消费方对齐。
+
+    安全性没有降低：逐段丢掉空段 / `.` / `..` 与盘符（任何 `../` 都被结构性消掉），
+    再由调用方的 `os.path.commonpath([target, root]) == root` 兜底归属。
+    空串 = 这条素材没有可用的文件坐标。
     """
-    return os.path.basename(_text(_record(row).get('filePath')).replace('\\', '/'))
+    value = _text(_record(row).get('filePath')).replace('\\', '/')
+    parts: list[str] = []
+    for raw in value.split('/'):
+        piece = raw.strip()
+        if piece in ('', '.', '..') or ':' in piece:
+            continue
+        parts.append(piece)
+    return '/'.join(parts)
 
 
 def sticker_group_display_name(names: Any, raw: Any) -> str:
@@ -308,9 +346,17 @@ FIELD_NOTES: dict[str, str] = {
     'runtime.auto_create': '开启后第一次私聊会自动建故事；白名单仍优先决定谁能进来。',
 }
 
-#: 宿主配置页编辑不了「对象行列表」的提示（与 `_conf_schema.json` 里的 hint 同一句话）。
+#: 「对象行列表」在宿主配置页里的**不误导**提示（与 `_conf_schema.json` 里的 hint 逐字同一句）。
+#:
+#: 旧文案断言「此配置项不生效」——那是个**没有真机验证过**的结论：宿主 4.28 的产物里
+#: `type: "list"` 那条分支确实只给控件传 `modelValue` / `secret`（没有行 schema），可
+#: 「能不能落盘」「哪天会不会变」都不是我们读压缩产物能确定的。所以这里不下断言：
+#: 只说"看得见"，把**可执行的出路**（用本插件控制台改）与**怎么验证**给出来。
 #: 控制台**不**把这句铺在字段上（用户要求别在页面上重复解释），它留在数据里给将来的界面用。
-HOST_LIST_DEGRADED_NOTE = '⚠️此配置项不生效，请在「幕间控制台 → 配置」处进行配置'
+HOST_LIST_DEGRADED_NOTE = (
+    '这一项在宿主配置页可查看；若改不动、或保存后没生效，'
+    '请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。'
+)
 
 
 _SCHEMA_CACHE: dict[str, Any] = {'mtime': None, 'schema': {}}
@@ -440,6 +486,61 @@ def coerce_schema_value(spec: Any, value: Any, path: str = '') -> Any:
 
 #: 任务键 → 配置里对应的「指名模型」项（见 `AstrbotBridge.TASK_MODEL_PATHS`）。
 TASK_LABELS = dict(CONSOLE_TASKS)
+
+
+def _schema_default(spec: Any) -> tuple[Any, bool]:
+    """schema 节点 → `(默认值, 有没有默认值)`。
+
+    对象节点**逐子项递归**补一份出来（`{'enabled': True, ...}`）：宿主配置页对
+    `type: object` 的子项是递归渲染的，控制台的嵌套表单也一样——父对象缺了，子项就
+    全成了 `undefined`，界面上会挂一排「未设置」。
+    """
+    if not isinstance(spec, dict):
+        return None, False
+    default = spec.get('default')
+    if default is not None:
+        return copy.deepcopy(default), True
+    if str(spec.get('type')) == 'object' and isinstance(spec.get('items'), dict):
+        filled: dict[str, Any] = {}
+        for key, sub in spec['items'].items():
+            value, has = _schema_default(sub)
+            if has:
+                filled[key] = value
+        if filled:
+            return filled, True
+    return None, False
+
+
+def effective_field_value(field_key: str, spec: Any, current: Any) -> tuple[Any, str]:
+    """一个配置项的**生效值**与它的来源：`(value, 'explicit' | 'default' | 'missing')`。
+
+    ## 为什么要有它（用户点名的误导：「跟着"未设置"的标签」）
+
+    旧的判据是"磁盘配置里有没有这个键"：宿主每次加载都按 schema 重建配置，**新版本
+    新增的键在用户没去过宿主配置页之前根本不在文件里**（v1.9.0 的整个 `video` 组就是
+    这样）。于是控制台把"用的是默认值"显示成「未设置」+ 值显示成 `—`，用户看到的
+    是"这一项没配"，而运行期其实用的是默认值 —— 界面与行为相反（坑 34 的老病）。
+
+    新口径三选一，**说的就是事实**：
+
+    * `explicit`：磁盘上写过一个非空值（用户/宿主改过）；
+    * `default`：磁盘上没有，用的是 schema 默认值（**有值、有效**，不是"没设置"）；
+    * `missing`：既没写过、schema 也没有默认值 —— 只有这一种才真的是"没设过"。
+
+    读的值也一并对齐：`default` 把默认值填出来（对象递归），所以界面显示的就是
+    运行期真正生效的那一份。
+    """
+    present = isinstance(current, dict) and field_key in current
+    value = current.get(field_key) if isinstance(current, dict) else None
+    if present and value is not None:
+        return value, 'explicit'
+    default, has_default = _schema_default(spec)
+    if has_default:
+        # 显式写过但值是 `null` 也算『没有值』：运行期用的就是默认值。
+        return default, 'explicit' if (present and value is not None) else 'default'
+    if present:
+        return value, 'explicit'
+    return None, 'missing'
 
 
 def _resolve_schema_field(schema: Any, path: Any) -> dict[str, Any]:
@@ -856,7 +957,12 @@ class ConsoleApi:
                 'has_endpoint': bool(_text(raw.get('endpoint')).strip()),
                 'model': _text(raw.get('model')),
                 'has_key': bool(_text(raw.get('api_key')).strip()),
-                'tasks': [TASK_LABELS[key] for key, _ in CONSOLE_TASKS if raw.get(f'use_for_{key}') is True],
+                # 用途徽章按 `use_for_*` 逐键读（含 world_seeding / works / video），
+                # 不用路由任务表——那张表里的 `timeline` 没有独立开关（见上面的说明）。
+                'tasks': [
+                    label for key, label in CONNECTION_TASK_LABELS
+                    if raw.get('use_for_%s' % key) is True
+                ],
                 'prices': {
                     'input': raw.get('price_input') or 0,
                     'output': raw.get('price_output') or 0,
@@ -1366,9 +1472,15 @@ class ConsoleApi:
                         raw, path, read_section_path(raw, path),
                     )
                     field_present = bool(field_value)
+                    value_source = 'explicit' if field_present else 'default'
                 else:
-                    field_value = current.get(field_key, None)
-                    field_present = field_key in current
+                    # v1.9.1：值是**生效值**（磁盘上有就用磁盘的，没有就填 schema 默认值），
+                    # `present` = "这一项有生效值"。旧口径（"磁盘上有没有这个键"）会把
+                    # "用的是默认值"渲染成「未设置」+ `—`，与运行期相反（见
+                    # `effective_field_value` 的说明）。真要区分"用户改过没有"看
+                    # `value_source`（explicit / default / missing）。
+                    field_value, value_source = effective_field_value(field_key, spec, current)
+                    field_present = value_source != 'missing'
                 row = schema_row_fields(spec)
                 fields.append({
                     'key': field_key,
@@ -1397,6 +1509,10 @@ class ConsoleApi:
                     'advanced': bool(spec.get('advanced')),
                     'value': _mask_secrets(field_value),
                     'present': field_present,
+                    #: 值的来源：`explicit`（磁盘上写过）/ `default`（用的 schema 默认值）/
+                    #: `missing`（既没写过、schema 也没有默认值）。给界面用"默认值"这种
+                    #: 不误导的说法代替「未设置」；`present` 是它的布尔投影（下一轮前端跟改）。
+                    'value_source': value_source,
                     'note': host_editor_note(path, spec),
                     'delegated': path in DELEGATED_FIELDS,
                 })
@@ -2407,19 +2523,9 @@ class ConsoleApi:
             if key in counts:
                 counts[key] += 1
 
-        root = ''
-        config: dict[str, Any] = {}
-        service = self._service()
-        reader = getattr(service, 'sticker_library_root', None)
-        if callable(reader):
-            try:
-                root = _text(reader())
-            except Exception:  # noqa: BLE001 - 路径推导失败不影响列表
-                root = ''
-        if not root:
-            section = self.bridge.section('stickers')
-            directory = _text(section.get('directory')).strip() or 'data/hds-interlude/stickers'
-            root = os.path.abspath(os.path.join(_text(self.bridge.data_dir), directory))
+        # 列表里回给前端的 `root` 就是取图用的那一个：**同一处推导**（`_sticker_root`），
+        # 不再在这里另抄一份回落（§54）。
+        root = self._sticker_root()
         try:
             config = dict(self.bridge.section('stickers'))
         except Exception:  # noqa: BLE001
@@ -2984,7 +3090,17 @@ class ConsoleApi:
             await refresh()
 
     def _sticker_root(self) -> str:
-        """表情库根目录的绝对路径（服务层优先，回落到 bridge 数据目录 + 配置）。"""
+        """表情库根目录的绝对路径（**控制台里唯一的那一处推导**）。
+
+        服务层优先（`ServiceChunk2.sticker_library_root()` 是**生产唯一判据**：收藏
+        写入、扫盘与它读同一份 `helpers`）；服务层还没起来时才按 bridge 的数据目录
+        与配置回落——两处都会经过同一个纯函数 `helpers.sticker_root_from()`，
+        默认目录也来自同一个常量，不在这里再写第二份字面量。
+
+        列表、取图、上传、移动、删组搬迁全部走这一个方法：曾经 `stickers()` 自己
+        抄了一份回落（`bridge.data_dir` + 字面量默认目录），于是"服务层没起来"那条
+        分支与取图分支可以各算一个根。
+        """
         service = self._service()
         reader = getattr(service, 'sticker_library_root', None)
         if callable(reader):
@@ -2994,9 +3110,11 @@ class ConsoleApi:
                     return os.path.abspath(root)
             except Exception:  # noqa: BLE001 - 回落
                 pass
-        section = self.bridge.section('stickers')
-        directory = _text(section.get('directory')).strip() or 'data/hds-interlude/stickers'
-        return os.path.abspath(os.path.join(_text(self.bridge.data_dir), directory))
+        try:
+            directory = _text(self.bridge.section('stickers').get('directory'))
+        except Exception:  # noqa: BLE001 - 配置读不出来就按默认目录
+            directory = ''
+        return sticker_root_from(_text(self.bridge.data_dir), directory)
 
     def _sticker_row(self, asset_id: Any) -> Optional[dict[str, Any]]:
         """按 `assetId` 取一行（取不到回 `None`）。"""

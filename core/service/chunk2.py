@@ -110,6 +110,7 @@ from .helpers import (
     STICKER_AUTO_GROUP_MAX_GROUPS,
     STICKER_AUTO_GROUP_MAX_NEW_PER_DAY,
     STICKER_AUTO_GROUP_WINDOW_HOURS,
+    STICKER_DEFAULT_DIRECTORY,
     STICKER_DESCRIPTION_MAX,
     STICKER_FILE_SUFFIX,
     STICKER_FOLLOW_UP_MAX_PER_TURN,
@@ -153,6 +154,8 @@ from .helpers import (
     sticker_group_directory_ids,
     sticker_group_items,
     sticker_group_name_problem,
+    host_data_dir,
+    sticker_root_from,
     uploaded_sticker_asset_id,
     verify_sticker_image_bytes,
     visible_reply_text,
@@ -1379,7 +1382,7 @@ class ServiceChunk2(ServiceBase):
             'auto_disable': _config_value(
                 configured, 'autoDisable', 'auto_disable',
             ) is not False,
-            'directory': str(directory if directory else 'data/hds-interlude/stickers').strip(),
+            'directory': str(directory if directory else STICKER_DEFAULT_DIRECTORY).strip(),
             'max_file_size_mb': max(1.0, min(
                 30.0, _config_number(configured, 'maxFileSizeMB', 'max_file_size_mb', 10),
             )),
@@ -1482,6 +1485,11 @@ class ServiceChunk2(ServiceBase):
         self.sticker_scan_running = True
         try:
             root = self.sticker_library_root()
+            if not root:
+                # 根目录不可知时**必须直接退出**：往下走的话枚举结果是空列表，下面那圈
+                # "文件不在盘上就标 missing" 会把库里每一行都标成缺失——一次静默的
+                # 全库误伤。`sticker_library_root()` 已经打了可见 warn。
+                return
             lister = getattr(self.transport, 'list_sticker_files', None)
             files = await lister(root) if callable(lister) else _list_sticker_files(root)
             existing = await self.db_get('interlude_sticker', {})
@@ -1619,15 +1627,39 @@ class ServiceChunk2(ServiceBase):
             self.sticker_scan_running = False
 
     def sticker_library_root(self) -> str:
-        """表情库根目录的绝对路径（配置里的 `directory` 相对插件数据目录）。
+        """表情库根目录的绝对路径（配置里的 `directory` 相对**插件数据目录**）。
 
-        `scan_sticker_library()` 与自动收藏都从这一个地方取根 —— 两份路径推导迟早漂移，
-        而"收藏写进了 A 目录、扫描看的是 B 目录"会表现为"收了但库里没有"。
+        **唯一判据**（§54）：数据目录走 `helpers.host_data_dir()`（与
+        `chunk12.interlude_data_dir()` 同一个函数——权限表与表情库不会各读一个属性），
+        相对目录的拼接走 `helpers.sticker_root_from()`。收藏写入、扫盘、控制台读图、
+        删组搬迁全部从这里取根："收藏写进了 A 目录、扫描看的是 B 目录"会表现为
+        "收了但库里没有"。
+
+        数据目录**拿不到**时回空串（而不是 `abspath` 出来的 cwd 相对路径）：那种
+        静默回落会把文件写到进程当前目录里去，然后没人找得到它。这里同时打一条
+        **可见 warn**（每个实例一次），调用方按"根目录不可知"显式失败。
         """
-        return os.path.abspath(os.path.join(
-            str(getattr(self.ctx, 'base_dir', '') or ''),
-            str(self.sticker_config.get('directory') or ''),
-        ))
+        root = sticker_root_from(
+            host_data_dir(self), self.sticker_config.get('directory'),
+        )
+        if not root:
+            self._warn_sticker_root_unavailable()
+        return root
+
+    def _warn_sticker_root_unavailable(self) -> None:
+        """节流 warn：拿不到插件数据目录 → 表情库没有任何可用的根目录。
+
+        这是**能力缺失**（坑 25：需要用户看见的不许走 diagnostic）：静默回落会让
+        "收藏成功但文件找不到"变成无解之谜。每个实例只报一次（同一个原因不必刷屏）。
+        """
+        if getattr(self, '_sticker_root_warned', False):
+            return
+        self._sticker_root_warned = True
+        self.report_standalone(
+            'warn',
+            '表情库根目录不可用：拿不到插件数据目录（ctx.base_dir / context.base_dir 都是空的），'
+            '扫描与自动收藏已跳过——请检查 AstrBot 的 data 目录与 cwd（ASTRBOT_ROOT）配置。',
+        )
 
     async def describe_sticker_asset(
         self, asset: Any, payload: bytes, config: Any = None,
@@ -2108,6 +2140,14 @@ class ServiceChunk2(ServiceBase):
             return None
 
         root = self.sticker_library_root()
+        if not root:
+            # 根目录不可知（数据目录都拿不到）：**绝不建一个"看起来成功"的档**。
+            # `sticker_library_root()` 已经打了可见 warn，这里只负责不放行。
+            self.report_standalone_operation(
+                'standard', 'warn', '表情包收藏失败：表情库根目录不可用，未建档 来源种类=%s',
+                kind or 'sticker',
+            )
+            return None
         file_path = '%s/%s%s' % (
             COLLECTED_STICKER_DIR, digest[:32], STICKER_FILE_SUFFIX.get(mime, '.png'),
         )
@@ -2118,9 +2158,21 @@ class ServiceChunk2(ServiceBase):
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, 'wb') as handle:
                 handle.write(payload)
+            # **写出之后必须真的验一次**：这是本轮的真机教训——DB 里有档、盘上没文件，
+            # 控制台于是永远 404。`write()` 返回成功不等于文件在盘上（配额、只读挂载、
+            # 同步盘把它拦下、路径被重定向…），所以这里按"字节数相等"落地确认。
+            # 任何一步失败都不许建档（失败即 warn + 不建，见 §54）。
+            written = os.path.getsize(target)
         except OSError as error:
             self.report_standalone_operation(
-                'standard', 'warn', '表情包收藏落盘失败 文件=%s 错误=%s', file_path, error,
+                'standard', 'warn', '表情包收藏落盘失败，未建档 文件=%s 错误=%s', file_path, error,
+            )
+            return None
+        if written != len(payload):
+            self.report_standalone_operation(
+                'standard', 'warn',
+                '表情包收藏落盘不完整，未建档 文件=%s 期望=%dB 实际=%dB',
+                file_path, len(payload), written,
             )
             return None
 
@@ -2613,6 +2665,26 @@ class ServiceChunk2(ServiceBase):
             )
             return []
 
+    def _sticker_root_for_write(self, operation: str) -> str:
+        """**要动盘**的操作取根：拿不到根就当场拒绝，绝不回落到进程当前目录。
+
+        为什么单独有这一层：`os.path.abspath('')` 就是 cwd。拿不到插件数据目录时，
+        `os.path.abspath(self.sticker_library_root())` 会把"新建分组 / 上传素材 /
+        搬文件 / 删组目录"**静默**做在进程当前目录里——目录建了、文件写了、
+        返回值还说成功，而用户在自己的数据目录里一个都找不到（`helpers.host_data_dir`
+        的说明里点名过的那个回落，和 §54「收藏写进了 A 目录」是同一族）。
+
+        `sticker_library_root()` 已经为"根不可知"打过一条可见 warn（每实例一次），
+        这里负责**不放行**：抛 `ValueError`（控制台把它翻成给用户看的 400）。
+        """
+        root = self.sticker_library_root()
+        if not root:
+            raise ValueError(
+                '表情库根目录不可用（拿不到插件数据目录），%s已拒绝：不会写到进程当前目录。'
+                '下一步：检查 AstrBot 的 data 目录与 ASTRBOT_ROOT 配置。' % operation,
+            )
+        return os.path.abspath(root)
+
     @staticmethod
     def _sticker_group_dir(root: str, name: str) -> str:
         """`<表情库根>/<名字>` 的绝对路径；越界当场抛（**第二道闸**）。
@@ -2685,7 +2757,7 @@ class ServiceChunk2(ServiceBase):
           合成一份）；不一样 → **抛错拒绝，绝不覆盖**；
         * 源文件不在盘上（`missing` 行）→ 只改库，不动磁盘。
         """
-        root = os.path.abspath(self.sticker_library_root())
+        root = self._sticker_root_for_write('搬迁素材')
         plan: list[dict[str, Any]] = []
         for row in rows or []:
             if not isinstance(row, dict):
@@ -2783,7 +2855,7 @@ class ServiceChunk2(ServiceBase):
 
         只搬文件、不写库（这些文件根本没有行）。目标撞名同样走"同内容合成 / 不同内容拒绝"。
         """
-        root = os.path.abspath(self.sticker_library_root())
+        root = self._sticker_root_for_write('搬迁未入库的散落文件')
         try:
             source_dir = self._sticker_group_dir(root, source_group)
         except ValueError:
@@ -2812,7 +2884,7 @@ class ServiceChunk2(ServiceBase):
 
     def _remove_sticker_group_dir(self, group_id: str) -> None:
         """删掉分组目录（自底向上 `rmdir`）；还剩东西就留着并记一条 warn。"""
-        root = os.path.abspath(self.sticker_library_root())
+        root = self._sticker_root_for_write('删除分组目录')
         try:
             target = self._sticker_group_dir(root, group_id)
         except ValueError:
@@ -2907,7 +2979,7 @@ class ServiceChunk2(ServiceBase):
         if not wanted:
             if await self._sticker_group_exists(text):
                 raise ValueError('分组已存在：%s' % text)
-            root = os.path.abspath(self.sticker_library_root())
+            root = self._sticker_root_for_write('新建分组目录')
             directory = self._sticker_group_dir(root, text)
             try:
                 os.makedirs(directory, exist_ok=True)
@@ -2962,7 +3034,7 @@ class ServiceChunk2(ServiceBase):
         于是刚改的名又被改回去（而且素材还多出一条重复行）。
         模型归的组（`groupGuessed` 的行）文件不在本组目录里：它只改 `group`，不动路径。
         """
-        root = os.path.abspath(self.sticker_library_root())
+        root = self._sticker_root_for_write('改名分组目录')
         old_dir = self._sticker_group_dir(root, old)
         new_dir = self._sticker_group_dir(root, new)
         if os.path.isdir(old_dir):
@@ -3267,7 +3339,7 @@ class ServiceChunk2(ServiceBase):
         if len(given_name) > STICKER_NAME_MAX:
             raise ValueError('名字最长 %d 个字符' % STICKER_NAME_MAX)
         target_group = await self._resolve_upload_group(group_id)
-        root = os.path.abspath(self.sticker_library_root())
+        root = self._sticker_root_for_write('上传素材落盘')
         file_path = '%s/%s%s' % (
             target_group, digest, STICKER_FILE_SUFFIX.get(mime, '.png'),
         )

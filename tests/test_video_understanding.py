@@ -106,6 +106,7 @@ class FakeFfmpeg:
         fail_frames: bool = False,
         fail_audio: bool = False,
         timeout_frames: bool = False,
+        frames_before_timeout: int = 0,
         timeout_audio: bool = False,
         audio_bytes: int = 0,
     ) -> None:
@@ -115,6 +116,8 @@ class FakeFfmpeg:
         self.fail_frames = fail_frames
         self.fail_audio = fail_audio
         self.timeout_frames = timeout_frames
+        #: 抽帧超时**之前**先写出几帧（真机上 ffmpeg 被杀时磁盘上就是这样的半成品）。
+        self.frames_before_timeout = frames_before_timeout
         self.timeout_audio = timeout_audio
         self.audio_bytes = audio_bytes
         self.calls: list[list[str]] = []
@@ -136,6 +139,10 @@ class FakeFfmpeg:
         if kind == 'frames':
             if self.timeout_frames:
                 import subprocess  # noqa: PLC0415 - 与真实实现同一类异常
+                pattern = args[-1]
+                for index in range(1, self.frames_before_timeout + 1):
+                    with open(pattern % index, 'wb') as handle:
+                        handle.write(_png_bytes())
                 raise subprocess.TimeoutExpired(binary, timeout)
             if self.fail_frames:
                 return 1, '', 'Invalid data found when processing input\n'
@@ -205,22 +212,32 @@ class Host(ServiceChunk0, ServiceChunk3):
 
 
 def video_config(enabled: bool = True, mode: str = 'frames', model_id: str = '') -> dict[str, Any]:
-    """一份"模型中心"配置：视频那三个键 + 两条既有通道各自的开关。"""
+    """一份"模型中心"配置：视频那一组 + 两条既有通道各自的开关。
+
+    视频那组按 **schema 的默认值** 起手（`VIDEO_CONFIG_DEFAULTS`），要改哪一项就在
+    用例里直接改——这样"新增配置键忘了进夹具"不会变成假绿。
+    """
+    section = dict(video.VIDEO_CONFIG_DEFAULTS)
+    section.update({'enabled': enabled, 'mode': mode, 'model_id': model_id})
     return {
         'model': {
             'vision': {'enabled': True, 'mode': 'native', 'detail': 'auto', 'max_image_dimension': 0},
             'audio': {
                 'enabled': True, 'out_format': 'mp3', 'max_file_size_mb': 10, 'max_per_message': 1,
             },
-            'video': {'enabled': enabled, 'mode': mode, 'model_id': model_id},
+            'video': section,
         },
     }
 
 
-def video_session(target: str = 'https://cdn.example.com/v.mp4') -> SessionView:
-    """一条带视频的入站事件（适配器直给元素 = 可信坐标）。"""
+def video_session(target: str = 'https://cdn.example.com/v.mp4', *, is_direct: bool = True) -> SessionView:
+    """一条带视频的**私聊**入站事件（适配器直给元素 = 可信坐标）。
+
+    `is_direct=True` 是生产值：适配层 `session_view()` 一定会按事件填它
+    （`is_direct=not resolved.is_group`）。群聊用例显式传 `False`。
+    """
     return SessionView(
-        platform='onebot', self_id='1', user_id='2',
+        platform='onebot', self_id='1', user_id='2', is_direct=is_direct,
         content='看这个<video src="%s"/>' % target,
         elements=[{'type': 'video', 'attrs': {'src': target}, 'children': []}],
         media=[],
@@ -288,7 +305,7 @@ class _TempVideo:
 
     def session(self) -> SessionView:
         return SessionView(
-            platform='onebot', self_id='1', user_id='2',
+            platform='onebot', self_id='1', user_id='2', is_direct=True,
             content='<video src="file://%s"/>' % self.path,
             elements=[{'type': 'video', 'attrs': {'src': 'file://%s' % self.path}, 'children': []}],
             media=[],
@@ -312,9 +329,9 @@ class VideoConfigTests(unittest.TestCase):
     def test_the_group_lives_in_the_model_center_next_to_vision_and_audio(self) -> None:
         keys = list(self.schema['model_center']['items'])
         self.assertIn('video', keys)
-        # 位置：`vision` / `audio` / `providers` 必须先出现（宿主配置页的既有顺序断言
-        # 钉着前三个），视频组紧随其后。
-        self.assertEqual(keys[:4], ['vision', 'audio', 'providers', 'video'])
+        # 位置（v1.9.1 新契约，用户口径）：感知类设置排在**连接池前面** ——
+        # 视频理解在语音 / 音频理解下面、模型连接上面。
+        self.assertEqual(keys[:4], ['vision', 'audio', 'video', 'providers'])
         self.assertEqual(self.video['description'], '视频理解设置')
 
     def test_defaults_are_the_cost_saving_side(self) -> None:
@@ -324,16 +341,48 @@ class VideoConfigTests(unittest.TestCase):
         self.assertEqual(items['model_id']['default'], '')
         self.assertEqual(items['mode']['options'], ['frames', 'native', 'external'])
         self.assertEqual(items['mode']['default'], video.VIDEO_DEFAULT_MODE)
+        # v1.9.1：预算全部可配，默认值一律取省成本那侧。
+        self.assertEqual(items['frame_mode']['options'], ['sequence', 'average'])
+        self.assertEqual(items['frame_mode']['default'], 'sequence')
+        self.assertEqual(items['frame_interval_seconds']['default'],
+                         video.VIDEO_FRAME_INTERVAL_SECONDS)
+        self.assertEqual(items['frame_average_count']['default'], video.VIDEO_AVERAGE_FRAMES)
+        self.assertEqual(items['out_format']['default'], video.VIDEO_DEFAULT_AUDIO_FORMAT)
+        # 音轨格式与「语音 / 音频理解」那组**同名同候选**（别另造一套语义）。
+        self.assertEqual(items['out_format']['options'],
+                         self.schema['model_center']['items']['audio']['items']['out_format']['options'])
+        self.assertEqual(items['out_format']['default'],
+                         self.schema['model_center']['items']['audio']['items']['out_format']['default'])
+        self.assertEqual(items['audio_duration']['options'], ['custom', 'unlimited'])
+        self.assertEqual(items['audio_duration']['default'], 'custom')
+        self.assertEqual(items['audio_duration_seconds']['default'],
+                         video.VIDEO_AUDIO_CLIP_SECONDS)
+        self.assertEqual(items['timeout_seconds']['default'],
+                         video.VIDEO_FFMPEG_TIMEOUT_SECONDS)
+        self.assertIs(items['group_enabled']['default'], False)
+        # 群聊默认关 = 省成本那侧（私聊不受它管，见 `GroupChatSwitchTests`）。
+        self.assertIs(items['group_enabled']['default'], video.VIDEO_DEFAULT_GROUP_ENABLED)
 
     def test_core_defaults_match_the_schema(self) -> None:
         from plugin.core.service.config import CONFIG_DEFAULTS  # noqa: PLC0415
 
-        self.assertEqual(CONFIG_DEFAULTS['model']['video'], {
-            'enabled': False, 'mode': 'frames', 'model_id': '',
-        })
+        # 三方逐字一致：schema 的 `default`、core 的 `CONFIG_DEFAULTS`、
+        # `video_understanding.VIDEO_CONFIG_DEFAULTS`（默认值只有一处真相）。
         self.assertEqual(
             CONFIG_DEFAULTS['model']['video'],
             {key: value['default'] for key, value in self.video['items'].items()},
+        )
+        self.assertEqual(CONFIG_DEFAULTS['model']['video'], video.VIDEO_CONFIG_DEFAULTS)
+        self.assertEqual(
+            video.VIDEO_CONFIG_DEFAULTS,
+            {key: value['default'] for key, value in self.video['items'].items()},
+        )
+
+    def test_the_master_switch_hint_is_verbatim(self) -> None:
+        """用户逐字口径：总开关那句只留两截，多一个字都不加。"""
+        self.assertEqual(
+            self.video['items']['enabled']['hint'],
+            '视频理解的总开关（默认关）。关闭时视频只留一条「收到了一段视频」的事实。',
         )
 
     def test_the_model_key_is_a_named_provider_picker(self) -> None:
@@ -344,12 +393,16 @@ class VideoConfigTests(unittest.TestCase):
         self.assertIn('外挂识别', node['hint'])
         self.assertIn('不回落', node['hint'])
 
-    def test_the_mode_hint_names_ffmpeg_and_the_budgets(self) -> None:
+    def test_the_mode_hint_is_the_users_verbatim_sentence(self) -> None:
+        """识别模式的描述：状态提示顶在最前面，后面接用户逐字那一句（v1.9.1）。
+
+        静态 hint 里**不许**再写死任何数字：抽帧间隔 / 帧数 / 音轨秒数现在都是配置项，
+        写进文案就是第二个真相（过时即误导）。
+        """
         hint = self.video['items']['mode']['hint']
-        self.assertIn('FFmpeg', hint)
-        self.assertIn('ffmpeg -version', hint)
-        self.assertIn(str(video.VIDEO_MAX_FRAMES), hint)
-        self.assertIn(str(video.VIDEO_AUDIO_CLIP_SECONDS), hint)
+        self.assertEqual(hint, '需要启用语音原生理解与启用图片理解后抽帧模式才会生效。')
+        self.assertNotIn(str(video.VIDEO_MAX_FRAMES), hint)
+        self.assertNotIn(str(video.VIDEO_AUDIO_CLIP_SECONDS), hint)
         # description 不放 URL、不写长句（宿主配置页标题的规则，与其它组同一条尺子）。
         for key, node in self.video['items'].items():
             with self.subTest(key=key):
@@ -362,7 +415,7 @@ class VideoConfigTests(unittest.TestCase):
 
         self.assertIn('video', conf.ConfigurationSchemaTest.LOCAL_ONLY_FIELDS['model_center'])
         paths = {(path, key) for path, key, _value in conf.DEEP_DEFAULTS}
-        for key in ('enabled', 'mode', 'model_id'):
+        for key in self.video['items']:
             self.assertIn((('model_center', 'video'), key), paths)
         # 三处同改的第三处是文档（`test_config_map_documents_the_group_and_every_key`）。
         self.assertTrue(hasattr(conf, 'DEEP_DEFAULTS'))
@@ -375,7 +428,8 @@ class VideoConfigTests(unittest.TestCase):
             self.skipTest('发布仓布局没有 docs/CONFIG_MAP.md')
         with open(path, encoding='utf-8') as handle:
             config_map = handle.read()
-        for key in ('video', 'video.enabled', 'video.mode', 'video.model_id'):
+        documented = ['video'] + ['video.%s' % key for key in self.video['items']]
+        for key in documented:
             self.assertIn('`model_center.%s`' % key, config_map)
 
 
@@ -383,22 +437,28 @@ class VideoConfigIoTests(unittest.TestCase):
     """导出 / 导入是**跨版本用户资产**：新键必须能原样带走、缺键补默认、双拼写都认。"""
 
     def test_export_import_carries_the_video_group(self) -> None:
+        """v1.9.1：**每一个**视频配置键都要能原样带走（含新增的七项）。
+
+        导出文件是跨版本用户资产：新键漏出往返，用户的预算设置就会在导入后回到默认。
+        """
         from plugin.core.service.config import normalize_config, to_schema_shape  # noqa: PLC0415
 
-        config = normalize_config({'model': {'video': {
+        section = {
             'enabled': True, 'mode': 'external', 'model_id': 'vlm',
-        }}})
-        self.assertEqual(config['model']['video'],
-                         {'enabled': True, 'mode': 'external', 'model_id': 'vlm'})
+            'frame_mode': 'average', 'frame_interval_seconds': 6, 'frame_average_count': 2,
+            'out_format': 'flac', 'audio_duration': 'unlimited', 'audio_duration_seconds': 90,
+            'timeout_seconds': 45, 'group_enabled': True,
+        }
+        config = normalize_config({'model': {'video': dict(section)}})
+        self.assertEqual(config['model']['video'], section)
         # 落盘要转 **schema 分组名**（`model_center`），否则宿主配置页显示"全是默认值"。
-        self.assertEqual(to_schema_shape(config)['model_center']['video'],
-                         {'enabled': True, 'mode': 'external', 'model_id': 'vlm'})
+        self.assertEqual(to_schema_shape(config)['model_center']['video'], section)
+        self.assertEqual(set(section), set(video.VIDEO_CONFIG_DEFAULTS))
 
     def test_missing_keys_are_filled_with_the_cost_saving_defaults(self) -> None:
         from plugin.core.service.config import normalize_config  # noqa: PLC0415
 
-        self.assertEqual(normalize_config({})['model']['video'],
-                         {'enabled': False, 'mode': 'frames', 'model_id': ''})
+        self.assertEqual(normalize_config({})['model']['video'], video.VIDEO_CONFIG_DEFAULTS)
 
     def test_both_spellings_are_read(self) -> None:
         from plugin.core.service.config import normalize_config  # noqa: PLC0415
@@ -423,11 +483,15 @@ class VideoConfigIoTests(unittest.TestCase):
 class FfmpegStatusTests(unittest.TestCase):
 
     def test_the_label_has_the_two_values_the_user_asked_for(self) -> None:
+        """两个取值 + **文本标记**：宿主配置页不支持着色（依据见模块注释），
+        所以用 ✅ / ⚠️ 代替绿 / 黄。"""
         with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
-            self.assertEqual(video.ffmpeg_status_label(), 'FFmpeg 已识别')
+            self.assertEqual(video.ffmpeg_status_label(), '✅ FFmpeg 已识别')
+            self.assertEqual(video.ffmpeg_status_label(), video.FFMPEG_FOUND_LABEL)
             self.assertTrue(video.ffmpeg_available())
         with mock.patch.object(video, '_FFMPEG_PATH', ''):
-            self.assertEqual(video.ffmpeg_status_label(), '未检查到 FFmpeg')
+            self.assertEqual(video.ffmpeg_status_label(), '⚠️ 未发现 FFmpeg')
+            self.assertEqual(video.ffmpeg_status_label(), video.FFMPEG_MISSING_LABEL)
             self.assertFalse(video.ffmpeg_available())
 
     def test_the_probe_reflects_which_on_a_fresh_process(self) -> None:
@@ -452,10 +516,10 @@ class FfmpegStatusTests(unittest.TestCase):
         self.assertNotIn('已识别', static_hint, '静态 hint 里不许写死状态')
         with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
             label = video.apply_ffmpeg_status_hint(schema)
-        self.assertEqual(label, 'FFmpeg 已识别')
+        self.assertEqual(label, '✅ FFmpeg 已识别')
         dynamic = schema['model_center']['items']['video']['items']['mode']['hint']
-        self.assertTrue(dynamic.startswith('FFmpeg 已识别'))
-        self.assertIn('ffmpeg -version', dynamic)
+        self.assertEqual(dynamic, '✅ FFmpeg 已识别。' + video.VIDEO_MODE_HINT)
+        self.assertNotIn('<span', dynamic, '宿主把 hint 当纯文本，HTML 只会显示成源码')
         # 只改了**内存里的**这一份；仓库里的文件一字未动（用户明确要求）。
         with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
             self.assertEqual(json.load(handle)['model_center']['items']['video']['items']['mode']['hint'],
@@ -466,15 +530,13 @@ class FfmpegStatusTests(unittest.TestCase):
         with mock.patch.object(video, '_FFMPEG_PATH', ''):
             video.apply_ffmpeg_status_hint(schema)
         hint = schema['model_center']['items']['video']['items']['mode']['hint']
-        self.assertTrue(hint.startswith('未检查到 FFmpeg'))
-        self.assertIn('降级', hint)
-        self.assertIn('装上 FFmpeg', hint)
+        self.assertEqual(hint, '⚠️ 未发现 FFmpeg。' + video.VIDEO_MODE_HINT)
 
     def test_a_missing_schema_node_never_raises(self) -> None:
         for schema in (None, {}, {'model_center': {}}, {'model_center': {'items': {'video': None}}}):
             with self.subTest(schema=schema):
                 with mock.patch.object(video, '_FFMPEG_PATH', ''):
-                    self.assertEqual(video.apply_ffmpeg_status_hint(schema), '未检查到 FFmpeg')
+                    self.assertEqual(video.apply_ffmpeg_status_hint(schema), '⚠️ 未发现 FFmpeg')
 
     def test_the_plugin_applies_the_patch_at_load_and_logs_one_line(self) -> None:
         source = _read('main.py')
@@ -592,11 +654,11 @@ class FramesModeTests(VideoTestCase):
         self.assertIn('-frames:v', argv)
         self.assertEqual(argv[argv.index('-frames:v') + 1], str(video.VIDEO_MAX_FRAMES))
         self.assertEqual(argv[argv.index('-t') + 1], str(video.VIDEO_MAX_DURATION_SECONDS))
-        # 音轨：单独一条命令、16k 单声道 wav、只取前 N 秒。
+        # 音轨：单独一条命令、16k 单声道、按配置的格式与时长。
         self.assertEqual(audio[0][audio[0].index('-t') + 1], str(video.VIDEO_AUDIO_CLIP_SECONDS))
         self.assertEqual(audio[0][audio[0].index('-ar') + 1], str(video.VIDEO_AUDIO_SAMPLE_RATE))
         self.assertEqual(audio[0][audio[0].index('-ac') + 1], '1')
-        self.assertEqual(audio[0][-1].split('.')[-1], 'wav')
+        self.assertEqual(audio[0][-1].split('.')[-1], video.VIDEO_DEFAULT_AUDIO_FORMAT)
         self.assertEqual(len(result.image_sources), video.VIDEO_MAX_FRAMES)
 
     async def test_more_frames_than_the_cap_are_truncated(self) -> None:
@@ -646,12 +708,13 @@ class FramesModeTests(VideoTestCase):
         host = Host(config=video_config())
         result = await self._collect(host, video_session(), ffmpeg)
         self.assertEqual(len(result.audio_sources), 1)
-        self.assertTrue(result.audio_sources[0].startswith('data:audio/wav;base64,'))
+        self.assertTrue(result.audio_sources[0].startswith(
+            'data:audio/%s;base64,' % video.VIDEO_DEFAULT_AUDIO_FORMAT))
         audio = await ServiceChunk3.load_native_audio(
             host, {'id': 's'}, result.audio_sources, None,
         )
         self.assertEqual(len(audio), 1)
-        self.assertEqual(audio[0]['format'], 'wav')
+        self.assertEqual(audio[0]['format'], video.VIDEO_DEFAULT_AUDIO_FORMAT)
         self.assertEqual(audio[0]['id'], 'turn-audio-1')
 
     async def test_the_vision_and_audio_switches_of_the_existing_channels_still_apply(self) -> None:
@@ -834,7 +897,8 @@ class TurnLevelWiringTests(VideoTestCase):
         for source in host.seen['images']:
             self.assertTrue(source.startswith('onebot-file:'), source)
         self.assertEqual(len(host.seen['audio']), 1)
-        self.assertTrue(host.seen['audio'][0].startswith('data:audio/wav;base64,'))
+        self.assertTrue(host.seen['audio'][0].startswith(
+            'data:audio/%s;base64,' % video.VIDEO_DEFAULT_AUDIO_FORMAT))
 
         # ② 进叙事的形态：帧是原生视觉图片、音轨是原生音频附件。
         images = host.calls['try_decide'][9]
@@ -843,7 +907,7 @@ class TurnLevelWiringTests(VideoTestCase):
         for image in images:
             self.assertEqual(image['mime_type'], 'image/png')
             self.assertNotIn('path', image, '交给模型的是字节，不是本地路径')
-        self.assertEqual([item['format'] for item in audio], ['wav'])
+        self.assertEqual([item['format'] for item in audio], [video.VIDEO_DEFAULT_AUDIO_FORMAT])
 
         # ③ 正文里那句事实（含可数线索）并进了本回合的用户消息。
         user_message = host.calls['try_decide'][5]
@@ -1061,13 +1125,13 @@ class ExternalModeTests(VideoTestCase):
 class MutationTests(unittest.TestCase):
 
     def test_removing_the_frame_cap_would_break_the_argv_assertion(self) -> None:
-        """上限不是装饰：`-frames:v` / `fps=1/4` / `-t` 都由常量算出并写进命令行。"""
+        """上限不是装饰：`-frames:v` / `fps=…` / `-t` 都由配置算出并写进命令行（v1.9.1）。"""
         source = _read('core/video_understanding.py')
-        self.assertIn("'-frames:v', str(max(1, int(max_frames)))", source)
+        self.assertIn("'-frames:v', str(frames_cap)", source)
         self.assertIn("'fps=1/%d' % max(1, int(interval_seconds))", source)
         self.assertIn("'-t', str(max_duration_seconds)", source)
-        self.assertIn('frames = sorted(', source)
-        self.assertIn(')[:max(1, int(max_frames))]', source)
+        self.assertIn('frames = _collect_frames(directory, frames_cap)', source)
+        self.assertIn('return frames[:max(1, int(cap))]', source)
         # 真正的行为守卫在 `FramesModeTests.test_more_frames_than_the_cap_are_truncated`
         # 与 `test_a_long_video_is_truncated_with_a_countable_clue`：那两条会真的喂 50 帧。
 
@@ -1121,6 +1185,206 @@ class MissingFfmpegTests(VideoTestCase):
         message = video.degradation_message(video.FFMPEG_MISSING_REASON)
         self.assertIn('FFmpeg', message)
         self.assertIn('ffmpeg -version', message)
+
+
+# =========================================================================== #
+# 4.5 可配置预算（v1.9.1）：抽帧模式 / 帧数 / 音轨格式 / 音轨时长 / 超时 / 群聊开关
+# =========================================================================== #
+
+class BudgetConfigTests(VideoTestCase):
+    """**读配置只在一处**（`resolve_video_config`），行为必须真的跟着配置走。"""
+
+    async def _collect(
+        self, host: Host, session: SessionView, ffmpeg: FakeFfmpeg,
+    ) -> video.VideoMedia:
+        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
+                mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg):
+            return await video.collect_video_sources(host, {'id': 's'}, session)
+
+    def _config(self, **video_keys: Any) -> dict[str, Any]:
+        config = video_config()
+        config['model']['video'].update(video_keys)
+        return config
+
+    # ---- 4.5.1 抽帧模式 ----
+    async def test_sequence_mode_uses_the_configured_interval(self) -> None:
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(frame_interval_seconds=10))
+        await self._collect(host, video_session(), ffmpeg)
+        argv = ffmpeg.argvs('frames')[0]
+        self.assertIn('fps=1/10', argv)
+        self.assertEqual(argv[argv.index('-frames:v') + 1], str(video.VIDEO_MAX_FRAMES))
+
+    async def test_average_mode_spreads_exactly_the_configured_frame_count(self) -> None:
+        """变异保护：平均抽帧**必须**按「平均抽几帧」算 fps 与帧数上限。
+
+        改成忽略它（照旧 `fps=1/4`、或照旧封顶 3 帧）这一条就红。
+        """
+        ffmpeg = FakeFfmpeg(duration='  Duration: 00:00:12.00, start: 0.000000')
+        host = Host(config=self._config(frame_mode='average', frame_average_count=1))
+        result = await self._collect(host, video_session(), ffmpeg)
+        argv = ffmpeg.argvs('frames')[0]
+        self.assertIn('fps=%.6f' % (1 / 12), argv)
+        self.assertEqual(argv[argv.index('-frames:v') + 1], '1')
+        self.assertEqual(len(result.image_sources), 1, '配成 1 帧就只能交 1 帧')
+        self.assertIn('已整段平均抽了 1 帧画面', result.note)
+
+    async def test_average_mode_without_a_probeable_duration_falls_back_to_the_interval(self) -> None:
+        """探不到时长就退回连续抽帧那条 fps（**不猜时长**），帧数上限照旧是配置值。"""
+        ffmpeg = FakeFfmpeg(duration='  Duration: N/A, bitrate: N/A')
+        host = Host(config=self._config(frame_mode='average', frame_average_count=2))
+        await self._collect(host, video_session(), ffmpeg)
+        argv = ffmpeg.argvs('frames')[0]
+        self.assertIn('fps=1/%d' % video.VIDEO_FRAME_INTERVAL_SECONDS, argv)
+        self.assertEqual(argv[argv.index('-frames:v') + 1], '2')
+
+    # ---- 4.5.2 音轨：格式与时长 ----
+    async def test_the_configured_audio_format_reaches_ffmpeg_and_the_voice_channel(self) -> None:
+        """转码格式照「语音 / 音频理解」那组**同名同义**：复用器与 data URI 的格式段都要
+        对上，否则 `fetch_native_audio` 的白名单会把音轨整条丢掉（静默没声音）。"""
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(out_format='ogg'))
+        result = await self._collect(host, video_session(), ffmpeg)
+        argv = ffmpeg.argvs('audio')[0]
+        self.assertEqual(argv[argv.index('-f') + 1], 'ogg')
+        self.assertTrue(argv[-1].endswith('.ogg'), argv[-1])
+        self.assertTrue(result.audio_sources[0].startswith('data:audio/ogg;base64,'))
+        audio = await ServiceChunk3.load_native_audio(host, {'id': 's'}, result.audio_sources, None)
+        self.assertEqual([item['format'] for item in audio], ['ogg'])
+
+    async def test_the_default_audio_format_is_the_voice_groups_default(self) -> None:
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=video_config())
+        result = await self._collect(host, video_session(), ffmpeg)
+        self.assertEqual(ffmpeg.argvs('audio')[0][-1].split('.')[-1],
+                         video.VIDEO_DEFAULT_AUDIO_FORMAT)
+        audio = await ServiceChunk3.load_native_audio(host, {'id': 's'}, result.audio_sources, None)
+        self.assertEqual([item['format'] for item in audio], [video.VIDEO_DEFAULT_AUDIO_FORMAT])
+
+    async def test_custom_audio_duration_is_a_configuration_value(self) -> None:
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(audio_duration='custom', audio_duration_seconds=15))
+        result = await self._collect(host, video_session(), ffmpeg)
+        argv = ffmpeg.argvs('audio')[0]
+        self.assertEqual(argv[argv.index('-t') + 1], '15')
+        self.assertIn('已单独抽出前 15 秒音轨', result.note)
+
+    async def test_unlimited_audio_duration_does_not_truncate_the_track(self) -> None:
+        """变异保护：`unlimited` 还按 60 秒截 → 红。
+
+        `-t` 就是截断本身；不限制时音轨那条命令里一个字都不该出现（帧那条命令的 `-t`
+        是"最长处理多长"，与音轨时长无关，所以只看 audio 那条 argv）。
+        """
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(audio_duration='unlimited'))
+        result = await self._collect(host, video_session(), ffmpeg)
+        argv = ffmpeg.argvs('audio')[0]
+        self.assertNotIn('-t', argv, '不限制 = 不给 ffmpeg 传 -t')
+        self.assertIn('已单独抽出整段音轨', result.note)
+
+    # ---- 4.5.3 超时：抽到几帧交几帧（用户口径） ----
+    async def test_a_timeout_keeps_the_frames_already_written(self) -> None:
+        """变异保护：超时把已抽到的帧丢掉 → 红（旧行为就是"整段丢弃"）。"""
+        ffmpeg = FakeFfmpeg(timeout_frames=True, frames_before_timeout=2)
+        host = Host(config=self._config(timeout_seconds=7))
+        result = await self._collect(host, video_session(), ffmpeg)
+        self.assertEqual(len(result.image_sources), 2, '超时前抽到的帧必须照常交出去')
+        for source in result.image_sources:
+            self.assertTrue(source.startswith('onebot-file:'), source)
+        # 可数线索：超时上限 + 已交付帧数。
+        self.assertIn('抽帧在 7 秒超时，已抽到的 2 帧照常提交', result.note)
+        self.assertTrue(result.reason.startswith(video.VIDEO_FRAME_TIMEOUT_PREFIX))
+        self.assertIn('2 帧', result.reason)
+        self.assertTrue(any('照常交给模型' in message for message in host.warns()),
+                        '超时是"配置可调"的降级，必须打一条可行动的 warn')
+        # 帧真的能走既有图像通道（不是只留下一串路径）。
+        images = await ServiceChunk3.load_native_images(
+            host, {'id': 's'}, result.image_sources, None,
+        )
+        self.assertEqual(len(images), 2)
+
+    async def test_a_timeout_without_any_frame_is_still_a_frame_failure(self) -> None:
+        """一帧都没抽到就不该假装"交了几帧"：走既有的抽帧失败降级。"""
+        ffmpeg = FakeFfmpeg(timeout_frames=True)
+        host = Host(config=self._config(timeout_seconds=7))
+        result = await self._collect(host, video_session(), ffmpeg)
+        self.assertEqual(result.image_sources, [])
+        self.assertEqual(result.reason, video.VIDEO_FRAME_FAILED_REASON)
+        self.assertIn('抽帧失败', result.note)
+
+    # ---- 4.5.4 群聊独立开关 ----
+    async def test_the_group_switch_off_means_zero_ffmpeg_in_groups(self) -> None:
+        """变异保护：群聊开关关着仍抽帧 → 红。"""
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(group_enabled=False))
+        result = await self._collect(host, video_session(is_direct=False), ffmpeg)
+        self.assertEqual(ffmpeg.calls, [], '群聊开关关着时一个 ffmpeg 命令都不许发')
+        self.assertEqual((result.image_sources, result.audio_sources, result.note), ([], [], ''))
+
+    async def test_the_group_switch_on_is_the_only_difference_in_groups(self) -> None:
+        """反向：同一个群聊会话，开关打开就照常抽帧（闸门真的在管，不是恒假）。"""
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(group_enabled=True))
+        result = await self._collect(host, video_session(is_direct=False), ffmpeg)
+        self.assertEqual(len(ffmpeg.argvs('frames')), 1)
+        self.assertTrue(result.image_sources)
+
+    async def test_private_chats_are_not_gated_by_the_group_switch(self) -> None:
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(group_enabled=False))
+        result = await self._collect(host, video_session(is_direct=True), ffmpeg)
+        self.assertTrue(result.image_sources, '私聊只受总开关管')
+
+    # ---- 4.5.5 配置归一化：手改坏了也不许悄悄变成"更贵的那个" ----
+    def test_resolve_video_config_clamps_and_falls_back(self) -> None:
+        resolved = video.resolve_video_config({
+            'frame_mode': 'AVERAGE', 'frameIntervalSeconds': '3',
+            'frame_average_count': 99, 'outFormat': 'MP3',
+            'audio_duration': 'UNLIMITED', 'audioDurationSeconds': '0',
+            'timeoutSeconds': 'abc', 'groupEnabled': True,
+        })
+        self.assertEqual(resolved['frame_mode'], 'average')
+        self.assertEqual(resolved['frame_interval_seconds'], 3)
+        self.assertEqual(resolved['frame_average_count'], video.VIDEO_MAX_FRAMES,
+                         '帧数上限 = 视觉预算，多配了也只能夹到它')
+        self.assertEqual(resolved['out_format'], 'mp3')
+        self.assertEqual(resolved['audio_duration'], 'unlimited')
+        self.assertEqual(resolved['audio_duration_seconds'], 1, '脏值回默认再夹到下限')
+        self.assertEqual(resolved['timeout_seconds'], video.VIDEO_FFMPEG_TIMEOUT_SECONDS)
+        self.assertIs(resolved['group_enabled'], True)
+        for raw in ('weird', None, 7):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    video.resolve_video_config({'frame_mode': raw})['frame_mode'], 'sequence',
+                )
+                self.assertEqual(
+                    video.resolve_video_config({'audio_duration': raw})['audio_duration'], 'custom',
+                )
+                self.assertEqual(
+                    video.resolve_video_config({'out_format': raw})['out_format'], 'mp3',
+                )
+
+    def test_unlimited_is_the_only_way_to_get_no_clip(self) -> None:
+        self.assertIsNone(video.audio_clip_seconds({'audio_duration': 'unlimited'}))
+        self.assertEqual(video.audio_clip_seconds({'audio_duration': 'custom',
+                                                   'audio_duration_seconds': 30}), 30)
+        self.assertEqual(video.audio_clip_seconds({}), video.VIDEO_AUDIO_CLIP_SECONDS)
+
+    def test_the_config_is_read_in_exactly_one_place(self) -> None:
+        """判据一处：模块里只有 `video_config()` 读 `model.video`，其余函数只收参数。"""
+        source = _read('core/video_understanding.py')
+        self.assertEqual(source.count("'video', 'video_understanding'"), 1)
+        # `collect_video_sources` 把**归一化后的**配置往下传（不再各自读一遍）。
+        for needle in (
+            "frame_mode=config['frame_mode']",
+            "interval_seconds=config['frame_interval_seconds']",
+            "average_frames=config['frame_average_count']",
+            "audio_format=config['out_format']",
+            "timeout=float(config['timeout_seconds'])",
+        ):
+            self.assertIn(needle, source)
+        # 常量退化成默认值：命令行里的数字全部由参数（= 配置）算出来。
+        self.assertIn("'fps=1/%d' % max(1, int(interval_seconds))", source)
 
 
 # =========================================================================== #

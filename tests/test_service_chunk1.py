@@ -3209,6 +3209,164 @@ class FlushGroupTurnTests(ServiceHarness):
         self.assertEqual(metadata['commit_id'], 'commit:x')
 
 
+# =========================================================================== #
+# 群聊视频理解（v1.9.1）：群回合没有视觉通道，音轨那条通道是通的
+# =========================================================================== #
+
+class GroupVideoUnderstandingTests(ServiceHarness):
+    """群开关打开时的**真实**后果（用户裁决 ②：不许"开着却什么都不发生"）。
+
+    事实（源码依据，别当猜测）：
+
+    * 群回合**有**音频通道——`chunk1.flush_group_turn` 把 `_load_group_batch_audio`
+      的产物按位置传给 `try_decide(..., audio=...)`（本文件 `FlushGroupTurnTests` 的
+      `test_the_group_audio_batch_reaches_the_model_with_the_budget` 钉着）；
+    * 群回合**没有**视觉通道——同一个调用点的图片位是字面量 `[]`，群消息也不带
+      `imageSources`（§46 的既有设计）。
+
+    所以开关打开后：音轨进模型（真的进），画面帧丢弃并**节流明说一次**。反向：门关着
+    时一个 ffmpeg 都不许发。
+    """
+
+    def _video_session(self, url: str = 'https://cdn.example.com/v.mp4') -> SessionView:
+        return group_session(elements=[
+            {'type': 'video', 'attrs': {'url': url}, 'children': []},
+        ])
+
+    def _prepare(self, service: Any, session: SessionView, content: str = '看这个') -> None:
+        service.buffered_group_turns['key'] = {
+            'story_id': PRIVATE_STORY_ID, 'group_id': '9',
+            'rule': group_rule_stub(debounceSeconds=0),
+            'channel_id': '9', 'latest_session': session,
+            'messages': [{'content': content}],
+            'revision': 3, 'mentioned_bot': True, 'quoted_bot': False,
+        }
+
+    def _stub_turn(self, service: Any, seen: dict[str, Any]) -> None:
+        """把回合里与本用例无关的兄弟成员换成显式替身（Chunk6/7 尚未落地的那些）。"""
+
+        async def decide(*args: Any, **_kwargs: Any) -> dict[str, Any]:
+            seen['args'] = args
+            return {'decision': {'groupReply': {'mode': 'none'}}, 'succeeded': True}
+
+        async def persist(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'messages': [], 'commit': None, 'scriptEntry': None, 'script_entry': None}
+
+        async def send(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'deliveredSegments': [], 'complete': True, 'segmentOutcomes': []}
+
+        service.try_decide = decide
+        service.persist_decision = persist
+        service.send_group_message = send
+        service.semantic_turn_embedding_enabled = lambda: False
+        service.sticker_catalog_for_session = _empty_list
+        service.group_chat_capabilities = lambda _session, _messages: None
+        service.schedule_compaction = _noop
+        service.schedule_conversation_follow_ups_after_turn = _noop
+
+    def _patch_ffmpeg(self) -> Any:
+        """真的去调 `_run_ffmpeg` 的替身（见 `test_video_understanding.FakeFfmpeg`）。"""
+        from unittest import mock  # noqa: PLC0415 - 只在需要时引入
+        from plugin.core import video_understanding as video  # noqa: PLC0415
+        from plugin.tests.test_video_understanding import FakeFfmpeg  # noqa: PLC0415
+
+        ffmpeg = FakeFfmpeg()
+        return ffmpeg, mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
+            mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg)
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_the_group_switch_on_feeds_the_audio_track_and_says_the_frames_are_lost(self) -> None:
+        """群开关开 + 群里有视频 → **音轨真的进去**，画面帧**明说一次**（节流）。
+
+        变异保护：把那条 warn 去掉、或把音轨那一跳拿掉，本用例都会红。
+        """
+        from plugin.core import video_understanding as video  # noqa: PLC0415
+
+        service = self.make_service(make_config(model={
+            'audio': {'enabled': True, 'maxPerMessage': 1},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, self._video_session())
+            await service.flush_group_turn('key', 3)
+
+        # ① 真的抽了（帧与音轨各一条 ffmpeg 命令）。
+        self.assertEqual(len(ffmpeg.argvs('frames')), 1)
+        self.assertEqual(len(ffmpeg.argvs('audio')), 1)
+
+        # ② 音轨走**既有**语音通道（`load_native_audio` 真的把 data URI 转成了附件）。
+        audio = seen['args'][10]
+        self.assertEqual(len(audio), 1, '群开关打开时至少要让声音进去')
+        self.assertEqual(audio[0]['format'], video.VIDEO_DEFAULT_AUDIO_FORMAT)
+        self.assertTrue(audio[0]['base64'], '音轨是字节，不是空壳')
+        self.assertEqual(audio[0]['id'], 'group-audio-1', '与群语音批次同一套附件编号')
+
+        # ③ 画面帧没有去处：图片位仍然是空的（群聊没有视觉通道）。
+        self.assertEqual(seen['args'][9], [])
+
+        # ④ 正文事实写实：说清"帧没进去"，不谎称"抽了 N 帧画面"。
+        user_message = seen['args'][5]
+        self.assertIn(video.VIDEO_FACT_PREFIX, user_message)
+        self.assertIn(video.GROUP_NO_VISION_REASON, user_message)
+        self.assertNotIn('帧画面', user_message)
+
+        # ⑤ 那条**可行动**的 warn 真的打了（节流口 = `note_access_skip`）。
+        self.assertIn('群回合没有视觉通道', self.sink.text())
+        self.assertIn('请在私聊里发', self.sink.text())
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_the_group_switch_off_means_zero_ffmpeg_calls(self) -> None:
+        """**反向**：群开关关着（默认）→ 一个 ffmpeg 都不发、一条说明都没有。"""
+        service = self.make_service(make_config(model={
+            'audio': {'enabled': True, 'maxPerMessage': 1},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': False},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, self._video_session())
+            await service.flush_group_turn('key', 3)
+
+        self.assertEqual(ffmpeg.calls, [], '群开关关着时连 ffmpeg 都不调')
+        self.assertEqual(seen['args'][10], [])
+        self.assertEqual(seen['args'][9], [])
+        self.assertNotIn('[视频', seen['args'][5])
+        self.assertNotIn('群回合没有视觉通道', self.sink.text())
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_the_audio_channel_being_off_still_says_the_frames_are_lost(self) -> None:
+        """音轨通道关着（`audio.enabled=false`）：画面对声音都没有去处，**但绝不静默**。
+
+        这是"开着开关却什么都不发生"最容易被放过的一格：帧被丢、音轨根本没抽，
+        所以必须留下那条说明（它同时点出"音轨要靠语音总开关"这条出路）。
+        """
+        from plugin.core import video_understanding as video  # noqa: PLC0415
+
+        service = self.make_service(make_config(model={
+            'audio': {'enabled': False},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, self._video_session())
+            await service.flush_group_turn('key', 3)
+
+        self.assertEqual(len(ffmpeg.argvs('frames')), 1, '帧照抽（抽了才知道有没有内容）')
+        self.assertEqual(ffmpeg.argvs('audio'), [], '语音总开关关着时连音轨都不抽（省一次 ffmpeg）')
+        self.assertEqual(seen['args'][10], [])
+        self.assertIn(video.GROUP_NO_VISION_REASON, seen['args'][5])
+        self.assertIn('那条总开关关着时声音也不会进去', self.sink.text())
+
+
 async def _empty_list(*_args: Any, **_kwargs: Any) -> list[Any]:
     """替身：`stickerCatalogForSession` 等返回空列表的成员。"""
     return []

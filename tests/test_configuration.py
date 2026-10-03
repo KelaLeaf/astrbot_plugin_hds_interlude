@@ -290,6 +290,23 @@ DEEP_DEFAULTS = [
     (("model_center", "video"), "enabled", False),
     (("model_center", "video"), "mode", "frames"),
     (("model_center", "video"), "model_id", ""),
+    # v1.9.1：预算全部可配。默认值一律取**省成本那侧**：
+    # 连续抽帧（不额外依赖时长探测）/ 每 4 秒 1 帧 / 整段 3 帧 / mp3 / 前 60 秒音轨 /
+    # 20 秒超时 / **群聊关**（群聊里视频刷屏最贵）。
+    (("model_center", "video"), "frame_mode", "sequence"),
+    (("model_center", "video"), "frame_interval_seconds", 4),
+    (("model_center", "video"), "frame_average_count", 3),
+    (("model_center", "video"), "out_format", "mp3"),
+    (("model_center", "video"), "audio_duration", "custom"),
+    (("model_center", "video"), "audio_duration_seconds", 60),
+    (("model_center", "video"), "timeout_seconds", 20),
+    (("model_center", "video"), "group_enabled", False),
+    # v1.9.1：合并转发单条最多读取的视频数。默认 **1**（不是省成本那侧的 0）：
+    # 用户口径是"可配置单条转发最多读取的视频数"——配了却默认永不生效不算配置；
+    # 1 = 配了就生效，同时把单卡的额外成本封在一次以内。core 那一份默认值在
+    # `forward_message.DEFAULT_LIMITS.max_videos`（`forward_read_limits` 缺键时的
+    # fallback 就是它），两处必须一致。
+    (("forward_message",), "max_videos", 1),
     (("model_center", "failover"), "enabled", True),
     (("model_center", "failover"), "strategy", "priority"),
     (("model_center", "failover"), "max_attempts_per_provider", 1),
@@ -760,7 +777,10 @@ class ConfigurationSchemaTest(unittest.TestCase):
 
     def test_model_console_centralizes_connections_without_exposing_ids(self):
         model = self.section("model_center")
-        self.assertEqual(list(model.keys())[:3], ["vision", "audio", "providers"])
+        # 顺序契约（v1.9.1 起）：**感知类设置排在连接池前面** —— 图片 / 语音 / 视频
+        # 三组紧挨着，`providers` 跟在它们后面。用户口径：视频理解设置应该在模型连接
+        # 上面、语音 / 音频理解设置下面。
+        self.assertEqual(list(model.keys())[:4], ["vision", "audio", "video", "providers"])
         for absent in ("mode", "zhipu", "models", "main_model_id", "mainModelId"):
             self.assertNotIn(absent, model)
         self.assertEqual(model["main_response_format"]["default"], "json-object")
@@ -787,6 +807,38 @@ class ConfigurationSchemaTest(unittest.TestCase):
                       "deepseek_reasoning_effort", "dashscope_region",
                       "price_input", "price_output", "price_cached_input"):
             self.assertIn(extra, items)
+
+    def test_the_provider_row_declares_every_field_core_reads(self) -> None:
+        """一条连接行该有哪些字段：schema 的 `items` **与** 默认行必须一样齐（v1.9.1）。
+
+        两个方向都钉：
+
+        * `items` 里声明了、`default` 行里没有 → 新用户的第一条连接在界面上是一堆
+          空项（"看起来没配"，其实跑的是默认值）；
+        * core 会读、`items` 里没有 → 用户点不到，而且真写进配置也会被宿主按 schema
+          重建时删掉（坑 22）。
+
+        后一条正是 `use_for_video` / `use_for_works` 的来历：`model_routing.is_assigned_to()`
+        认这两个键（外挂视频理解 / 共同作品写手），适配层为"指名 AstrBot Provider"合成
+        的连接行也挂它们—— 但 schema 里原先没有，于是"用自建连接行跑外挂识别"根本点不到。
+        """
+        providers = self.section("model_center")["providers"]
+        items = providers["items"]
+        row = providers["default"][0]
+        self.assertEqual(
+            sorted(set(items) - set(row)), [],
+            "默认连接行缺这些键（界面上会显示成未设置）",
+        )
+        for flag in ("use_for_video", "use_for_works"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, items, "core 会读这个键，schema 里必须有，否则宿主重载会删掉它")
+                self.assertIs(items[flag]["default"], False, "省成本那侧：默认不勾")
+        # 新勾选与 core 的判据同名（`is_assigned_to(provider, 'video' | 'works')`）。
+        routing_path = os.path.join(PLUGIN_ROOT, 'core', 'model_routing.py')
+        with open(routing_path, encoding='utf-8') as handle:
+            routing = handle.read()
+        for flag in ('use_for_video', 'use_for_works'):
+            self.assertIn(flag, routing)
 
     def test_provider_mode_enum_matches_upstream_presets(self):
         mode = self.section("model_center")["providers"]["items"]["mode"]
@@ -1097,9 +1149,11 @@ class ConfigurationSchemaTest(unittest.TestCase):
         "qzone": {"auto_feed"},
         # v1.8.7：合并转发节点里的图片坐标也要交给模型，于是多了**第四道预算**
         # （单条转发最多取几张图，默认 3、区间 0~10）。上游 `forwardMessage` 组只有
-        # 三重预算（节点 / 字符 / 深度），这一项由本移植版新增；整条链路只加这一个键，
-        # 整条消息的转发媒体总数上限是 core 里的常量（`FORWARD_MEDIA_MAX_PER_TURN`）。
-        "forward_message": {"max_images"},
+        # 三重预算（节点 / 字符 / 深度），这一项由本移植版新增；整条消息的转发媒体
+        # 总数上限是 core 里的常量（`FORWARD_MEDIA_MAX_PER_TURN`）。
+        # v1.9.1：再加**第五道** —— 单条转发最多读取的视频数（默认 **1** = 一张卡最多
+        # 看一段；显式配 0 才是"一段都不读"）。
+        "forward_message": {"max_images", "max_videos"},
         # v1.6.0：平台动作目录的开关（`plugin/core/platform_actions.py` 是唯一事实源，
         # 键名逐字 = 动作 id）。上游 Console 里没有这一层，整组由本移植版新增；
         # 逐项覆盖与落点由 `test_every_catalog_action_has_exactly_one_switch` 盯着。
@@ -1146,6 +1200,21 @@ class ConfigurationSchemaTest(unittest.TestCase):
                     node = node[step]["items"]
                 self.assertIn(key, node)
                 self.assertEqual(node[key]["default"], expected)
+
+    def test_the_forward_video_default_tracks_the_core_constant(self):
+        """`forward_message.max_videos`：schema 的 `default` 必须等于 core 的默认值。
+
+        core 侧只有一份默认值（`forward_message.DEFAULT_LIMITS.max_videos` =
+        `FORWARD_VIDEO_MAX_PER_FORWARD`，也是 `forward_read_limits()` 缺键时的 fallback）；
+        `core/service/config.py` 的 `CONFIG_DEFAULTS` **没有 `forward_message` 段**
+        （那一组从不进 `default_config()`）。所以这一条只对这两处，抓的是"改了一边忘了另一边"
+        ——默认 0 与默认 1 是"配了永不生效"与"配了就生效"的区别，漂了就没人发现。
+        """
+        from plugin.core.forward_message import FORWARD_VIDEO_MAX_PER_FORWARD
+
+        node = self.schema["forward_message"]["items"]["max_videos"]
+        self.assertEqual(node["default"], FORWARD_VIDEO_MAX_PER_FORWARD)
+        self.assertEqual(node["default"], 1)
 
     def test_deep_sections_are_complete(self):
         model = self.section("model_center")

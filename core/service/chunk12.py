@@ -44,6 +44,8 @@ from ..qzone import QZONE_VISIBILITY_VALUES, qzone_visible_value
 from ..time import iso
 from .base import ServiceBase, pick
 from .config import merge_legacy_section_values, read_section_path
+#: 数据目录的唯一判据（§54）：权限表与表情库根目录读同一个函数。
+from .helpers import host_data_dir
 
 __all__ = ['ServiceChunk12']
 
@@ -117,12 +119,12 @@ class ServiceChunk12(ServiceBase):
         * `ctx` 存在但**没有** `base_dir` / 完全没 `ctx` → 退到宿主注入的
           `context.base_dir`（单测的裸宿主常这么塞）→ 自己的 `base_dir`；
         * 一个都拿不到 → 回空串 = 回落空表 / 目录默认档，**绝不抛**。
+
+        判据本身住在 `helpers.host_data_dir()`（§54）：表情库根目录
+        （`chunk2.sticker_library_root`）读的是**同一个**函数——两处各写一遍
+        "从哪个属性取数据目录"，就会出现"权限表读 A、表情库写 B"。
         """
-        for holder in (getattr(self, 'ctx', None), getattr(self, 'context', None), None):
-            base = getattr(self, 'base_dir', '') if holder is None else getattr(holder, 'base_dir', '')
-            if base:
-                return str(base)
-        return ''
+        return host_data_dir(self)
 
     def timer_host(self) -> Any:
         """能排定时器的那个对象（生产上是 `ServiceBase.ctx` = `InterludeContext`）。

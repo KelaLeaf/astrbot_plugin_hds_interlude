@@ -488,10 +488,18 @@ def _structured_image_sources(entries: Any) -> list[str]:
     `file://…`（适配器把图落到本地）归一成 `onebot-file:…`，与上游从 `session.elements`
     认本地路径的那套坐标**同形** —— 那是本移植版里唯一允许读本地文件的坐标。
     卡片（`source` 为空）不产生来源。
+
+    **视频条目（`kind='video'`，v1.9.1）不进这张表**：它是"合并转发里读到的一段视频"
+    的坐标，而 `imageSources` 是**图片**那一半的判据 —— 混进来它就会被当成一张图去
+    下载（视频 URL 取回来的当然不是图片）。视频坐标由
+    `core/video_understanding.extract_session_video_sources()` 从同一张媒体表里读：
+    同一个来源，各取各的那一半。
     """
     sources: list[str] = []
     for entry in entries or []:
         if not is_record(entry):
+            continue
+        if _text(pick(entry, 'kind')).strip().lower() == 'video':
             continue
         source = _text(pick(entry, 'source')).strip()
         if not source or source in sources:
@@ -569,6 +577,11 @@ def _structured_session_media(session: Any) -> list[dict[str, Any]]:
             continue
         seen.add(source)
         summary = _text(pick(entry, 'summary')).strip()
+        if kind == 'video':
+            # 视频（v1.9.1）：媒体表里留着它（`attachments` / 事实按 source 对齐），
+            # 但标签是 `[视频]` 而不是 `[图片]`——种类只有一处判据（适配层观测到的段类型）。
+            media.append({'source': source, 'kind': 'video', 'summary': summary, 'label': '[视频]'})
+            continue
         label = (
             label_of_image(kind or 'image', summary) if callable(label_of_image) else '[图片]'
         )

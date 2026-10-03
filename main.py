@@ -462,7 +462,8 @@ class HDSInterludePlugin(Star):
         self._console = ConsoleApi(self.bridge)
         self._register_config_page_apis(context)
         #: 视频抽帧识别的 FFmpeg 状态（v1.9.0）：同时写进**内存里的** schema，
-        #: 让配置页「识别模式」旁边显示「FFmpeg 已识别 / 未检查到 FFmpeg」。
+        #: 让配置页「识别模式」旁边显示「✅ FFmpeg 已识别 / ⚠️ 未发现 FFmpeg」
+        #: （文本标记：宿主的 hint 是纯文本渲染，着不了色，依据见那个模块的注释）。
         #: 宿主每打开一次配置页都现取 `config.schema` 这个活对象
         #: （`astrbot/dashboard/services/config_service.py:866`），而
         #: `AstrbotConfig.save_config()` 只写配置值、**schema 从不落盘**

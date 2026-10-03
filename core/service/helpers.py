@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from datetime import datetime
 from typing import Any
@@ -83,6 +84,10 @@ __all__ = [
     'wire_media_kind',
     'STICKER_IMAGE_MIMES',
     'STICKER_FILE_SUFFIX',
+    # ---- 插件数据目录 / 表情库根目录（本移植版新增，§54）----
+    'STICKER_DEFAULT_DIRECTORY',
+    'host_data_dir',
+    'sticker_root_from',
     # ---- 表情库分组 / 上传（本移植版新增，§47）----
     'COLLECTED_STICKER_GROUP_ID',
     'COLLECTED_STICKER_GROUP_NAME',
@@ -357,7 +362,7 @@ def resolve_sticker_config(value: Any = None) -> dict[str, Any]:
         # 同一把尺子（`is not False`）：缺失 / NULL / 字符串一律按默认（开）走；
         # 关掉它就只写描述、一个字的启用状态都不动。
         'auto_disable': config_get(configured, 'auto_disable', 'autoDisable') is not False,
-        'directory': str(directory if directory else 'data/hds-interlude/stickers').strip(),
+        'directory': str(directory if directory else STICKER_DEFAULT_DIRECTORY).strip(),
         'max_file_size_mb': max(1.0, min(30.0, _config_number_or(
             configured, 'maxFileSizeMB', 'max_file_size_mb', 10,
         ))),
@@ -905,6 +910,54 @@ def stable_sticker_asset_id(file_path: Any, hash_value: Any) -> str:
     stem = stem[:220] or 'sticker'
     suffix = re.sub(r'[^a-fA-F0-9]', '', _str(hash_value))[:16].lower() or 'unhashed'
     return ('%s-%s' % (stem, suffix))[:255]
+
+
+# =========================================================================== #
+# 插件数据目录 / 表情库根目录（**全工程唯一判据**；受控偏离，见 §54）
+#
+# "收藏写进了 A 目录、扫描与控制台看的是 B 目录"是这类功能的头号故障（真机症状：
+# 库里能看到这条素材，缩略图却 404）。所以路径推导只留这两个纯函数：谁要根目录都
+# 调它们，一处漂移就一处修。
+# =========================================================================== #
+
+#: 表情库根目录的**默认相对路径**（相对插件数据目录）。
+#: `_conf_schema.json` 的 `default`、`config.CONFIG_DEFAULTS`、服务层与适配层的回落
+#: 全都照这一处读——再多写一份字面量，就是第二个真相。
+STICKER_DEFAULT_DIRECTORY = 'data/hds-interlude/stickers'
+
+
+def host_data_dir(host: Any) -> str:
+    """宿主对象 → 插件数据目录（核心侧与适配层共用的**唯一判据**）。
+
+    三种情形都要有定义，且**绝不抛**：
+
+    * 生产形状：`host.ctx.base_dir`（`ServiceBase` 存的是 `self.ctx`）；
+    * 裸宿主：`ctx` 没有 `base_dir`（或压根没有 `ctx`）→ 退到宿主注入的
+      `host.context.base_dir`；
+    * 单测的 `ServiceChunkN.__new__` 宿主 → 最后退到自己的 `host.base_dir`。
+
+    一个都拿不到 → 回空串。**空串不是"当前工作目录"**：调用方必须把它当"根目录
+    不可知"处理（可见 warn / 直接失败），`os.path.abspath('')` 那种回落会静默写到
+    cwd 去——那正是"文件不在数据目录里"的来源。
+    """
+    for holder in (getattr(host, 'ctx', None), getattr(host, 'context', None), None):
+        base = getattr(host, 'base_dir', '') if holder is None else getattr(holder, 'base_dir', '')
+        if base:
+            return str(base)
+    return ''
+
+
+def sticker_root_from(data_dir: Any, directory: Any = '') -> str:
+    """插件数据目录 + `stickers.directory` → 表情库根目录的绝对路径（唯一判据）。
+
+    收藏写入、扫盘、控制台读图、删组搬迁**全部**从这里取根。数据目录拿不到时回
+    空串（**不是** cwd 相对路径），由调用方按"根目录不可知"可见地失败。
+    """
+    base = _str(data_dir).strip()
+    if not base:
+        return ''
+    relative = _str(directory).strip() or STICKER_DEFAULT_DIRECTORY
+    return os.path.abspath(os.path.join(base, relative))
 
 
 # =========================================================================== #

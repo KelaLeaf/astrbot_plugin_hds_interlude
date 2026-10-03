@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""视频理解（v1.9.0）：抽帧识别 / 原生识别 / 外挂识别。
+"""视频理解（v1.9.0；v1.9.1 起预算可配）：抽帧识别 / 原生识别 / 外挂识别。
 
 上游（Koishi `1.0.1-rc28`）没有这一层：入站的 `<video>` 只是一段文本标记，
 没有任何"把视频变成模型看得懂的东西"的实现。本移植版按用户要求在**模型中心**新增
@@ -7,31 +7,40 @@
 
 | 模式 | 干什么 | 前提 |
 | --- | --- | --- |
-| `frames`（默认） | ffmpeg 间隔抽帧 + 单独抽音轨；帧走**现有图像理解通道**、音轨走**现有语音理解通道** | 系统里要有 `ffmpeg`（外部二进制，缺了显式降级） |
+| `frames`（默认） | ffmpeg 抽帧 + 单独抽音轨；帧走**现有图像理解通道**、音轨走**现有语音理解通道** | 系统里要有 `ffmpeg`（外部二进制，缺了显式降级） |
 | `native` | 把视频原样交给模型 | **本宿主没有这条路**（源码依据见下）→ 显式降级，绝不假装成功 |
 | `external` | 把视频交给 `model_id` 指名的模型 | 指名一个能吃视频的 Provider；指名却找不到**失败不回落** |
 
-## 抽帧识别的预算（全部是有界常量）
+## 预算全部可配（v1.9.1；常量退化成默认值，**读配置只有一处**）
 
-* **间隔抽帧**：每 `VIDEO_FRAME_INTERVAL_SECONDS` 秒 1 帧，最多 `VIDEO_MAX_FRAMES` 帧。
-  帧数上限**照直发视觉预算定**——`chunk3.load_native_images` 里就是 `sources[:3]`，
-  视频帧与直发图片**共用**那一个 3 张的预算，这里刻意不另立第二套。
-* **音轨**：`-vn -ac 1 -ar 16000` 转 16k 单声道 wav，最多取前
-  `VIDEO_AUDIO_CLIP_SECONDS` 秒；再按现有音频预算（`audio.max_file_size_mb`）交给
-  `load_native_audio`（`data:audio/wav;base64,…` 正是它认的输入形态之一）。
-* **时长**：超过 `VIDEO_MAX_DURATION_SECONDS` 只处理前 N 秒，并在正文留可数线索。
-* **体积**：本地文件超过 `VIDEO_MAX_FILE_SIZE_MB` 直接降级（直链没有本地体积，
-  由时长上限与命令超时兜底——见 `extract_video` 的说明）。
-* **超时 / 并发**：单条 ffmpeg 命令 `VIDEO_FFMPEG_TIMEOUT_SECONDS` 秒；同时最多
-  `VIDEO_MAX_CONCURRENCY` 个视频在处理，超出的那条**明确 warn 后跳过**，
-  不让一个视频卡住回合。
+用户口径：抽帧模式（连续 / 平均）+ 各自的那个量、音轨转码格式、音轨时长
+（自定义秒数 / 不限制）、ffmpeg 超时、群聊独立开关。落点：
 
-## 降级一律不静默（坑 25）
+| 配置键（`model_center.video.*`） | 默认值 | 常量来源 | 作用 |
+| --- | --- | --- | --- |
+| `frame_mode` | `sequence` | `VIDEO_DEFAULT_FRAME_MODE` | `sequence` 连续抽帧（每 N 秒 1 帧）/ `average` 平均抽帧（整段均分 N 帧） |
+| `frame_interval_seconds` | `4` | `VIDEO_FRAME_INTERVAL_SECONDS` | 连续抽帧：每几秒抽 1 帧 |
+| `frame_average_count` | `3` | `VIDEO_AVERAGE_FRAMES` | 平均抽帧：整段平均抽几帧（上限 = 视觉预算 `VIDEO_MAX_FRAMES`） |
+| `out_format` | `mp3` | `VIDEO_DEFAULT_AUDIO_FORMAT` | 音轨转码输出格式（与「语音 / 音频理解」那组的**同名同义键**） |
+| `audio_duration` | `custom` | `VIDEO_DEFAULT_AUDIO_DURATION` | `custom` 按下面的秒数截；`unlimited` 整段都要（只受体积预算与超时兜底） |
+| `audio_duration_seconds` | `60` | `VIDEO_AUDIO_CLIP_SECONDS` | `custom` 时取前几秒音轨 |
+| `timeout_seconds` | `20` | `VIDEO_FFMPEG_TIMEOUT_SECONDS` | 单条 ffmpeg 命令超时（秒） |
+| `group_enabled` | `false` | `VIDEO_DEFAULT_GROUP_ENABLED` | **群聊**的视频理解独立开关（打开后群回合只让**音轨**进去，画面帧没有通道；私聊只受总开关管） |
 
-ffmpeg 不存在 / 抽帧失败 / 命令超时 / 无音轨 / 视频超时长或体积 —— 每一条都：
-① 正文里留一句**可行动**的说明（`video_fact_note`，含可数线索）；
-② 打一条按会话节流的 `warn`（走 `service.note_access_skip`，同一原因 10 分钟一条）；
-③ **绝不因此丢消息**（回合照常，视频退化成"收到了一段视频"这条事实）。
+`resolve_video_config()` 是**唯一**读这段配置的地方（schema 默认值、`CONFIG_DEFAULTS`
+与 `VIDEO_CONFIG_DEFAULTS` 三份逐字一致，用例钉着）。
+
+## 超时口径：抽到几帧交几帧（v1.9.1）
+
+旧行为是"超时 → 整段丢弃"。新口径照用户原话：**到达超时时间时，已经抽到磁盘上的帧
+照常交出去**（`VideoExtraction.timed_out`），并在正文里留可数线索、打一条可行动的 warn
+（"想抽完就调大超时秒数 / 把视频裁短"）。一帧都没抽到时仍是"抽帧失败"那条降级路径。
+
+## 为什么"平均抽帧"要先用 ffmpeg 探时长
+
+平均 = 整段均分 N 帧，命令只能是 `-vf fps=N/时长`（ffmpeg 没有"一共抽 N 帧"的开关）。
+时长由 `probe_video` 顺手拿到（探测命令本来就要跑，不额外加进程）；探不到时长时
+退回连续抽帧那条 fps（**不猜时长**），帧数上限照旧。
 
 ## 为什么 `native` 只能是显式降级（源码依据，别推翻）
 
@@ -59,6 +68,21 @@ Provider 的是**视频直链文本（URL）**，不是字节：宿主出站部�
 * 指名了但找不到 / 不可用 → 明确失败（照既有"指名 Provider"的纪律）；
 * 视频只有本地文件、没有直链 → 明确失败（宿主没有上传通道）。
 
+## 群聊与合并转发
+
+* **群聊**独立开关（`group_enabled`，默认关=省成本）：群聊里视频刷屏最贵，默认不动它；
+  关着时连 `ffmpeg` 都不调（与总开关关着同一条路径）。私聊只看总开关。
+  **打开后的真实语义（写实，别读成"群里能看见画面"）**：群回合会为这段视频跑一次
+  ffmpeg——**音轨**并进群音频批次（`chunk1.flush_group_turn` 的 `group_audio`，那条
+  通道是通的），**帧没有视觉通道可去**（群回合给 `try_decide` 的图片位恒为 `[]`）→
+  丢弃，并按 `GROUP_NO_VISION_REASON` 打一条**节流**的可见说明。
+  接线见 `collect_group_video_media()`。
+* **合并转发里的视频**由 `forward_message.max_videos`（单条转发最多读取的视频数，
+  默认 **1** = 一张卡最多读一段；配 0 才是一段都不读）在 `core/forward_message.py`
+  那一侧截断，读出来的坐标经
+  `SessionView.media`（`kind='video'`）流到这里——**判据只有一处**：本模块的
+  `extract_session_video_sources()` 顺带收媒体表里的视频坐标。
+
 不 import astrbot（`plugin/core/` 的硬约束）。
 """
 
@@ -72,42 +96,50 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import unquote
 
 __all__ = [
-    'VIDEO_FRAME_INTERVAL_SECONDS', 'VIDEO_MAX_FRAMES', 'VIDEO_MAX_DURATION_SECONDS',
-    'VIDEO_MAX_FILE_SIZE_MB', 'VIDEO_AUDIO_CLIP_SECONDS', 'VIDEO_AUDIO_SAMPLE_RATE',
-    'VIDEO_FFMPEG_TIMEOUT_SECONDS', 'VIDEO_MAX_CONCURRENCY', 'VIDEO_WARN_INTERVAL_MS',
-    'VIDEO_MODES', 'VIDEO_DEFAULT_MODE', 'VIDEO_CONFIG_DEFAULTS', 'VIDEO_FACT_PREFIX',
-    'VIDEO_TASK', 'VIDEO_MODE_HINT', 'FFMPEG_MISSING_REASON', 'NATIVE_UNSUPPORTED_REASON',
-    'EXTERNAL_NO_MODEL_REASON', 'EXTERNAL_MISSING_MODEL_REASON', 'EXTERNAL_NO_URL_REASON',
-    'VIDEO_TRUNCATED_REASON', 'VIDEO_TOO_LARGE_REASON', 'VIDEO_BUSY_REASON', 'clip',
-    'VideoExtraction', 'VideoMedia', 'resolve_video_config', 'video_config',
-    'ffmpeg_path', 'ffmpeg_available', 'reset_ffmpeg_probe', 'ffmpeg_status_label',
-    'apply_ffmpeg_status_hint', 'extract_session_video_sources', 'video_input_target',
-    'extract_video', 'video_fact_note', 'degradation_message', 'collect_video_sources',
-    'reset_video_runtime_state',
+    'VIDEO_FRAME_INTERVAL_SECONDS', 'VIDEO_AVERAGE_FRAMES', 'VIDEO_MAX_FRAMES',
+    'VIDEO_MAX_DURATION_SECONDS', 'VIDEO_MAX_FILE_SIZE_MB', 'VIDEO_AUDIO_CLIP_SECONDS',
+    'VIDEO_AUDIO_SAMPLE_RATE', 'VIDEO_FFMPEG_TIMEOUT_SECONDS', 'VIDEO_MAX_CONCURRENCY',
+    'VIDEO_WARN_INTERVAL_MS', 'VIDEO_MODES', 'VIDEO_DEFAULT_MODE', 'VIDEO_FRAME_MODES',
+    'VIDEO_DEFAULT_FRAME_MODE', 'VIDEO_AUDIO_FORMATS', 'VIDEO_DEFAULT_AUDIO_FORMAT',
+    'VIDEO_AUDIO_DURATIONS', 'VIDEO_DEFAULT_AUDIO_DURATION', 'VIDEO_DEFAULT_GROUP_ENABLED',
+    'VIDEO_CONFIG_DEFAULTS', 'VIDEO_FACT_PREFIX', 'VIDEO_TASK', 'VIDEO_MODE_HINT',
+    'FFMPEG_MISSING_REASON', 'NATIVE_UNSUPPORTED_REASON', 'EXTERNAL_NO_MODEL_REASON',
+    'EXTERNAL_MISSING_MODEL_REASON', 'EXTERNAL_NO_URL_REASON', 'VIDEO_TRUNCATED_REASON',
+    'VIDEO_TOO_LARGE_REASON', 'VIDEO_BUSY_REASON', 'VIDEO_FRAME_TIMEOUT_PREFIX',
+    'VIDEO_FRAME_PARTIAL_PREFIX', 'GROUP_NO_VISION_REASON',
+    'FFMPEG_FOUND_LABEL', 'FFMPEG_MISSING_LABEL',
+    'clip', 'VideoExtraction', 'VideoMedia', 'resolve_video_config', 'video_config',
+    'audio_clip_seconds', 'frame_timeout_reason', 'frame_partial_reason', 'ffmpeg_path', 'ffmpeg_available', 'reset_ffmpeg_probe',
+    'ffmpeg_status_label', 'apply_ffmpeg_status_hint', 'extract_session_video_sources',
+    'video_input_target', 'extract_video', 'video_fact_note', 'degradation_message',
+    'collect_video_sources', 'collect_group_video_media', 'reset_video_runtime_state',
 ]
 
 # =========================================================================== #
-# 预算常量（有界；改这里就够了，别在调用点再写一遍数字）
+# 预算常量（**默认值**；可配的项见 `VIDEO_CONFIG_DEFAULTS`，改这里就够了）
 # =========================================================================== #
 
-#: 间隔抽帧：每 N 秒取 1 帧。
+#: 连续抽帧：每 N 秒取 1 帧（`frame_interval_seconds` 的默认值）。
 VIDEO_FRAME_INTERVAL_SECONDS = 4
+#: 平均抽帧：整段平均抽几帧（`frame_average_count` 的默认值）。
+VIDEO_AVERAGE_FRAMES = 3
 #: 一条视频最多抽几帧。**等于直发视觉预算**（`chunk3.load_native_images` 的
 #: `sources[:3]`）——两者同量级是刻意的：视频帧和直发图片抢同一个 3 张预算。
+#: `frame_average_count` 的**上限**也是它：多抽的帧到不了模型，只是白花时间。
 VIDEO_MAX_FRAMES = 3
 #: 一条视频最多处理多长（秒）；超出部分只留可数线索，不再抽帧。
 VIDEO_MAX_DURATION_SECONDS = 180
 #: 本地视频文件的上限（MB）。直链没有本地体积可言，由时长上限 + 命令超时兜底。
 VIDEO_MAX_FILE_SIZE_MB = 50
-#: 音轨最多取多长（秒）。
+#: 音轨最多取多长（秒；`audio_duration_seconds` 的默认值）。
 VIDEO_AUDIO_CLIP_SECONDS = 60
 #: 音轨采样率（单声道）：语音模型 / STT 都认的窄带形态，往上传也小。
 VIDEO_AUDIO_SAMPLE_RATE = 16_000
-#: 单条 ffmpeg 命令的超时（秒）。
+#: 单条 ffmpeg 命令的超时（秒；`timeout_seconds` 的默认值）。
 VIDEO_FFMPEG_TIMEOUT_SECONDS = 20
 #: 同时最多处理几个视频（超出的那条明确 warn 后跳过）。
 VIDEO_MAX_CONCURRENCY = 1
@@ -119,8 +151,50 @@ VIDEO_WARN_INTERVAL_MS = 10 * 60 * 1000
 VIDEO_MODES = ('frames', 'native', 'external')
 #: 默认模式：抽帧识别（不吃外部 API、不依赖 Provider 选型）。
 VIDEO_DEFAULT_MODE = 'frames'
-#: `model_center.video` 的默认值（与 schema 默认逐字一致）。
-VIDEO_CONFIG_DEFAULTS: dict[str, Any] = {'enabled': False, 'mode': VIDEO_DEFAULT_MODE, 'model_id': ''}
+#: 两种抽帧模式（连续 / 平均）。
+VIDEO_FRAME_MODES = ('sequence', 'average')
+#: 默认抽帧模式：连续抽帧（等间隔，最省 ffmpeg 的一次探测结果依赖）。
+VIDEO_DEFAULT_FRAME_MODE = 'sequence'
+#: 音轨转码格式。**逐字等于「语音 / 音频理解」那组的 `out_format` 候选**
+#: （`chunk3.fetch_native_audio` 的 `data:audio/<fmt>` 白名单也是这六个）。
+VIDEO_AUDIO_FORMATS = ('mp3', 'wav', 'ogg', 'm4a', 'flac', 'amr')
+#: 默认音轨格式：与「语音 / 音频理解」的默认同值（mp3 兼容性最好、体积最小）。
+VIDEO_DEFAULT_AUDIO_FORMAT = 'mp3'
+#: 音轨时长口径：`custom`（按 `audio_duration_seconds` 截）/ `unlimited`（不截）。
+VIDEO_AUDIO_DURATIONS = ('custom', 'unlimited')
+#: 默认口径：自定义秒数（省字节；`unlimited` 由体积预算与超时兜底）。
+VIDEO_DEFAULT_AUDIO_DURATION = 'custom'
+#: 群聊视频理解默认开关。**省成本那侧 = 关**：群聊里视频刷屏最费 ffmpeg 与模型调用，
+#: 而私聊一条视频是"她真的在看"的强信号。要开就明确去开。
+#: 打开后**只让音轨进去**（群回合没有视觉通道，见 `GROUP_NO_VISION_REASON`）——
+#: 这个开关的真实语义是"群里的视频要不要花一次 ffmpeg 把声音取出来"。
+VIDEO_DEFAULT_GROUP_ENABLED = False
+
+#: `model_center.video` 的默认值（与 schema 默认逐字一致；`CONFIG_DEFAULTS` 也照抄它）。
+VIDEO_CONFIG_DEFAULTS: dict[str, Any] = {
+    'enabled': False,
+    'mode': VIDEO_DEFAULT_MODE,
+    'model_id': '',
+    'frame_mode': VIDEO_DEFAULT_FRAME_MODE,
+    'frame_interval_seconds': VIDEO_FRAME_INTERVAL_SECONDS,
+    'frame_average_count': VIDEO_AVERAGE_FRAMES,
+    'out_format': VIDEO_DEFAULT_AUDIO_FORMAT,
+    'audio_duration': VIDEO_DEFAULT_AUDIO_DURATION,
+    'audio_duration_seconds': VIDEO_AUDIO_CLIP_SECONDS,
+    'timeout_seconds': VIDEO_FFMPEG_TIMEOUT_SECONDS,
+    'group_enabled': VIDEO_DEFAULT_GROUP_ENABLED,
+}
+
+#: 音轨格式 → (ffmpeg 复用器, 文件扩展名)。`.m4a` 的复用器叫 `mp4`——两者不同名，
+#: 所以这张表必须显式写（别拿格式当复用器用）。
+_AUDIO_CONTAINERS: dict[str, tuple[str, str]] = {
+    'mp3': ('mp3', 'mp3'),
+    'wav': ('wav', 'wav'),
+    'ogg': ('ogg', 'ogg'),
+    'm4a': ('mp4', 'm4a'),
+    'flac': ('flac', 'flac'),
+    'amr': ('amr', 'amr'),
+}
 
 #: 正文里那句视频事实的**固定前缀**（用例按它断言；也是"这一回合有视频"的机器可读标记）。
 VIDEO_FACT_PREFIX = '[视频'
@@ -129,7 +203,7 @@ VIDEO_TASK = '视频理解'
 
 
 # =========================================================================== #
-# 配置
+# 配置（**唯一**读取点）
 # =========================================================================== #
 
 def _pick(record: Any, *names: str) -> Any:
@@ -156,21 +230,77 @@ def _text(value: Any) -> str:
     return value if isinstance(value, str) else str(value)
 
 
+def _int_in(value: Any, fallback: int, low: int, high: int) -> int:
+    """读一个整数并夹到 `[low, high]`（读不出来 / 是 bool 之外的非数 → `fallback`）。
+
+    "手改坏了配置"与"从没写过"都回到默认值，绝不因为一个脏值把超时变成 0 秒
+    （那会把每一条视频都判成超时）。
+    """
+    if isinstance(value, bool) or value is None:
+        return fallback
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return fallback
+    return max(low, min(high, number))
+
+
 def resolve_video_config(raw: Any) -> dict[str, Any]:
     """`model_center.video` 段 → 归一化配置（缺键按默认，口径与 schema 一致）。
 
-    缺键一律按**省成本那侧**：`enabled=False`（关）、`mode='frames'`、`model_id=''`。
-    `mode` 认不出来时回到 `frames`（用户手改坏了配置也不该悄悄变成"原生识别"）。
+    缺键一律按**省成本那侧**：关着、抽帧识别、连续抽帧、mp3、自定义 60 秒、群聊关。
+    认不出来的枚举值回到默认（用户手改坏了配置也不该悄悄变成"原生识别"或
+    "不限制音轨时长"）。
     """
     section = raw if isinstance(raw, dict) else {}
     mode = _text(_pick(section, 'mode')).strip().lower()
     if mode not in VIDEO_MODES:
         mode = VIDEO_DEFAULT_MODE
+    frame_mode = _text(_pick(section, 'frameMode', 'frame_mode')).strip().lower()
+    if frame_mode not in VIDEO_FRAME_MODES:
+        frame_mode = VIDEO_DEFAULT_FRAME_MODE
+    out_format = _text(_pick(section, 'outFormat', 'out_format')).strip().lower()
+    if out_format not in VIDEO_AUDIO_FORMATS:
+        out_format = VIDEO_DEFAULT_AUDIO_FORMAT
+    audio_duration = _text(_pick(section, 'audioDuration', 'audio_duration')).strip().lower()
+    if audio_duration not in VIDEO_AUDIO_DURATIONS:
+        audio_duration = VIDEO_DEFAULT_AUDIO_DURATION
     return {
         'enabled': _pick(section, 'enabled') is True,
         'mode': mode,
         'model_id': _text(_pick(section, 'modelId', 'model_id')).strip(),
+        'frame_mode': frame_mode,
+        'frame_interval_seconds': _int_in(
+            _pick(section, 'frameIntervalSeconds', 'frame_interval_seconds'),
+            VIDEO_FRAME_INTERVAL_SECONDS, 1, 60,
+        ),
+        'frame_average_count': _int_in(
+            _pick(section, 'frameAverageCount', 'frame_average_count'),
+            VIDEO_AVERAGE_FRAMES, 1, VIDEO_MAX_FRAMES,
+        ),
+        'out_format': out_format,
+        'audio_duration': audio_duration,
+        'audio_duration_seconds': _int_in(
+            _pick(section, 'audioDurationSeconds', 'audio_duration_seconds'),
+            VIDEO_AUDIO_CLIP_SECONDS, 1, 3600,
+        ),
+        'timeout_seconds': _int_in(
+            _pick(section, 'timeoutSeconds', 'timeout_seconds'),
+            VIDEO_FFMPEG_TIMEOUT_SECONDS, 1, 600,
+        ),
+        'group_enabled': _pick(section, 'groupEnabled', 'group_enabled') is True,
     }
+
+
+def audio_clip_seconds(config: Any) -> Optional[int]:
+    """配置 → 音轨时长（秒）；`unlimited` 回 `None`（= 不给 ffmpeg 传 `-t`）。"""
+    section = config if isinstance(config, dict) else {}
+    if _text(section.get('audio_duration')).strip().lower() == 'unlimited':
+        return None
+    value = section.get('audio_duration_seconds')
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return VIDEO_AUDIO_CLIP_SECONDS
+    return max(1, int(value))
 
 
 def video_config(service: Any) -> dict[str, Any]:
@@ -183,6 +313,17 @@ def video_config(service: Any) -> dict[str, Any]:
     config = getattr(service, 'config', None)
     section = _pick(config, 'model', 'model_center')
     return resolve_video_config(_pick(section, 'video', 'video_understanding'))
+
+
+def _is_group_session(session: Any) -> bool:
+    """这条会话是不是群聊（`SessionView.is_direct`，适配层按事件判出来的那一份）。
+
+    只有**显式** `False` 才算群聊：拿不到这个字段（老适配器 / 手搓 dict 会话）时
+    按私聊处理 —— 群聊开关是"省成本"的闸，不该把"判不出来"当成"是群聊"而静默
+    什么都不做（那就成了能力缺失无声降级）。生产里 `session_view()` 总会填它。
+    """
+    direct = _pick(session, 'isDirect', 'is_direct')
+    return direct is False
 
 
 # =========================================================================== #
@@ -221,22 +362,25 @@ def ffmpeg_available() -> bool:
     return bool(ffmpeg_path())
 
 
+#: 识别模式那一项最前面的状态提示（用户口径的两个取值；宿主配置页**不支持着色**，
+#: 所以用文本标记，见 `apply_ffmpeg_status_hint` 的宿主依据）。
+FFMPEG_FOUND_LABEL = '✅ FFmpeg 已识别'
+FFMPEG_MISSING_LABEL = '⚠️ 未发现 FFmpeg'
+
+
 def ffmpeg_status_label() -> str:
-    """配置项旁边那句状态（用户原话的两个取值）。"""
-    return 'FFmpeg 已识别' if ffmpeg_available() else '未检查到 FFmpeg'
+    """配置项旁边那句状态（用户原话的两个取值 + 文本标记）。"""
+    return FFMPEG_FOUND_LABEL if ffmpeg_available() else FFMPEG_MISSING_LABEL
 
 
-#: 配置项的**静态** hint：无论探测结果如何都要说清"抽帧识别需要 FFmpeg"。
-#: 动态那句由 `apply_ffmpeg_status_hint` 顶在这个前缀上（见那边的说明）。
-VIDEO_MODE_HINT = (
-    '抽帧识别需要系统装有 FFmpeg（能执行 ffmpeg -version）：'
-    '按每 %d 秒 1 帧、最多 %d 帧抽画面，并单独抽前 %d 秒音轨，'
-    '分别走图片理解与语音理解模型。'
-) % (VIDEO_FRAME_INTERVAL_SECONDS, VIDEO_MAX_FRAMES, VIDEO_AUDIO_CLIP_SECONDS)
+#: 识别模式的**静态** hint（用户逐字口径）：状态提示由 `apply_ffmpeg_status_hint`
+#: 顶在它前面。这里刻意**不写**任何具体数字——抽帧间隔 / 帧数 / 音轨秒数现在都是
+#: 配置项，写死在文案里就是第二个真相（过时即误导）。
+VIDEO_MODE_HINT = '需要启用语音原生理解与启用图片理解后抽帧模式才会生效。'
 
 
 def apply_ffmpeg_status_hint(schema: Any) -> str:
-    """把「FFmpeg 已识别 / 未检查到 FFmpeg」写进**内存里的** schema（返回状态文本）。
+    """把「✅ FFmpeg 已识别 / ⚠️ 未发现 FFmpeg」写进**内存里的** schema（返回状态文本）。
 
     ## 为什么能动态（宿主源码依据，AstrBot 4.28）
 
@@ -252,8 +396,19 @@ def apply_ffmpeg_status_hint(schema: Any) -> str:
     * 而 `AstrbotConfig.save_config()` 只写 `dict(self)`（配置值），
       **schema 从不落盘**（`astrbot/core/config/astrbot_config.py:262-272 / :308 / :339`）。
 
-    所以改内存里的 schema 既能动态、又**不碰仓库里的 `_conf_schema.json`**（用户明确
-    要求不许改写那个文件）。改的是 `video.mode.hint` —— 用户原话就是"这个配置项旁边"。
+    ## 为什么**不能**着色（宿主源码依据，AstrBot 4.28；别改成 HTML）
+
+    宿主配置页把 hint / description 一律当**纯文本**渲染：
+
+    * `astrbot/dashboard/dist/assets/ProviderSelectMenu-DArc81Nx.js:26`（该文件是
+      一行压缩产物，行号即唯一长行）里每一处 hint 都是
+      `b(m(U(A.__template_key, ie, "hint", G.hint)), 1)`（如 `property-hint` /
+      `config-hint` 那几处）：`m` = Vue `toDisplayString`、`b` = `createTextVNode`
+      ——落成**文本节点**，HTML 会被转义；
+    * 同一个文件里 `innerHTML` / `v-html` **出现 0 次**（`grep -c` 实测 0）。
+
+    所以「绿色 / 黄色状态提示」只能退化成文本标记（用户给的替代口径：
+    `✅ FFmpeg 已识别` / `⚠️ 未发现 FFmpeg`）。
 
     拿不到那个节点（宿主换了形状 / 手搓 schema）时**原样返回**，只把状态文本交给调用方
     去写日志：绝不为了让提示好看而抛异常。
@@ -261,12 +416,7 @@ def apply_ffmpeg_status_hint(schema: Any) -> str:
     label = ffmpeg_status_label()
     if not isinstance(schema, dict):
         return label
-    hint = '%s。%s' % (
-        label,
-        VIDEO_MODE_HINT if ffmpeg_available() else
-        (VIDEO_MODE_HINT + '当前没探测到 FFmpeg：抽帧识别会降级成一句「收到了一段视频」，'
-                           '装上 FFmpeg 后重载插件即可生效。'),
-    )
+    hint = '%s。%s' % (label, VIDEO_MODE_HINT)
     try:
         node = schema['model_center']['items']['video']['items']['mode']
         if isinstance(node, dict):
@@ -306,6 +456,25 @@ def _local_path(value: Any) -> str:
     return text.strip()
 
 
+def _trusted_video_source(value: Any) -> str:
+    """**可信**来源坐标（适配器直给的段 / 媒体表）→ `onebot-url:` / `onebot-file:`。
+
+    判据只有这一处：元素（`session.elements`）与媒体表（`session.media`）都走它。
+    认不出形状（ftp:// 之类）回空串 —— 那不属于"可取回"的那几类。
+    """
+    text = _text(value).strip()
+    if not text:
+        return ''
+    if re.match(r'^https?://', text, re.IGNORECASE):
+        return 'onebot-url:%s' % text
+    if text.lower().startswith('file://'):
+        local = _local_path(text)
+        return 'onebot-file:%s' % local if local else ''
+    if re.match(r'^(?:[A-Za-z]:[\\/]|/)', text):
+        return 'onebot-file:%s' % text
+    return ''
+
+
 def _element_video_source(element: Any) -> str:
     """一个适配器直给的 `<video>` 元素 → 可信坐标；认不出回空串。"""
     if not isinstance(element, dict):
@@ -315,14 +484,9 @@ def _element_video_source(element: Any) -> str:
     attrs = element.get('attrs') if isinstance(element.get('attrs'), dict) else {}
     data = element.get('data') if isinstance(element.get('data'), dict) else {}
     for key in ('src', 'url', 'file'):
-        value = _text(attrs.get(key) or data.get(key)).strip()
-        if not value:
-            continue
-        if re.match(r'^https?://', value, re.IGNORECASE):
-            return 'onebot-url:%s' % value
-        local = _local_path(value)
-        if local:
-            return 'onebot-file:%s' % local
+        source = _trusted_video_source(attrs.get(key) or data.get(key))
+        if source:
+            return source
     return ''
 
 
@@ -331,6 +495,9 @@ def extract_session_video_sources(session: Any) -> list[str]:
 
     * 第一遍只认**适配器直给的元素**（`session.elements`）——适配器从观测到的
       原始段写下来的，是可信坐标（`onebot-url:` / `onebot-file:`）；
+    * 第二遍认**结构化媒体表**里 `kind == 'video'` 的条目（`session.media`）：
+      合并转发节点里的视频坐标就是这么进来的（数量已由
+      `forward_message.max_videos` 在那一侧截断；这里只翻译坐标，不再数一遍）；
     * 文本那一遍（正文里的 `<video src=…/>` 与 `[CQ:video,…]`）一律加 `text:` 前缀，
       `video_input_target` 见到它**永不取回**。
     """
@@ -339,6 +506,16 @@ def extract_session_video_sources(session: Any) -> list[str]:
     if isinstance(trusted, list):
         for element in trusted:
             source = _element_video_source(element)
+            if source and source not in sources:
+                sources.append(source)
+    media = _pick(session, 'media')
+    if isinstance(media, list):
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            if _text(item.get('kind')).strip().lower() != 'video':
+                continue
+            source = _trusted_video_source(item.get('source'))
             if source and source not in sources:
                 sources.append(source)
     raw = _text(_pick(session, 'content'))
@@ -365,7 +542,7 @@ def video_input_target(source: Any) -> tuple[str, str]:
     """来源坐标 → `('file'|'url'|'', 目标)`。
 
     * `onebot-file:` / `file://…` / 裸绝对路径 → 本地文件（**唯一读本地文件的口子**，
-      只能由适配器直给的元素产生）；
+      只能由适配器直给的元素 / 媒体表产生）；
     * `onebot-url:` → 直链（适配器给的平台 CDN 地址）；
     * `text:` 前缀 → `('', '')`：**永不处理**（正文坐标，用户可写）；
     * 裸 http(s) 只在**没有** `text:` 时当直链（手搓 `SessionView` / 桌面桥的坐标）。
@@ -418,7 +595,7 @@ def _run_ffmpeg(binary: str, args: list[str], timeout: float) -> tuple[int, str,
 class VideoExtraction:
     """一次抽帧 + 抽音轨的结果（**只描述事实**，降级文本由 `video_fact_note` 拼）。"""
 
-    #: 抽出来的帧文件绝对路径（按时间顺序；≤ `VIDEO_MAX_FRAMES`）。
+    #: 抽出来的帧文件绝对路径（按时间顺序；≤ 帧数上限）。
     frames: tuple[str, ...] = ()
     #: 抽出来的音轨文件绝对路径（没有音轨 / 抽取失败时为空串）。
     audio_path: str = ''
@@ -432,6 +609,8 @@ class VideoExtraction:
     audio_error: str = ''
     #: 视频里有没有音轨（探测结论；探不到按"有"处理，别把"不知道"说成"没有"）。
     has_audio: bool = True
+    #: 抽帧命令**超时**（`frames` 里就是超时前已经落到磁盘的那些帧）。
+    timed_out: bool = False
     #: 本次用的临时目录（调用方读完帧字节后要删掉它，见 `collect_video_sources`）。
     workdir: str = ''
 
@@ -445,7 +624,8 @@ def probe_video(binary: str, target: str, timeout: float) -> tuple[float, bool, 
 
     用 `ffmpeg -i <target>` 本身（只读文件头，退出码是 1）：**不引入 ffprobe**
     这第二个二进制——用户装了 ffmpeg 不等于装了 ffprobe（静态构建里常常只有一个）。
-    时长探不到时回 `0.0`，调用方据此**不声称截断**（"不知道"不等于"很短"）。
+    时长探不到时回 `0.0`，调用方据此**不声称截断**（"不知道"不等于"很短"），
+    也不拿它算平均抽帧的 fps（见 `_frame_filter`）。
     """
     try:
         _, _, stderr = _run_ffmpeg(binary, ['-hide_banner', '-nostdin', '-i', target], timeout)
@@ -465,34 +645,88 @@ def probe_video(binary: str, target: str, timeout: float) -> tuple[float, bool, 
     return duration, has_audio, ''
 
 
+def _frame_filter(
+    frame_mode: str, duration: float, *, interval_seconds: int, average_frames: int,
+    max_duration_seconds: int,
+) -> tuple[str, int]:
+    """抽帧模式 → `(-vf 的值, 帧数上限)`。
+
+    * `sequence`：`fps=1/每几秒`，上限 = 视觉预算 `VIDEO_MAX_FRAMES`（与直发图共用）；
+    * `average`：整段均分 N 帧 → `fps=N/时长`，上限 = N。时长**探不到**时退回连续
+      抽帧那条 fps（不猜时长），上限仍然是 N。
+
+    两个模式都受同一件事实约束：**多抽的帧到不了模型**（`chunk3.load_native_images`
+    的 `sources[:3]`），所以平均抽帧的 N 上限就是 `VIDEO_MAX_FRAMES`。
+    """
+    frames_cap = max(1, int(average_frames)) if frame_mode == 'average' else VIDEO_MAX_FRAMES
+    if frame_mode == 'average':
+        span = min(duration, float(max_duration_seconds)) if duration > 0 else 0.0
+        if span > 0:
+            return 'fps=%.6f' % (max(1, int(average_frames)) / span), frames_cap
+        return 'fps=1/%d' % max(1, int(interval_seconds)), frames_cap
+    return 'fps=1/%d' % max(1, int(interval_seconds)), frames_cap
+
+
+def _collect_frames(directory: str, cap: int) -> list[str]:
+    """把目录里已经写出的帧按序号收回来（**超时 / 失败之后也要收**）。
+
+    只认非空文件：超时那一瞬间 ffmpeg 可能刚建好下一个文件、还没写字节，
+    空文件交出去只会让视觉通道多一次必然失败的取字节。
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:  # pragma: no cover - 目录被外力删掉
+        return []
+    frames: list[str] = []
+    for name in sorted(names):
+        if not (name.startswith('frame-') and name.endswith('.jpg')):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if os.path.getsize(path) <= 0:
+                continue
+        except OSError:  # pragma: no cover
+            continue
+        frames.append(path)
+    return frames[:max(1, int(cap))]
+
+
 def extract_video(
     target: str,
     *,
     binary: str = '',
     workdir: str = '',
+    frame_mode: str = VIDEO_DEFAULT_FRAME_MODE,
     interval_seconds: int = VIDEO_FRAME_INTERVAL_SECONDS,
-    max_frames: int = VIDEO_MAX_FRAMES,
+    average_frames: int = VIDEO_AVERAGE_FRAMES,
     max_duration_seconds: int = VIDEO_MAX_DURATION_SECONDS,
-    audio_seconds: int = VIDEO_AUDIO_CLIP_SECONDS,
+    audio_seconds: Optional[int] = VIDEO_AUDIO_CLIP_SECONDS,
+    audio_format: str = VIDEO_DEFAULT_AUDIO_FORMAT,
     with_audio: bool = True,
     timeout: float = VIDEO_FFMPEG_TIMEOUT_SECONDS,
 ) -> VideoExtraction:
-    """间隔抽帧 + 单独抽音轨（**同步**、阻塞；异步调用方走 `asyncio.to_thread`）。
+    """抽帧 + 单独抽音轨（**同步**、阻塞；异步调用方走 `asyncio.to_thread`）。
 
-    两条命令：
+    两条命令（`fps` 由抽帧模式算，`-t` 只在音轨口径是"自定义秒数"时出现）：
 
     ```
     ffmpeg -hide_banner -loglevel error -nostdin -y -i <target> -t <max_duration>
-           -vf fps=1/<interval> -frames:v <max_frames> -q:v 3 <dir>/frame-%02d.jpg
-    ffmpeg -hide_banner -loglevel error -nostdin -y -i <target> -t <audio_seconds>
-           -vn -ac 1 -ar 16000 -f wav <dir>/audio.wav
+           -vf <fps=…> -frames:v <上限> -q:v 3 <dir>/frame-%02d.jpg
+    ffmpeg -hide_banner -loglevel error -nostdin -y -i <target> [-t <audio_seconds>]
+           -vn -ac 1 -ar 16000 -f <复用器> <dir>/audio.<ext>
     ```
 
     单条命令各自的失败**互不牵连**：抽帧失败不影响音轨，音轨没有也不影响帧
     （"无音轨 → 只走图像不失败"）。命令超时同样只影响那一条。
 
+    **超时口径（v1.9.1，用户原话）**：抽帧超时时**不丢弃**已经写到磁盘的帧——
+    `timed_out=True` 且 `frames` 就是那些帧，调用方照常交出去并在正文里留可数线索。
+
     `with_audio=False` 时**连音轨那条命令都不发**（调用方已经知道语音理解那条通道
-    关着，抽出来也会被丢掉 —— 省一次 ffmpeg 与 60 秒音轨的字节）。
+    关着，抽出来也会被丢掉 —— 省一次 ffmpeg 与音轨的字节）。
+
+    `audio_seconds=None` = 音轨时长不限制（不给 `-t`）：整段都要，由体积预算
+    （`audio.max_file_size_mb`）与这里的超时兜底。
     """
     binary = binary or ffmpeg_path()
     if not binary:
@@ -502,42 +736,48 @@ def extract_video(
     duration, has_audio, _probe_error = probe_video(binary, target, timeout)
     truncated = bool(duration and duration > max_duration_seconds)
 
+    filter_value, frames_cap = _frame_filter(
+        frame_mode, duration, interval_seconds=interval_seconds,
+        average_frames=average_frames, max_duration_seconds=max_duration_seconds,
+    )
     frames: list[str] = []
     frame_error = ''
+    timed_out = False
     pattern = os.path.join(directory, 'frame-%02d.jpg')
     try:
         code, _, stderr = _run_ffmpeg(binary, [
             '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
             '-i', target, '-t', str(max_duration_seconds),
-            '-vf', 'fps=1/%d' % max(1, int(interval_seconds)),
-            '-frames:v', str(max(1, int(max_frames))),
+            '-vf', filter_value,
+            '-frames:v', str(frames_cap),
             '-q:v', '3', pattern,
         ], timeout)
         if code != 0:
             frame_error = _last_error_line(stderr) or '抽帧命令退出码 %d' % code
     except subprocess.TimeoutExpired:
+        # **超时不丢帧**：进程已经被 subprocess 杀掉并回收，磁盘上写好的帧还在。
+        timed_out = True
         frame_error = '抽帧超时（超过 %d 秒）' % timeout
     except OSError as error:
         frame_error = '抽帧失败：%s' % error
-    if not frame_error:
-        frames = sorted(
-            os.path.join(directory, name) for name in os.listdir(directory)
-            if name.startswith('frame-') and name.endswith('.jpg')
-        )[:max(1, int(max_frames))]
-        if not frames:
-            frame_error = '抽帧没有得到任何一帧'
+    # 无条件回收磁盘上的帧：成功、非零退出、超时三条路都可能是"抽到了一部分"。
+    frames = _collect_frames(directory, frames_cap)
+    if not frame_error and not frames:
+        frame_error = '抽帧没有得到任何一帧'
 
     audio_path = ''
     audio_error = ''
     if has_audio and with_audio:
-        candidate = os.path.join(directory, 'audio.wav')
+        container, extension = _AUDIO_CONTAINERS.get(
+            _text(audio_format).strip().lower(), _AUDIO_CONTAINERS[VIDEO_DEFAULT_AUDIO_FORMAT],
+        )
+        candidate = os.path.join(directory, 'audio.%s' % extension)
+        args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', target]
+        if audio_seconds is not None:
+            args += ['-t', str(max(1, int(audio_seconds)))]
+        args += ['-vn', '-ac', '1', '-ar', str(VIDEO_AUDIO_SAMPLE_RATE), '-f', container, candidate]
         try:
-            code, _, stderr = _run_ffmpeg(binary, [
-                '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
-                '-i', target, '-t', str(max(1, int(audio_seconds))),
-                '-vn', '-ac', '1', '-ar', str(VIDEO_AUDIO_SAMPLE_RATE),
-                '-f', 'wav', candidate,
-            ], timeout)
+            code, _, stderr = _run_ffmpeg(binary, args, timeout)
             if code != 0:
                 audio_error = _last_error_line(stderr) or '音轨命令退出码 %d' % code
             elif not os.path.exists(candidate) or os.path.getsize(candidate) <= 44:
@@ -556,7 +796,7 @@ def extract_video(
     return VideoExtraction(
         frames=tuple(frames), audio_path=audio_path, duration_seconds=duration,
         truncated=truncated, frame_error=frame_error, audio_error=audio_error,
-        has_audio=has_audio, workdir=directory,
+        has_audio=has_audio, timed_out=timed_out, workdir=directory,
     )
 
 
@@ -588,12 +828,20 @@ def video_fact_note(
     audio_attempted: bool = True,
     frame_error: str = '',
     degrade_reason: str = '',
+    frame_mode: str = VIDEO_DEFAULT_FRAME_MODE,
+    interval_seconds: int = VIDEO_FRAME_INTERVAL_SECONDS,
+    average_frames: int = VIDEO_AVERAGE_FRAMES,
+    audio_seconds: Optional[int] = VIDEO_AUDIO_CLIP_SECONDS,
+    max_duration_seconds: int = VIDEO_MAX_DURATION_SECONDS,
+    timed_out: bool = False,
+    timeout_seconds: int = VIDEO_FFMPEG_TIMEOUT_SECONDS,
 ) -> str:
     """正文里那句视频事实（含**可数线索**：时长 / 抽了几帧 / 音频取了几秒 / 有没有截断）。
 
     措辞与 `describe_user_event` 给图片 / 语音写的那几句同一条尺子：只报形式与边界，
-    不报画面（"没看到就别编"）。`degrade_reason` 非空时那句降级说明顶在最前面——
-    视频没有进入任何模型时，必须让模型知道"这一段你确实没看见"。
+    不报画面（"没看到就别编"）。数字全部来自**这一次生效的配置**（不写死常量）。
+    `degrade_reason` 非空时那句降级说明顶在最前面——视频没有完整进入任何模型时，
+    必须让模型知道"这一段你确实没看见 / 只看见了多少"。
     """
     parts: list[str] = []
     if degrade_reason:
@@ -601,16 +849,23 @@ def video_fact_note(
     if duration_seconds:
         parts.append('约 %s' % _seconds_label(duration_seconds))
     if truncated:
-        parts.append('超过 %d 秒上限，只看了前 %d 秒' % (
-            VIDEO_MAX_DURATION_SECONDS, VIDEO_MAX_DURATION_SECONDS,
-        ))
+        parts.append('超过 %d 秒上限，只看了前 %d 秒' % (max_duration_seconds, max_duration_seconds))
     if frame_count:
-        parts.append('已按每 %d 秒 1 帧抽了 %d 帧画面' % (VIDEO_FRAME_INTERVAL_SECONDS, frame_count))
+        if frame_mode == 'average':
+            parts.append('已整段平均抽了 %d 帧画面' % frame_count)
+        else:
+            parts.append('已按每 %d 秒 1 帧抽了 %d 帧画面' % (interval_seconds, frame_count))
+        if timed_out:
+            # 超时但交出去了：把"这不是全部"说清楚（可数：超时上限 + 已交付帧数）。
+            parts.append('抽帧在 %d 秒超时，已抽到的 %d 帧照常提交' % (timeout_seconds, frame_count))
     elif frame_error and not degrade_reason:
         # `degrade_reason` 已经说过抽帧失败时不再重复（同一件事说两遍是噪音）。
         parts.append('抽帧失败')
     if has_audio:
-        parts.append('已单独抽出前 %d 秒音轨' % VIDEO_AUDIO_CLIP_SECONDS)
+        if audio_seconds is None:
+            parts.append('已单独抽出整段音轨')
+        else:
+            parts.append('已单独抽出前 %d 秒音轨' % int(audio_seconds))
     elif audio_attempted and not degrade_reason:
         parts.append('没有音轨')
     body = '，'.join(parts) if parts else '没取到内容'
@@ -659,10 +914,45 @@ VIDEO_TRUNCATED_REASON = '视频超过 %d 秒上限，只处理了前 %d 秒' % 
     VIDEO_MAX_DURATION_SECONDS, VIDEO_MAX_DURATION_SECONDS,
 )
 
+#: 抽帧超时的降级原因**前缀**：`degradation_message` 用包含匹配认它，所以带计数的
+#: 完整原因（`frame_timeout_reason()`）也能拿到同一句可行动的提示。别把它改成一个
+#: 只在完整句子里出现的写法——那样 warn 就断了。
+VIDEO_FRAME_TIMEOUT_PREFIX = '抽帧超时'
+
+
+def frame_timeout_reason(timeout_seconds: int, frame_count: int) -> str:
+    """超时但抽到了帧的降级原因（带可数线索：超时上限 + 已交付帧数）。"""
+    return '%s（超过 %d 秒）：只抽到 %d 帧，已照常提交，剩下的没有抽' % (
+        VIDEO_FRAME_TIMEOUT_PREFIX, int(timeout_seconds), int(frame_count),
+    )
+
+
+#: 抽帧命令**中途报错**（非零退出）但仍写出了若干帧时的降级原因前缀。
+#: 不进 `_ACTIONABLE_REASONS`：这是单条视频的偶然失败（撞上坏尾 / 平台直链断了），
+#: 不是能力或配置问题——线索写进正文就够了，不刷 warn（与"没有音轨"同一条尺子）。
+VIDEO_FRAME_PARTIAL_PREFIX = '抽帧中断'
+
+
+def frame_partial_reason(frame_count: int) -> str:
+    """抽帧中断但拿到了若干帧的降级原因（带可数线索）。"""
+    return '%s：只拿到 %d 帧，已照常提交' % (VIDEO_FRAME_PARTIAL_PREFIX, int(frame_count))
+
+
+#: **群聊回合没有视觉通道**：`chunk1.flush_group_turn` 给 `try_decide` 的图片位恒为 `[]`
+#: （群消息也不带 `imageSources`），所以帧抽出来也无处可去。这是**唯一**一句要用户看见的
+#: 说明——它既是正文事实的降级前缀，也是 `note_access_skip` 的节流键（同故事同原因 10 分钟
+#: 一条）。别把它改成只有内部人才懂的名词：用户就是靠这句话知道"为什么开了开关也看不见画面"。
+GROUP_NO_VISION_REASON = '这段视频来自群聊，而群回合没有视觉通道，抽出的画面帧没有提交给模型'
+
 
 #: 降级原因 → 一条**可行动**的 warn（`service.note_access_skip` 的 message）。
 #: 只放"能力 / 配置"层面的原因：单条视频的偶然失败（比如这段没有音轨）不该刷 warn。
 _ACTIONABLE_REASONS: dict[str, str] = {
+    GROUP_NO_VISION_REASON: (
+        '视频理解：这条视频来自群聊，而群回合没有视觉通道（群里发的图片同样进不去），'
+        '抽出的画面帧没有提交给模型。音轨走的是「语音 / 音频理解」那条通道，'
+        '那条总开关关着时声音也不会进去。想让她看见视频画面，请在私聊里发。'
+    ),
     FFMPEG_MISSING_REASON: (
         '视频理解降级：本机没检查到 FFmpeg，抽帧识别不可用；'
         '装上 FFmpeg（命令行里能执行 ffmpeg -version）并重载插件后才会生效。'
@@ -713,6 +1003,12 @@ _ACTIONABLE_REASONS: dict[str, str] = {
         '视频理解降级：视频超过 %d 秒上限，只处理了前 %d 秒（正文里留了这条线索）。'
         '整段都要看的话请先自行裁剪。' % (VIDEO_MAX_DURATION_SECONDS, VIDEO_MAX_DURATION_SECONDS)
     ),
+    # 包含匹配（键是前缀）：完整句子里带着"超时上限 + 已交付帧数"，那句话本身就是线索。
+    VIDEO_FRAME_TIMEOUT_PREFIX: (
+        '视频理解降级：抽帧超时了，**已经抽到的帧照常交给模型**（正文里写了帧数），'
+        '剩下的没有抽。想抽完请调大「模型中心 → 视频理解」的「抽帧超时秒数」，'
+        '或把视频裁短。'
+    ),
 }
 
 
@@ -720,7 +1016,7 @@ def degradation_message(reason: str) -> str:
     """降级原因 → 可行动的 warn 文案（没有对应文案时回空串 = 不刷 warn）。
 
     先精确匹配，再做一次包含匹配：外挂识别失败时原因里会再挂上底层报错
-    （`指名的…（Connection error）`），那一条也该拿到同一句可行动的提示。
+    （`指名的…（Connection error）`），抽帧超时那条带着计数，都该拿到同一句可行动的提示。
     """
     text = _text(reason).strip()
     if not text:
@@ -776,7 +1072,7 @@ class VideoMedia:
     * `image_sources`：抽出来的帧，作为**现有图像理解通道**的来源
       （`load_native_images`，与直发图片共用那一个 3 张预算）；
     * `audio_sources`：抽出来的音轨，作为**现有语音理解通道**的来源
-      （`load_native_audio` 认的 `data:audio/wav;base64,…`）；
+      （`load_native_audio` 认的 `data:audio/<fmt>;base64,…`）；
     * `note`：进当前事件的正文事实（空串 = 一个字都不加）；
     * `workdir`：临时目录，**调用方读完帧字节后**必须删（`cleanup()`）。
     """
@@ -800,8 +1096,13 @@ class VideoMedia:
             pass
 
 
-def _wav_data_uri(path: str, max_bytes: float) -> str:
-    """音轨文件 → `data:audio/wav;base64,…`（超预算回空串）。"""
+def _audio_data_uri(path: str, audio_format: str, max_bytes: float) -> str:
+    """音轨文件 → `data:audio/<fmt>;base64,…`（超预算 / 空文件回空串）。
+
+    格式段用**裸格式名**（`mp3` / `wav` / …）而不是真 MIME：`chunk3.fetch_native_audio`
+    的白名单就是这六个裸名（`data:audio/([a-z0-9]+)` 之后按 `mp3|wav|ogg|m4a|flac|amr`
+    判），写成 `audio/mpeg` 会被那条判据拒掉（"静默没声音"）。
+    """
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -813,7 +1114,10 @@ def _wav_data_uri(path: str, max_bytes: float) -> str:
             data = handle.read()
     except OSError:
         return ''
-    return 'data:audio/wav;base64,%s' % base64.b64encode(data).decode('ascii')
+    fmt = _text(audio_format).strip().lower()
+    if fmt not in VIDEO_AUDIO_FORMATS:
+        fmt = VIDEO_DEFAULT_AUDIO_FORMAT
+    return 'data:audio/%s;base64,%s' % (fmt, base64.b64encode(data).decode('ascii'))
 
 
 def _local_size_bytes(target: str) -> int:
@@ -872,6 +1176,8 @@ async def _collect_external(
         row for row in (_pick(section, 'providers') or [])
         if isinstance(row, dict) and row.get('enabled') is not False and provider_reachable(row)
     ]
+    # 用途勾选「用于视频理解」（`use_for_video`）或适配层为"指名 AstrBot Provider"
+    # 合成的那条连接行——两者都挂这个标志。
     bound = [row for row in rows if is_assigned_to(row, 'video')]
     if not bound:
         # 指名却找不到 → 明确失败，**不回落**（连"退回去抽帧"都不做：那是另一套判据，
@@ -907,7 +1213,6 @@ async def _collect_external(
     return '', clip(observation, 800)
 
 
-
 async def collect_video_sources(
     service: Any, story: Any, session: Any,
 ) -> VideoMedia:
@@ -917,7 +1222,13 @@ async def collect_video_sources(
     `image_sources` / `audio_sources` —— 帧走 `load_native_images`、音轨走
     `load_native_audio`，**一条判据、一套实现**，这里不另造通道。
 
-    `enabled=False` 时**一个 ffmpeg 都不调、一个模型都不调**，直接回空。
+    三道闸的顺序（都在任何 ffmpeg / 模型调用之前）：
+
+    1. `enabled=False` → 直接回空（一个 ffmpeg 都不调、一个模型都不调）；
+    2. 这条会话没有视频坐标 → 回空；
+    3. **群聊且 `group_enabled=False`** → 回空（群聊独立开关，默认关=省成本）。
+
+    配置只在这里读一次（`video_config`），下面全部按它传参。
     """
     result = VideoMedia(mode=VIDEO_DEFAULT_MODE)
     config = video_config(service)
@@ -926,6 +1237,9 @@ async def collect_video_sources(
         return result
     sources = extract_session_video_sources(session)
     if not sources:
+        return result
+    if _is_group_session(session) and not config['group_enabled']:
+        # 群聊开关关着：与总开关关着同一条路径（连坐标都不再看一眼）。
         return result
 
     if config['mode'] == 'native':
@@ -982,8 +1296,18 @@ async def collect_video_sources(
         _warn(service, story, result.reason)
         return result
     audio_enabled = _audio_channel_enabled(service)
+    audio_seconds = audio_clip_seconds(config)
     try:
-        extraction = await asyncio.to_thread(extract_video, target, with_audio=audio_enabled)
+        extraction = await asyncio.to_thread(
+            extract_video, target,
+            frame_mode=config['frame_mode'],
+            interval_seconds=config['frame_interval_seconds'],
+            average_frames=config['frame_average_count'],
+            audio_seconds=audio_seconds,
+            audio_format=config['out_format'],
+            with_audio=audio_enabled,
+            timeout=float(config['timeout_seconds']),
+        )
     except Exception as error:  # noqa: BLE001 - 抽帧出任何岔子都不许带崩回合
         extraction = VideoExtraction(frame_error='抽帧异常：%s' % error)
     finally:
@@ -994,7 +1318,7 @@ async def collect_video_sources(
     audio_budget = _audio_budget_bytes(service)
     notes = {'audio_over_budget': False}
     if extraction.audio_path and audio_enabled:
-        uri = _wav_data_uri(extraction.audio_path, audio_budget)
+        uri = _audio_data_uri(extraction.audio_path, config['out_format'], audio_budget)
         if uri:
             result.audio_sources = [uri]
         else:
@@ -1004,7 +1328,16 @@ async def collect_video_sources(
             notes['audio_over_budget'] = True
             result.reason = VIDEO_AUDIO_OVER_BUDGET_REASON
     if result.image_sources or result.audio_sources:
-        if extraction.frame_error and not result.image_sources and not result.reason:
+        if extraction.timed_out and result.image_sources and not result.reason:
+            # **超时但抽到了帧**：照常交出去（用户口径），并把"这不是全部"说清楚。
+            result.reason = frame_timeout_reason(
+                config['timeout_seconds'], len(result.image_sources),
+            )
+        elif extraction.frame_error and result.image_sources and not result.reason:
+            # 非零退出（撞上坏尾 / 直链断了）但写出了若干帧：同样是"只交付了一部分"，
+            # 留可数线索、不刷 warn（单条视频的偶然失败）。
+            result.reason = frame_partial_reason(len(result.image_sources))
+        elif extraction.frame_error and not result.image_sources and not result.reason:
             # 画面一帧都没有、只有声音：**也是降级**，得让人看见（用户点名的
             # "抽帧失败 / 超时 → 明确降级 + 可行动的 warn"）。具体报错只在日志里。
             result.reason = VIDEO_FRAME_FAILED_REASON
@@ -1017,6 +1350,12 @@ async def collect_video_sources(
             audio_attempted=bool(audio_enabled and not notes['audio_over_budget']),
             frame_error=extraction.frame_error,
             degrade_reason=result.reason,
+            frame_mode=config['frame_mode'],
+            interval_seconds=config['frame_interval_seconds'],
+            average_frames=config['frame_average_count'],
+            audio_seconds=audio_seconds,
+            timed_out=extraction.timed_out,
+            timeout_seconds=config['timeout_seconds'],
         )
         if result.reason:
             _warn(service, story, result.reason)
@@ -1032,16 +1371,58 @@ async def collect_video_sources(
         duration_seconds=extraction.duration_seconds,
         frame_error=extraction.frame_error,
         degrade_reason=result.reason,
+        audio_seconds=audio_seconds,
+        timed_out=extraction.timed_out,
+        timeout_seconds=config['timeout_seconds'],
     )
     _warn(service, story, result.reason)
     return result
+
+
+async def collect_group_video_media(service: Any, story: Any, session: Any) -> VideoMedia:
+    """**群聊回合**的视频接线：帧没有通道可去，音轨有（判据仍然只有 `collect_video_sources`）。
+
+    与私聊的差别只有一处：群回合给 `try_decide` 的图片位恒为 `[]`
+    （`chunk1.flush_group_turn`；群消息也不带 `imageSources`，§46 的既有设计），
+    所以帧抽出来也没处可去——"开着开关却什么都不发生"正是用户最恼的那类误导，
+    所以这里**必须**留下一条看得见的说明：
+
+    * **帧**：丢掉，并按原因打一条**节流**的 warn（`GROUP_NO_VISION_REASON`，
+      同故事同原因 10 分钟一条）。绝不静默。
+    * **音轨**：`audio_sources` 原样交给调用方并进群音频批次——那条通道是**通的**
+      （`chunk1` 的 `group_audio` 就是它），所以开关打开时**至少让声音进去**。
+    * **正文事实**：`note` 按"帧没进去"**重写**。`collect_video_sources` 那句会声称
+      "抽了 N 帧画面"，在群聊那是假的——模型不该以为她看见了画面。
+
+    开关链路与私聊共用：总开关关 / 群开关关 / 没有视频坐标时，这里一个 ffmpeg 都不调
+    （提前 return，连 `image_sources` 都是空）。
+    """
+    media = await collect_video_sources(service, story, session)
+    if not media.image_sources:
+        return media
+    frames = len(media.image_sources)
+    media.image_sources = []
+    config = video_config(service)
+    # 用**同一个** `video_fact_note` 造句，只把"抽了 N 帧"那句换成"帧没进去"。
+    media.note = video_fact_note(
+        degrade_reason='%s（抽到的 %d 帧已丢弃）' % (GROUP_NO_VISION_REASON, frames),
+        has_audio=bool(media.audio_sources),
+        audio_attempted=True,
+        audio_seconds=audio_clip_seconds(config),
+        frame_mode=config['frame_mode'],
+        interval_seconds=config['frame_interval_seconds'],
+        average_frames=config['frame_average_count'],
+        timeout_seconds=config['timeout_seconds'],
+    )
+    _warn(service, story, GROUP_NO_VISION_REASON)
+    return media
 
 
 def _audio_channel_enabled(service: Any) -> bool:
     """`model.audio.enabled`（语音理解总开关）：与 `load_native_audio` 读的是**同一个键**。
 
     关着时那条通道本来就会丢下音轨，所以抽帧识别**连抽都不抽**（省一次 ffmpeg 与
-    60 秒音轨的字节）；正文里也就不会声称"抽出了音轨"。
+    音轨的字节）；正文里也就不会声称"抽出了音轨"。
     """
     section = _pick(_pick(getattr(service, 'config', None), 'model', 'model_center'), 'audio')
     return _pick(section, 'enabled') is True
