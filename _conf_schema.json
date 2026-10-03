@@ -245,8 +245,7 @@
             "type": "string",
             "default": "",
             "_special": "select_provider",
-            "description": "外挂视频理解模型",
-            "hint": "只有「识别模式」选外挂识别时才会用上：指名一个能吃视频的模型；留空或指名了却找不到都会明确失败，**不回落**到抽帧或主模型。识别模式是抽帧 / 原生时本项不生效。"
+            "description": "外挂视频理解模型"
           },
           "frame_mode": {
             "type": "string",
@@ -303,14 +302,13 @@
           "timeout_seconds": {
             "type": "int",
             "description": "抽帧超时秒数",
-            "default": 20,
-            "hint": "单条 ffmpeg 命令的超时；超时后**已经抽到的帧照常交出去**，没抽完的不再等。长视频抽不完就把这里调大。"
+            "default": 20
           },
           "group_enabled": {
             "type": "bool",
-            "description": "群聊也做视频理解",
+            "description": "群聊视频理解",
             "default": false,
-            "hint": "默认关：群里连 ffmpeg 都不调（群聊视频刷屏最费 ffmpeg 与模型调用）。开启后群回合会为这段视频跑一次 ffmpeg，**音轨**作为音频证据交给模型（还要「语音 / 音频理解」总开关也开着）；群回合没有视觉通道，抽出的画面帧进不去，每次会有一条节流说明。私聊不受这一项管。"
+            "hint": "群里沿用上面同一套设置；群回合没有视觉通道，画面进不去会说明一次。"
           }
         }
       },
@@ -498,9 +496,8 @@
           },
           "use_for_video": {
             "type": "bool",
-            "description": "用于视频理解（外挂识别）",
-            "default": false,
-            "hint": "只有视频识别模式选「外挂识别」时才会用上：勾了它的连接行才会拿到视频直链。也可以在上面「外挂视频理解模型」里直接指名 AstrBot 的模型（那条优先）。"
+            "description": "用于视频理解",
+            "default": false
           },
           "use_for_works": {
             "type": "bool",
