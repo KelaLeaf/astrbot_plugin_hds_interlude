@@ -77,6 +77,12 @@ Provider 的是**视频直链文本（URL）**，不是字节：宿主出站部�
   通道是通的），**帧没有视觉通道可去**（群回合给 `try_decide` 的图片位恒为 `[]`）→
   丢弃，并按 `GROUP_NO_VISION_REASON` 打一条**节流**的可见说明。
   接线见 `collect_group_video_media()`。
+  **群回合沿用上面同一套设置**：`frame_mode` / `frame_average_count` /
+  `frame_interval_seconds` / `out_format` / `audio_duration(_seconds)` /
+  `timeout_seconds` 一项都不特判（都从同一个 `video_config()` 来、走同一个
+  `extract_video(...)` 调用点），所以群与私聊的 ffmpeg 命令行**逐字相同**；唯一的差别是
+  帧的去处。群里另来一套更省的就等于多一个真相（配置页说什么都不再可信），
+  用例 `test_video_understanding.GroupVideoParityTests` 钉着这一点。
 * **合并转发里的视频**由 `forward_message.max_videos`（单条转发最多读取的视频数，
   默认 **1** = 一张卡最多读一段；配 0 才是一段都不读）在 `core/forward_message.py`
   那一侧截断，读出来的坐标经
@@ -1404,10 +1410,15 @@ async def collect_group_video_media(service: Any, story: Any, session: Any) -> V
     media.image_sources = []
     config = video_config(service)
     # 用**同一个** `video_fact_note` 造句，只把"抽了 N 帧"那句换成"帧没进去"。
+    #
+    # `audio_attempted` 也要**读配置**（`model.audio.enabled`）而不是写死 True：
+    # 语音通道关着时 `collect_video_sources` 连音轨那条命令都不发，句子就不该说"试过取音轨"。
+    # 群里的配置项**一项都不许特判**（用户口径："群里沿用上面同一套设置"），这条和
+    # `frame_mode` / `out_format` / `audio_duration` 一样，只是它落在句子而不是命令行上。
     media.note = video_fact_note(
         degrade_reason='%s（抽到的 %d 帧已丢弃）' % (GROUP_NO_VISION_REASON, frames),
         has_audio=bool(media.audio_sources),
-        audio_attempted=True,
+        audio_attempted=bool(_audio_channel_enabled(service)),
         audio_seconds=audio_clip_seconds(config),
         frame_mode=config['frame_mode'],
         interval_seconds=config['frame_interval_seconds'],

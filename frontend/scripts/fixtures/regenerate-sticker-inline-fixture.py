@@ -52,12 +52,13 @@ def main() -> int:
         payload = response.payload
 
         # 金样的自检：形状/字节都要对得上，否则写出去的就是一份错夹具。
-        assert set(payload) == {'assetId', 'mimeType', 'size', 'data'}, sorted(payload)
+        #: 键名是 `base64` **不是** `data`（改回去 = 真机整屏缩略图又挂，见 §45.8）。
+        assert set(payload) == {'assetId', 'mimeType', 'size', 'base64'}, sorted(payload)
         assert payload['assetId'] == ASSET_ID, payload['assetId']
         assert payload['mimeType'] == 'image/png', payload['mimeType']
         assert payload['size'] == len(body), (payload['size'], len(body))
-        decoded = base64.b64decode(payload['data'])
-        assert decoded == body, 'data 必须逐字节等于原文件'
+        decoded = base64.b64decode(payload['base64'])
+        assert decoded == body, 'base64 必须逐字节等于原文件'
         assert decoded[:8] == b'\x89PNG\r\n\x1a\n', '得是一张真 PNG'
     finally:
         case.tearDown()
@@ -65,7 +66,7 @@ def main() -> int:
     with open(FIXTURE, 'w', encoding='utf-8') as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write('\n')
-    print('已写入 %s（%d 字节 base64，原图 %d 字节）' % (FIXTURE, len(payload['data']), payload['size']))
+    print('已写入 %s（%d 字节 base64，原图 %d 字节）' % (FIXTURE, len(payload['base64']), payload['size']))
     return 0
 
 

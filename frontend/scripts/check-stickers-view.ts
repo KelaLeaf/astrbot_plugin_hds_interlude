@@ -11,7 +11,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   DEFAULT_PAGE_SIZE, DELETE_CONFIRM_LABEL, DELETE_LABEL, DESCRIPTION_LIMIT, DISABLE_LABEL,
-  EMPTY_FILTERS, ENABLE_LABEL, NAME_LIMIT, PAGE_SIZE_MAX, activeFilterCount, deleteDoneNote,
+  EMPTY_FILTERS, ENABLE_LABEL, NAME_LIMIT, PAGE_SIZE_MAX, activeFilterCount, brokenTitle,
+  deleteDoneNote,
   deletePayload, descriptionOwner, disabledPayload, emptyHint, fileLabel, isManual, kindLabel,
   mergeStickerItems, pageOffset, pageSize, pageWindow, rescanNote, restorePayload,
   resultSummary, saveBlocker, sourceLabel, staleOverridesNote, statusLabel,
@@ -282,6 +283,22 @@ assert.equal(thumbnailEndpoint({ thumbnailUrl: '', assetId: '' }), '')
 assert.equal(fileLabel(item({ file: 'collected/1a2b.png' })), '1a2b.png')
 assert.equal(fileLabel({ file: 'a\\b\\c.gif' }), 'c.gif')
 assert.equal(fileLabel({ file: '' }), '没有文件')
+
+/* --------------------------------------------- 取不到图那句提示（带上"找的是哪儿"） */
+
+// 没有理由时就是那句状态词（老后端 / 直连失败都没有后端 message）。
+assert.equal(brokenTitle(''), '取不到图')
+assert.equal(brokenTitle(undefined), '取不到图')
+assert.equal(brokenTitle('   '), '取不到图')
+// 有理由就带上——后端 404 的 message 里写着库根与目标路径。
+assert.equal(
+  brokenTitle('表情包文件不存在：已找过 …/stickers/collected/e6f0f8cae70cbd897bad1f538ed92585.jpg'),
+  '取不到图 · 表情包文件不存在：已找过 …/stickers/collected/e6f0f8cae70cbd897bad1f538ed92585.jpg',
+)
+// 多行 / 超长都压成一行且截断：工具提示不是小作文。
+assert.equal(brokenTitle('第一行\n第二行'), '取不到图 · 第一行')
+assert.ok(brokenTitle('x'.repeat(400)).endsWith('…'), '过长要截断')
+assert.ok(brokenTitle('x'.repeat(400)).length <= 210, '截断后仍然很短')
 
 /* ------------------------------------------- 相对端点 → 真实地址（bridge.endpointUrl） */
 

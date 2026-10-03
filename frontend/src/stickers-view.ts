@@ -406,3 +406,18 @@ export function fileLabel(item: { file?: unknown }): string {
   const parts = name.split('/')
   return parts[parts.length - 1] || '没有文件'
 }
+
+/**
+ * 占位框那句短提示：**取不到图的理由比"取不到图"三个字有用得多**。
+ *
+ * 后端 404 的 `message` 里带着"已找过哪儿"（库根 + 目标路径）。宿主 bridge 只把
+ * `message` 透给面板（`data` 在 `plugin_page_bridge` 那一层丢掉了，实测），所以能拿到的
+ * 就是它。这里只做两件事：拼上状态词、把过长的理由截断（工具提示不是小作文）。
+ * 没有理由时回那句状态词——**不许**因为没理由就什么都不显示。
+ */
+export function brokenTitle(reason: unknown): string {
+  const detail = clean(reason).split('\n')[0].trim()
+  if (!detail) return '取不到图'
+  const trimmed = detail.length > 200 ? `${detail.slice(0, 199)}…` : detail
+  return `取不到图 · ${trimmed}`
+}

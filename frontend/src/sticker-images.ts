@@ -101,6 +101,14 @@ export interface StickerImageCache {
   get: (assetId: string) => Promise<string | null>
   /** 已经在缓存里的地址（同步，渲染时先用它，避免闪一下占位框）。 */
   peek: (assetId: string) => string | null
+  /**
+   * 上一条**失败理由**（后端 404 的 `message`，里面带着"已找过哪儿"）；没失败过回空串。
+   *
+   * 为什么要留它：占位框只写"取不到图"，用户与维护者都看不出它找的是哪儿——真机上的
+   * 404 就是这么瞎的。这里只负责**记录**，怎么显示由面板决定（`stickers-view.brokenTitle()`）。
+   * 网络抖这类没有后端消息的失败回空串（**不编原因**）。
+   */
+  reason: (assetId: string) => string
   /** 后端有没有这条 JSON 取图路（`false` = 已经撞过一次，别再问）。 */
   supported: () => boolean
   /** 还在飞/排队的条数（harness 断言用）。 */
@@ -127,6 +135,8 @@ export function createStickerImageCache(options: StickerImageCacheOptions): Stic
   const concurrency = Math.max(1, Math.floor(options.concurrency ?? 4))
   const retries = Math.max(0, Math.floor(options.retries ?? 1))
   const urls = new Map<string, string>()
+  //: 失败理由（assetId → 后端 message）。只在失败时写、成功时清。
+  const reasons = new Map<string, string>()
   const waiters = new Map<string, Array<(url: string | null) => void>>()
   const queue: Array<() => void> = []
   let running = 0
@@ -189,12 +199,17 @@ export function createStickerImageCache(options: StickerImageCacheOptions): Stic
             capability = 'ok'
             url = options.toUrl(payload)
             urls.set(assetId, url)
+            reasons.delete(assetId)
           } catch (error) {
             if (error instanceof UnsupportedStickerImage) {
               unsupported = true
             } else {
               // 非"没这条路"的失败（网络抖/文件不在）说明路是通的，放开并发。
               capability = 'ok'
+              // 后端给的理由（404 的 message 里带着"已找过哪儿"）原样留下来；
+              // 没有 message 的失败（网络抖动）留空——**不编一个理由**。
+              const message = error instanceof Error ? error.message.trim() : ''
+              if (message) reasons.set(assetId, message)
             }
             stats.failures += 1
             url = null
@@ -228,6 +243,9 @@ export function createStickerImageCache(options: StickerImageCacheOptions): Stic
     peek(assetId) {
       return urls.get(String(assetId || '')) ?? null
     },
+    reason(assetId) {
+      return reasons.get(String(assetId || '')) ?? ''
+    },
     supported() {
       return !unsupported
     },
@@ -243,6 +261,7 @@ export function createStickerImageCache(options: StickerImageCacheOptions): Stic
         stats.released += 1
       }
       urls.clear()
+      reasons.clear()
       waiters.clear()
       queue.length = 0
     },

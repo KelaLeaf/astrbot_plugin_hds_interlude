@@ -45,7 +45,7 @@ import {
 } from '../sticker-images'
 import {
   DEFAULT_PAGE_SIZE, DELETE_CONFIRM_LABEL, DELETE_LABEL, DESCRIPTION_LIMIT, DISABLE_LABEL,
-  EMPTY_FILTERS, ENABLE_LABEL, PAGE_SIZE_MAX, activeFilterCount, deleteDoneNote,
+  EMPTY_FILTERS, ENABLE_LABEL, PAGE_SIZE_MAX, activeFilterCount, brokenTitle, deleteDoneNote,
   deletePayload, descriptionOwner, disabledPayload, emptyHint, fileLabel, kindLabel,
   mergeStickerItems, overrideMap, pageWindow, rescanNote, restorePayload, resultSummary,
   saveBlocker, sourceLabel, staleOverridesNote, statusLabel, statusTone, stickerParams,
@@ -1218,6 +1218,9 @@ function StickerThumb({ item, images }: { item: StickerItem; images: StickerImag
   const [url, setUrl] = useState<string | null>(() => images.peek(item.assetId))
   const [direct, setDirect] = useState(false)
   const [broken, setBroken] = useState(false)
+  //: 取不到的**理由**（后端 404 的 message 里带着"已找过哪儿"）。有它就显示它——
+  //: 只写"取不到图"的话，用户与维护者都看不出后端到底去哪儿找了（真机就是这么瞎的）。
+  const [reason, setReason] = useState('')
   const box = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -1226,6 +1229,7 @@ function StickerThumb({ item, images }: { item: StickerItem; images: StickerImag
     setUrl(cached)
     setDirect(false)
     setBroken(false)
+    setReason('')
     if (cached) return () => { alive = false }
     if (!images.supported()) {
       setDirect(true)
@@ -1236,7 +1240,10 @@ function StickerThumb({ item, images }: { item: StickerItem; images: StickerImag
       if (!alive) return
       if (got) setUrl(got)
       else if (!images.supported()) setDirect(true) // 后端没有 JSON 取图路：退回直连
-      else setBroken(true)
+      else {
+        setBroken(true)
+        setReason(images.reason(item.assetId))
+      }
     }
     const node = box.current
     if (node && typeof IntersectionObserver !== 'undefined') {
@@ -1281,7 +1288,9 @@ function StickerThumb({ item, images }: { item: StickerItem; images: StickerImag
     <div
       ref={box}
       class="flex h-20 w-20 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-line bg-raised text-[10px] text-muted"
-      title={broken || direct ? '取不到图' : '正在取图…'}
+      // 提示里带上后端给的理由（它找的是哪儿）：`brokenTitle` 只在有理由时才追加，
+      // 直连失败（`direct`）没有后端 message，就还是那句状态词。
+      title={broken || direct ? brokenTitle(broken ? reason : '') : '正在取图…'}
     >
       <Icon name="image" class="h-4 w-4 opacity-60" />
       <span class="px-1 text-center">{fileLabel(item)}</span>

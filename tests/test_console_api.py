@@ -32,6 +32,7 @@ from plugin.adapters import console_api as console_module
 from plugin.adapters.console_api import ConsoleApi, ConsoleError, CONSOLE_TASKS, mask_endpoint
 from plugin.core import platform_actions
 from plugin.core.database import Database
+from plugin.core.logging import set_log_sink
 from plugin.core.service import helpers as helpers_module
 from plugin.core.service.base import InterludeContext
 from plugin.core.service.chunk2 import ServiceChunk2
@@ -2885,21 +2886,44 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
         return _run(plugin.page_console_sticker_file())
 
     def test_inline_returns_a_base64_envelope_that_round_trips_the_file(self):
-        """`inline=1`：四字段信封 + `data` 解回**与原文件逐字节相同**的内容。"""
+        """`inline=1`：四字段信封 + `base64` 解回**与原文件逐字节相同**的内容。"""
         self._insert('sticker-abc-1')
         response = self._page(assetId='sticker-abc-1', inline='1')
         self.assertEqual(response.status_code, 200)
         payload = response.payload
-        self.assertEqual(set(payload), {'assetId', 'mimeType', 'size', 'data'},
+        self.assertEqual(set(payload), {'assetId', 'mimeType', 'size', 'base64'},
                          '信封字段是冻结的（前端按这四个键解析）')
         self.assertEqual(payload['assetId'], 'sticker-abc-1')
         self.assertEqual(payload['mimeType'], 'image/png')
         self.assertEqual(payload['size'], len(_PNG_BYTES))
-        self.assertFalse(payload['data'].startswith('data:'), '`data` 不含 data: 前缀')
+        self.assertFalse(payload['base64'].startswith('data:'), '`base64` 不含 data: 前缀')
         with open(os.path.join(self.root, 'sticker-abc-1.png'), 'rb') as handle:
             on_disk = handle.read()
-        self.assertEqual(base64.b64decode(payload['data']), on_disk, '必须逐字节相同')
+        self.assertEqual(base64.b64decode(payload['base64']), on_disk, '必须逐字节相同')
         self.assertEqual(payload['size'], len(on_disk))
+
+    def test_the_envelope_survives_the_host_pages_data_unwrap(self):
+        """**真机那条链的最后一跳**：信封顶层不许有 `data` 键（宿主 bridge 会整包取走）。
+
+        宿主父页面 `PluginPagePage-*.js` 的 `api:get` 分支递进 iframe 的值是
+        `response.data?.data ?? response.data`，而 `json_response()` 是**扁平**的
+        （`astrbot/api/web.py::json_response` 直接 `JSONResponse(data)`，不套
+        `{status,data}`；`error_response` 才是手写那层信封）。所以信封里那个叫 `data`
+        的键（装 base64）会被当成"整包"取走：iframe 只收到一条裸 base64 字符串，前端
+        `parseImageEnvelope`（只认对象信封 / `data:` URL）判 `null` → 整屏缩略图全挂，
+        而后端是 200、日志一个字都没有（真机 v1.9.1 / v1.9.2 的现场）。
+
+        变异保护：键名改回 `data`（或再加一个 `data`）→ 本用例立刻红。
+        """
+        self._insert('sticker-abc-1')
+        payload = self._page(assetId='sticker-abc-1', inline='1').payload
+        self.assertNotIn('data', payload, '`data` 会被宿主 bridge 当成整包取走')
+        # 逐字照宿主那一跳：有顶层 `data` 就取它，否则原样递整个信封。
+        delivered = payload['data'] if 'data' in payload else payload
+        self.assertIsInstance(delivered, dict, 'iframe 收到的必须是信封对象，不是裸 base64')
+        self.assertIsInstance(delivered['base64'], str)
+        with open(os.path.join(self.root, 'sticker-abc-1.png'), 'rb') as handle:
+            self.assertEqual(base64.b64decode(delivered['base64']), handle.read())
 
     def test_without_inline_the_response_is_still_the_raw_byte_stream(self):
         """反向用例：缺省 / `inline=0` / `inline=` 一律**还是字节流**，不是 JSON 信封。"""
@@ -2939,7 +2963,16 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
         inline = self._page(assetId='sticker-gone', inline='1')
         self.assertEqual((plain.status_code, inline.status_code), (404, 404))
         self.assertEqual(plain.payload['message'], inline.payload['message'])
-        self.assertEqual(plain.payload['message'], '表情包文件不存在（可能已被删除）')
+        # 404 不再是一句"可能已被删除"的空壳（§56）：短提示里必须能看到**它找的是哪儿**
+        # （面板只有 message 可看——宿主 bridge 把 `data` 丢了）。
+        expected = os.path.abspath(os.path.join(self.root, 'sticker-gone.png'))
+        self.assertIn(
+            console_module.shorten_path(expected), plain.payload['message'],
+            '面板那句提示要能看出找的是哪儿',
+        )
+        self.assertLess(len(plain.payload['message']), 160, '只留状态词与必要信息，不是小作文')
+        self.assertEqual(plain.payload['data'], inline.payload['data'],
+                         '两条分支的诊断逐字一致')
 
     def test_inline_refuses_huge_files_without_reading_them(self):
         """超上限 → 400；**一个字节都不读进内存**（防轰炸：先判体积再读）。"""
@@ -2959,7 +2992,7 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
         with mock.patch('builtins.open', spy):
             response = self._page(assetId='sticker-huge', inline='1')
         self.assertEqual(response.status_code, 400)
-        self.assertNotIn('data', response.payload, '拒绝时不许回任何内容')
+        self.assertIsNone(response.payload['data'], '拒绝时不许回任何内容')
         self.assertIn('太大', response.payload['message'])
         self.assertNotIn(path, opened, '先判体积：超限时不该打开文件')
 
@@ -2975,8 +3008,15 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
         inline = self._page(assetId='sticker-escape', inline='1')
         self.assertEqual((plain.status_code, inline.status_code), (404, 404))
         self.assertEqual(plain.payload['message'], inline.payload['message'])
-        self.assertNotIn('data', plain.payload)
-        self.assertNotIn('data', inline.payload)
+        # 404 现在带诊断（"找的是哪儿"），但诊断里**一个字都不许提到库外**：
+        # 每个候选都必须落在库根里，`../secret.txt` 绝不能被当成候选路径。
+        for payload in (plain.payload, inline.payload):
+            tried = payload['data']['tried']
+            self.assertTrue(tried, '越界也要说清找过哪儿')
+            for candidate in tried:
+                self.assertTrue(candidate.startswith(os.path.abspath(self.root) + os.sep),
+                                candidate)
+            self.assertNotIn(os.path.abspath(secret), tried, '库外路径不许进候选')
         self.assertNotIn('top secret', json.dumps(inline.payload, ensure_ascii=False))
         self.assertIsNone(inline.payload.get('path'), '信封里也不许泄露库外路径')
 
@@ -3208,7 +3248,7 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
         with open(path, 'rb') as handle:
             self.assertEqual(handle.read(), _PNG_BYTES)
         envelope = _run(self.api.sticker_file_inline(asset_id))
-        self.assertEqual(base64.b64decode(envelope['data']), _PNG_BYTES)
+        self.assertEqual(base64.b64decode(envelope['base64']), _PNG_BYTES)
         self.assertEqual(envelope['size'], len(_PNG_BYTES))
 
     def test_a_collected_sticker_in_a_subdirectory_is_not_read_as_a_basename(self):
@@ -3216,6 +3256,9 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
 
         `collected/x.png` 落在 `root/collected/x.png`；按 basename 拼成 `root/x.png`
         必然不存在。这条同时钉住"分组目录不许被削掉"。
+
+        ⚠️ 断言必须看 `found`（命中的是**行里那条路径**，不是兜底找回）：§56 的哈希
+        兜底正好能救回 basename 拼法——只看"取到了图"的话，拼法退化了也照样绿。
         """
         asset = _run(self.service.store_collected_sticker(_PNG_BYTES, 'sticker'))
         row = self._collected_row(asset['assetId'])
@@ -3224,7 +3267,12 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
             os.path.exists(os.path.join(self.root, os.path.basename(row['filePath']))),
             '根目录下没有这个文件——basename 拼法必然 404',
         )
-        self.assertTrue(os.path.isfile(_run(self.api.sticker_file(asset['assetId']))))
+        path, diagnostics = _run(self.api._sticker_file_detail(asset['assetId']))
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(
+            diagnostics['found'], 'filePath',
+            '分组目录必须真的参与拼路径：靠兜底找回说明拼法已经退化了',
+        )
 
     def test_a_failed_write_never_creates_a_lookalike_row(self):
         """落盘失败 → **不建档** + 一条可行动 warn（不许出现"库里有、盘上没有"）。"""
@@ -3299,7 +3347,7 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
         path = _run(self.api.sticker_file(asset_id))
         self.assertEqual(os.path.abspath(path), os.path.abspath(scanned))
         envelope = _run(self.api.sticker_file_inline(asset_id))
-        self.assertEqual(base64.b64decode(envelope['data']), _PNG_BYTES)
+        self.assertEqual(base64.b64decode(envelope['base64']), _PNG_BYTES)
 
     def test_collect_scan_and_console_read_compute_one_root(self):
         """三处（收藏写入 / 扫盘 / 控制台取图）的根**相等**，而且只由一处判据算出。
@@ -3333,6 +3381,170 @@ class ConsoleStickerLibraryTests(unittest.TestCase):
         asset = _run(self.service.store_collected_sticker(_PNG_BYTES, 'sticker'))
         self.assertIsNone(asset)
         self.assertEqual(self.database.count('interlude_sticker'), 0)
+
+    # ---- §56：取图失败必须**自报家门**（诊断），路径对不上按哈希兜底 ----
+
+    def _page_diagnostics(self, asset_id: str) -> dict[str, Any]:
+        """跑一次取图路由，取出 404 的**诊断**（顺带钉住它真的是 404）。"""
+        response = self._page(assetId=asset_id, inline='1')
+        self.assertEqual(response.status_code, 404, response.payload)
+        return response.payload['data']
+
+    def test_a_row_whose_path_lost_its_directory_is_recovered_by_hash(self):
+        """② `filePath` 指向不存在的地方，但库根下有同哈希文件 → 兜底找回 + 可见 info。
+
+        真机形状：行里只记着 `<hash>.jpg`（分组目录那一段丢了），而文件确实在
+        `collected/<hash>.jpg`——按行里的路径拼就是 404，按**内容哈希**扫库根就能找到。
+        """
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        on_disk = os.path.join(self.root, 'collected', '%s.jpg' % digest[:32])
+        with open(on_disk, 'wb') as handle:
+            handle.write(_PNG_BYTES)
+        self.database.insert('interlude_sticker', self._row(
+            'sticker-hash-1', filePath='%s.jpg' % digest[:32], hash=digest,
+        ))
+        captured: list[tuple[str, str]] = []
+        set_log_sink(lambda level, text: captured.append((level, text)))
+        self.addCleanup(set_log_sink, None)
+        path, diagnostics = _run(self.api._sticker_file_detail('sticker-hash-1'))
+        self.assertEqual(os.path.abspath(path), os.path.abspath(on_disk))
+        self.assertEqual(diagnostics['found'], 'hash')
+        self.assertEqual(diagnostics['reason'], 'hash-recovered')
+        self.assertTrue(diagnostics['isfile'])
+        self.assertEqual(diagnostics['size'], len(_PNG_BYTES))
+        self.assertIn(os.path.abspath(on_disk), diagnostics['tried'])
+        # **可见 info**：自我修复不许静默（用户得知道"记录路径对不上、靠内容找回来了"）。
+        self.assertTrue(
+            any('按哈希找回' in text for _level, text in captured),
+            '兜底找回必须留一条可见 info：%r' % (captured,),
+        )
+        # 字节分支与信封分支都要读得出来（同一个 `_sticker_file_detail`）。
+        self.assertEqual(_run(self.api.sticker_file('sticker-hash-1')),
+                         os.path.abspath(on_disk))
+        envelope = _run(self.api.sticker_file_inline('sticker-hash-1'))
+        self.assertEqual(base64.b64decode(envelope['base64']), _PNG_BYTES)
+
+    def test_a_readable_row_never_goes_through_the_hash_fallback(self):
+        """反向：行里的路径**就在盘上**时不许走兜底（也不许刷"按哈希找回"）。"""
+        digest = hashlib.sha256(_PNG_BYTES).hexdigest()
+        on_disk = os.path.join(self.root, 'collected', '%s.jpg' % digest[:32])
+        with open(on_disk, 'wb') as handle:
+            handle.write(_PNG_BYTES)
+        self.database.insert('interlude_sticker', self._row(
+            'sticker-plain-1', filePath='collected/%s.jpg' % digest[:32], hash=digest,
+        ))
+        captured: list[tuple[str, str]] = []
+        set_log_sink(lambda level, text: captured.append((level, text)))
+        self.addCleanup(set_log_sink, None)
+        _path, diagnostics = _run(self.api._sticker_file_detail('sticker-plain-1'))
+        self.assertEqual(diagnostics['found'], 'filePath')
+        self.assertEqual(diagnostics['reason'], '')
+        self.assertFalse(
+            any('按哈希找回' in text for _level, text in captured),
+            '主路径就命中时不许打兜底日志：%r' % (captured,),
+        )
+
+    def test_neither_side_present_reports_the_root_and_every_tried_path(self):
+        """③ 两边都没有 → 诊断里能读到**库根**与**尝试过的绝对路径**（不许静默空壳）。"""
+        self._insert('sticker-lost-1')
+        os.remove(os.path.join(self.root, 'sticker-lost-1.png'))
+        diagnostics = self._page_diagnostics('sticker-lost-1')
+        self.assertEqual(diagnostics['root'], os.path.abspath(self.root))
+        self.assertEqual(
+            diagnostics['tried'], [os.path.abspath(os.path.join(self.root, 'sticker-lost-1.png'))],
+        )
+        self.assertFalse(diagnostics['isfile'])
+        self.assertIsNone(diagnostics['size'])
+        self.assertIsNone(diagnostics['found'])
+        self.assertEqual(diagnostics['reason'], 'missing')
+        # 两个来源的当前值都要在："写成 A、读成 B"一眼可见。
+        self.assertEqual(diagnostics['dataDir'], self.bridge.data_dir)
+        self.assertEqual(diagnostics['directory'], 'stickers')
+        self.assertEqual(diagnostics['filePath'], 'sticker-lost-1.png')
+        self.assertEqual(diagnostics['relative'], 'sticker-lost-1.png')
+        self.assertEqual(diagnostics['assetId'], 'sticker-lost-1')
+
+    def test_an_absolute_file_path_inside_the_library_is_readable(self):
+        """`filePath` 是**绝对路径**（继承来的旧数据）也要能读——两种写法都认。"""
+        self._insert('sticker-abs-1')
+        absolute = os.path.join(self.root, 'sticker-abs-1.png')
+        self._set_file_path('sticker-abs-1', absolute)
+        self.assertEqual(
+            _run(self.api.sticker_file('sticker-abs-1')), os.path.abspath(absolute),
+        )
+
+    def test_an_absolute_file_path_outside_the_library_is_still_refused(self):
+        """反向：绝对路径**在库外**照样不许读（文件真的存在也不行）。"""
+        outside = os.path.join(self.tmp, 'outside.png')
+        with open(outside, 'wb') as handle:
+            handle.write(_PNG_BYTES)
+        self.database.insert('interlude_sticker', self._row('sticker-outside', filePath=outside))
+        with self.assertRaises(FileNotFoundError):
+            _run(self.api.sticker_file('sticker-outside'))
+
+    def test_a_file_path_relative_to_the_data_directory_is_readable(self):
+        """第三种写法：相对**插件数据目录**（多带一截库根前缀）也要能读。
+
+        生产里库根就落在数据目录下面（`<data>/data/hds-interlude/stickers`），
+        旧写方完全可能把 `data/hds-interlude/stickers/collected/x.jpg` 整条记进去。
+        """
+        self.bridge.data_dir = self.tmp
+        self.assertEqual(self.api._sticker_root(), os.path.abspath(self.root))
+        self._insert('sticker-nested-1', filePath='stickers/sticker-nested-1.png')
+        self.assertEqual(
+            _run(self.api.sticker_file('sticker-nested-1')),
+            os.path.abspath(os.path.join(self.root, 'sticker-nested-1.png')),
+        )
+
+    def test_an_unknown_root_is_a_diagnostic_not_a_crash(self):
+        """根拿不到（数据目录未知）→ **带诊断的 404**，不是 `commonpath` 的 ValueError 500。
+
+        旧实现走 `os.path.commonpath(['/abs', ''])`（绝对 + 相对混用）会抛 `ValueError`：
+        异常分支兜不住 → 500，前端只看到"取不到图"（真机上就是这么瞎的）。
+        """
+        self._insert('sticker-noroot-1')
+        self.service.ctx = InterludeContext()
+        self.bridge.data_dir = ''
+        self.assertEqual(self.api._sticker_root(), '', '夹具：根真的拿不到')
+        response = self._page(assetId='sticker-noroot-1', inline='1')
+        self.assertEqual(response.status_code, 404, response.payload)
+        self.assertEqual(response.payload['data']['reason'], 'root-unknown')
+        self.assertEqual(response.payload['data']['root'], '')
+        self.assertEqual(response.payload['data']['tried'], [])
+        self.assertIn('库根不可知', response.payload['message'], '要把原因说清楚')
+
+    def test_the_console_root_comes_from_the_service(self):
+        """反向：控制台**不许自己算一套根**——服务层给的根就是唯一判据（§54 / §56）。
+
+        真机 404 的头号成因就是"写的根 ≠ 读的根"。这里把服务层的根换成一个可辨认的
+        哨兵：控制台若又去自己拼一份（数据目录 + 配置），这条立刻红。
+        """
+        sentinel = os.path.join(self.tmp, 'sentinel-root')
+        self.service.sticker_library_root = lambda: sentinel
+        self.assertEqual(self.api._sticker_root(), os.path.abspath(sentinel))
+
+    def test_shorten_path_keeps_short_paths_and_trims_long_ones(self):
+        """日志/短提示里的路径：短的照原样，长的只留末尾几段（不写整条磁盘结构）。"""
+        self.assertEqual(console_module.shorten_path('/a/b/c.png'), '/a/b/c.png')
+        long_path = ('/srv/astrbot/data/plugin_data/astrbot_plugin_hds_interlude'
+                     '/data/hds-interlude/stickers/collected/x.jpg')
+        shortened = console_module.shorten_path(long_path)
+        self.assertTrue(shortened.startswith('…/'), shortened)
+        self.assertEqual(
+            shortened,
+            '…/astrbot_plugin_hds_interlude/data/hds-interlude/'
+            'stickers/collected/x.jpg',
+        )
+        self.assertEqual(console_module.shorten_path(''), '')
+        self.assertLess(len(shortened), len(long_path))
+
+    def _set_file_path(self, asset_id: str, file_path: str) -> None:
+        """直接改行里的 `filePath`（模拟继承来的旧数据）。"""
+        self.database.conn.execute(
+            'UPDATE interlude_sticker SET filePath = ? WHERE assetId = ?',
+            (file_path, asset_id),
+        )
+        self.database.conn.commit()
 
 
 class ConsoleStickerGroupTests(unittest.TestCase):

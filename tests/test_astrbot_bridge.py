@@ -357,8 +357,12 @@ def _install_astrbot_stub():
         return _FakeWebResponse(payload=data, status_code=status_code)
 
     def _error_response(message, *, status_code=400, data=None, headers=None):  # noqa: ARG001
+        # 与真宿主逐字同形（`astrbot/api/web.py` 的 `error_response`）：
+        # `{"status", "message", "data"}`。`data` 是取图失败的**诊断**落点（§56），
+        # 桩里把它丢掉就等于那批断言测不到东西。
         return _FakeWebResponse(
-            payload={'status': 'error', 'message': message}, status_code=status_code,
+            payload={'status': 'error', 'message': message, 'data': data},
+            status_code=status_code,
         )
 
     def _file_response(path, *, filename=None, content_type=None, headers=None):  # noqa: ARG001
