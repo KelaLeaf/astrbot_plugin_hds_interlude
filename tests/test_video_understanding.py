@@ -389,9 +389,8 @@ class VideoConfigTests(unittest.TestCase):
         node = self.video['items']['model_id']
         self.assertEqual(node['_special'], 'select_provider')
         self.assertIn('外挂', node['description'])
-        # 只在 external 时生效 + 找不到不回落，两句都要写清楚。
-        self.assertIn('外挂识别', node['hint'])
-        self.assertIn('不回落', node['hint'])
+        # 用户点名删掉了解释句（v1.9.2）：这一项只留标题，行为不变（找不到不回落仍在代码里）。
+        self.assertNotIn('hint', node)
 
     def test_the_mode_hint_is_the_users_verbatim_sentence(self) -> None:
         """识别模式的描述：状态提示顶在最前面，后面接用户逐字那一句（v1.9.1）。
