@@ -1087,6 +1087,11 @@ class ConfigurationSchemaTest(unittest.TestCase):
         },
         # v1.6.0：QQ 空间转正后多出来的那个"自动刷动态"开关（上游 qzone 只有六个键）。
         "qzone": {"auto_feed"},
+        # v1.8.7：合并转发节点里的图片坐标也要交给模型，于是多了**第四道预算**
+        # （单条转发最多取几张图，默认 3、区间 0~10）。上游 `forwardMessage` 组只有
+        # 三重预算（节点 / 字符 / 深度），这一项由本移植版新增；整条链路只加这一个键，
+        # 整条消息的转发媒体总数上限是 core 里的常量（`FORWARD_MEDIA_MAX_PER_TURN`）。
+        "forward_message": {"max_images"},
         # v1.6.0：平台动作目录的开关（`plugin/core/platform_actions.py` 是唯一事实源，
         # 键名逐字 = 动作 id）。上游 Console 里没有这一层，整组由本移植版新增；
         # 逐项覆盖与落点由 `test_every_catalog_action_has_exactly_one_switch` 盯着。

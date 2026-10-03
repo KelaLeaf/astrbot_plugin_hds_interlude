@@ -32,15 +32,21 @@ import unittest
 from plugin.core.forward_message import (
     DEFAULT_LIMITS,
     FORWARD_FETCH_TIMEOUT_MS,
+    FORWARD_MEDIA_MAX_PER_FORWARD,
+    FORWARD_MEDIA_MAX_PER_TURN,
+    ForwardMediaBudget,
     ForwardReadLimits,
     ForwardReadResult,
     as_record,
     clamp_int,
     extract_forward_ids,
+    extract_forward_media,
     failure_result,
+    forward_media_note,
     forward_read_content,
     forward_read_ids,
     forward_read_limits,
+    forward_read_with_media,
     normalize_forward_messages,
     normalize_forward_segments,
     with_timeout,
@@ -59,6 +65,20 @@ def _node(**kwargs):
 
 def _text_segment(text):
     return {'type': 'text', 'data': {'text': text}}
+
+
+def _image_segment(url='', sub_type='0', summary='', **extra):
+    """一个 OneBot 图片段（`sub_type` / `summary` 是平台给的种类判据）。"""
+    data = {'url': url, 'sub_type': sub_type, 'summary': summary}
+    data.update(extra)
+    return {'type': 'image', 'data': data}
+
+
+def _image_node(count, prefix='https://gchat.qpic.cn/a/', start=1, **kwargs):
+    """一个只装 `count` 张图的节点（默认坐标各不相同）。"""
+    return _node(message=[
+        _image_segment('%s%d' % (prefix, index)) for index in range(start, start + count)
+    ], **kwargs)
 
 
 def _nested_node(user_id, nested_id):
@@ -602,6 +622,291 @@ class ForwardReadTests(unittest.TestCase):
         ))
         # 越界值被夹到下限（1 / 500 / 8），而不是被当"没填"。
         self.assertLessEqual(len(result.content), 500 + 32)
+
+
+# =========================================================================== #
+# 媒体（v1.8.7：第四道预算 + 三条出口的原料）
+# =========================================================================== #
+
+class ForwardMediaBudgetTests(unittest.TestCase):
+    """单条转发的媒体预算：默认 3、区间 0~10、超预算截断但**数得出来**。"""
+
+    def test_defaults_and_range(self):
+        self.assertEqual(FORWARD_MEDIA_MAX_PER_FORWARD, 3)
+        self.assertEqual(DEFAULT_LIMITS.max_images, 3)
+        self.assertEqual(forward_read_limits().max_images, 3)
+        self.assertEqual(forward_read_limits({'maxImages': 0}).max_images, 0, '0 是合法值')
+        self.assertEqual(forward_read_limits({'max_images': 0}).max_images, 0, '两种拼写都认')
+        self.assertEqual(forward_read_limits({'maxImages': -5}).max_images, 0, '夹到下限 0')
+        self.assertEqual(forward_read_limits({'maxImages': 99}).max_images, 10, '夹到上限 10')
+        # "没写"与"写了不可用"仍是两回事（与三重预算同一条语义）。
+        self.assertEqual(forward_read_limits({'maxImages': 'abc'}).max_images, 3)
+        self.assertEqual(forward_read_limits({'maxImages': None}).max_images, 0, 'Number(null)=0')
+
+    def test_exactly_the_limit_is_taken_and_the_rest_is_counted(self):
+        budget = ForwardMediaBudget(max_images=3)
+        media = extract_forward_media(_image_node(15), budget)
+        self.assertEqual(len(media), 3, '恰好取上限张')
+        self.assertEqual([item.source for item in media],
+                         ['https://gchat.qpic.cn/a/1', 'https://gchat.qpic.cn/a/2',
+                          'https://gchat.qpic.cn/a/3'], '只取排在前面的')
+        self.assertEqual(budget.image_count, 15, '见到几张要数满')
+        self.assertEqual(budget.taken, 3)
+        self.assertEqual(forward_media_note(budget), '[图片×15，仅取前 3 张]')
+
+    def test_limit_zero_takes_nothing_but_says_how_many_were_there(self):
+        """**反向用例**：上限配成 0 也必须按规则走（不是"永远全取"）。"""
+        budget = ForwardMediaBudget(max_images=0)
+        self.assertEqual(extract_forward_media(_image_node(15), budget), [])
+        self.assertEqual(budget.image_count, 15)
+        self.assertEqual(forward_media_note(budget), '[图片×15，仅取前 0 张]')
+
+    def test_limit_one_takes_exactly_one(self):
+        budget = ForwardMediaBudget(max_images=1)
+        media = extract_forward_media(_image_node(4), budget)
+        self.assertEqual([item.source for item in media], ['https://gchat.qpic.cn/a/1'])
+        self.assertEqual(forward_media_note(budget), '[图片×4，仅取前 1 张]')
+
+    def test_no_note_when_everything_fits(self):
+        budget = ForwardMediaBudget(max_images=3)
+        extract_forward_media(_image_node(2), budget)
+        self.assertEqual(forward_media_note(budget), '', '没超预算就一个字都不加')
+        empty = ForwardMediaBudget(max_images=3)
+        self.assertEqual(forward_media_note(empty), '', '一张图都没有也不加字')
+
+    def test_the_same_image_twice_counts_once(self):
+        """去重：同一张图在节点里出现两次只算一次（坐标字面量）。"""
+        node = _node(message=[
+            _image_segment('https://gchat.qpic.cn/a/1'),
+            _image_segment('https://gchat.qpic.cn/a/2'),
+            _image_segment('https://gchat.qpic.cn/a/1'),
+        ])
+        budget = ForwardMediaBudget(max_images=5)
+        media = extract_forward_media(node, budget)
+        self.assertEqual([item.source for item in media],
+                         ['https://gchat.qpic.cn/a/1', 'https://gchat.qpic.cn/a/2'])
+        self.assertEqual(budget.image_count, 2, '重复的那张不计数')
+        self.assertEqual(forward_media_note(budget), '')
+
+    def test_segments_without_a_usable_coordinate_do_not_count(self):
+        """`url` / `file` / `path` 都没有 = 拿不到，不是"没取"——数都不数。"""
+        node = _node(message=[
+            {'type': 'image', 'data': {}},
+            _image_segment('https://gchat.qpic.cn/a/1'),
+        ])
+        budget = ForwardMediaBudget(max_images=5)
+        media = extract_forward_media(node, budget)
+        self.assertEqual(len(media), 1)
+        self.assertEqual(budget.image_count, 1)
+
+    def test_file_and_path_are_fallbacks_for_the_coordinate(self):
+        node = _node(message=[
+            {'type': 'image', 'data': {'file': 'file:///tmp/a.png'}},
+            {'type': 'image', 'data': {'path': '/tmp/b.png'}},
+        ])
+        budget = ForwardMediaBudget(max_images=5)
+        self.assertEqual([item.source for item in extract_forward_media(node, budget)],
+                         ['file:///tmp/a.png', '/tmp/b.png'])
+
+    def test_kind_follows_the_platform_sub_type_table(self):
+        """种类只看平台段字段（三档表的同一张表）：0 图 / 1 收藏表情 / 2-3-7 候选。"""
+        node = _node(message=[
+            _image_segment('https://gchat.qpic.cn/a/1', sub_type='0'),
+            _image_segment('https://gchat.qpic.cn/a/2', sub_type='1', summary='[中午好]'),
+            _image_segment('https://gchat.qpic.cn/a/3', sub_type='0', summary='[动画表情]'),
+            _image_segment('https://gchat.qpic.cn/a/4', sub_type='7'),
+            _image_segment('https://gchat.qpic.cn/a/5', sub_type='5'),
+            _image_segment('https://gchat.qpic.cn/a/6', sub_type=''),
+        ])
+        budget = ForwardMediaBudget(max_images=10)
+        kinds = [(item.kind, item.summary) for item in extract_forward_media(node, budget)]
+        self.assertEqual(kinds, [
+            ('image', ''),
+            ('sticker', '[中午好]'),
+            ('animated', '[动画表情]'),
+            ('sticker-candidate', ''),
+            ('image', ''),
+            ('image', ''),
+        ])
+
+    def test_videos_are_counted_but_never_taken(self):
+        """视频只标注不取帧：不产生媒体条目，但数得出来。"""
+        node = _node(message=[
+            {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
+            _image_segment('https://gchat.qpic.cn/a/1'),
+            {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/2'}},
+        ])
+        budget = ForwardMediaBudget(max_images=5)
+        media = extract_forward_media(node, budget)
+        self.assertEqual([item.source for item in media], ['https://gchat.qpic.cn/a/1'])
+        self.assertEqual(budget.video_count, 2)
+
+
+class ForwardMediaReadTests(unittest.TestCase):
+    """`forward_read_with_media()`：一次取页，正文 + 媒体条目 + 可数线索。"""
+
+    def _fetch(self, pages):
+        return _FakeFetch(pages)
+
+    def test_media_and_text_come_from_a_single_fetch(self):
+        fetch = self._fetch({'a': {'data': {'messages': [_image_node(2, nickname='甲')]}}})
+        read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxImages': 3}))
+        self.assertEqual(fetch.calls, ['a'], '只许取一次页（rkey 是短效的）')
+        self.assertFalse(read.result.failed)
+        self.assertEqual([item.source for item in read.media],
+                         ['https://gchat.qpic.cn/a/1', 'https://gchat.qpic.cn/a/2'])
+        self.assertEqual(read.skipped_images, 0)
+        self.assertIn('甲', read.result.content)
+
+    def test_over_budget_truncates_and_leaves_a_countable_clue(self):
+        fetch = self._fetch({'a': {'data': {'messages': [_image_node(15)]}}})
+        read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxImages': 3}))
+        self.assertEqual(len(read.media), 3)
+        self.assertEqual(read.skipped_images, 12)
+        self.assertIn('[图片×15，仅取前 3 张]', read.result.content)
+        # 正文一行都不能丢：图后面的文字照旧在。
+        self.assertIn('[合并转发内容｜节点数 1]', read.result.content)
+
+    def test_budget_zero_keeps_the_text_and_the_placeholder(self):
+        """**反向用例**：上限 0 → 一张都不取，但正文与占位符逐字照旧 + 线索。"""
+        fetch = self._fetch({'a': {'data': {'messages': [
+            _node(message=[_text_segment('你好'), _image_segment('https://gchat.qpic.cn/a/1')]),
+        ]}}})
+        read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxImages': 0}))
+        self.assertEqual(read.media, ())
+        self.assertEqual(read.skipped_images, 1)
+        self.assertIn('你好', read.result.content)
+        self.assertIn('[图片×1，仅取前 0 张]', read.result.content)
+
+    def test_the_clue_lands_on_the_image_line_not_on_the_text_line(self):
+        fetch = self._fetch({'a': {'data': {'messages': [
+            _node(message=[_text_segment('先说话'), _image_segment('https://gchat.qpic.cn/a/1'),
+                           _image_segment('https://gchat.qpic.cn/a/2')]),
+        ]}}})
+        read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxImages': 1}))
+        lines = read.result.content.split('\n')
+        self.assertEqual(lines[-2:], ['[图片×2，仅取前 1 张]', '[图片]'])
+
+    def test_videos_are_annotated_but_never_taken(self):
+        fetch = self._fetch({'a': {'data': {'messages': [
+            _node(message=[
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/1'}},
+                {'type': 'video', 'data': {'url': 'https://gchat.qpic.cn/v/2'}},
+            ]),
+        ]}}})
+        read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxImages': 3}))
+        self.assertEqual(read.media, ())
+        self.assertEqual(read.video_count, 2)
+        self.assertIn('[视频×2，未取]', read.result.content)
+
+    def test_unknown_segment_types_keep_their_current_text(self):
+        fetch = self._fetch({'a': {'data': {'messages': [
+            _node(message=[{'type': 'json', 'data': {'data': '{}'}},
+                           _image_segment('https://gchat.qpic.cn/a/1', sub_type='1')]),
+        ]}}})
+        read = asyncio.run(forward_read_with_media(['a'], fetch, {'maxImages': 3}))
+        self.assertIn('[未支持的消息类型：json]', read.result.content)
+        self.assertEqual([item.kind for item in read.media], ['sticker'])
+
+    def test_node_budget_bounds_the_media_too(self):
+        """三重预算仍然先生效：节点预算之外的节点连图片都不该被看到。"""
+        fetch = self._fetch({'a': {'data': {'messages': [
+            _image_node(1, prefix='https://gchat.qpic.cn/first/', nickname='1'),
+            _image_node(1, prefix='https://gchat.qpic.cn/second/', nickname='2'),
+        ]}}})
+        read = asyncio.run(forward_read_with_media(
+            ['a'], fetch, {'maxImages': 5, 'maxNodes': 1},
+        ))
+        self.assertEqual([item.source for item in read.media], ['https://gchat.qpic.cn/first/1'])
+        self.assertNotIn('second', read.result.content)
+
+    def test_nested_media_is_collected_in_display_order(self):
+        """嵌套展开顺序 = 正文顺序：先外层节点的图，再嵌套页里的图。"""
+        pages = {
+            'outer': {'data': {'messages': [{'nickname': 'A', 'message': [
+                _image_segment('https://gchat.qpic.cn/a/outer'),
+                {'type': 'forward', 'data': {'id': 'inner'}},
+            ]}]}},
+            'inner': {'data': {'messages': [{'nickname': 'B', 'message': [
+                _image_segment('https://gchat.qpic.cn/a/inner'),
+            ]}]}},
+        }
+        read = asyncio.run(forward_read_with_media(['outer'], self._fetch(pages), {'maxDepth': 3}))
+        self.assertEqual([item.source for item in read.media],
+                         ['https://gchat.qpic.cn/a/outer', 'https://gchat.qpic.cn/a/inner'])
+
+    def test_media_is_still_collected_at_the_depth_cap(self):
+        """`maxDepth=0` 只表示"不展开嵌套"，**不是**"不收集这一页的图"。
+
+        （实现里踩过一次：收集写在节点循环里、而深度早退在循环之前，`maxDepth=0`
+        时最外层那一页的图一张都收不到。默认 `maxDepth=3` 完全看不出来。）
+        """
+        pages = {
+            'outer': {'data': {'messages': [{'nickname': 'A', 'message': [
+                _image_segment('https://gchat.qpic.cn/a/outer'),
+                {'type': 'forward', 'data': {'id': 'inner'}},
+            ]}]}},
+            'inner': {'data': {'messages': [{'nickname': 'B', 'message': [
+                _image_segment('https://gchat.qpic.cn/a/inner'),
+            ]}]}},
+        }
+        fetch = self._fetch(pages)
+        read = asyncio.run(forward_read_with_media(['outer'], fetch, {'maxDepth': 0}))
+        self.assertEqual(fetch.calls, ['outer'], 'maxDepth=0 时一个嵌套请求都不发')
+        self.assertEqual([item.source for item in read.media], ['https://gchat.qpic.cn/a/outer'])
+
+    def test_fetch_failure_keeps_the_text_and_yields_no_media(self):
+        """取不到节点：正文照旧、媒体为空，**绝不吞正文**。"""
+        async def broken(_identifier):
+            raise RuntimeError('连接断了')
+
+        read = asyncio.run(forward_read_with_media(['a'], broken, {'maxImages': 3}))
+        self.assertTrue(read.result.failed)
+        self.assertEqual(read.result.content, '[收到一条合并转发消息，但暂时无法读取内容]')
+        self.assertEqual(read.media, ())
+        self.assertEqual((read.skipped_images, read.video_count), (0, 0))
+
+    def test_no_forward_returns_none_without_asking(self):
+        fetch = self._fetch({})
+        self.assertIsNone(asyncio.run(forward_read_with_media([], fetch)))
+        self.assertEqual(fetch.calls, [], '没有 id 就不许发请求')
+
+    def test_platform_error_frame_is_a_failure_with_no_media(self):
+        async def fetch(_identifier):
+            return {'retcode': 1200, 'wording': '合并转发已过期'}
+
+        read = asyncio.run(forward_read_with_media(['a'], fetch))
+        self.assertTrue(read.result.failed)
+        self.assertEqual(read.media, ())
+
+    def test_the_old_entry_points_never_collect_media(self):
+        """老入口（`forward_read_ids` / `forward_read_content`）行为逐字不变。"""
+        fetch = self._fetch({'a': {'data': {'messages': [_image_node(3)]}}})
+        result = asyncio.run(forward_read_ids(['a'], fetch, {'maxImages': 3}))
+        self.assertEqual(
+            result.content,
+            '[合并转发内容｜节点数 1]\n[节点 1｜未知发送者]\n[图片]\n[图片]\n[图片]',
+            '老入口的正文里不许出现媒体线索',
+        )
+
+    def test_a_broken_nested_forward_still_yields_the_outer_media(self):
+        """坏嵌套只坏那一段：外层图照收、正文照旧（失败不吞线索）。"""
+        async def fetch(identifier):
+            if identifier == 'outer':
+                return {'data': {'messages': [{'nickname': 'A', 'message': [
+                    _image_segment('https://gchat.qpic.cn/a/outer'),
+                    {'type': 'forward', 'data': {'id': 'inner'}},
+                ]}]}}
+            raise RuntimeError('inner 读不到')
+
+        read = asyncio.run(forward_read_with_media(['outer'], fetch, {'maxDepth': 3}))
+        self.assertIn('[嵌套合并转发读取失败｜资源 inner]', read.result.content)
+        self.assertEqual([item.source for item in read.media], ['https://gchat.qpic.cn/a/outer'])
+
+    def test_the_per_turn_cap_is_a_single_constant(self):
+        """整条消息的转发媒体总数上限是一个 core 常量（不暴露配置）。"""
+        self.assertEqual(FORWARD_MEDIA_MAX_PER_TURN, 6)
+        self.assertGreaterEqual(FORWARD_MEDIA_MAX_PER_TURN, FORWARD_MEDIA_MAX_PER_FORWARD)
 
 
 # =========================================================================== #

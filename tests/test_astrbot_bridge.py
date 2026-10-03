@@ -2567,6 +2567,215 @@ class ForwardMessageReadTests(unittest.TestCase):
         self.assertEqual(bridge.forward_ids_for_event(event), ['raw-9', 'cq-1', 'res-1'])
 
 
+# =========================================================================== #
+# 6c. 转发媒体的三个出口（v1.8.7）：attachments / 视觉 sources / 表情包收藏
+# =========================================================================== #
+
+def _forward_image_pages(count, prefix='https://gchat.qpic.cn/ft/', **segment):
+    """一页合并转发节点：一个节点里 `count` 张图（坐标各不相同）。"""
+    return {'status': 'ok', 'retcode': 0, 'data': {'messages': [
+        {'user_id': '100', 'nickname': '甲', 'message_type': 'group', 'message': [
+            {'type': 'image', 'data': {
+                'url': '%s%d' % (prefix, index), 'sub_type': '0', 'summary': '', **segment,
+            }} for index in range(1, count + 1)
+        ]},
+    ]}}
+
+
+class ForwardMediaIntegrationTests(unittest.TestCase):
+    """转发节点里的图**怎么被交给模型**：并进同一条结构化媒体链路（§46/§52）。
+
+    这里只走适配层那半段（`SessionView.media`），核心那半段的规矩由
+    `test_forward_message.py` 与 `test_service_chunk*.py` 分别钉着。
+    """
+
+    def test_merged_media_keeps_the_direct_ones_first_and_dedupes(self):
+        media = bridge_module.merge_forward_media(
+            [{'kind': 'image', 'source': 'https://gchat.qpic.cn/direct/1', 'summary': ''}],
+            [
+                {'source': 'https://gchat.qpic.cn/ft/1', 'kind': 'image', 'summary': ''},
+                {'source': 'https://gchat.qpic.cn/direct/1', 'kind': 'image', 'summary': ''},
+                {'source': 'https://gchat.qpic.cn/ft/2', 'kind': 'sticker', 'summary': '[中午好]'},
+            ],
+        )
+        self.assertEqual(
+            [item['source'] for item in media],
+            ['https://gchat.qpic.cn/direct/1', 'https://gchat.qpic.cn/ft/1',
+             'https://gchat.qpic.cn/ft/2'],
+            '直发在前；与直发同坐标的那张不重复挂',
+        )
+        self.assertEqual(media[-1]['kind'], 'sticker', '种类原样带过来（判据不在这里）')
+        self.assertEqual(media[-1]['source_kind'], 'url')
+
+    def test_merge_treats_a_missing_media_table_as_missing(self):
+        """一条转发媒体都没有时**原样返回**：`None` 与 `[]` 是两件事。"""
+        self.assertIsNone(bridge_module.merge_forward_media(None, []))
+        self.assertEqual(bridge_module.merge_forward_media([], []), [])
+
+    def test_merge_caps_the_total_and_counts_cards_outside_the_cap(self):
+        forwarded = [{'source': 'https://gchat.qpic.cn/ft/%d' % i, 'kind': 'image'} for i in range(1, 9)]
+        forwarded.append({'source': '', 'kind': 'card'})
+        media = bridge_module.merge_forward_media([], forwarded, max_per_turn=3)
+        images = [item for item in media if item['kind'] == 'image']
+        self.assertEqual(len(images), 3, '整条消息的转发媒体总数要封顶')
+        # 卡片没有来源、也不花视觉 token：它不占图片额度（这里它没有来源，所以被过滤）。
+        self.assertEqual([item['source'] for item in images],
+                         ['https://gchat.qpic.cn/ft/1', 'https://gchat.qpic.cn/ft/2',
+                          'https://gchat.qpic.cn/ft/3'])
+
+    def test_forward_images_become_sources_and_attachments_on_the_session(self):
+        """端到端那一半：转发的图进 `SessionView.media` → 视觉来源 / 附件原料。"""
+        bot = _FakeOneBotClient({'res-1': _forward_image_pages(2)})
+        bridge = _bridge_with_bot({'forward_message': {'max_images': 3}}, bot)
+        event = FakeMessageEvent(message='', components=[Forward(id='res-1')], raw_message={
+            'post_type': 'message', 'message': [{'type': 'forward', 'data': {'id': 'res-1'}}],
+        })
+        received = []
+
+        async def fake_receive(session):
+            received.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        asyncio.run(bridge.handle_event(event))
+        self.assertEqual(len(received), 1, '读到了就该走叙事')
+        session = received[0]
+        sources = [item['source'] for item in session.media]
+        self.assertEqual(sources, ['https://gchat.qpic.cn/ft/1', 'https://gchat.qpic.cn/ft/2'])
+        # 视觉来源就是媒体表的规范化形式（core 侧同一份数据）——`imageCount` 取的就是它。
+        from plugin.core.service.chunk3 import _extract_session_image_sources
+        self.assertEqual(_extract_session_image_sources(session), sources)
+        self.assertGreater(len(sources), 0, 'imageCount 要真的 > 0（这次修的正是它）')
+
+    def test_over_budget_keeps_the_text_clue_and_the_card_mark(self):
+        bot = _FakeOneBotClient({'res-1': _forward_image_pages(15)})
+        bridge = _bridge_with_bot({'forward_message': {'max_images': 2}}, bot)
+        event = FakeMessageEvent(message='', components=[Forward(id='res-1')], raw_message={
+            'post_type': 'message', 'message': [{'type': 'forward', 'data': {'id': 'res-1'}}],
+        })
+        received = []
+
+        async def fake_receive(session):
+            received.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        asyncio.run(bridge.handle_event(event))
+        session = received[0]
+        self.assertIn('<forward id="res-1"/>', session.content, '卡片线索不能丢')
+        self.assertIn('[图片×15，仅取前 2 张]', session.content, '超预算要留下可数线索')
+        self.assertEqual(len(session.media), 2)
+
+    def test_config_max_images_is_read_from_the_schema_group(self):
+        """`forward_message.max_images` 真的接到读取侧（三处同改里的第三处）。"""
+        bot = _FakeOneBotClient({'res-1': _forward_image_pages(5)})
+        bridge = _bridge_with_bot({'forward_message': {'max_images': 1}}, bot)
+        event = FakeMessageEvent(message='', components=[Forward(id='res-1')], raw_message={
+            'post_type': 'message', 'message': [{'type': 'forward', 'data': {'id': 'res-1'}}],
+        })
+        received = []
+
+        async def fake_receive(session):
+            received.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        asyncio.run(bridge.handle_event(event))
+        self.assertEqual(len(received[0].media), 1)
+
+    def test_fetch_failure_keeps_the_text_and_the_placeholders_verbatim(self):
+        """**反向用例**：取不到节点 → 正文与占位符逐字不变 + 一条 warn，媒体为空。"""
+        bot = _FakeOneBotClient({'res-1': RuntimeError('连接断了')})
+        bridge = _bridge_with_bot({}, bot)
+        event = FakeMessageEvent(message='', components=[Forward(id='res-1')], raw_message={
+            'post_type': 'message', 'message': [{'type': 'forward', 'data': {'id': 'res-1'}}],
+        })
+        received = []
+
+        async def fake_receive(session):
+            received.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            asyncio.run(bridge.handle_event(event))
+        session = received[0]
+        self.assertEqual(session.content, '<forward id="res-1"/>',
+                         '失败时正文逐字不变（不塞失败文案、也不丢卡片线索）')
+        self.assertEqual(session.media, [], '取不到就没有媒体条目')
+        warnings = [str(item) for item in logged.call_args_list
+                    if item.args and item.args[0] == 'warn']
+        self.assertTrue(any('合并转发' in item for item in warnings), warnings)
+
+    def test_forward_sticker_kind_reaches_the_collection_hook(self):
+        """转发里的收藏表情走**同一套三档判据**被收藏（转发 ≠ 另一套判据）。
+
+        * `sub_type=1`（观测到就是收藏表情）→ 一档，直接是 `sticker`；
+        * `sub_type=7` + 方括号名字（候选档）→ 判据在**入站当次**判名字信号，
+          「方括号名字」那把尺子只有一处实现（`helpers.sticker_media_signal`），
+          转发来的候选走的是**同一次调用**。
+        """
+        pages = {'res-1': {'status': 'ok', 'retcode': 0, 'data': {'messages': [
+            {'user_id': '100', 'nickname': '甲', 'message': [
+                {'type': 'image', 'data': {
+                    'url': 'https://gchat.qpic.cn/ft/sticker', 'sub_type': '1',
+                    'summary': '[中午好]',
+                }},
+                {'type': 'image', 'data': {
+                    'url': 'https://gchat.qpic.cn/ft/candidate', 'sub_type': '7',
+                    'summary': '[猫猫叹气]',
+                }},
+                {'type': 'image', 'data': {
+                    'url': 'https://gchat.qpic.cn/ft/photo', 'sub_type': '0', 'summary': '',
+                }},
+            ]},
+        ]}}}
+        bot = _FakeOneBotClient({'res-1': pages['res-1']})
+        bridge = _bridge_with_bot({}, bot)
+        event = FakeMessageEvent(message='', components=[Forward(id='res-1')], raw_message={
+            'post_type': 'message', 'message': [{'type': 'forward', 'data': {'id': 'res-1'}}],
+        })
+        received = []
+
+        async def fake_receive(session):
+            received.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        asyncio.run(bridge.handle_event(event))
+        from plugin.core.service.chunk3 import _extract_session_media
+        from plugin.core.service.helpers import collectible_sticker_kind
+        media = _extract_session_media(received[0])
+        self.assertEqual([item['kind'] for item in media], ['sticker', 'sticker', 'image'])
+        # 一档判据（唯一入口）认了前两条；那条普通照片照旧不收。
+        self.assertEqual([collectible_sticker_kind(item['kind']) for item in media],
+                         ['sticker', 'sticker', ''],
+                         '转发与直发同一条判据')
+        self.assertEqual(media[0]['label'], '[表情包]', '标签也走同一个 media_kind_label')
+        self.assertEqual(media[1]['label'], '[表情包]')
+        self.assertEqual(media[2]['label'], '[图片]')
+
+    def test_the_media_does_not_survive_into_the_next_event(self):
+        """媒体只在入站当次活着：下一条没有转发的事件不许挂上一条的图。"""
+        bot = _FakeOneBotClient({'res-1': _forward_image_pages(2)})
+        bridge = _bridge_with_bot({}, bot)
+        first = FakeMessageEvent(message='', components=[Forward(id='res-1')], raw_message={
+            'post_type': 'message', 'message': [{'type': 'forward', 'data': {'id': 'res-1'}}],
+        })
+        received = []
+
+        async def fake_receive(session):
+            received.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        asyncio.run(bridge.handle_event(first))
+        self.assertEqual(len(received[0].media), 2)
+        second = FakeMessageEvent(message='普通一句话', components=[Plain('普通一句话')])
+        asyncio.run(bridge.handle_event(second))
+        self.assertEqual(received[1].media, [], '上一条转发的图不许漏到下一条')
+
+
 class ConfigTransferTests(unittest.TestCase):
     """配置导出 / 导入（本移植版新增）与它的**向后兼容**契约。
 

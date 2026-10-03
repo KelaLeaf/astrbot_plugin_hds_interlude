@@ -2830,6 +2830,12 @@
         "type": "int",
         "description": "嵌套合并转发最多展开层数",
         "default": 3
+      },
+      "max_images": {
+        "type": "int",
+        "description": "单条转发最多读取的图片数",
+        "default": 3,
+        "hint": "转发里的图会作为视觉输入交给模型，每多一张就多一份 token 与下载时间；超出的只留数量线索。"
       }
     }
   },

@@ -2428,6 +2428,52 @@ class VisionSourceProvenanceTests(ServiceHarness):
                 from plugin.core.service.helpers import describe_group_attachments
                 self.assertIn(label, describe_group_attachments(content), '上游的文本标签照旧')
 
+    @needs('describe_vision_event', 'load_native_images', 'fetch_native_image')
+    async def test_forwarded_media_reaches_the_same_payload_path(self) -> None:
+        """转发媒体（v1.8.7）**一条新路都没开**：走的就是这条既有的来源 → 取回链路。
+
+        适配层把转发节点的图并进 `SessionView.media` 之后，这里钉的是"它真的被取回、
+        真的进 payload 的图片列表、编号与 `attachments` 对齐"——`currentEvent.imageCount`
+        取的就是这个列表的长度（真机上它曾经是 0，那正是这条修复的现场）。
+        """
+        forwarded = ['https://gchat.qpic.cn/ft/%d.png' % index for index in (1, 2, 3)]
+        transport = _GroupByteTransport({url: _png(url.encode()) for url in forwarded})
+        service = self._service(transport)
+        story = self.make_story()
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='2', channel_id='private:2',
+            content='<forward id="res-1"/>\n[合并转发内容｜节点数 1]\n[图片×15，仅取前 3 张]',
+            media=[{'kind': 'image', 'source': url, 'source_kind': 'url',
+                    'summary': '', 'raw': {}} for url in forwarded],
+        )
+        vision = service.describe_vision_event(session)
+        self.assertEqual(vision['sources'], forwarded, '转发图片就是普通图片来源')
+        self.assertGreater(len(vision['sources']), 0, '`imageCount` 要真的 > 0')
+        images = await service.load_native_images(story, vision['sources'], session, vision['media'])
+        self.assertEqual([item['id'] for item in images],
+                         ['turn-image-1', 'turn-image-2', 'turn-image-3'])
+        self.assertEqual(transport.fetched, forwarded, '三张都真的去取了')
+        self.assertEqual([item.get('media_label') for item in images], ['[图片]'] * 3)
+
+    @needs('describe_vision_event', 'load_native_images', 'fetch_native_image')
+    async def test_a_forwarded_sticker_is_labelled_as_a_sticker_in_the_payload(self) -> None:
+        """转发来的收藏表情在 payload 里也是 `sticker`（不是普图）——`attachments` 靠它。"""
+        url = 'https://gchat.qpic.cn/ft/sticker.png'
+        transport = _GroupByteTransport({url: _png(b'sticker')})
+        service = self._service(transport)
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='2', channel_id='private:2',
+            content='<forward id="res-1"/>',
+            media=[{'kind': 'sticker', 'source': url, 'source_kind': 'url',
+                    'summary': '[中午好]', 'raw': {}}],
+        )
+        vision = service.describe_vision_event(session)
+        images = await service.load_native_images(
+            self.make_story(), vision['sources'], session, vision['media'],
+        )
+        self.assertEqual(images[0]['media_kind'], 'sticker')
+        self.assertEqual(images[0]['media_label'], '[表情包]')
+
     # ---- §46.9：没有观测通道这件事必须可见（坑 25），但按会话节流 ----
 
     def _media_warns(self) -> list[tuple[str, str]]:

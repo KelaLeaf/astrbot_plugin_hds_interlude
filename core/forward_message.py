@@ -50,6 +50,15 @@
    组件拿到的是**裸 id**（那条组件带 `id`，而 `get_message_str()` 只给 `[转发消息]`），
    所以 core 除了"从正文里抠 id"的 `forward_read_content`，还提供"按已抠好的 id 读"的
    `forward_read_ids`。两者共用同一套预算 / 递归 / 失败分支，只是入口不同。
+8. **多一个入口 `forward_read_with_media(ids, fetch, limits)`（v1.8.7）**：转发的图片
+   坐标（`url` / `file` / `path`）**只在入站当次的响应里有效**（QQ 图床 URL 带短效
+   `rkey`），所以媒体不能"读一遍正文、再读一遍媒体"——那要发两次 `get_forward_msg`，
+   而且第二次拿到的可能已经是过期的 `rkey`。这一个入口**只取一次页**，同时产出正文与
+   媒体条目（`ForwardMediaRead`）。`forward_read_ids` / `forward_read_content` 保持原
+   签名与返回值不变（老调用方与逐字断言都不动）。
+9. **媒体预算（第四道预算，v1.8.7）**：上游根本没有这一层（上游只读正文）。规则与
+   取值见下面的「媒体预算」一节。**超出预算只截断 + 在正文里留可数线索**，绝不因为
+   预算丢正文、也绝不因为取媒体失败丢正文。
 
 **字符预算与层级语义（与上游逐字一致，别顺手"优化"）**：
 
@@ -77,29 +86,69 @@
 失败分支的文案也是上游原文：
 `[收到一条合并转发消息，但暂时无法读取内容]`、
 `[嵌套合并转发读取失败｜资源 <id>]`。
+
+## 媒体预算（v1.8.7，上游没有这一层）
+
+真机现场：一条 17 节点的转发里 15 张图，模型只看到 15 个 `[图片]`——`imageCount=0`、
+`visualEvidenceMode=none`，视觉观察 / `attachments` / 表情包收藏**一样都拿不到**。
+修法是"把节点里的图片坐标也交出去"，但**不能全交**：一条转发里十几张图如果全塞进
+原生视觉输入，就是一个 token / 延迟 / 成本的黑洞。所以在上游那三重预算（节点数 /
+字符数 / 深度）之外，**再加一道媒体预算**：
+
+| 预算 | 位置 | 默认 | 区间 | 理由 |
+| --- | --- | --- | --- | --- |
+| `maxImages`（单条转发最多取几张图） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_images` | **3** | 0~10 | 与直发消息的视觉预算**同一个数量级**（`chunk3` 的 `sources[:3]`）：她一次能"看"的图就是这么多。取 3 而不是 15，省的是每回合的原生图 token 与下载时间；取 0 就等于关掉"转发也看图"，是个**合法**配置（用例钉着） |
+| `FORWARD_MEDIA_MAX_PER_TURN`（整条消息的转发媒体总数上限） | 本模块常量（**不暴露配置**） | **6** | — | 一条消息里可能有多张转发卡片，单卡上限管不住总量。6 = 两张卡的默认值之和，够用又封顶；真正的视觉输入上限仍是 `chunk3` 的 3 |
+| 单张体积上限 | **不加新键**：复用 `stickers.max_file_size_mb`（默认 10MB） | 视觉路径 `chunk3.MAX_NATIVE_IMAGE_BYTES`（4MB）、收藏路径 `store_collected_sticker` 的 `max_file_size_mb` | — | "一张图多大算大"在这个仓库里已经有答案，再写一份就是第二个真相 |
+| 只取前面的 | 节点顺序（含嵌套展开顺序） | — | — | 与三重预算同一条纪律：**排在前面的先拿**，后面的只留线索 |
+| 去重 | 坐标字面量（这里）与内容 sha256（`store_collected_sticker`） | — | — | 同一张图在节点里出现两次只算一次；字节到手的路径上仍按内容哈希去重（那条判据只有一处） |
+
+**取不到就什么都不做**：节点取不到 / 字段缺失 / 坐标不是可取回的那几类，一律连媒体
+条目都不产生——正文照旧（`[图片]` 占位一个不少），**绝不因为媒体失败吞正文**。
+
+**超预算的可见线索**（短、可数，写在图片那一行上）：
+
+```
+[图片×15，仅取前 3 张]      # 按预算取了 3 张
+[图片×15，仅取前 0 张]      # 上限配成 0：一张都不取，但仍然数得出来有几张
+[视频×2，未取]              # 没有抽帧能力：只标注，不假装能看
+```
+
+数值取自**平台响应里的图片段数**（不是"成功取回的字节数"）：字节要等下游下载才知道，
+而"她少看了 12 张"这件事必须现在就说得出来。
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 __all__ = [
     'DEFAULT_LIMITS',
     'FORWARD_FETCH_TIMEOUT_MS',
+    'FORWARD_MEDIA_MAX_PER_FORWARD',
+    'FORWARD_MEDIA_MAX_PER_TURN',
+    'ForwardMedia',
+    'ForwardMediaBudget',
+    'ForwardMediaRead',
     'ForwardReadLimits',
     'ForwardReadResult',
     'as_record',
     'clamp_int',
     'extract_forward_ids',
+    'extract_forward_media',
     'failure_result',
+    'forward_media_budget',
+    'forward_media_note',
     'forward_read_content',
     'forward_read_ids',
     'forward_read_limits',
+    'forward_read_with_media',
     'normalize_forward_messages',
     'normalize_forward_segments',
+    'sticker_media_signal',
     'with_timeout',
 ]
 
@@ -110,21 +159,42 @@ __all__ = [
 
 @dataclass(frozen=True)
 class ForwardReadLimits:
-    """读取预算（上游 `ForwardReadLimits`）。
+    """读取预算（上游 `ForwardReadLimits` + 本移植版的 `max_images`）。
 
     默认值与区间见 `DEFAULT_LIMITS` / `forward_read_limits`：上游
     `index.ts:214-219` 的 `forwardMessage` 组（`maxNodes` 1~100 / `maxCharacters`
     500~32000 / `maxDepth` **0**~8）。**`maxDepth` 的下限是 0**（0 = 不展开嵌套），
     别当成 1。
+
+    `max_images`（v1.8.7）是**第四道预算**：单条合并转发最多取几张图的坐标。
+    默认 3（与直发消息的视觉预算同量级）、区间 0~10，理由见模块 docstring。
     """
 
     max_nodes: int = 30
     max_characters: int = 8_000
     max_depth: int = 3
+    max_images: int = 3
 
 
-#: 上游 `DEFAULT_LIMITS`（`forward-message.ts:73`）。
+#: 上游 `DEFAULT_LIMITS`（`forward-message.ts:73`）+ 本移植版的媒体上限。
 DEFAULT_LIMITS = ForwardReadLimits()
+
+#: 单条转发最多取几张图（`ForwardReadLimits.max_images` 的默认值）。
+FORWARD_MEDIA_MAX_PER_FORWARD = DEFAULT_LIMITS.max_images
+
+#: **整条消息**里所有合并转发的媒体条目总数上限（v1.8.7）。
+#:
+#: 为什么不暴露成配置键：它是"一张消息里最多挂几张转发来的图"的硬顶，与单卡
+#: `max_images` 正交（一张卡 3 张 × 两张卡就 6 张）。真正的视觉输入上限在别处
+#: （`chunk3` 的 `sources[:3]`），这里封的是"媒体条目表能长多长"——链路下游
+#: （attachments / 视觉来源 / 收藏）都按条数线性增长，不封顶就是把成本交给运气。
+FORWARD_MEDIA_MAX_PER_TURN = 6
+
+#: **取字节时**的单张体积上限：**不加新键**，复用表情库的 `stickers.max_file_size_mb`
+#: （默认 10MB）。这里只写一个给读者看的说明性默认值，**不参与判据** —— 真正的体积闸
+#: 在两条既有路径上：视觉 `chunk3.MAX_NATIVE_IMAGE_BYTES`（4MB）与收藏
+#: `store_collected_sticker` 的 `max_file_size_mb`。再写一份阈值就是第二个真相。
+FORWARD_MEDIA_MAX_IMAGE_MB = 10
 
 #: 上游 `withTimeout(…, 30_000)`：单页 `get_forward_msg` 的等待上限。
 FORWARD_FETCH_TIMEOUT_MS = 30_000
@@ -167,11 +237,12 @@ def failure_result() -> ForwardReadResult:
 
 
 def forward_read_limits(value: Any = None) -> ForwardReadLimits:
-    """夹取读取预算（上游 `forwardReadLimits`）。
+    """夹取读取预算（上游 `forwardReadLimits` + 本移植版的 `maxImages`）。
 
     逐条对齐上游的区间：`maxNodes` 1~100（默认 30）、`maxCharacters` 500~32000
-    （默认 8000）、`maxDepth` **0**~8（默认 3）。两种拼写都认（优先 camelCase）；
-    传一个已经夹取过的 `ForwardReadLimits` 时原样返回（内部递归会这么用，见
+    （默认 8000）、`maxDepth` **0**~8（默认 3）；本移植版追加 `maxImages` **0**~10
+    （默认 3，理由见模块 docstring）。两种拼写都认（优先 camelCase）；传一个已经
+    夹取过的 `ForwardReadLimits` 时原样返回（内部递归会这么用，见
     `_fetch_forward_nodes` 的第二层预算）。
     """
     if isinstance(value, ForwardReadLimits):
@@ -183,6 +254,11 @@ def forward_read_limits(value: Any = None) -> ForwardReadLimits:
             source, 'maxCharacters', 'max_characters', 500, 32_000, DEFAULT_LIMITS.max_characters,
         ),
         max_depth=_limit_value(source, 'maxDepth', 'max_depth', 0, 8, DEFAULT_LIMITS.max_depth),
+        # 下限是 **0**：0 = "转发里的图一张都不取"（合法配置，只留可数线索），
+        # 与 `maxDepth` 的下限是 0 同一种语义。写成 1 就把"关掉"这件事说死了。
+        max_images=_limit_value(
+            source, 'maxImages', 'max_images', 0, 10, DEFAULT_LIMITS.max_images,
+        ),
     )
 
 
@@ -274,6 +350,282 @@ async def with_timeout(awaitable: Any, timeout_ms: int = FORWARD_FETCH_TIMEOUT_M
     Promise 工厂——`asyncio.wait_for` 会在超时后取消它，我们不需要自己清 timer。
     """
     return await asyncio.wait_for(awaitable, timeout_ms / 1000)
+
+
+# --------------------------------------------------------------------------- #
+# 媒体（v1.8.7：转发节点里的图片 / 视频坐标）
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class ForwardMedia:
+    """转发节点里的**一条**媒体坐标（`source` 就是适配层认的那个字面量）。
+
+    形状刻意与 `SessionView.media[]` 的前两个键同名（`source` / `kind` /
+    `summary`）——适配层把它原样并进那条链路，**不另立第二套媒体表**
+    （`docs/PORTING_NOTES.md` §46 的唯一链路）。
+
+    * `kind`：`image` / `animated` / `sticker` / `sticker-candidate`，由平台响应里的段字段
+      （`sub_type` / `summary`）**观测**得到，取值口径与适配层 `_image_media_kind` 一致
+      （三档判据仍然只有那一处实现）。**视频不在这里**：没有抽帧能力，所以它只留下
+      `[视频×K，未取]` 这条正文线索（见 `ForwardMediaBudget.video_count`）；
+    * `source`：可取回的坐标（`https://…` / `file://…` / 裸路径）；
+    * `summary`：平台原文（`[动画表情]` 之类）。
+    """
+
+    source: str
+    kind: str = 'image'
+    summary: str = ''
+
+
+@dataclass
+class ForwardMediaBudget:
+    """媒体预算的**计数状态**（可变：随遍历推进）。
+
+    刻意**不是** frozen：它就是一次遍历的累加器（`image_count` / `taken` 在走页面时
+    递增，`collected` 追加条目）。做成 frozen 会在第一张图上就抛
+    `FrozenInstanceError` —— 而调用方那条路径上"收集媒体失败"是允许降级的，
+    于是 bug 会被静默吞成"一张图都没有"。可变对象不用装成不可变的。
+    """
+
+    max_images: int = FORWARD_MEDIA_MAX_PER_FORWARD
+    #: 平台那一侧**见到**的可取回图片数（含超预算没取的）——线索里的那个 N。
+    image_count: int = 0
+    #: 真正收下的条目（≤ `max_images`；由 `_collect_forward_media` 追加）。
+    collected: list[ForwardMedia] = field(default_factory=list)
+    #: 真正收下的条目数（≤ `max_images`）。
+    taken: int = 0
+    #: 见到的视频段数（只标注、不取帧）。
+    video_count: int = 0
+    #: 已经出现过的坐标字面量（同一张图在节点里出现两次只算一次）。
+    seen: set[str] = field(default_factory=set)
+    #: 「超预算线索」是否已经写进正文（每条转发只写一次，短）。
+    noted: bool = False
+
+
+@dataclass(frozen=True)
+class ForwardMediaRead:
+    """`forward_read_with_media()` 的结果：正文 + 媒体条目 + 可数的截断事实。"""
+
+    result: ForwardReadResult
+    media: tuple[ForwardMedia, ...] = ()
+    #: 平台见到但**没取**的图片数（`image_count - taken`）。
+    skipped_images: int = 0
+    #: 见到的视频段数（只标注）。
+    video_count: int = 0
+
+
+def forward_media_budget(limits: Any = None) -> ForwardMediaBudget:
+    """从预算里取出媒体那一份（`ForwardReadLimits` / 字典都认）。"""
+    resolved = forward_read_limits(limits)
+    return ForwardMediaBudget(max_images=resolved.max_images)
+
+
+def forward_media_note(budget: ForwardMediaBudget) -> str:
+    """超预算时写在**图片那一行**上的可数线索（短；正文照旧不丢）。
+
+    形态（措辞钉死，用例逐字断言）：
+
+    * 没有图片 → 空串（不多写一个字）；
+    * 图片都在预算内 → 空串（**只有真的截了才说**，否则每行都挂个"×3"是噪音）；
+    * 超预算 → `[图片×N，仅取前 M 张]`；`M == 0` 时是 `[图片×N，仅取前 0 张]`
+      —— 0 也要说出来，否则"配成 0"看起来就像"这条转发里没有图"。
+    """
+    if budget.image_count <= 0 or budget.image_count <= budget.taken:
+        return ''
+    return '[图片×%d，仅取前 %d 张]' % (budget.image_count, budget.taken)
+
+
+def extract_forward_media(node: Any, budget: ForwardMediaBudget) -> list[ForwardMedia]:
+    """一个节点里的媒体 → 条目（**按预算截断**，并推进 `budget` 的计数）。
+
+    * 图片：`url` → `file` → `path`（与适配层 `_media_source_from_attrs` 同一条
+      优先级），三条都没有 → 不算（数都不数：那不是"没取"，是"拿不到"）；
+    * 视频：只 `video_count += 1`，**不产生条目**（没有抽帧能力，别假装有）；
+    * 其它段（`json` / `face` / `mface` / 文件 / 嵌套转发…）不看——本移植版没有
+      它们的"取回"路径，乱认只会让下游多一次必然失败的取字节。
+
+    `kind` 的口径与适配层的三档表**同一套字段**（`sub_type` 0/1 → `image`/`sticker`、
+    2/3/7 → 候选档、`summary` 含「动画」→ `animated`）；这里只是不 import 适配层
+    （`core` 不得依赖 `astrbot_bridge`），值由 `_forward_image_kind` 按同一张表算。
+    """
+    record = as_record(node)
+    segments = record.get('message')
+    if not isinstance(segments, (list, tuple)):
+        return []
+    collected: list[ForwardMedia] = []
+    for raw in segments:
+        segment = as_record(raw)
+        segment_type = str(segment.get('type') or '').lower()
+        data = as_record(segment.get('data'))
+        if segment_type in ('image', 'img'):
+            source = _forward_media_source(data)
+            if not source or source in budget.seen:
+                continue
+            budget.seen.add(source)
+            budget.image_count += 1
+            if budget.taken >= budget.max_images:
+                continue
+            budget.taken += 1
+            collected.append(ForwardMedia(
+                source=source,
+                kind=_forward_image_kind(data),
+                summary=str(data.get('summary') or '').strip(),
+            ))
+        elif segment_type == 'video':
+            budget.video_count += 1
+    return collected
+
+
+#: 段上的「媒体预算线索」私有键（`_fetch_forward_nodes` 写、`normalize_forward_segments`
+#: 读）。为什么借段传：`normalize_forward_messages` 的签名与正文形态是上游逐字契约
+#: （那两条 `test_exact_injection_shape` 之类的断言钉着），媒体线索只能**随节点**走，
+#: 不能多加一个参数改变调用形态。
+_SEGMENT_MEDIA_NOTE = '_hdsiForwardMediaNote'
+
+#: 段上的「视频段数」私有键（同一个 `_fetch_forward_nodes` 写、`normalize_forward_segments`
+#: 读）。视频**不产生媒体条目**（没有抽帧能力），所以它的"可数线索"只能走这条路。
+_SEGMENT_VIDEO_COUNT = '_hdsiForwardVideoCount'
+
+
+def _collect_forward_media(node: dict[str, Any], budget: ForwardMediaBudget) -> list[ForwardMedia]:
+    """`extract_forward_media` + 把两条可数线索挂到段上。
+
+    线索只挂一次、且只挂在对应类型的段上（它是**那一行**的旁注，不是整段转发的旁注）：
+
+    * 图片超预算 → 第一张图片段上写 `[图片×N，仅取前 M 张]`；
+    * 视频 → 每一段视频上写"到目前为止见过几段"（末位那段最后会被写成总数）。
+      一张图 / 一段视频都没有时一个字都不加。
+    """
+    collected = extract_forward_media(node, budget)
+    if collected:
+        budget.collected.extend(collected)
+    segments = node.get('message')
+    if not isinstance(segments, (list, tuple)):
+        return collected
+    if not budget.noted:
+        note = forward_media_note(budget)
+        if note:
+            for raw in segments:
+                segment = as_record(raw)
+                if str(segment.get('type') or '').lower() in ('image', 'img'):
+                    segment[_SEGMENT_MEDIA_NOTE] = note
+                    budget.noted = True  # 只有真的写进去了才算写过（否则线索会随节点丢掉）
+                    break
+    if budget.video_count > 0:
+        for raw in segments:
+            segment = as_record(raw)
+            if str(segment.get('type') or '').lower() != 'video':
+                continue
+            prior = _int_text(segment.get(_SEGMENT_VIDEO_COUNT))
+            if budget.video_count > prior:
+                segment[_SEGMENT_VIDEO_COUNT] = budget.video_count
+    return collected
+
+
+def _int_text(value: Any) -> int:
+    """段上的私有计数键 → 整数（读不出来当 0；不抛）。"""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _collect_forward_media_page(
+    messages: Any, max_nodes: int, budget: ForwardMediaBudget,
+) -> None:
+    """一页节点里的媒体 → `budget`（节点预算与 `_fetch_forward_nodes` 的页内预算一致）。
+
+    单独抽出来只为一件事：**深度到顶也要收**。上游的节点预算写在一个 `break` 循环里，
+    而 `depth >= maxDepth` 那条早退在循环之前——如果把收集塞进循环，`maxDepth=0`
+    时最外层那一页的图就一张都收不到了（`maxDepth` 默认 3 时看不出来，配成 0 就露）。
+    """
+    source = messages if isinstance(messages, (list, tuple)) else []
+    remaining = max_nodes
+    for node in source:
+        remaining -= 1
+        if remaining < 0:
+            break
+        if isinstance(node, dict):
+            _collect_forward_media(node, budget)
+
+
+#: OneBot 图片段 `sub_type` → 种类（与适配层 `_ONEBOT_IMAGE_SUB_TYPES` **同一张表**：
+#: 依据见那一处的 NapCat 枚举快照；core 不 import 适配层，所以只复制这两个取值）。
+_FORWARD_IMAGE_SUB_TYPES = {'0': 'image', '1': 'sticker'}
+
+#: 平台标了"可能是表情"的 `sub_type`（候选档）。这张表只决定"属于哪一档"，
+#: **收不收由 `helpers.sticker_media_signal` 那一处说得算**（名字信号在这里判、
+#: GIF / alpha / 尺寸在拿到字节之后判）。
+_FORWARD_IMAGE_CANDIDATE_SUB_TYPES = frozenset({'2', '3', '7'})
+
+
+def _forward_image_kind(data: dict[str, Any]) -> str:
+    """图片段的 `sub_type` / `summary` → 媒体种类（口径同适配层三档表）。
+
+    * `sub_type` 0 / 1 → `image` / `sticker`（确定档）；
+    * `2` / `3` / `7` → 候选档：**名字信号在这里判一次**（方括号名字 `[中午好]` ——
+      入站就有、不用下载），命中 → `sticker`，否则 `sticker-candidate`（能不能收交给
+      拿到字节之后的**同一个**结构检查 `helpers.sticker_media_signal`）；
+    * 其余 / 缺失 → `image`；
+    * `summary` 含「动画」→ 升级 `animated`（NapCat 自己的占位口径，不是我们猜的）。
+
+    ⚠️ 候选档必须在这里判名字信号：直发图片走 `serialize_component` → `_image_media_kind`
+    时判的就是它。转发不判的话，**同一个对方、同一张带名字的表情**，直发能收、转发收不了
+    ——看起来像"转发里的表情不算表情"。
+    """
+    sub_type = str(data.get('sub_type') if data.get('sub_type') is not None else '').strip()
+    kind = _FORWARD_IMAGE_SUB_TYPES.get(sub_type, '')
+    if not kind and sub_type in _FORWARD_IMAGE_CANDIDATE_SUB_TYPES:
+        kind = 'sticker' if sticker_media_signal(name=data.get('summary')) else 'sticker-candidate'
+    if not kind:
+        kind = 'image'
+    summary = str(data.get('summary') or '')
+    if '动画' in summary:
+        kind = 'animated'
+    return kind
+
+
+def sticker_media_signal(name: Any = '', mime_type: Any = '', data: Any = None) -> str:
+    """`helpers.sticker_media_signal` 的**惰性**入口（结构信号的唯一实现仍在 helpers）。
+
+    为什么要包一层：`core/forward_message.py` 是"纯策略、能单独按文件路径导入"的模块
+    （`test_module_is_importable_without_the_package_context` 钉着），模块级相对 import
+    会让那条用例炸；而结构信号的判据**只有一处**（`helpers`，§49.1），不许在这里抄第二份。
+    惰性 import + 缓存既保住独立可导入，又保住"一份实现"。
+
+    依赖缺失 / 判据层异常时回空串（= 不命中任何信号）：候选档于是停在候选档，
+    **不冒认成"确定是表情"**——判不了时的默认方向是"不认"。
+    """
+    global _sticker_signal_impl
+    if _sticker_signal_impl is None:
+        try:
+            from .service.helpers import sticker_media_signal as impl  # noqa: PLC0415 - 见 docstring
+
+            _sticker_signal_impl = impl
+        except Exception:  # noqa: BLE001 - 独立导入 / 裁剪安装：判不了就不认
+            return ''
+    try:
+        return _sticker_signal_impl(name=name, mime_type=mime_type, data=data)
+    except Exception:  # noqa: BLE001 - 判据层异常不许打断正文
+        return ''
+
+
+#: `sticker_media_signal` 的实现缓存（`None` = 还没解析过）。
+_sticker_signal_impl: Any = None
+
+
+def _forward_media_source(data: dict[str, Any]) -> str:
+    """图片段 → 可取回的坐标（`url` → `file` → `path`）。
+
+    只认这三类（与适配层 `_media_source_from_attrs` 同一条优先级）。**刻意不认
+    `base64://` / 裸文件名之类**：本移植版没有把它们变成字节的路径，认了就等于给
+    下游挂一条必然失败的任务（"拿不准=没有"）。
+    """
+    for key in ('url', 'file', 'path'):
+        value = str(data.get(key) or '').strip()
+        if value:
+            return value
+    return ''
 
 
 # --------------------------------------------------------------------------- #
@@ -410,6 +762,51 @@ async def forward_read_ids(
         return failure_result()
 
 
+async def forward_read_with_media(
+    ids: Any,
+    fetch: Any,
+    limits: Any = None,
+) -> Optional[ForwardMediaRead]:
+    """**只取一次页**，同时产出正文与媒体条目（v1.8.7；上游没有这一层）。
+
+    为什么必须"一次取页"：QQ 图床 URL 里的 `rkey` 是短效的，而 `get_forward_msg` 的
+    响应就是那些坐标的唯一来源——"先读一遍正文、再读一遍媒体"既多打一次平台请求，
+    又可能第二次拿到的已经不是同一份数据（`rkey` 过期 / 平台缓存）。所以媒体在
+    `_fetch_forward_nodes` 走那一页时就地收集（见那个函数的 `media_budget` 参数），
+    与正文共用同一次响应。
+
+    契约与失败分支与 `forward_read_ids` **逐条相同**（认不出 → `None`；读不到 →
+    `ForwardMediaRead(result=failure_result())` 且 `media` 为空）。差别只有两点：
+
+    * `result.content` 里会多出**可数线索**（`[图片×15，仅取前 3 张]` /
+      `[视频×2，未取]`）——只在真的超预算 / 真的见到视频时才有；
+    * 返回的是 `ForwardMediaRead`（`result` + `media` + 计数），调用方按需取用。
+    """
+    resolved = _normalize_ids(ids)
+    if not resolved:
+        return None
+    budget = forward_read_limits(limits)
+    media_budget = forward_media_budget(budget)
+    try:
+        call = _fetcher(fetch)
+    except TypeError:
+        return ForwardMediaRead(result=failure_result())
+    try:
+        nodes = await _fetch_forward_nodes(call, resolved[0], budget, 0, media_budget)
+    except Exception:  # noqa: BLE001 - 上游 `catch { return failureResult() }`
+        return ForwardMediaRead(result=failure_result())
+    # 正文与媒体来自**同一份节点**：媒体是在 `_fetch_forward_nodes` 走页面时就地收进
+    # `media_budget.collected` 的（连同段上的线索键），这里只读不写。
+    collected = media_budget.collected[:budget.max_images]
+    result = normalize_forward_messages(nodes, budget)
+    return ForwardMediaRead(
+        result=result,
+        media=tuple(collected),
+        skipped_images=max(0, media_budget.image_count - len(collected)),
+        video_count=media_budget.video_count,
+    )
+
+
 async def forward_read_content(
     content: Any,
     fetch: Any,
@@ -427,12 +824,23 @@ async def forward_read_content(
     return await forward_read_ids(extract_forward_ids(content), fetch, limits)
 
 
-async def _fetch_forward_nodes(fetch: Any, identifier: str, limits: ForwardReadLimits, depth: int) -> list[Any]:
-    """上游 `fetchForwardNodes(internal, id, limits, depth)`。
+async def _fetch_forward_nodes(
+    fetch: Any,
+    identifier: str,
+    limits: ForwardReadLimits,
+    depth: int,
+    media_budget: Optional[ForwardMediaBudget] = None,
+) -> list[Any]:
+    """上游 `fetchForwardNodes(internal, id, limits, depth)`；`media_budget` 是本移植版
+    追加的末位参数（`None` = 不收集媒体，`forward_read_ids` 那条老路径就是 `None`）。
 
     取一页节点；`depth < maxDepth` 时把页内每个 `forward` 段就地展开成 `text` 段
     （`segment.type='text'; segment.data={'text': 嵌套正文}`），失败就地写成
     `[嵌套合并转发读取失败｜资源 <id>]`——**整页不会因为一个坏嵌套整体失败**。
+
+    `media_budget` 非 `None` 时，**在就地改写之前**把节点里的图片 / 视频坐标收集起来
+    （改写只影响 `forward` 段，图片段不受影响，但顺序必须与正文一致：某个节点的图片
+    先于它内部的嵌套正文）。嵌套那一层的页同样按同一个预算收集。
 
     节点是原样返回的（可能被就地改写过），与上游一致。
     """
@@ -444,6 +852,12 @@ async def _fetch_forward_nodes(fetch: Any, identifier: str, limits: ForwardReadL
     messages = data.get('messages') if isinstance(data, dict) else None
     if not isinstance(messages, list) or not messages:
         return []
+    # 节点预算作用在**每一层页内**（上游语义：`remaining` 每页重置）。
+    # **媒体收集必须在"深度到顶"之前**：深度上限只影响"要不要递归展开嵌套"，
+    # 不影响"这一页里的图算不算数"（`maxDepth=0` 时最外层那一页的图当然要收）。
+    # 顺序 = 平台给的节点顺序（含嵌套展开顺序）：先这个节点的图，再它内部的嵌套。
+    if media_budget is not None:
+        _collect_forward_media_page(messages, limits.max_nodes, media_budget)
     if depth >= limits.max_depth:
         return messages
     remaining = limits.max_nodes
@@ -470,13 +884,14 @@ async def _fetch_forward_nodes(fetch: Any, identifier: str, limits: ForwardReadL
             if not nested_id:
                 continue
             try:
-                nested = await _fetch_forward_nodes(fetch, nested_id, limits, depth + 1)
+                nested = await _fetch_forward_nodes(fetch, nested_id, limits, depth + 1, media_budget)
                 inner = normalize_forward_messages(
                     nested,
                     {
                         'maxNodes': min(limits.max_nodes, 10),
                         'maxCharacters': limits.max_characters,
                         'maxDepth': limits.max_depth,
+                        'maxImages': limits.max_images,
                     },
                     depth + 1,
                 )
@@ -663,11 +1078,16 @@ def normalize_forward_segments(segments: Any, limits: Any, depth: int) -> dict[s
                     else '[嵌套合并转发；资源标识缺失]'
                 )
         elif segment_type in ('image', 'img'):
-            lines.append('[图片]')
+            # 媒体预算线索（v1.8.7）：只在 `forward_read_with_media` 那条路上由
+            # `_fetch_forward_nodes` 挂上；老路径没有这个键 → 输出与历史逐字一致。
+            note = str(segment.get(_SEGMENT_MEDIA_NOTE) or '').strip()
+            lines.append(note or '[图片]')
         elif segment_type in ('record', 'audio'):
             lines.append('[语音]')
         elif segment_type == 'video':
-            lines.append('[视频]')
+            # 没有抽帧能力：只标注"这几段视频一段都没取"（可数，且不假装能看）。
+            count = _int_text(segment.get(_SEGMENT_VIDEO_COUNT))
+            lines.append('[视频×%d，未取]' % count if count > 0 else '[视频]')
         elif segment_type == 'file':
             detail = str(data.get('name') or data.get('file') or '').strip()
             lines.append('[文件：%s]' % detail if detail else '[文件]')
