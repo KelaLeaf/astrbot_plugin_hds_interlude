@@ -67,9 +67,6 @@ function ConfigOverview({ groups, edits }: { groups: ConfigGroup[]; edits: Recor
         <details key={item.key} class="rounded-xl border border-line bg-panel">
           <summary class="cursor-pointer px-4 py-3 text-sm font-semibold">
             {groupTitle(item)}
-            {item.status && (
-              <Badge tone={item.status.includes('✅') ? 'ok' : 'warn'}>{item.status}</Badge>
-            )}
             <span class="ml-2 text-[11px] font-normal text-muted">
               {item.fields.length} 项
               {item.fields.some((field) => field.path in edits) ? ' · 有未保存改动' : ''}
@@ -225,12 +222,6 @@ function ConfigEditor({ refreshKey }: Pick<PanelProps, 'refreshKey'>) {
         description={groupDetail(active!)}
         actions={
           <>
-            {/* 分组级状态词（后端 `config_schema` 里给的那一份，判据在 core 里只有一处）：
-                用户报过"配置页上根本看不到 FFmpeg 状态"，所以它挂在分组标题这一行，
-                而不是缩在某个子项旁边的 11px 灰字里。`✅` / `⚠️` 已经在词里，不再着色。 */}
-            {active?.status && (
-              <Badge tone={active.status.includes('✅') ? 'ok' : 'warn'}>{active.status}</Badge>
-            )}
             <Button
               variant="primary"
               icon="save"

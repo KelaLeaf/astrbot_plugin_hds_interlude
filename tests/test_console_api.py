@@ -50,6 +50,49 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+#: FFmpeg 状态词的**文字**判据（不含 emoji，与 `test_video_understanding` 同一口径）：
+#: 全量扫描用它，免得漏掉手滑写进来的变体。
+FFMPEG_STATUS_NEEDLES = ('FFmpeg 已识别', '未发现 FFmpeg')
+
+
+def _status_bearing_paths(node, path=()):
+    """全量扫描：**每一处**含状态词的 `hint` / `description` / 分组级 `status` 的点分路径。
+
+    递归走所有 dict / list（分组 → 字段 → 行 → 候选项）。`items` 只是结构层，不入路径
+    （与 `video_understanding.ffmpeg_hint_field_path` 同一口径，便于人来读）。
+    """
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ('hint', 'description', 'status') and isinstance(value, str):
+                if any(needle in value for needle in FFMPEG_STATUS_NEEDLES):
+                    found.append('.'.join(path + (key,)))
+            else:
+                found.extend(_status_bearing_paths(value, path if key == 'items' else path + (key,)))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            found.extend(_status_bearing_paths(value, path + (str(index),)))
+    return found
+
+
+def _console_config_status_paths(payload):
+    """整份控制台配置 payload（分组标题/描述/status + 每个字段的**渲染节点**）里的状态词路径。
+
+    走字段的原始 schema 节点（`field['node']`）——前端就是拿它递归渲染的，所以扫它就等于
+    扫"页面上真会显示的每一个 hint / description"。
+    """
+    found = []
+    for group in payload['groups']:
+        found.extend(_status_bearing_paths(
+            {'title': group.get('title'), 'description': group.get('description'),
+             'status': group.get('status')},
+            (group['key'],),
+        ))
+        for field in group['fields']:
+            found.extend(_status_bearing_paths(field.get('node'), tuple(field['path'].split('.'))))
+    return sorted(found)
+
+
 #: 仓库根（`plugin/tests/x.py` → `tests` → `plugin` → 仓库根）。发布仓布局里没有 `docs/`。
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1438,9 +1481,9 @@ class ConfigEditorTests(unittest.TestCase):
         blob = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn('sk-real', blob)
 
-    # ---- FFmpeg 状态（本轮：用户报"配置页上看不到"）----
+    # ---- FFmpeg 状态（v1.9.8：只贴「视频识别模式」一处）----
 
-    def test_the_payload_carries_the_ffmpeg_status_for_both_states(self):
+    def test_the_payload_carries_the_ffmpeg_status_only_on_the_mode_field(self):
         """有 / 无 ffmpeg 两种状态各自渲染出的**字面量**（控制台这一层**不看宿主 schema**）。
 
         为什么必须在这里再算一遍：控制台读的是**仓库里的** `_conf_schema.json`
@@ -1454,27 +1497,37 @@ class ConfigEditorTests(unittest.TestCase):
                 with mock.patch.object(video_module, '_FFMPEG_PATH', probe):
                     payload = _run(self.api.config_schema())
                 group = next(item for item in payload['groups'] if item['key'] == 'model_center')
-                self.assertEqual(group['status'], expected)
                 video = next(field for field in group['fields'] if field['key'] == 'video')
                 items = video['node']['items']
                 self.assertTrue(items['mode']['hint'].startswith(expected + '。'))
-                self.assertTrue(items['enabled']['hint'].startswith(expected + '。'))
+                self.assertNotIn('FFmpeg', items['enabled']['hint'],
+                                 '总开关的 hint 回到它自己的静态文案（v1.9.8 那处已撤）')
                 # 状态词本身极短：只有状态词，不附解释。
                 self.assertEqual(len(expected), len(expected.strip()))
 
-    def test_only_the_model_center_group_carries_a_status(self):
+    def test_no_group_and_no_other_hint_carries_a_status_word(self):
+        """**全量扫描** payload：所有分组、分组标题/描述、所有字段的渲染节点。
+
+        只许 `model_center.video.mode.hint` 带状态词；分组级 `status` 一律不许有
+        （v1.9.8 撤掉的那条路）。
+        反向：给 `config_schema()` 加回 `'status': …`，或把状态词贴到任何一个别处 → 红。
+        """
         with mock.patch.object(video_module, '_FFMPEG_PATH', ''):
             payload = _run(self.api.config_schema())
         for group in payload['groups']:
             with self.subTest(group=group['key']):
-                if group['key'] == 'model_center':
-                    self.assertEqual(group['status'], '⚠️ 未发现 FFmpeg')
-                else:
-                    self.assertFalse(group.get('status'), '状态只挂在它真正所属的分组上')
+                self.assertFalse(group.get('status'), '分组级状态词那条路已撤（v1.9.8）')
+        self.assertEqual(_console_config_status_paths(payload), ['model_center.video.mode.hint'])
+        # 守卫的**反向自检**：把分组徽章加回去 → 全量扫描必须报出来（它不是恒真的口号）。
+        center = next(item for item in payload['groups'] if item['key'] == 'model_center')
+        center['status'] = '⚠️ 未发现 FFmpeg'
+        self.assertIn('model_center.status', _console_config_status_paths(payload))
 
-    def test_the_console_status_is_the_same_judgement_as_the_host_page(self):
-        """两处文本**逐字相同**、判据只有一处：`video_understanding.ffmpeg_status_label()`。
+    def test_the_console_hint_is_the_same_judgement_as_the_host_page(self):
+        """两个页面**逐字相同**、判据只有一处：`video_understanding.ffmpeg_status_label()`。
 
+        识别模式那一项的 hint 在「宿主配置页」与「控制台配置页」上必须是同一个串
+        ——用户看到的就是这一份（这是状态词**唯一**的落点）。
         反向：控制台自己另算一次可用性（例如直接 `shutil.which`）→ 这条对账就散了。
         """
         with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
@@ -1483,16 +1536,14 @@ class ConfigEditorTests(unittest.TestCase):
             host_label = video_module.apply_ffmpeg_status_hint(host_schema)
             payload = _run(self.api.config_schema())
         group = next(item for item in payload['groups'] if item['key'] == 'model_center')
-        self.assertEqual(group['status'], host_label)
         video = next(field for field in group['fields'] if field['key'] == 'video')
-        self.assertEqual(
-            video['node']['items']['mode']['hint'],
-            host_schema['model_center']['items']['video']['items']['mode']['hint'],
-        )
-        self.assertEqual(
-            video['node']['items']['enabled']['hint'],
-            host_schema['model_center']['items']['video']['items']['enabled']['hint'],
-        )
+        host_items = host_schema['model_center']['items']['video']['items']
+        console_items = video['node']['items']
+        self.assertEqual(console_items['mode']['hint'], host_items['mode']['hint'])
+        self.assertTrue(console_items['mode']['hint'].startswith(host_label + '。'))
+        # 总开关两边也都回到同一份静态文案（没有状态词）。
+        self.assertEqual(console_items['enabled']['hint'], host_items['enabled']['hint'])
+        self.assertNotIn('FFmpeg', host_items['enabled']['hint'])
 
     def test_the_status_write_does_not_poison_the_cached_schema(self):
         """写在一份深拷贝上：`load_config_schema()` 是 mtime 缓存，就地改会漏给全进程。"""
@@ -4926,7 +4977,8 @@ class FfmpegStatusFallbackTests(unittest.TestCase):
         self.assertEqual(plugin.video_ffmpeg_status, '✅ FFmpeg 已识别')
         video = cfg.schema['model_center']['items']['video']['items']
         self.assertEqual(video['mode']['hint'], '✅ FFmpeg 已识别。' + video_module.VIDEO_MODE_HINT)
-        self.assertTrue(video['enabled']['hint'].startswith('✅ FFmpeg 已识别。视频理解的总开关'))
+        self.assertNotIn('FFmpeg', video['enabled']['hint'],
+                         '总开关的 hint 回到它自己的静态文案（状态词只有识别模式一处）')
         self.assertFalse(
             [text for text in self._warnings() if 'FFmpeg 状态' in text],
             '写得进去就不该有这句 warn',
@@ -4960,11 +5012,16 @@ class FfmpegStatusFallbackTests(unittest.TestCase):
 
         # 打开配置页 → 顺带把状态补写到"新的"那份 schema 上（并重探 ffmpeg）。
         with mock.patch.object(video_module.shutil, 'which', lambda _name: ''):
-            _run(plugin.page_console_config())
+            response = _run(plugin.page_console_config())
         items = rebuilt['model_center']['items']['video']['items']
         self.assertTrue(items['mode']['hint'].startswith('⚠️ 未发现 FFmpeg。'), items['mode']['hint'])
-        self.assertTrue(items['enabled']['hint'].startswith('⚠️ 未发现 FFmpeg。'), items['enabled']['hint'])
+        self.assertNotIn('FFmpeg', items['enabled']['hint'], '总开关不许跟着翻状态')
         self.assertEqual(plugin.video_ffmpeg_status, '⚠️ 未发现 FFmpeg')
+        # `page_console_config()` 的**返回值**（用户真正拿到的那份 payload）全量扫一遍：
+        # 状态词只在识别模式那一项上，分组级 status 一处也没有。
+        payload = response.payload
+        self.assertEqual(_console_config_status_paths(payload), ['model_center.video.mode.hint'])
+        self.assertFalse([group.get('status') for group in payload['groups'] if group.get('status')])
 
 
 class TokenStatsAvailabilityTests(unittest.TestCase):

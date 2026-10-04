@@ -129,7 +129,6 @@ __all__ = [
     'VIDEO_FRAME_PARTIAL_PREFIX', 'GROUP_NO_VISION_REASON',
     'FFMPEG_FOUND_LABEL', 'FFMPEG_MISSING_LABEL', 'FFMPEG_STATUS_LABELS',
     'FFMPEG_HINT_TARGETS', 'ffmpeg_hint_field_path', 'ffmpeg_status_hint_targets',
-    'ffmpeg_status_group',
     'clip', 'VideoExtraction', 'VideoMedia', 'resolve_video_config', 'video_config',
     'audio_clip_seconds', 'frame_timeout_reason', 'frame_partial_reason', 'ffmpeg_path', 'ffmpeg_available', 'reset_ffmpeg_probe',
     'ffmpeg_status_label', 'apply_ffmpeg_status_hint',
@@ -454,15 +453,19 @@ def ffmpeg_status_label(*, refresh: bool = False) -> str:
 #: 配置项，写死在文案里就是第二个真相（过时即误导）。
 VIDEO_MODE_HINT = '需要启用语音原生理解与启用图片理解后抽帧模式才会生效。'
 
-#: 状态提示要贴的 schema 节点 —— **同一份状态文本、同一处判据**，贴两处：
-#: 「识别模式」说的是这条状态管什么，「启用视频理解」（总开关）是用户找"视频理解到底
-#: 开没开"的第一眼位置。只贴一处是用户报"看不见"的直接原因之一。
+#: 状态提示要贴的 schema 节点 —— **只有一处**：「识别模式」。
 #:
-#: 每组 = `(schema 节点路径, 接续文本)`；接续文本为 `None` 时接着该节点**自己已有的**
-#: hint 写——静态文案的真相在 `_conf_schema.json` 里，这里不复制第二份（否则改一处漏一处）。
-FFMPEG_HINT_TARGETS: tuple[tuple[tuple[str, ...], Optional[str]], ...] = (
+#: v1.9.8 起收窄（用户真机验收原话："怎么到处都是 `✅ FFmpeg 已识别` 的文字，
+#: 只需要「视频识别模式」那里显示就可以了"）：v1.9.8 曾同时贴「识别模式」+「启用视频理解」
+#: 总开关、并在控制台分组标题上加徽章，三处重复＝噪声。状态词现在只出现在它真正管的那一项
+#: 旁边。放宽这张表 = 用户可见的重复，由 `tests/test_video_understanding.py` 的
+#: `FfmpegHintUniquenessTests` **全量扫描**看着（全 schema 的 hint / description 里只许
+#: `model_center.video.mode` 带状态词）。
+#:
+#: 每组 = `(schema 节点路径, 接续文本)`；接续文本是这项自己的**静态** hint——静态文案的真相
+#: 在 `_conf_schema.json` 里，这里不复制第二份（否则改一处漏一处）。
+FFMPEG_HINT_TARGETS: tuple[tuple[tuple[str, ...], str], ...] = (
     (('model_center', 'items', 'video', 'items', 'mode'), VIDEO_MODE_HINT),
-    (('model_center', 'items', 'video', 'items', 'enabled'), None),
 )
 
 
@@ -497,13 +500,8 @@ def _schema_node(root: Any, path: Any) -> Optional[dict]:
 
 
 def ffmpeg_status_hint_targets() -> tuple[str, ...]:
-    """状态提示落在哪几个字段上（控制台按这份表找那两项）。"""
+    """状态提示落在哪几个字段上（**只有「识别模式」一项**；控制台按这份表找那个字段）。"""
     return tuple(ffmpeg_hint_field_path(path) for path, _ in FFMPEG_HINT_TARGETS)
-
-
-def ffmpeg_status_group() -> str:
-    """状态提示所在的分组（schema 顶层键）——控制台按它把状态词挂在分组标题上。"""
-    return FFMPEG_HINT_TARGETS[0][0][0]
 
 
 def apply_ffmpeg_status_hint(schema: Any, *, refresh: bool = False) -> str:
@@ -543,10 +541,12 @@ def apply_ffmpeg_status_hint(schema: Any, *, refresh: bool = False) -> str:
 
     ## 写到哪几处
 
-    `FFMPEG_HINT_TARGETS` 那张表：**识别模式**（这条状态管什么）与**启用视频理解**
-    （总开关，用户找"视频理解开没开"的第一眼位置）。两处贴的是**同一份文本**，
-    判据只有 `ffmpeg_status_label()` 一处，不各算一次。写入是**幂等**的（写之前把
-    上一次贴的那句剥掉），所以每个刷新点都可以放心重写。
+    `FFMPEG_HINT_TARGETS` 那张表：**只有「识别模式」**（这条状态管的就是它）。贴的是
+    **同一份文本**，判据只有 `ffmpeg_status_label()` 一处，不各算一次。写入是**幂等**的
+    （写之前把上一次贴的那句剥掉），所以每个刷新点都可以放心重写。
+
+    「只许这一处」是硬约束：`tests/test_video_understanding.py` 的
+    `FfmpegHintUniquenessTests` 全量扫整份 schema 的每个 hint / description，别处出现状态词即红。
 
     拿不到节点（宿主换了形状 / 手搓 schema）时**原样返回状态文本**，把原因交给
     `apply_ffmpeg_status_hint_or_problem()` 的第二个返回值——调用方负责喊出来，
@@ -574,9 +574,10 @@ def apply_ffmpeg_status_hint_or_problem(
         if node is None:
             missed.append(ffmpeg_hint_field_path(path))
             continue
-        #: 接续文本：`mode` 用模块常量（与 `_conf_schema.json` 里那句同源）；
-        #: `enabled` 用它**自己**已有的 hint（静态文案不复制第二份）。
-        tail = static if isinstance(static, str) else _status_free_hint(node.get('hint'))
+        #: 幂等（写第二次不叠罗汉）：接续文本先**剥一次**再去顶新的状态词。
+        #: 优先用这一项声明的静态文案（与 `_conf_schema.json` 同源，不复制第二份真相），
+        #: 没声明时才用它**自己**已有的 hint。
+        tail = _status_free_hint(static) or _status_free_hint(node.get('hint'))
         node['hint'] = ('%s。%s' % (label, tail)) if tail else label
     if missed:
         return label, '配置 schema 里没有这些节点：%s' % '、'.join(missed)

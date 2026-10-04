@@ -582,43 +582,50 @@ class FfmpegStatusTests(unittest.TestCase):
                     self.assertEqual(video.apply_ffmpeg_status_hint(schema), '⚠️ 未发现 FFmpeg')
 
     # ------------------------------------------------------------------ #
-    # 本轮（v1.9.8）：用户报"配置页上根本看不到 FFmpeg 状态"
+    # v1.9.8：状态词**只许出现在「识别模式」一处**（用户真机验收原话：
+    # "怎么到处都是 `✅ FFmpeg 已识别` 的文字，只需要「视频识别模式」那里显示就可以了"）
     # ------------------------------------------------------------------ #
 
-    def test_the_status_lands_on_both_the_mode_and_the_master_switch(self) -> None:
-        """**同一份状态文本、同一处判据**，贴两处：识别模式 + 总开关。
+    def test_the_status_lands_on_the_mode_field_and_nowhere_else(self) -> None:
+        """**同一份状态文本、同一处判据**，但只贴一个节点：识别模式。
 
-        用户报"看不见"的直接原因之一：只贴在「识别模式」一个子项上，
-        而"视频理解到底开没开"的第一眼位置是总开关。
+        反向：把 `video.enabled` 加回 `FFMPEG_HINT_TARGETS`（或给它的 hint 顶上状态词）
+        → 本条的 `enabled` 相等断言红，`FfmpegHintUniquenessTests` 也红。
         """
         with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
             schema = json.load(handle)
         enabled_static = schema['model_center']['items']['video']['items']['enabled']['hint']
+        self.assertNotIn('FFmpeg', enabled_static, '总开关的静态文案本来就没有状态词')
         with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
             self.assertEqual(video.apply_ffmpeg_status_hint(schema), '✅ FFmpeg 已识别')
         items = schema['model_center']['items']['video']['items']
         self.assertEqual(items['mode']['hint'], '✅ FFmpeg 已识别。' + video.VIDEO_MODE_HINT)
-        # 总开关那一处接的是它**自己**的静态 hint（不复制第二份文案）。
-        self.assertEqual(items['enabled']['hint'], '✅ FFmpeg 已识别。' + enabled_static)
+        self.assertEqual(items['enabled']['hint'], enabled_static, '总开关一字不动')
+
+    def test_the_write_target_table_has_exactly_one_entry(self) -> None:
+        """写入表只有一项 —— 放宽它就是"到处都有状态词"（用户真机验收的原话）。"""
+        self.assertEqual(video.FFMPEG_HINT_TARGETS, (
+            (('model_center', 'items', 'video', 'items', 'mode'), video.VIDEO_MODE_HINT),
+        ))
+        self.assertEqual(video.ffmpeg_status_hint_targets(), ('model_center.video.mode',))
 
     def test_the_two_labels_are_the_only_text_that_follows_the_state(self) -> None:
-        """有 / 无 ffmpeg 两种状态各自渲染出的**字面量**。"""
+        """有 / 无 ffmpeg 两种状态各自渲染出的**字面量**（只落在识别模式那一项上）。"""
         with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
             schema = json.load(handle)
         with mock.patch.object(video, '_FFMPEG_PATH', ''):
             video.apply_ffmpeg_status_hint(schema)
         items = schema['model_center']['items']['video']['items']
         self.assertTrue(items['mode']['hint'].startswith('⚠️ 未发现 FFmpeg。'))
-        self.assertTrue(items['enabled']['hint'].startswith('⚠️ 未发现 FFmpeg。'))
-        # 判据一处：这两句的前缀就是 `ffmpeg_status_label()` 当时返回的那个串。
+        # 判据一处：这句的前缀就是 `ffmpeg_status_label()` 当时返回的那个串。
         with mock.patch.object(video, '_FFMPEG_PATH', ''):
             self.assertEqual(video.ffmpeg_status_label(), '⚠️ 未发现 FFmpeg')
         with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
             video.apply_ffmpeg_status_hint(schema)
             self.assertEqual(video.ffmpeg_status_label(), '✅ FFmpeg 已识别')
         self.assertTrue(items['mode']['hint'].startswith('✅ FFmpeg 已识别。'))
-        self.assertTrue(items['enabled']['hint'].startswith('✅ FFmpeg 已识别。'))
         self.assertNotIn('⚠️', items['mode']['hint'], '旧状态必须被剥掉，不许两句并存')
+        self.assertNotIn('FFmpeg', items['enabled']['hint'], '总开关那处不许跟着翻状态')
 
     def test_writing_twice_does_not_stack_the_status(self) -> None:
         """每个刷新点都会重写；重写必须幂等（否则配置页会「⚠️。⚠️。⚠️。」）。"""
@@ -630,7 +637,7 @@ class FfmpegStatusTests(unittest.TestCase):
         items = schema['model_center']['items']['video']['items']
         self.assertEqual(items['mode']['hint'], '⚠️ 未发现 FFmpeg。' + video.VIDEO_MODE_HINT)
         self.assertEqual(
-            items['enabled']['hint'].count('⚠️ 未发现 FFmpeg'), 1,
+            items['mode']['hint'].count('⚠️ 未发现 FFmpeg'), 1,
             '状态词只许出现一次',
         )
 
@@ -648,9 +655,9 @@ class FfmpegStatusTests(unittest.TestCase):
         with mock.patch.object(video, '_FFMPEG_PATH', ''):
             label, problem = video.apply_ffmpeg_status_hint_or_problem({'model_center': {}})
         self.assertEqual(label, '⚠️ 未发现 FFmpeg')
-        # 原因要点名**缺了哪几个节点**（用户/维护者据此知道是宿主形状变了）。
+        # 原因要点名**缺了哪个节点**（用户/维护者据此知道是宿主形状变了）。
         self.assertIn('model_center.video.mode', problem)
-        self.assertIn('model_center.video.enabled', problem)
+        self.assertNotIn('model_center.video.enabled', problem, '总开关不再是写入目标')
 
         with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
             ok_schema = json.load(handle)
@@ -703,6 +710,88 @@ class FfmpegStatusTests(unittest.TestCase):
             'astrbot_bridge.py:3845-3866',
         ):
             self.assertIn(needle, source, '宿主依据要写在注释里，别只在聊天里说')
+
+
+#: 状态词的**文字**判据（不含 emoji）：全量扫描用它，免得漏掉手滑写进来的变体
+#: （`✅ FFmpeg 已识别` / `⚠️ 未发现 FFmpeg` 两个取值共用这两个词根）。
+FFMPEG_STATUS_NEEDLES = ('FFmpeg 已识别', '未发现 FFmpeg')
+
+
+def _status_bearing_paths(node: Any, path: tuple[str, ...] = ()) -> list[str]:
+    """全量扫描：整份 schema 里**每一处**含状态词的 `hint` / `description` 的点分路径。
+
+    递归走所有 dict / list（分组 → `items` → 键 → 行 → 候选项），`hint` 与 `description`
+    都查。`items` 只是结构层，不入路径（与 `ffmpeg_hint_field_path` 同一口径，便于人来读）。
+    """
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ('hint', 'description') and isinstance(value, str):
+                if any(needle in value for needle in FFMPEG_STATUS_NEEDLES):
+                    found.append('.'.join(path + (key,)))
+            else:
+                found.extend(_status_bearing_paths(value, path if key == 'items' else path + (key,)))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            found.extend(_status_bearing_paths(value, path + (str(index),)))
+    return found
+
+
+class FfmpegHintUniquenessTests(unittest.TestCase):
+    """**全量唯一性守卫**：状态词只许出现在 `model_center.video.mode.hint`。
+
+    用户真机验收："怎么到处都是 `✅ FFmpeg 已识别` 的文字，只需要「视频识别模式」那里
+    显示就可以了。"——所以判据不能是"我检查了那两处"，而是**遍历整份 schema 的每一个
+    hint / description**：将来谁把状态词贴到第三个地方（新字段、行、候选项、分组描述…），
+    都会在这里被抓住。
+    """
+
+    def _repo_schema(self) -> dict[str, Any]:
+        with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            return json.load(handle)
+
+    def test_the_repo_schema_carries_no_status_word_at_all(self) -> None:
+        """静态 schema（`_conf_schema.json`，一个字都不改）里状态词必须是**零处**。"""
+        self.assertEqual(_status_bearing_paths(self._repo_schema()), [])
+
+    def test_after_the_write_exactly_one_place_carries_the_status(self) -> None:
+        for probe, expected in (('/usr/bin/ffmpeg', '✅ FFmpeg 已识别'),
+                                ('', '⚠️ 未发现 FFmpeg')):
+            with self.subTest(expected=expected):
+                schema = self._repo_schema()
+                with mock.patch.object(video, '_FFMPEG_PATH', probe):
+                    video.apply_ffmpeg_status_hint(schema)
+                self.assertEqual(_status_bearing_paths(schema), ['model_center.video.mode.hint'])
+                self.assertTrue(
+                    schema['model_center']['items']['video']['items']['mode']['hint']
+                    .startswith(expected + '。')
+                )
+
+    def test_the_guard_itself_catches_a_second_place(self) -> None:
+        """守卫的**反向用例**：把状态词贴回总开关 / 分组描述 → 全量扫描必须报出来。
+
+        没有这一条，"唯一性"就只是个恒真的口号（守卫自己也要能被证明会红）。
+        """
+        schema = self._repo_schema()
+        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
+            video.apply_ffmpeg_status_hint(schema)
+        items = schema['model_center']['items']['video']['items']
+        # 反向 ①：v1.9.8 那处「启用视频理解」总开关。
+        items['enabled']['hint'] = '✅ FFmpeg 已识别。' + items['enabled']['hint']
+        self.assertEqual(
+            sorted(_status_bearing_paths(schema)),
+            ['model_center.video.enabled.hint', 'model_center.video.mode.hint'],
+        )
+        # 反向 ②：分组描述（控制台分组徽章那条路回到文案上）。
+        schema['model_center']['description'] = '✅ FFmpeg 已识别'
+        self.assertIn('model_center.description', _status_bearing_paths(schema))
+        # 反向 ③：深层 —— 抽帧设置里某一行 / 某个候选项也算"别处"。
+        schema['model_center']['items']['video']['items']['frame_interval'] = {
+            'hint': '⚠️ 未发现 FFmpeg', 'options': [{'description': '未发现 FFmpeg 时不可用'}],
+        }
+        self.assertIn('model_center.video.frame_interval.hint', _status_bearing_paths(schema))
+        self.assertIn('model_center.video.frame_interval.options.0.description',
+                      _status_bearing_paths(schema))
 
 
 def _schema_video() -> dict[str, Any]:

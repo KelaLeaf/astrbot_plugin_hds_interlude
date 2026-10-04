@@ -465,9 +465,10 @@ class HDSInterludePlugin(Star):
         self._console = ConsoleApi(self.bridge)
         self._register_config_page_apis(context)
         #: 视频抽帧识别的 FFmpeg 状态（v1.9.0）：写进**内存里的** schema，
-        #: 让配置页「识别模式」与「启用视频理解」旁边显示
-        #: 「✅ FFmpeg 已识别 / ⚠️ 未发现 FFmpeg」
-        #: （文本标记：宿主的 hint 是纯文本渲染，着不了色，依据见那个模块的注释）。
+        #: 只贴「视频识别模式」（`model_center.video.mode`）这一项的 hint——
+        #: 用户真机验收："只需要「视频识别模式」那里显示就可以了"
+        #: （v1.9.8 曾同时贴总开关 + 控制台分组徽章，都是重复，已撤）。
+        #: 文本标记：宿主的 hint 是纯文本渲染，着不了色，依据见那个模块的注释。
         #: 宿主每打开一次配置页都现取 `config.schema` 这个活对象
         #: （`astrbot/dashboard/services/config_service.py:853-872` 的
         #: `"items": plugin_md.config.schema`），而 `AstrBotConfig.save_config()`
@@ -507,7 +508,8 @@ class HDSInterludePlugin(Star):
             logger.info('hds-interlude：插件加载开始')
 
     def _refresh_ffmpeg_status_hint(self, *, refresh: bool = False) -> str:
-        """把 FFmpeg 状态（重）写进宿主配置页那两处提示，并更新 `self.video_ffmpeg_status`。
+        """把 FFmpeg 状态（重）写进宿主配置页「视频识别模式」那一项的提示，并更新
+        `self.video_ffmpeg_status`。
 
         ## 为什么不是"初始化时写一次就完"
 
@@ -535,7 +537,7 @@ class HDSInterludePlugin(Star):
             self._ffmpeg_hint_problem = problem
             logger.warning(
                 'hds-interlude：未能把 FFmpeg 状态写进宿主配置页提示：%s；'
-                '控制台「配置 → 模型中心 → 视频理解」里仍能看到同一个状态。' % problem
+                '控制台「配置 → 模型中心 → 视频理解 → 识别模式」里仍能看到同一个状态。' % problem
             )
         return label
 
@@ -787,7 +789,7 @@ class HDSInterludePlugin(Star):
         # 每次打开控制台配置页都补一次状态（`_refresh_ffmpeg_status_hint`）：宿主那边
         # 一次性的内存改动不是承诺，而且用户可能刚装上 ffmpeg（`refresh=True` 重探）。
         # 控制台自己那份 payload 也会带同一个状态（见 `adapters/console_api.py`），
-        # 所以就算宿主这条路断了，用户在控制台里照样看得见。
+        # 所以就算宿主这条路断了，用户在「识别模式」那一项旁边照样看得见。
         self._refresh_ffmpeg_status_hint(refresh=True)
         return await self._console_json(lambda api, q: api.config_schema())
 
