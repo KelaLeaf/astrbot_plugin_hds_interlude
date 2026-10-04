@@ -608,7 +608,6 @@ class MemoryConfig(TypedDict, total=False):
 
     enabled: bool
     background_interval_minutes: int
-    max_stories_per_compaction_run: int
     scene_entry_threshold: int
     scene_character_threshold: int
     compaction_entry_limit: int
@@ -618,7 +617,6 @@ class MemoryConfig(TypedDict, total=False):
     arc_summary_characters: int
     #: 有多少个紧邻其前的已关闭场景摘要加入 prompt。
     previous_scene_summaries: int
-    recent_entry_limit: int
     fact_limit: int
     fact_content_characters: int
     fact_importance_weight: float
@@ -677,7 +675,6 @@ class RuntimeConfig(TypedDict, total=False):
     proactive_willingness_threshold: float
     sweep_interval_minutes: int
     minimum_advance_minutes: int
-    max_stories_per_sweep: int
     context_entry_limit: int
     #: 除条数下限之外，还保留这个近期时间窗内的原始条目。
     context_time_window_minutes: float
@@ -729,7 +726,6 @@ class BrowserConfig(TypedDict, total=False):
     #: 每次后台 sweep 的工作上限，避免积压把故事队列握住几分钟。
     max_research_per_sweep: int
     navigation_timeout: float
-    wait_until: Literal['domcontentloaded', 'networkidle2']
     max_text_characters: int
     max_excerpt_characters: int
     max_observations_in_prompt: int
@@ -1786,7 +1782,8 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         'world': '',
         'supporting_cast': '',
         'location': '',
-        'style': 'Realistic, restrained, and centered on ordinary life.',
+        # v1.9.5：对齐 schema 的中文默认值（此前 core 保上游英文原文 = 两处默认）。
+        'style': '现实主义日常叙事，情绪克制，关系变化缓慢而具体。',
         'timezone': 'Asia/Shanghai',
         # AstrBot 适配层扩展位（上游没有）。
         'persona_id': '',
@@ -1822,7 +1819,11 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         'main_timeout': 60_000,
         'main_response_format': 'json-object',
         'main_streaming_mode': 'off',
-        'main_payload_order': 'legacy',
+        # 上游 `src/index.ts:155` 的 default 是 `cache-first`；这里早先写成 `legacy`，
+        # 与 schema（用户可见的默认值）打架：宿主按 schema 补 `cache-first`，core 只在
+        # 配置真缺这一项时才用 `legacy` —— 同一个键两处默认，走哪条路取决于调用方。
+        # 以 schema / 上游为准（`test_config_binding.py` 有逐键对账）。
+        'main_payload_order': 'cache-first',
         'failover': {
             'enabled': True, 'strategy': 'priority',
             'max_attempts_per_provider': 1, 'cooldown_minutes': 5,
@@ -1896,9 +1897,11 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         'proactive_willingness_threshold': 0.65,
         'sweep_interval_minutes': 5,
         'minimum_advance_minutes': 30,
-        'max_stories_per_sweep': 20,
-        'context_entry_limit': 50,
-        'context_time_window_minutes': 60,
+        # 上游 `src/index.ts:230-231`：35 / 45。早先这里写 50 / 60，与 schema
+        # （用户可见的默认值）打架 —— 宿主按 schema 补 35 / 45，core 只在真缺键时
+        # 用 50 / 60，同一个键两处默认。
+        'context_entry_limit': 35,
+        'context_time_window_minutes': 45,
         'memory_limit': 20,
         'max_script_characters': 8_000,
         'max_message_characters': 2_000,
@@ -1964,7 +1967,6 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     'memory': {
         'enabled': True,
         'background_interval_minutes': 10,
-        'max_stories_per_compaction_run': 20,
         'scene_entry_threshold': 16,
         'scene_character_threshold': 10_000,
         'compaction_entry_limit': 80,
@@ -1973,7 +1975,6 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         'scene_summary_characters': 8_000,
         'arc_summary_characters': 12_000,
         'previous_scene_summaries': 2,
-        'recent_entry_limit': 30,
         'fact_limit': 20,
         'fact_content_characters': 4_000,
         'fact_importance_weight': 0.5,
@@ -2000,7 +2001,9 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         'overlay_weekly_window_days': 5,
         'overlay_monthly_window_days': 10,
         'overlay_weekly_summary_characters': 1_600,
-        'overlay_monthly_summary_characters': 3_200,
+        # 上游 `src/index.ts:360` / schema / `chunk8._MEMORY_DEFAULTS` 三处都是 2_400；
+        # 这里早先写 3_200，是四处默认值里唯一的例外。
+        'overlay_monthly_summary_characters': 2_400,
         'facts_dedupe_enabled': True,
         'facts_contradiction_enabled': True,
         'temporal_anchor_enabled': True,
@@ -2043,7 +2046,6 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         'max_concurrent_pages': 1,
         'max_research_per_sweep': 1,
         'navigation_timeout': 15_000,
-        'wait_until': 'domcontentloaded',
         'max_text_characters': 12_000,
         'max_excerpt_characters': 3_000,
         'max_observations_in_prompt': 4,

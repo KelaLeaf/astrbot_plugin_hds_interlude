@@ -84,10 +84,14 @@ Provider 的是**视频直链文本（URL）**，不是字节：宿主出站部�
   帧的去处。群里另来一套更省的就等于多一个真相（配置页说什么都不再可信），
   用例 `test_video_understanding.GroupVideoParityTests` 钉着这一点。
 * **合并转发里的视频**由 `forward_message.max_videos`（单条转发最多读取的视频数，
-  默认 **1** = 一张卡最多读一段；配 0 才是一段都不读）在 `core/forward_message.py`
-  那一侧截断，读出来的坐标经
+  默认 **1**；配 0 才是一段都不读）在 `core/forward_message.py` 那一侧截断，读出来的坐标经
   `SessionView.media`（`kind='video'`）流到这里——**判据只有一处**：本模块的
-  `extract_session_video_sources()` 顺带收媒体表里的视频坐标。
+  `extract_session_video_sources()` 顺带收媒体表里的视频坐标。**v1.9.4 起同一个数也是
+  "一回合真正读取几段"的上限**（`video_read_budget()`）：配几段就真读几段，来源比预算多
+  时在当前事件里留 `[视频×5，本回合仅取前 1 段]` 并打一条节流的可行动 warn。
+* **群聊开关只认会话**：`group_enabled` 只管群会话（`_is_group_session()` 读事件的
+  `is_direct`）——私聊里**转发**来的视频与它无关，只看总开关。它只管"群里的视频要不要花
+  一次 ffmpeg 把声音取出来"，抽出的帧与图片共用**同一个**每回合图片预算。
 
 不 import astrbot（`plugin/core/` 的硬约束）。
 """
@@ -104,6 +108,10 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import unquote
+
+# 单卡转发上限（`forward_message.max_videos`）是**一回合真正读取几段视频**的同一处判据，
+# 见 `video_read_budget()`。夹取与默认值都留在 `forward_message` 那一处，这里只读结果。
+from .forward_message import forward_read_limits
 
 __all__ = [
     'VIDEO_FRAME_INTERVAL_SECONDS', 'VIDEO_AVERAGE_FRAMES', 'VIDEO_MAX_FRAMES',
@@ -123,6 +131,8 @@ __all__ = [
     'ffmpeg_status_label', 'apply_ffmpeg_status_hint', 'extract_session_video_sources',
     'video_input_target', 'extract_video', 'video_fact_note', 'degradation_message',
     'collect_video_sources', 'collect_group_video_media', 'reset_video_runtime_state',
+    'video_read_budget', 'video_turn_budget_note', 'video_turn_budget_warning',
+    'VIDEO_TURN_BUDGET_PREFIX',
 ]
 
 # =========================================================================== #
@@ -320,6 +330,44 @@ def video_config(service: Any) -> dict[str, Any]:
     config = getattr(service, 'config', None)
     section = _pick(config, 'model', 'model_center')
     return resolve_video_config(_pick(section, 'video', 'video_understanding'))
+
+
+#: 合并转发那一段的组名（新名优先、旧隐藏兼容位兜底）。与适配层
+#: `AstrbotBridge.FORWARD_SECTION_NAMES` 同一套顺序 —— 两处读的是同一个用户配置，
+#: 兜底顺序不一致就等于"配置页写 A、行为读 B"。
+_FORWARD_SECTION_NAMES: tuple[str, ...] = (
+    'forward_message', 'forwardMessage', 'forward_message_compat',
+)
+
+
+def _forward_section(service: Any) -> dict[str, Any]:
+    """`forward_message` 段（读不到回空字典 = 全默认）。"""
+    config = getattr(service, 'config', None)
+    for name in _FORWARD_SECTION_NAMES:
+        section = _pick(config, name)
+        if isinstance(section, dict) and section:
+            return section
+    return {}
+
+
+def video_read_budget(service: Any) -> int:
+    """一回合真正读取几段视频（v1.9.4）= `forward_message.max_videos`，**判据一处**。
+
+    为什么就是它（而不再另立一个"每回合视频预算"）：视频比图贵一个量级 —— 一段就是
+    一次 ffmpeg 抽帧，抽出的帧还与直发 / 转发的图抢同一个每回合图片预算。配了
+    "单条转发最多读取 N 段"却只读第 1 段，正是"配置项存在但只有第 1 段生效"那类
+    不合逻辑的实现（`collect_video_sources` 早先写死 `sources[0]`）；两处各算一份数字
+    就会重演图片那两张卡打架。所以**同一个数**既是单卡取坐标的上限，也是这一回合
+    真正读取的上限。
+
+    `0` 时按 **1** 算：`max_videos=0` 管的是"**转发里**的视频一段都不读"
+    （转发那一侧连坐标都不收，`forward_message.extract_forward_media`），私聊直发的
+    视频不该被一个转发键关掉 —— 那是同一把闸的两处判据。
+
+    夹取（0~10，缺键默认 1）只在 `forward_message.forward_read_limits()` 一处，这里
+    不重写区间。
+    """
+    return max(1, forward_read_limits(_forward_section(service)).max_videos)
 
 
 def _is_group_session(session: Any) -> bool:
@@ -921,6 +969,47 @@ VIDEO_TRUNCATED_REASON = '视频超过 %d 秒上限，只处理了前 %d 秒' % 
     VIDEO_MAX_DURATION_SECONDS, VIDEO_MAX_DURATION_SECONDS,
 )
 
+#: 一回合的视频段数被**单卡上限**截断（v1.9.4）这条降级原因的**前缀**：
+#: `degradation_message` 用包含匹配认它，带计数的完整句子也能拿到同一句可行动的提示。
+VIDEO_TURN_BUDGET_PREFIX = '本回合的视频段数被「单条转发最多读取的视频数」截断'
+
+
+def video_turn_budget_reason(available: int, granted: int) -> str:
+    """超过一回合读取预算时的降级原因（可数：本回合几段 / 只读了前几段）。"""
+    return '%s（本回合 %d 段，只读了前 %d 段）' % (
+        VIDEO_TURN_BUDGET_PREFIX, int(available), int(granted),
+    )
+
+
+def video_turn_budget_warning(available: Any, granted: Any) -> str:
+    """超预算时那条 warn 文案（可数：本回合几段 / 只读了前几段）。"""
+    try:
+        total = int(available)
+        taken = int(granted)
+    except (TypeError, ValueError):
+        return ''
+    return (
+        '本回合收到 %d 段视频，按「单条转发最多读取的视频数」只读了前 %d 段'
+        '（每多读一段多一次 ffmpeg 抽帧）。'
+    ) % (total, max(0, taken))
+
+
+def video_turn_budget_note(available: Any, granted: Any) -> str:
+    """超预算时那句可数线索（短；**只有真的截了才说**）——与图片那句同一族。
+
+    形态 `[视频×5，本回合仅取前 1 段]`：卡的旁注（`[视频×5，仅取前 1 段]`）管的是
+    "从**这一张卡**里取几段坐标"，这句管的是"**整个回合**真正读了几段"（多张卡 /
+    直发多个视频时两者才会不一样）。
+    """
+    try:
+        total = int(available)
+        taken = int(granted)
+    except (TypeError, ValueError):
+        return ''
+    if total <= 0 or taken >= total:
+        return ''
+    return '[视频×%d，本回合仅取前 %d 段]' % (total, max(0, taken))
+
 #: 抽帧超时的降级原因**前缀**：`degradation_message` 用包含匹配认它，所以带计数的
 #: 完整原因（`frame_timeout_reason()`）也能拿到同一句可行动的提示。别把它改成一个
 #: 只在完整句子里出现的写法——那样 warn 就断了。
@@ -1082,7 +1171,9 @@ class VideoMedia:
     * `audio_sources`：抽出来的音轨，作为**现有语音理解通道**的来源
       （`load_native_audio` 认的 `data:audio/<fmt>;base64,…`）；
     * `note`：进当前事件的正文事实（空串 = 一个字都不加）；
-    * `workdir`：临时目录，**调用方读完帧字节后**必须删（`cleanup()`）。
+    * `workdir` / `workdirs`：临时目录，**调用方读完帧字节后**必须删（`cleanup()`）。
+      一回合读多段视频就有多个目录（每段一次 ffmpeg）：`workdir` 是第一个（老调用方与
+      老用例只认它），其余的都在 `workdirs` 里 —— 少删一个就是每回合漏一个临时目录。
     """
 
     mode: str = VIDEO_DEFAULT_MODE
@@ -1091,17 +1182,32 @@ class VideoMedia:
     note: str = ''
     reason: str = ''
     workdir: str = ''
+    #: 第二段起的临时目录（见 `cleanup()`）。
+    workdirs: list[str] = field(default_factory=list)
 
     def cleanup(self) -> None:
-        """删掉本次的临时目录（幂等；失败不抛）。"""
-        directory = self.workdir
+        """删掉本次的全部临时目录（幂等；失败不抛）。"""
+        first = self.workdir
         self.workdir = ''
+        rest = list(self.workdirs)
+        self.workdirs = []
+        for directory in [first, *rest]:
+            if not directory:
+                continue
+            try:
+                shutil.rmtree(directory, ignore_errors=True)
+            except Exception:  # noqa: BLE001 - 临时文件删不掉不该影响回合
+                pass
+
+    def _add_workdir(self, directory: str) -> None:
+        """记下一个临时目录（第一个进 `workdir`，其余进 `workdirs`）。"""
         if not directory:
             return
-        try:
-            shutil.rmtree(directory, ignore_errors=True)
-        except Exception:  # noqa: BLE001 - 临时文件删不掉不该影响回合
-            pass
+        if not self.workdir:
+            self.workdir = directory
+            return
+        if directory != self.workdir and directory not in self.workdirs:
+            self.workdirs.append(directory)
 
 
 def _audio_data_uri(path: str, audio_format: str, max_bytes: float) -> str:
@@ -1135,16 +1241,20 @@ def _local_size_bytes(target: str) -> int:
         return -1
 
 
-def _warn(service: Any, story: Any, reason: str) -> None:
-    """按会话节流地打一条降级 warn（`note_access_skip`：同一原因 10 分钟一条）。"""
-    message = degradation_message(reason)
-    if not message:
+def _warn(service: Any, story: Any, reason: str, message: Optional[str] = None) -> None:
+    """按会话节流地打一条降级 warn（`note_access_skip`：同一原因 10 分钟一条）。
+
+    `message` 给得出可数文案的调用方（如回合视频预算）直接传那一句；不传就走
+    `degradation_message(reason)` 的静态映射。
+    """
+    text = message or degradation_message(reason)
+    if not text:
         return
     note = getattr(service, 'note_access_skip', None)
     story_id = _text(_pick(story, 'id')) or '-'
     if callable(note):
         try:
-            note('video|%s|%s' % (story_id, reason), VIDEO_WARN_INTERVAL_MS, message)
+            note('video|%s|%s' % (story_id, reason), VIDEO_WARN_INTERVAL_MS, text)
             return
         except Exception:  # noqa: BLE001 - 报告失败不该带崩回合
             pass
@@ -1154,7 +1264,7 @@ def _warn(service: Any, story: Any, reason: str) -> None:
     if not callable(report):
         return
     try:
-        report('warn', message)
+        report('warn', text)
     except Exception:  # noqa: BLE001
         pass
 
@@ -1230,11 +1340,16 @@ async def collect_video_sources(
     `image_sources` / `audio_sources` —— 帧走 `load_native_images`、音轨走
     `load_native_audio`，**一条判据、一套实现**，这里不另造通道。
 
-    三道闸的顺序（都在任何 ffmpeg / 模型调用之前）：
+    四道闸的顺序（都在任何 ffmpeg / 模型调用之前）：
 
     1. `enabled=False` → 直接回空（一个 ffmpeg 都不调、一个模型都不调）；
     2. 这条会话没有视频坐标 → 回空；
     3. **群聊且 `group_enabled=False`** → 回空（群聊独立开关，默认关=省成本）。
+       ⚠️ 这条只看**会话是不是群聊**（`is_direct`）：私聊里转发来的视频与群聊开关无关
+       （私聊只看总开关）；
+    4. 一回合真正读取的视频段数 = `forward_message.max_videos`（v1.9.4，
+       `video_read_budget()`）：第 N 段之后的坐标在这里截断，**线索与 warn 都可见**
+       —— 早先写死 `sources[0]`，于是"配了 3 段也只读第 1 段"。
 
     配置只在这里读一次（`video_config`），下面全部按它传参。
     """
@@ -1256,7 +1371,48 @@ async def collect_video_sources(
         _warn(service, story, result.reason)
         return result
 
-    kind, target = video_input_target(sources[0])
+    # 一回合真正读取的视频段数（判据一处：`video_read_budget()`）。多段按顺序读，
+    # 帧与音轨都并进同一份结果；截断时正文里留条数、日志里留一条可行动的 warn。
+    #
+    # 计数只算**取得到坐标**的来源：正文里那些 `text:` 坐标永不取回（用户可写），
+    # 把它们算进"本回合有几段视频"会报出一个假条数（同一个视频既在元素里、又在正文里
+    # 出现时尤其明显）。
+    readable = [source for source in sources if video_input_target(source)[1]]
+    targets = readable[:video_read_budget(service)]
+    notes: list[str] = []
+    turn_note = video_turn_budget_note(len(readable), len(targets))
+    if turn_note:
+        notes.append(turn_note)
+        _warn(
+            service, story, video_turn_budget_reason(len(readable), len(targets)),
+            video_turn_budget_warning(len(readable), len(targets)),
+        )
+    for source in targets:
+        one = await _collect_one_video(service, story, config, source)
+        result.image_sources.extend(one.image_sources)
+        result.audio_sources.extend(one.audio_sources)
+        result._add_workdir(one.workdir)
+        if one.note:
+            notes.append(one.note)
+        if one.reason and not result.reason:
+            # 多条视频各有各的降级原因时，**第一条**就是 `reason`（warn 已经在各自的
+            # 分路上打过了，这里不再重复报一遍同一条）。
+            result.reason = one.reason
+    result.note = '\n'.join(notes)
+    return result
+
+
+async def _collect_one_video(
+    service: Any, story: Any, config: dict[str, Any], source: str,
+) -> VideoMedia:
+    """**一段**视频：`external` 外挂识别 / `frames` 抽帧识别（一行一段，各自降级）。
+
+    抽出来的只有**来源坐标**（帧是本地文件、音轨是 `data:` URI）与正文事实；真正的取回
+    由调用方那两条既有通道做。多段视频就是把这个函数按顺序调用多次
+    （见 `collect_video_sources()`）。
+    """
+    result = VideoMedia(mode=config['mode'])
+    kind, target = video_input_target(source)
     if config['mode'] == 'external':
         if kind == 'file':
             # 宿主出站部件没有"上传视频"这一种：本地文件发不出去。

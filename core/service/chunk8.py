@@ -79,7 +79,7 @@ from ..script.knowledge_evidence import normalize_knowledge_evidence, supports_r
 from ..schedule_preplan import apply_schedule_preplan_proposal
 from ..story_state import decode_story_state, encode_story_state, normalize_life_status
 from ..time import calendar_day_key, dt_ms, iso, parse_dt, utc_now
-from .base import ServiceBase, _config_section, pick
+from .base import ServiceBase, _camel_to_snake, _config_section, pick
 from .config import SCHEDULE_PREPLAN_RETRY_BACKOFF
 from .helpers import (
     clamp_number,
@@ -465,8 +465,16 @@ class ServiceChunk8(ServiceBase):
         return section if isinstance(section, dict) else {}
 
     def _memory_raw(self, camel: str, snake: Optional[str] = None) -> Any:
-        """只读配置段（无默认值）——用于 `?? 另一个字段` 这类上游语义。"""
-        return pick(self._memory_section(), camel, snake)
+        """只读配置段（无默认值）——用于 `?? 另一个字段` 这类上游语义。
+
+        `snake` 缺省时**按 camelCase 自动推导** snake_case（本模块的读取点写的是上游
+        camelCase，`_conf_schema.json` 落盘的是 snake_case）。这条不是可有可无的客气：
+        `pick()` 只在两种拼写**都传进去**时才双读，早期版本这里 snake 留空 → 只查
+        `'sceneEntryThreshold'` 一种拼写 → 用户改 `scene_entry_threshold` 一个字都传不
+        进来，运行期照旧回 `_MEMORY_DEFAULTS`（"改了没反应"）。同一个键在
+        `chunk5._cfg`（一直双读）与这里能读出两个值，也是靠这一行收口。
+        """
+        return pick(self._memory_section(), camel, snake or _camel_to_snake(camel))
 
     def _memory(self, camel: str, snake: Optional[str] = None, default: Any = None) -> Any:
         """读 memory 配置项：配置缺省时回落上游默认值（`:5758-5798`）。"""

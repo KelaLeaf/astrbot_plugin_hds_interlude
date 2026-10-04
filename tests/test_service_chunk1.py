@@ -3319,6 +3319,43 @@ class GroupVideoUnderstandingTests(ServiceHarness):
         self.assertIn('请在私聊里发', self.sink.text())
 
     @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_three_video_tracks_are_sliced_with_a_countable_clue(self) -> None:
+        """v1.9.5：多段视频的音轨被「每个事件音频数上限」切开时**必须说清几段**。
+
+        三段时间轨走同一条语音通道，`maxPerMessage = 1` 只放行第一段；以前第二段起被
+        **静默**丢掉。现在正文里留 `[音轨×3，本回合仅取前 1 段]`、日志留一条节流 warn。
+        反向：把线索那一句删掉（或把总开关那档也硬报截断）→ 本用例红。
+        """
+        service = self.make_service(make_config(
+            model={
+                'audio': {'enabled': True, 'maxPerMessage': 1},
+                'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+            },
+            forward_message={'max_videos': 3},
+        ))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        session = group_session(elements=[
+            {'type': 'video', 'attrs': {'url': 'https://cdn.example.com/%d.mp4' % index},
+             'children': []}
+            for index in range(1, 4)
+        ])
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, session)
+            await service.flush_group_turn('key', 3)
+
+        self.assertEqual(len(ffmpeg.argvs('audio')), 3, '三段视频各抽一次音轨')
+        audio = seen['args'][10]
+        self.assertEqual(len(audio), 1, '上限 1：只把第一段交给模型')
+        user_message = seen['args'][5]
+        self.assertIn('[音轨×3，本回合仅取前 1 段]', user_message,
+                      '可数线索必须给模型：一共几段、给了几段')
+        self.assertIn('本回合收到 3 段音轨', self.sink.text())
+        self.assertIn('每个事件音频数上限', self.sink.text())
+
+    @needs('flush_group_turn', 'group_cooldown_active')
     async def test_the_group_switch_off_means_zero_ffmpeg_calls(self) -> None:
         """**反向**：群开关关着（默认）→ 一个 ffmpeg 都不发、一条说明都没有。"""
         service = self.make_service(make_config(model={

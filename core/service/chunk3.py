@@ -80,6 +80,10 @@ from typing import Any, Optional
 from urllib.parse import unquote, urlsplit
 
 from ..delivery import message_event_reference
+#: 合并转发的读取预算（v1.9.4）：每回合图片预算的**默认值**向上跟随单卡上限
+#: （`forward_message.max_images`）。单卡上限的夹取只有 `forward_message` 那一处，
+#: 这里只把**已经夹好的**那个数交给 `resolve_image_budget()`（判据仍然只有一处）。
+from ..forward_message import forward_read_limits
 from ..qq_face import normalize_qq_native_face_segments
 from ..script.commit_builder import find_outgoing_script_event
 from ..script.delivery_ledger import platform_action_reference
@@ -307,10 +311,121 @@ def _audio_config(service: Any) -> dict[str, Any]:
     return fallback if isinstance(fallback, dict) else {}
 
 
+# --------------------------------------------------------------------------- #
+# 音频通道的回合预算（v1.9.5：切片与线索**同一处**算）
+# --------------------------------------------------------------------------- #
+
+#: 音频截断告警的节流间隔（毫秒）。与 `core/vision_budget.VISION_IMAGE_BUDGET_WARN_INTERVAL_MS`
+#: 同档：丢的是内容，必须让人看见，但同一条原因不能刷屏。
+AUDIO_TURN_BUDGET_WARN_INTERVAL_MS = 10 * 60 * 1000
+
+
+def audio_turn_slice(
+    service: Any, sources: Any, max_count: Optional[int] = None,
+) -> tuple[list[Any], int, int]:
+    """本回合的音频切片（**判据一处**）：返回 `(要取的来源, 候选段数, 本回合取几段)`。
+
+    多段视频的音轨与直发语音走**同一条**语音通道、被同一个 `maxPerMessage`（默认 1）
+    切片。切片规则以前只住在 `load_native_audio` 里，调用方拿不到"切了几段"这个数，
+    于是多段视频的音轨被**静默**切掉。现在切片与计数在同一处算：`load_native_audio`
+    与两个调用方（私聊回合 / 群聊视频音轨）共用它，线索里的数与真正取几段永远是同一个。
+    """
+    items = list(sources) if isinstance(sources, (list, tuple)) else []
+    available = len(items)
+    config = _audio_config(service)
+    if not _value(config, 'enabled', False):
+        # 总开关关着 = 整条语音通道不读。这**不是**预算截断，别报"仅取前 0 段"：
+        # 返回 `granted = available`（= 没有截断），线索与 warn 都不出声。
+        return [], available, available
+    limit = _int_value(
+        _value(config, 'maxPerMessage', DEFAULT_AUDIO_MAX_PER_MESSAGE),
+        DEFAULT_AUDIO_MAX_PER_MESSAGE,
+    )
+    if max_count is not None:
+        limit = min(limit, max(0, _int_value(max_count, 0)))
+    granted = min(available, max(0, limit))
+    return items[:granted], available, granted
+
+
+def audio_turn_budget_note(available: Any, granted: Any) -> str:
+    """超预算时那句可数线索（短；**只有真的截了才说**）——与图片那句同一族。
+
+    形态 `[音轨×%d，本回合仅取前 %d 段]`。
+    """
+    try:
+        total = int(available)
+        taken = int(granted)
+    except (TypeError, ValueError):
+        return ''
+    if total <= 0 or taken >= total:
+        return ''
+    return '[音轨×%d，本回合仅取前 %d 段]' % (total, max(0, taken))
+
+
+def note_audio_budget_skip(
+    service: Any, session: Any, available: Any, granted: Any,
+) -> bool:
+    """按"会话 + 原因"节流的一条 warn：本回合切掉了几段音轨（返回这次是否打了）。
+
+    为什么是 warn 而不是 diagnostic（坑 25）：这里是**真的丢了内容** —— 多段视频的
+    音轨只进来第一段，用户只会在剧本里看见她少讲了几段声音。
+    """
+    note = getattr(service, 'note_access_skip', None)
+    if not callable(note):
+        return False
+    platform = _text(pick(session, 'platform')) or '?'
+    self_id = _text(pick(session, 'selfId', 'self_id')) or '?'
+    scope = (
+        _text(pick(session, 'channelId', 'channel_id'))
+        or _text(pick(session, 'userId', 'user_id'))
+        or '?'
+    )
+    try:
+        total = int(available)
+        taken = int(granted)
+    except (TypeError, ValueError):
+        return False
+    return bool(note(
+        'audio-budget|%s|%s|%s' % (platform, self_id, scope),
+        AUDIO_TURN_BUDGET_WARN_INTERVAL_MS,
+        '本回合收到 %d 段音轨，按「语音 / 音频理解 → 每个事件音频数上限」只交给模型前 %d 段。',
+        total, taken,
+    ))
+
+
 def _vision_config(service: Any) -> dict[str, Any]:
     """上游 `this.config.model.vision`。"""
     raw = pick(_group(service.config, 'model'), 'vision')
     return raw if isinstance(raw, dict) else {}
+
+
+#: 合并转发那一段的组名（新名优先、旧隐藏兼容位兜底）——与适配层
+#: `AstrbotBridge.FORWARD_SECTION_NAMES` 同一套（那边读的是宿主原始配置，这里读的是
+#: 服务层配置；两处的兜底顺序必须一致，否则"读的段位不等于写的段位"）。
+_FORWARD_SECTION_NAMES: tuple[str, ...] = (
+    'forward_message', 'forwardMessage', 'forward_message_compat',
+)
+
+
+def _forward_config(service: Any) -> dict[str, Any]:
+    """`forward_message` 段（v1.9.4：每回合图片预算的默认值跟随这里的 `max_images`）。"""
+    for name in _FORWARD_SECTION_NAMES:
+        section = _group(service.config, name)
+        if section:
+            return section
+    return {}
+
+
+def _image_budget(service: Any) -> int:
+    """每回合图片预算（v1.9.4 可配；v1.9.4 起默认值向上跟随单卡转发上限）。
+
+    **判据只有一处**：`vision_budget.resolve_image_budget()`。这里只负责把两个段位取出来
+    ——本项的"每回合几张"与「合并转发 → 单条转发最多读取的图片数」的"单卡取几个坐标"是
+    两个不同的量，谁也不能在别处再算一份（那正是"改了配置却还是 3 张"的成因）。
+    """
+    return resolve_image_budget(
+        _vision_config(service), forward_read_limits(_forward_config(service)).max_images,
+    )
 
 
 def _embedding_config(service: Any) -> dict[str, Any]:
@@ -1073,15 +1188,12 @@ class ServiceChunk3(ServiceBase):
         `max_count`（v1.7.6 补上，上游第 4 个参数）：群聊批次按预算算出的"还能收几条"，
         上游取 `min(maxPerMessage, maxCount)`；缺省（私聊路径）就是 `maxPerMessage`。
         """
-        config = _audio_config(self)
-        if not _value(config, 'enabled', False) or not sources:
+        if not sources:
             return []
+        # 切片与计数只有这一处（`audio_turn_slice`）：`max_count`（群聊批次预算）也在这里夹。
+        to_take, _available, _granted = audio_turn_slice(self, sources, max_count)
         audio: list[Any] = []
-        max_per_message = _int_value(_value(config, 'maxPerMessage', DEFAULT_AUDIO_MAX_PER_MESSAGE),
-                                    DEFAULT_AUDIO_MAX_PER_MESSAGE)
-        if max_count is not None:
-            max_per_message = min(max_per_message, max(0, _int_value(max_count, 0)))
-        for index, source in enumerate(sources[:max(0, max_per_message)]):
+        for index, source in enumerate(to_take):
             try:
                 item = await self.fetch_native_audio(source, session)
                 if item:
@@ -1200,12 +1312,12 @@ class ServiceChunk3(ServiceBase):
         取几张由**每回合图片预算**说了算（v1.9.4，`model_center.vision.max_per_turn`，
         见 `core/vision_budget.py`）。上游在这里写死 3；本移植版把它配置化，但**判据
         仍然只有一处**：这里的下刀与 `flush_buffered_narrative` 里那一次用的是同一个
-        `resolve_image_budget()`，所以「改了配置却还是 3 张」不会再出现。
-        截断线索由调用方（flush）写，因为只有那里知道**候选总数**。
+        `_image_budget()`（→ `resolve_image_budget()`），所以「改了配置却还是 3 张」
+        不会再出现。截断线索由调用方（flush）写，因为只有那里知道**候选总数**。
         """
         if not _value(_vision_config(self), 'enabled', False) or not sources:
             return []
-        image_budget = resolve_image_budget(_vision_config(self))
+        image_budget = _image_budget(self)
         kind_by_source: dict[str, dict[str, Any]] = {}
         for item in media or []:
             key = _text(pick(item, 'source'))
@@ -1619,12 +1731,14 @@ class ServiceChunk3(ServiceBase):
             chat_capabilities = self.private_chat_capabilities(latest_session)
             # 每回合图片预算（v1.9.4，`model_center.vision.max_per_turn`）：直发媒体与
             # 转发媒体在这里**合流**，预算也在这一处成立 —— 上游写死的 `[:3]` 改成
-            # 同一个 `resolve_image_budget()`（与 `load_native_images` 里那一刀同源，
+            # 同一个 `_image_budget()`（与 `load_native_images` 里那一刀同源，
             # 见 `core/vision_budget.py`，判据只有一处）。
+            # v1.9.4：本项没被改过时，默认值向上跟随「合并转发 → 单条转发最多读取的
+            # 图片数」——只调那一个键，这里就真的多给（`_image_budget()` 里那一条规则）。
             # 截断**必须可见**：候选总数只有这里知道，所以可数线索也在这里写。
             # 开关只读一次（v1.9.4 §59）：下面 `attachments` 与那句线索都用它。
             vision_enabled = bool(_value(_vision_config(self), 'enabled', False))
-            image_budget = resolve_image_budget(_vision_config(self))
+            image_budget = _image_budget(self)
             image_candidates = _unique([
                 source for message in batch
                 for source in (_turn_get(message, 'imageSources', 'image_sources') or [])
@@ -1707,7 +1821,8 @@ class ServiceChunk3(ServiceBase):
                 source for message in batch
                 for source in (_turn_get(message, 'audioSources', 'audio_sources') or [])
             ] + list(video_media.audio_sources))
-            audio = await self.load_native_audio(snapshot['story'], audio_sources, latest_session)
+            audio_to_take, audio_available, audio_granted = audio_turn_slice(self, audio_sources)
+            audio = await self.load_native_audio(snapshot['story'], audio_to_take, latest_session)
             # 图片预算的截断线索（v1.9.4）：**给模型的可数事实**（"一共几张、给了几张"）
             # 进当前事件；同一件事再给日志一条节流 warn（丢内容必须让人看见，坑 25）。
             # 两道前置：① 只有真的截了才有这句（没截断时一个字都不写，见 `image_budget_note`）；
@@ -1721,6 +1836,13 @@ class ServiceChunk3(ServiceBase):
                 note_image_budget_skip(
                     self, latest_session, len(available_images), len(image_sources), image_budget,
                 )
+            # 音轨预算的截断线索（v1.9.5）：多段视频的音轨与直发语音走同一条语音通道，
+            # 超出「每个事件音频数上限」的部分以前是**静默**切掉的。给模型一句可数事实，
+            # 同一件事再给日志一条节流 warn（丢内容必须让人看见，坑 25）。
+            audio_note = audio_turn_budget_note(audio_available, audio_granted)
+            if audio_note:
+                user_message = '%s\n%s' % (user_message, audio_note)
+                note_audio_budget_skip(self, latest_session, audio_available, audio_granted)
             if video_media.note:
                 # 视频事实进**当前事件**（与 `visual_observations` 同一处叙事观察）：
                 # 顺带带上"抽了几帧 / 有没有截断"这些可数线索。

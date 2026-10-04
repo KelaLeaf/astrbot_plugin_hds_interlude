@@ -154,7 +154,7 @@
             "type": "int",
             "description": "每回合图片数上限",
             "default": 3,
-            "hint": "直发、转发与视频帧合起来算（默认 3，可填 1~20）。转发里的图先按「合并转发 → 单条转发最多读取的图片数」截断，剩下的再过本项；超出的部分会告诉模型一共几张、给了几张。调大后 token、延迟与费用同步上升。"
+            "hint": "直发、转发与视频帧合起来算，可填 1~20。本项保持默认时向上跟随「单条转发最多读取的图片数」，改成别的数就以本项为准；超出的会告诉模型一共几张、给了几张。调大后 token、延迟与费用同步上升。"
           }
         }
       },
@@ -567,7 +567,7 @@
             "price_cached_input": 0.0
           }
         ],
-        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
+        "hint": "若在宿主配置页改不动，请在「幕间控制台 → 配置」里改。",
         "obvious_hint": true
       },
       "main_provider_id": {
@@ -886,7 +886,7 @@
   "qq_access": {
     "type": "object",
     "title": "接入与名单",
-    "description": "【必填 3】接入与名单：机器人账号、用户与群聊名单（三张名单各自可以\"只处理名单内\"或\"名单外也接\"），以及语音转写。",
+    "description": "【必填 3】接入与名单：机器人账号、用户与群聊名单（三张名单各自可以\"只处理名单内\"或\"名单外也接\"）。",
     "items": {
       "bot_accounts": {
         "type": "list",
@@ -910,7 +910,7 @@
           }
         },
         "default": [],
-        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
+        "hint": "若在宿主配置页改不动，请在「幕间控制台 → 配置」里改。",
         "obvious_hint": true
       },
       "bot_accounts_only": {
@@ -957,7 +957,7 @@
           }
         },
         "default": [],
-        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
+        "hint": "若在宿主配置页改不动，请在「幕间控制台 → 配置」里改。",
         "obvious_hint": true
       },
       "user_accounts_only": {
@@ -1143,7 +1143,7 @@
           }
         },
         "default": [],
-        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
+        "hint": "若在宿主配置页改不动，请在「幕间控制台 → 配置」里改。",
         "obvious_hint": true
       },
       "group_chats_only": {
@@ -1295,11 +1295,6 @@
         "description": "手动推进最小间隔分钟",
         "default": 30
       },
-      "max_stories_per_sweep": {
-        "type": "int",
-        "description": "单轮扫描故事上限",
-        "default": 20
-      },
       "context_entry_limit": {
         "type": "int",
         "description": "近期原始记录最低条数",
@@ -1420,7 +1415,7 @@
             "max_interval_minutes": 240
           }
         ],
-        "hint": "这一项在宿主配置页可查看；若改不动、或保存后没生效，请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。",
+        "hint": "若在宿主配置页改不动，请在「幕间控制台 → 配置」里改。",
         "obvious_hint": true
       },
       "input_status": {
@@ -1857,7 +1852,8 @@
       "max_file_size_mb": {
         "type": "int",
         "description": "单文件扫描上限 MB",
-        "default": 10
+        "default": 10,
+        "hint": "这一项同时是合并转发里单张图片的上限。"
       },
       "catalog_limit": {
         "type": "int",
@@ -1906,11 +1902,6 @@
         "description": "触发整理的字符数",
         "default": 10000
       },
-      "recent_entry_limit": {
-        "type": "int",
-        "description": "主叙事附带原始条目数",
-        "default": 30
-      },
       "fact_limit": {
         "type": "int",
         "description": "主叙事附带长期事实数",
@@ -1930,7 +1921,7 @@
         "type": "int",
         "description": "普通变化证据回合下限",
         "default": 3,
-        "hint": "已弃用，运行时不会低于 3"
+        "hint": "已弃用"
       },
       "state_patch_min_turns": {
         "type": "int",
@@ -1951,11 +1942,6 @@
         "type": "int",
         "description": "单剧本事实总量上限",
         "default": 200
-      },
-      "max_stories_per_compaction_run": {
-        "type": "int",
-        "description": "单轮整理剧本上限",
-        "default": 20
       },
       "compaction_entry_limit": {
         "type": "int",
@@ -2299,7 +2285,7 @@
         "items": {
           "type": "string"
         },
-        "hint": "localhost、私网与非 HTTP(S) 地址始终禁止"
+        "hint": "本机与私网地址默认禁止；写进「允许访问的域名」或搜索模板主机的除外。"
       },
       "max_concurrent_pages": {
         "type": "int",
@@ -2315,15 +2301,6 @@
         "type": "int",
         "description": "单页加载超时毫秒",
         "default": 15000
-      },
-      "wait_until": {
-        "type": "string",
-        "description": "页面等待条件",
-        "default": "domcontentloaded",
-        "options": [
-          "domcontentloaded",
-          "networkidle2"
-        ]
       },
       "max_text_characters": {
         "type": "int",
@@ -2658,12 +2635,6 @@
             "default": false,
             "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
           },
-          "auto_learn": {
-            "type": "bool",
-            "description": "主动了解新联系人",
-            "default": false,
-            "hint": "允许她主动了解新联系人/群：看资料卡、群公告、空间动态"
-          },
           "tts_provider_id": {
             "invisible": true,
             "type": "string",
@@ -2953,13 +2924,13 @@
         "type": "int",
         "description": "单条转发最多读取的图片数",
         "default": 3,
-        "hint": "转发里的图会作为视觉输入交给模型，每多一张就多一份 token 与下载时间；超出的只留数量线索。"
+        "hint": "转发里的图会作为视觉输入交给模型。「每回合图片数上限」没改过时跟随本项，改过就以那一项为准；超出的只留数量线索。"
       },
       "max_videos": {
         "type": "int",
         "description": "单条转发最多读取的视频数",
         "default": 1,
-        "hint": "默认 1＝一张卡最多看一段（配了就生效，读一段要跑一次 ffmpeg 抽帧，还要占视觉预算）；配 0 才是「转发里的视频一段都不读」。读到的视频交给「模型中心 → 视频理解」那条链，受它自己的总开关与群聊开关管。"
+        "hint": "一段 = 一条视频消息。本项既是单条转发取几段坐标的上限，也是一回合真正读取几段的上限；0 = 一段都不读。每读一段跑一次 ffmpeg，帧与图片共用「每回合图片数上限」。"
       }
     }
   },
@@ -3092,22 +3063,26 @@
       "main_prompt": {
         "type": "text",
         "description": "主叙事行为指令",
-        "default": "Continue the character-centered life script with grounded actions, motives, relationships, and ordinary time passing."
+        "default": "Continue the character-centered life script with grounded actions, motives, relationships, and ordinary time passing.",
+        "hint": "留空 = 用默认提示词。"
       },
       "format_prompt": {
         "type": "text",
         "description": "结构化输出补充规则",
-        "default": ""
+        "default": "",
+        "hint": "留空 = 用默认提示词。"
       },
       "fixed_prompt": {
         "type": "text",
         "description": "通用长期规则",
-        "default": ""
+        "default": "",
+        "hint": "留空 = 用默认提示词。"
       },
       "style_prompt": {
         "type": "text",
         "description": "全局叙事文风",
-        "default": "Use restrained, realistic prose with concrete daily details, natural pauses, and no forced drama."
+        "default": "Use restrained, realistic prose with concrete daily details, natural pauses, and no forced drama.",
+        "hint": "留空 = 用默认提示词。"
       }
     }
   },
@@ -3484,12 +3459,6 @@
         "description": "处理被拉群",
         "default": true,
         "hint": "同意或拒绝**别人拉机器人进群**的邀请/申请（不能主动加群）。"
-      },
-      "auto_learn": {
-        "type": "bool",
-        "description": "主动了解新联系人",
-        "default": false,
-        "hint": "允许她主动了解新联系人/群：看资料卡、群公告、空间动态"
       }
     }
   },
@@ -3671,12 +3640,6 @@
         "description": "删好友",
         "default": false,
         "hint": "此标签下功能具有一定风险，易误操作，请谨慎开启。"
-      },
-      "auto_learn": {
-        "type": "bool",
-        "description": "主动了解新联系人",
-        "default": false,
-        "hint": "允许她主动了解新联系人/群：看资料卡、群公告、空间动态"
       }
     },
     "invisible": true

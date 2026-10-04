@@ -118,7 +118,7 @@ UPSTREAM_FIELDS = {
         "userMessageDebounceSeconds", "narrativeRetryDelaySeconds", "narrativeRetryMaxAttempts",
         "captureDirectMessages", "autoCreate", "ignoreCommandMessages",
         "allowProactiveMessages", "proactiveWillingnessThreshold", "sweepIntervalMinutes",
-        "minimumAdvanceMinutes", "maxStoriesPerSweep", "contextEntryLimit",
+        "minimumAdvanceMinutes", "contextEntryLimit",
         "contextTimeWindowMinutes", "memoryLimit", "maxScriptCharacters",
         "maxMessageCharacters", "minimumDelayedReplySeconds", "maximumDelayedReplyMinutes",
         "cancelDelayedRepliesOnUserMessage", "autoAdvanceEnabled", "autoAdvanceIntervalMinutes",
@@ -146,10 +146,10 @@ UPSTREAM_FIELDS = {
     ],
     "memory": [
         "enabled", "backgroundIntervalMinutes", "sceneEntryThreshold",
-        "sceneCharacterThreshold", "recentEntryLimit", "factLimit",
+        "sceneCharacterThreshold", "factLimit",
         "statePatchConfidenceThreshold", "majorStatePatchConfidenceThreshold",
         "statePatchMinEvidence", "statePatchMinTurns", "statePatchMinDays",
-        "statePatchCooldownHours", "maxFactsPerStory", "maxStoriesPerCompactionRun",
+        "statePatchCooldownHours", "maxFactsPerStory",
         "compactionEntryLimit", "compactionCharacterLimit", "sceneHookCharacters",
         "sceneSummaryCharacters", "arcSummaryCharacters", "previousSceneSummaries",
         "factContentCharacters", "factImportanceWeight", "factConfidenceWeight",
@@ -168,7 +168,7 @@ UPSTREAM_FIELDS = {
     "browser": [
         "enabled", "mode", "allowSearch", "allowVisit", "searchUrlTemplate",
         "allowedDomains", "blockedDomains", "maxConcurrentPages", "maxResearchPerSweep",
-        "navigationTimeout", "waitUntil", "maxTextCharacters", "maxExcerptCharacters",
+        "navigationTimeout", "maxTextCharacters", "maxExcerptCharacters",
         "maxObservationsInPrompt", "cacheMinutes", "allowGroupTriggeredResearch",
         "logObservationPreview",
     ],
@@ -209,7 +209,7 @@ LEGACY_ACTION_COMPAT_GROUPS = {
     "actions_voice": ("enabled", "send_voice", "list_voices", "tts_provider_id", "default_voice"),
     "actions_contact": (
         "enabled", "list_contacts", "search_contacts", "get_user_profile", "get_group_info",
-        "handle_friend_request", "handle_group_request", "auto_learn",
+        "handle_friend_request", "handle_group_request",
     ),
     # v1.7.2/v1.7.3 的可见分组（v1.7.4 并进 `robot_actions` 之后降级成兼容位）。
     "actions_chat": (
@@ -221,7 +221,7 @@ LEGACY_ACTION_COMPAT_GROUPS = {
         "set_qq_profile", "set_qq_avatar", "get_qq_profile",
         "send_voice", "list_voices", "tts_provider_id", "default_voice",
         "list_contacts", "search_contacts", "get_user_profile", "get_group_info",
-        "handle_friend_request", "handle_group_request", "auto_learn", "delete_friend",
+        "handle_friend_request", "handle_group_request", "delete_friend",
     ),
     "actions_group": (
         "enabled", "get_group_members_info", "get_user_group_role", "get_group_honor_info",
@@ -437,7 +437,6 @@ CAMEL_TO_SNAKE = {
     "proactiveWillingnessThreshold": "proactive_willingness_threshold",
     "sweepIntervalMinutes": "sweep_interval_minutes",
     "minimumAdvanceMinutes": "minimum_advance_minutes",
-    "maxStoriesPerSweep": "max_stories_per_sweep",
     "contextEntryLimit": "context_entry_limit",
     "contextTimeWindowMinutes": "context_time_window_minutes",
     "memoryLimit": "memory_limit", "maxScriptCharacters": "max_script_characters",
@@ -473,7 +472,7 @@ CAMEL_TO_SNAKE = {
     "backgroundIntervalMinutes": "background_interval_minutes",
     "sceneEntryThreshold": "scene_entry_threshold",
     "sceneCharacterThreshold": "scene_character_threshold",
-    "recentEntryLimit": "recent_entry_limit", "factLimit": "fact_limit",
+    "factLimit": "fact_limit",
     "statePatchConfidenceThreshold": "state_patch_confidence_threshold",
     "majorStatePatchConfidenceThreshold": "major_state_patch_confidence_threshold",
     "statePatchMinEvidence": "state_patch_min_evidence",
@@ -481,7 +480,6 @@ CAMEL_TO_SNAKE = {
     "statePatchMinDays": "state_patch_min_days",
     "statePatchCooldownHours": "state_patch_cooldown_hours",
     "maxFactsPerStory": "max_facts_per_story",
-    "maxStoriesPerCompactionRun": "max_stories_per_compaction_run",
     "compactionEntryLimit": "compaction_entry_limit",
     "compactionCharacterLimit": "compaction_character_limit",
     "sceneHookCharacters": "scene_hook_characters",
@@ -514,7 +512,7 @@ CAMEL_TO_SNAKE = {
     "allowedDomains": "allowed_domains", "blockedDomains": "blocked_domains",
     "maxConcurrentPages": "max_concurrent_pages",
     "maxResearchPerSweep": "max_research_per_sweep",
-    "navigationTimeout": "navigation_timeout", "waitUntil": "wait_until",
+    "navigationTimeout": "navigation_timeout",
     "maxTextCharacters": "max_text_characters",
     "maxExcerptCharacters": "max_excerpt_characters",
     "maxObservationsInPrompt": "max_observations_in_prompt",
@@ -1003,8 +1001,6 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertEqual(browser["allowed_domains"]["default"], [])
         self.assertEqual(browser["blocked_domains"]["default"], [])
         self.assertEqual(browser["max_concurrent_pages"]["default"], 1)
-        self.assertEqual(browser["wait_until"]["options"],
-                         ["domcontentloaded", "networkidle2"])
         self.assertIs(browser["allow_group_triggered_research"]["default"], False)
         self.assertIs(browser["log_observation_preview"]["default"], False)
 
@@ -1240,6 +1236,28 @@ class ConfigurationSchemaTest(unittest.TestCase):
         # 默认取省成本那侧：与 v1.9.1 及之前的写死 3 逐字一致（升级即无感）。
         self.assertEqual(VISION_IMAGE_BUDGET_DEFAULT, 3)
 
+    def test_the_two_image_keys_share_one_starting_point(self):
+        """v1.9.4：两个图片键的默认值**必须是同一个数**（跟随规则的起点）。
+
+        「每回合图片数上限」没被改过时向上跟随「单条转发最多读取的图片数」
+        （`vision_budget.resolve_image_budget()`）——这条规则只有在两边默认值相等时才
+        自洽。任何一边单独漂移（schema 或 core 任一侧改了 3），`test_configuration` 这里
+        与 `test_forward_message.test_the_two_keys_share_one_starting_point` 都会红：
+        这正是用户那次真机报告的根 —— "3"这个数曾经在两处各写各的。
+        """
+        from plugin.core.forward_message import (  # noqa: PLC0415
+            FORWARD_MEDIA_MAX_PER_FORWARD,
+            forward_read_limits,
+        )
+        from plugin.core.vision_budget import VISION_IMAGE_BUDGET_DEFAULT  # noqa: PLC0415
+
+        forward = self.schema["forward_message"]["items"]["max_images"]
+        vision = self.schema["model_center"]["items"]["vision"]["items"]["max_per_turn"]
+        self.assertEqual(forward["default"], VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(vision["default"], VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(forward_read_limits({}).max_images, VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(FORWARD_MEDIA_MAX_PER_FORWARD, VISION_IMAGE_BUDGET_DEFAULT)
+
     def test_deep_sections_are_complete(self):
         model = self.section("model_center")
         prompts = self.section("prompts")
@@ -1364,7 +1382,7 @@ class ConfigurationSchemaTest(unittest.TestCase):
         # 2) 每个**可见**的动作子分组都要有总开关；组里除白名单外的键都必须是
         #    动作 id，而且必须是"该落在这个组"的动作。隐藏的旧组是历史快照（键可以比
         #    目录旧、也可以有非动作键），由 `LEGACY_ACTION_COMPAT_GROUPS` 单独对账。
-        extras = {"enabled", "default_voice", "auto_learn", "tts_provider_id"}
+        extras = {"enabled", "default_voice", "tts_provider_id"}
         action_groups = [path for path, spec in catalog.ACTION_CONFIG_GROUP_LABELS.items()
                          if path.rsplit(".", 1)[0] not in hidden_roots]
         self.assertTrue(action_groups, "schema 里没有可见的动作子分组")
@@ -1610,9 +1628,10 @@ class ConfigurationSchemaTest(unittest.TestCase):
         """`audio.enabled`（上游 `audioConfig.enabled`，v1.7.6 收口）：缺键=关，且真的有人读。
 
         这条键从 1.0.1 起就是上游的，上游在 `loadNativeAudio` 里拿它放行附件；本移植版
-        一开始就接了 core 那把闸（`chunk3.load_native_audio`）。这条用例把**三处**钉在
-        一起：schema 的默认值（保持现状=上游=关）、core 的闸、适配层的能力提示——
-        少任何一处都会变成"界面说着开、实际没生效"或反过来的假话。
+        一开始就接了 core 那把闸（v1.9.5 起那把闸收在 `chunk3.audio_turn_slice` 一处，
+        `load_native_audio` 与两处调用方共用它）。这条用例把**三处**钉在一起：schema 的
+        默认值（保持现状=上游=关）、core 的闸、适配层的能力提示——少任何一处都会变成
+        "界面说着开、实际没生效"或反过来的假话。
         """
         audio = self.section("model_center.audio")
         self.assertIs(audio["enabled"]["default"], False,
@@ -1623,7 +1642,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
         core = read(os.path.join(PLUGIN_ROOT, "core", "service", "chunk3.py"))
         self.assertIn("def load_native_audio", core)
         body = core.split("async def load_native_audio", 1)[1].split("async def ", 1)[0]
-        self.assertIn("'enabled'", body, "core 的加载闸必须读这个键")
+        self.assertIn("audio_turn_slice", body, "core 的加载闸必须走那一处判据")
+        gate = core.split("def audio_turn_slice", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("'enabled'", gate, "core 的加载闸必须读这个键")
         adapter = read(os.path.join(PLUGIN_ROOT, "adapters", "astrbot_bridge.py"))
         self.assertIn("def audio_understanding_enabled", adapter)
         self.assertIn("audio_understanding_enabled()", adapter)
@@ -1789,6 +1810,38 @@ class ImageBudgetConfigTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertEqual(resolve_image_budget(section), expected)
 
+    def test_the_turn_budget_follows_the_forward_cap_while_it_is_untouched(self):
+        """v1.9.4：**只调「单条转发最多读取的图片数」，模型就真的能多看到几张**。
+
+        规则只有一条：本项没被改过（= 默认 3）时向上跟随单卡上限。反向在同一个方法里
+        ——把跟随去掉（`resolve_image_budget({}, 6) == 3`）这几条全红。
+        """
+        from plugin.core.vision_budget import (  # noqa: PLC0415
+            VISION_IMAGE_BUDGET_DEFAULT,
+            VISION_IMAGE_BUDGET_MAX,
+            resolve_image_budget,
+        )
+
+        # 用户那次真机报告的场景：`max_images = 10`（单卡上限），每回合上限没动。
+        self.assertEqual(resolve_image_budget({}, 10), 10)
+        self.assertEqual(resolve_image_budget({'max_per_turn': 3}, 6), 6,
+                         '写出来恰好等于默认值 = 没改过（宿主按 schema 补默认值，分不出）')
+        self.assertEqual(resolve_image_budget({'maxPerTurn': 3}, 6), 6, '两种拼写同一条规则')
+        # 本项被改成别的数 → 以本项为准；单卡上限只管"从卡里取几个坐标"。
+        self.assertEqual(resolve_image_budget({'max_per_turn': 2}, 6), 2)
+        self.assertEqual(resolve_image_budget({'max_per_turn': 9}, 6), 9)
+        # **只向上跟随**：把单卡上限调小（1 / 0）不该连累直发图与视频帧的额度。
+        self.assertEqual(resolve_image_budget({}, 1), VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(resolve_image_budget({}, 0), VISION_IMAGE_BUDGET_DEFAULT)
+        # 上限照旧夹在本项自己的区间里（单卡上限 0~10 不可能超过它，这一条只是不变量）。
+        self.assertLessEqual(resolve_image_budget({}, 10), VISION_IMAGE_BUDGET_MAX)
+        # 不传 / 脏值 = 老行为：只有本项说了算（老调用方零回归）。
+        self.assertEqual(resolve_image_budget({}), VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(resolve_image_budget({'max_per_turn': 7}), 7)
+        self.assertEqual(resolve_image_budget({}, None), VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(resolve_image_budget({}, 'abc'), VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(resolve_image_budget({}, True), VISION_IMAGE_BUDGET_DEFAULT)
+
     def test_the_clue_only_speaks_when_something_was_cut(self):
         from plugin.core.vision_budget import image_budget_note  # noqa: PLC0415
 
@@ -1826,7 +1879,7 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
         "actions_status": {"update_qq_status": False},
         "actions_profile": {"set_qq_avatar": False},
         "actions_voice": {"default_voice": "zh-CN-YunxiNeural", "send_voice": False},
-        "actions_contact": {"auto_learn": True},
+        "actions_contact": {"get_group_info": False},
     }
 
     #: 一份 v1.7.2/v1.7.3 形状的配置：开关落在**顶层**那三个组里。
@@ -1885,7 +1938,7 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
         for path, expected in (
             ("send_poke", False), ("send_like", True), ("schedule_message", False),
             ("get_group_msg_history", True), ("update_qq_status", False),
-            ("set_qq_avatar", False), ("send_voice", False), ("auto_learn", True),
+            ("set_qq_avatar", False), ("send_voice", False), ("get_group_info", False),
             # 非动作旋钮（TTS 音色）也要跟着过来，否则用户的音色设置在升级后静默失效
             ("default_voice", "zh-CN-YunxiNeural"),
         ):
@@ -1963,7 +2016,6 @@ class LegacyActionSectionMergeTest(unittest.TestCase):
         schema = load_schema()
         defaults = schema_group_defaults("robot_actions.chat")
         self.assertEqual(defaults["send_poke"], True)
-        self.assertEqual(defaults["auto_learn"], False)
         self.assertEqual(defaults["default_voice"], "")
         self.assertEqual(defaults, {key: spec.get("default")
                                     for key, spec in schema_at(schema, "robot_actions.chat")["items"].items()})

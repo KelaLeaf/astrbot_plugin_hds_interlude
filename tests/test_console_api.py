@@ -55,10 +55,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 #: 「对象行列表」在宿主配置页的那句提示：**三处逐字一致**（`_conf_schema.json` 的 5 处
 #: hint / `console_api.HOST_LIST_DEGRADED_NOTE` / 两份 docs）。初版写的是「⚠️此配置项不
 #: 生效…」——那是个**没在真机上点过**的断言（依据见 `docs/PORTING_NOTES.md` §54.4），
-#: v1.9.1 改成"不下断言 + 给出路 + 怎么验证"。
+#: v1.9.5 按用户点名的最终文案收短成"只留出路"这一句。
 HOST_LIST_NOTE = (
-    '这一项在宿主配置页可查看；若改不动、或保存后没生效，'
-    '请在「幕间控制台 → 配置」里改（那边会按 schema 显示每项的生效值，可对照验证）。'
+    '若在宿主配置页改不动，请在「幕间控制台 → 配置」里改。'
 )
 
 #: 五处对象行列表（`type: list` + 行内字段映射）在 schema 里的路径。
@@ -1323,7 +1322,7 @@ class HostListNoteWordingTests(unittest.TestCase):
 
     三处必须逐字一致：`_conf_schema.json` 的 5 处对象行列表 `hint`、
     `console_api.HOST_LIST_DEGRADED_NOTE`、`docs/PORTING_NOTES.md` §54.4 与
-    `docs/CONFIG_MAP.md`。只改一处 → 红；改回旧断言 → 红。
+    `docs/CONFIG_MAP.md`。只改一处 → 红；改回旧断言 → 红（v1.9.5 已收短为一句）。
     """
 
     def test_the_console_constant_is_the_agreed_sentence(self) -> None:

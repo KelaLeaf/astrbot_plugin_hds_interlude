@@ -94,7 +94,10 @@ from .helpers import (
 # `load_native_audio`。chunk3 **不** import chunk1，所以这条模块级依赖不成环。
 # `_extract_session_media` 同源：群聊入站的自动收藏要**与私聊同一份**结构化媒体表
 # （`SessionView.media` → `[{source, kind, summary, label}]`），不能另外推一份（见 §45.6/§46）。
-from .chunk3 import _extract_session_media, _load_group_batch_audio
+from .chunk3 import (
+    _extract_session_media, _load_group_batch_audio,
+    audio_turn_budget_note, audio_turn_slice, note_audio_budget_skip,
+)
 # 视频理解（v1.9.1）：群回合**只有音轨有通道**的那条接线（判据在
 # `video_understanding.collect_group_video_media`，本文件只做群回合这一跳）。
 from ..video_understanding import collect_group_video_media
@@ -384,7 +387,15 @@ async def _group_video_audio(
         note = media.note
         if not media.audio_sources:
             return [], note
-        loaded = await service.load_native_audio(story, list(media.audio_sources), session)
+        # 音轨截断**可数**（v1.9.5）：多段视频的音轨走同一条语音通道、被同一个
+        # 「每个事件音频数上限」切片；线索与 warn 与私聊那条路共用同一处实现。
+        audio_to_take, audio_available, audio_granted = audio_turn_slice(
+            service, media.audio_sources)
+        audio_note = audio_turn_budget_note(audio_available, audio_granted)
+        if audio_note:
+            note = '\n'.join(part for part in (note, audio_note) if part)
+            note_audio_budget_skip(service, session, audio_available, audio_granted)
+        loaded = await service.load_native_audio(story, audio_to_take, session)
         # 与群语音批次同一套附件编号（`group-audio-N`），序列接在批次后面。
         return (
             [

@@ -233,15 +233,17 @@ def _normalize_browser_intent_draft_loose(value: Any) -> Optional[dict[str, Any]
 
 
 def _normalize_browser_intent_draft(draft: Any, config: Any) -> Optional[dict[str, Any]]:
-    """上游 `normalizeBrowserIntentDraft`（`:7896`）逐字移植。"""
-    normalized = _normalize_browser_intent_draft_loose(draft)
-    if not normalized:
-        return None
-    if normalized['mode'] == 'search' and not _cfg(config, 'allowSearch', True):
-        return None
-    if normalized['mode'] == 'visit' and not _cfg(config, 'allowVisit', True):
-        return None
-    return normalized
+    """上游 `normalizeBrowserIntentDraft`（`:7896`）——**判据只有 `chunk4` 那一处**。
+
+    v1.9.5：本文件曾自带一份等价实现，`allowSearch` / `allowVisit` 的**缺省与
+    `chunk4` 相反**（这里 `True`、那边 `False`）：同一个键两处判、还判得不一样。
+    本地实现删掉，改成委托 `chunk4`（延迟 import：两份都在 service 包内，避开模块
+    加载期的环）。`chunk4` 的缺省（缺键 = 拒绝）与上游一致 —— 上游写的是
+    `!config.allowSearch`，JS 的 `undefined` 就是拒绝；生产上这两个键由宿主按 schema
+    补齐（默认 `true`），所以"缺键 = 拒绝"只在夹具漏写时才会碰到。
+    """
+    from .chunk4 import _normalize_browser_intent_draft as impl  # noqa: PLC0415
+    return impl(draft, config)
 
 
 def _browser_intent_from_payload(payload: Any) -> Optional[dict[str, Any]]:

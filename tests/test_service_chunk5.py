@@ -804,8 +804,10 @@ class ServiceChunk5Tests(unittest.TestCase):
                 self.calls.append(('visit', url))
                 return self.page
 
+        # `allowSearch` / `allowVisit` 是 schema 默认值（宿主每次加载都会补上），
+        # 夹具照生产写法写全——少写这两项等于造一个生产不存在的配置（坑 39/66）。
         service = self._service(browser={
-            'enabled': True,
+            'enabled': True, 'allowSearch': True, 'allowVisit': True,
             'searchUrlTemplate': 'https://cn.bing.com/search?q={query}',
         })
         transport = NoSearchTransport(
@@ -823,7 +825,10 @@ class ServiceChunk5Tests(unittest.TestCase):
         self.assertIn(('visit', 'https://cn.bing.com/search?q=%E7%8C%AB'), transport.calls)
 
         # 模板抓取也拿不到内容 → 记成失败观察（而不是留一条空白"成功"）。
-        dead = self._service(browser={'enabled': True, 'searchUrlTemplate': 'https://example.com/s?q={query}'})
+        dead = self._service(browser={
+            'enabled': True, 'allowSearch': True, 'allowVisit': True,
+            'searchUrlTemplate': 'https://example.com/s?q={query}',
+        })
         dead.transport = NoSearchTransport(None)
         self.service = dead
         failed = asyncio.run(dead.collect_web_observation(
@@ -849,7 +854,9 @@ class ServiceChunk5Tests(unittest.TestCase):
                 self.calls.append(('visit', url))
                 return {'url': url, 'title': '页面标题', 'text': '页面正文 ' * 100}
 
-        service = self._service(browser={'enabled': True, 'cacheMinutes': 30})
+        service = self._service(browser={
+            'enabled': True, 'allowSearch': True, 'allowVisit': True, 'cacheMinutes': 30,
+        })
         transport = RecordingTransport()
         service.transport = transport
         self.service = service
@@ -1256,6 +1263,32 @@ class ServiceChunk5Tests(unittest.TestCase):
         self.assertEqual(row['validThrough'], '1970-01-01')
         self.assertEqual(row['reviewReason'], 'Administrator requested a rebuild.')
         self.assertEqual(row['updatedAt'], NOW)
+
+
+class BrowserIntentDraftSingleGateTests(unittest.TestCase):
+    """v1.9.5：`normalize_browser_intent_draft` 的判据只有 `chunk4` 一处。
+
+    `chunk5` 那份同名实现的 `allowSearch` / `allowVisit` 缺省曾是 `True`（与 `chunk4`
+    相反），又没有任何生产调用点 —— 同一个键两处判、还判得不一样。v1.9.5 删掉本地
+    实现、改成委托 `chunk4`。反向用例：把委托改回本地实现（缺省 `True`）→ 第一条断言红。
+    """
+
+    def test_chunk5_delegates_to_the_chunk4_gate(self) -> None:
+        from plugin.core.service import chunk4  # noqa: PLC0415
+
+        draft = {'mode': 'search', 'query': 'q', 'purpose': 'p'}
+        # 缺 config（= 宿主没写过这一项）时 `chunk4` 的缺省是"没允许" → 拒绝。
+        self.assertIsNone(chunk5_module.normalize_browser_intent_draft(draft, {}))
+        self.assertEqual(
+            chunk5_module.normalize_browser_intent_draft(draft, {}),
+            chunk4._normalize_browser_intent_draft(draft, {}),
+        )
+        self.assertIsNotNone(
+            chunk5_module.normalize_browser_intent_draft(draft, {'allowSearch': True})
+        )
+        visit = {'mode': 'visit', 'url': 'https://example.com/x', 'purpose': 'p'}
+        self.assertIsNone(chunk5_module.normalize_browser_intent_draft(visit, {}),
+                          'allowVisit 的缺省同样按 chunk4 的 False')
 
 
 if __name__ == '__main__':  # pragma: no cover

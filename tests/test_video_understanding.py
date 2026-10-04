@@ -916,6 +916,49 @@ class TurnLevelWiringTests(VideoTestCase):
         # ④ 这一次的临时目录在图像通道读完字节后就被删掉（不留垃圾）。
         self.assertEqual(self.new_temp_dirs(), [], self.new_temp_dirs())
 
+    async def test_three_forwarded_videos_really_take_three_ffmpeg_runs(self) -> None:
+        """v1.9.4 端到端：媒体表里 3 段转发视频 + `max_videos=3` → **三次抽帧**。
+
+        顺带把两件"共用通道"的事钉在真参数上（它们不是视频自己的闸，但决定了端到端
+        有效值）：
+
+        * 帧与直发 / 转发的图共用**每回合图片预算**：本用例把「单条转发最多读取的图片数」
+          调到 9（每回合上限没动 → 跟随成 9），所以 3×3 帧**全都**进得了模型；
+        * 音轨走的是**语音通道**，要服从那条通道自己的 `max_per_message`（默认 1；
+          可见键在「模型中心 → 语音 / 音频理解设置」）——它今天是一处**静默**截断，
+          本用例只如实断言现状，不在这一轮改它。
+        """
+        ffmpeg = FakeFfmpeg()
+        host = self._host()
+        host.config['forward_message'] = {'max_videos': 3, 'max_images': 9}
+        sources = ['https://cdn.example.com/v%d.mp4' % index for index in (1, 2, 3)]
+        turn = {
+            'storyId': 's', 'participantId': 'p',
+            'messages': [{'content': '看这几个视频', 'occurredAt': NOW,
+                          'imageSources': [], 'audioSources': []}],
+            'latestSession': SessionView(
+                platform='onebot', self_id='1', user_id='2', is_direct=True,
+                content='[视频]', elements=[],
+                media=[{'kind': 'video', 'source': source, 'summary': ''} for source in sources],
+            ),
+            'timer': None, 'nextRevision': 3,
+            'inFlightRequestId': None, 'obsoleteRequestIds': set(),
+        }
+        host.buffered_narrative_turns = {'k': turn}
+        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
+                mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg):
+            await ServiceChunk3.flush_buffered_narrative(host, 'k', 3)
+
+        self.assertEqual(len(ffmpeg.argvs('frames')), 3, '三段视频 = 三次抽帧（旧实现只有 1 次）')
+        self.assertEqual(len(host.seen['images']), 3 * video.VIDEO_MAX_FRAMES)
+        self.assertEqual(len(host.calls['try_decide'][9]), 3 * video.VIDEO_MAX_FRAMES,
+                         '每回合上限跟随到 9 → 九帧全都进模型')
+        self.assertEqual(len(host.calls['try_decide'][10]), 1,
+                         '音轨由语音通道的 max_per_message 决定（默认 1，可见键）')
+        self.assertEqual(host.calls['try_decide'][5].count(video.VIDEO_FACT_PREFIX), 3,
+                         '正文里一段视频一行事实')
+        self.assertEqual(self.new_temp_dirs(), [], '三个临时目录都要删干净')
+
     async def test_a_video_bug_never_breaks_the_turn_or_loses_the_message(self) -> None:
         """反向：视频理解炸了也必须**照常出正文**（回合主链不为附加能力回滚）。"""
         from plugin.core.service import chunk3 as chunk3_module  # noqa: PLC0415
@@ -1391,6 +1434,186 @@ class BudgetConfigTests(VideoTestCase):
             self.assertIn(needle, source)
         # 常量退化成默认值：命令行里的数字全部由参数（= 配置）算出来。
         self.assertIn("'fps=1/%d' % max(1, int(interval_seconds))", source)
+
+
+# =========================================================================== #
+# 4.5.5b 一回合读几段视频（v1.9.4）：`forward_message.max_videos` 是**同一处**判据
+# =========================================================================== #
+
+class MultiVideoBudgetTests(VideoTestCase):
+    """配了几段就真的读几段 —— 旧实现写死 `sources[0]`：配 3 段也只读第 1 段。
+
+    那是用户点名的"不合逻辑的分支"：配置项说"最多读取 N 段"，正文线索也写
+    「仅取前 N 段」，实际却只读第一段 —— 配置与线索同时说谎。这里的用例是那条的
+    反向守卫：`max_videos=3` 就必须有三次抽帧；写死回 1 → 红。
+    """
+
+    def _config(self, max_videos: Any, **video_keys: Any) -> dict[str, Any]:
+        config = video_config()
+        config['model']['video'].update(video_keys)
+        config['forward_message'] = {'max_videos': max_videos}
+        return config
+
+    @staticmethod
+    def _session(*targets: str, is_direct: bool = True) -> SessionView:
+        """一条带 N 段视频的会话（元素 = 可信坐标；正文那份 `text:` 坐标永不取回）。"""
+        return SessionView(
+            platform='onebot', self_id='1', user_id='2', is_direct=is_direct,
+            content=' '.join('<video src="%s"/>' % target for target in targets),
+            elements=[
+                {'type': 'video', 'attrs': {'src': target}, 'children': []}
+                for target in targets
+            ],
+            media=[],
+        )
+
+    async def _collect(
+        self, host: Host, session: SessionView, ffmpeg: FakeFfmpeg,
+    ) -> video.VideoMedia:
+        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
+                mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg):
+            return await video.collect_video_sources(host, {'id': 's'}, session)
+
+    async def test_every_video_in_the_turn_is_really_read(self) -> None:
+        """① 配 3 段 + 会话里 3 段 → **三次抽帧、三段音轨**（不是只读第一段）。"""
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(3))
+        session = self._session(*['https://cdn.example.com/v%d.mp4' % index for index in (1, 2, 3)])
+        result = await self._collect(host, session, ffmpeg)
+
+        self.assertEqual(len(ffmpeg.argvs('frames')), 3, '三段视频 = 三次抽帧命令')
+        self.assertEqual(len(ffmpeg.argvs('audio')), 3, '每段各抽一条音轨')
+        self.assertEqual(
+            len(result.image_sources), 3 * video.VIDEO_MAX_FRAMES, '每段各交自己的帧',
+        )
+        self.assertEqual(len(result.audio_sources), 3)
+        self.assertNotIn('仅取前', result.note, '没截断就不许说"仅取前 N 段"')
+
+    async def test_the_default_budget_reads_exactly_one_and_says_so(self) -> None:
+        """**反向**：默认（没有 `forward_message` 段 = 1）只读一段，并留下可数线索。
+
+        变异保护：把"写死 1"还原成"写死第 0 段但线索还写 N" → 这里断言的线索与条数对不上。
+        """
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=video_config())  # 刻意不给 forward_message 段 = 全默认
+        session = self._session(
+            'https://cdn.example.com/v1.mp4',
+            'https://cdn.example.com/v2.mp4',
+            'https://cdn.example.com/v3.mp4',
+        )
+        result = await self._collect(host, session, ffmpeg)
+        self.assertEqual(len(ffmpeg.argvs('frames')), 1, '默认只读一段（省成本那侧）')
+        self.assertEqual(len(result.image_sources), video.VIDEO_MAX_FRAMES)
+        self.assertIn('[视频×3，本回合仅取前 1 段]', result.note, '截断必须可见')
+        self.assertTrue(
+            any('单条转发最多读取的视频数' in message for message in host.warns()),
+            '截断是丢内容：日志里必须有一条可行动的 warn',
+        )
+
+    async def test_zero_does_not_switch_off_direct_videos(self) -> None:
+        """`max_videos=0` 管的是"**转发里**的视频一段都不读"（那一侧连坐标都不收）。
+
+        私聊直发的视频不该被一个转发键关掉 —— 所以预算的下限是 1（同一把闸不许两处判）。
+        """
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(0))
+        result = await self._collect(host, self._session('https://cdn.example.com/v1.mp4'), ffmpeg)
+        self.assertEqual(len(ffmpeg.argvs('frames')), 1)
+        self.assertTrue(result.image_sources)
+
+    def test_the_budget_is_the_forward_key_and_nothing_else(self) -> None:
+        """判据一处：一回合读几段就是 `forward_read_limits(...).max_videos`（含夹取）。"""
+        def budget(forward: dict[str, Any]) -> int:
+            config = video_config()
+            config['forward_message'] = forward
+            return video.video_read_budget(Host(config=config))
+
+        self.assertEqual(budget({'max_videos': 3}), 3)
+        self.assertEqual(budget({'maxVideos': 4}), 4, '两种拼写都认')
+        self.assertEqual(budget({}), 1, '缺键 = 默认 1')
+        self.assertEqual(budget({'max_videos': 99}), 10, '夹到上限 10（夹取只住在 forward_message）')
+        self.assertEqual(budget({'max_videos': -5}), 1, '夹到下限 0 之后按 1 算')
+        self.assertEqual(budget({'max_videos': 'abc'}), 1, '脏值回默认')
+        self.assertEqual(budget({'max_videos': 0}), 1, '0 = 转发里不读；直发仍按 1')
+
+    def test_the_section_names_match_the_adapter_and_the_service(self) -> None:
+        """段名兜底顺序三处同一套（否则"配置页写 A、行为读 B"，坑 41 / 65 同类）。"""
+        from plugin.core.service import chunk3 as chunk3_module  # noqa: PLC0415
+
+        expected = video._FORWARD_SECTION_NAMES
+        self.assertEqual(chunk3_module._FORWARD_SECTION_NAMES, expected)
+        bridge = _read('adapters/astrbot_bridge.py')
+        self.assertIn('FORWARD_SECTION_NAMES: tuple[str, ...] = %r' % (expected,), bridge)
+
+
+# =========================================================================== #
+# 4.5.5c 私聊里的转发视频不受**群聊开关**管（v1.9.4）
+# =========================================================================== #
+
+class PrivateForwardVideoTests(VideoTestCase):
+    """合并转发与群聊**没有关系**：私聊里转发来的视频只看总开关。
+
+    现场：`group_enabled`（群聊视频理解）默认关，而私聊转发来的视频走的是**同一个**
+    `collect_video_sources` —— 只要那一道闸按会话判（`is_direct`）而不是按"视频从哪来"，
+    私聊就不该被它挡住。这里的用例把两个方向都钉住。
+    """
+
+    def _config(self, **video_keys: Any) -> dict[str, Any]:
+        config = video_config()
+        config['model']['video'].update(video_keys)
+        return config
+
+    def _media_session(self, source: str, *, is_direct: bool) -> SessionView:
+        """一段**转发来的**视频：坐标在媒体表里（`kind='video'`），不在元素里。"""
+        return SessionView(
+            platform='onebot', self_id='1', user_id='2', is_direct=is_direct,
+            content='[视频]',
+            elements=[],
+            media=[{'kind': 'video', 'source': source, 'summary': ''}],
+        )
+
+    async def _collect(self, host: Host, session: SessionView, ffmpeg: FakeFfmpeg) -> Any:
+        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
+                mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg):
+            return await video.collect_video_sources(host, {'id': 's'}, session)
+
+    async def test_a_private_forward_is_not_gated_by_the_group_switch(self) -> None:
+        """**反向**：私聊 + 转发视频 + 群聊开关关着（默认）→ 照常抽帧。
+
+        变异保护：把群闸写成"看视频从哪来"而不是"看会话是不是群"（或者干脆恒真），
+        这一条立刻红。
+        """
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(group_enabled=False))
+        result = await self._collect(
+            host, self._media_session('https://cdn.example.com/f.mp4', is_direct=True),
+            ffmpeg,
+        )
+        self.assertEqual(len(ffmpeg.argvs('frames')), 1, '私聊只受总开关管')
+        self.assertTrue(result.image_sources)
+        self.assertTrue(result.audio_sources)
+
+    async def test_a_group_forward_is_gated_by_the_group_switch(self) -> None:
+        """同一段视频换到群会话：群开关关着 → 一个 ffmpeg 都不发（闸门真的在管）。"""
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=self._config(group_enabled=False))
+        result = await self._collect(
+            host, self._media_session('https://cdn.example.com/f.mp4', is_direct=False),
+            ffmpeg,
+        )
+        self.assertEqual(ffmpeg.calls, [])
+        self.assertEqual((result.image_sources, result.audio_sources, result.note), ([], [], ''))
+
+    def test_the_group_judgement_reads_only_the_session(self) -> None:
+        """判据只认会话的 `is_direct`；拿不到这个字段时按**私聊**处理（保守那侧）。"""
+        self.assertFalse(video._is_group_session(
+            SessionView(platform='onebot', self_id='1', user_id='2', is_direct=True),
+        ))
+        self.assertTrue(video._is_group_session(
+            SessionView(platform='onebot', self_id='1', user_id='2', is_direct=False),
+        ))
+        self.assertFalse(video._is_group_session({'platform': 'onebot', 'user_id': '2'}),
+                         '"判不出来"不当成群聊（不该静默什么都不做）')
 
 
 # =========================================================================== #

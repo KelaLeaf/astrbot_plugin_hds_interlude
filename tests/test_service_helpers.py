@@ -1310,8 +1310,10 @@ class NormalizeConfigTests(unittest.TestCase):
         self.assertEqual(normalized['logging']['colors'], True)
         self.assertEqual(normalized['logging']['color_theme'], 'dark')
         self.assertEqual(normalized['logging']['kaomoji'], True)
-        self.assertEqual(normalized['runtime']['context_entry_limit'], 50)
-        self.assertEqual(normalized['runtime']['context_time_window_minutes'], 60)
+        # 上游 `src/index.ts:230-231` 与 schema 都是 35 / 45（早先这里钉成 50 / 60，
+        # 等于把 core 的第二份默认值写进了契约，见 `test_config_binding.py`）。
+        self.assertEqual(normalized['runtime']['context_entry_limit'], 35)
+        self.assertEqual(normalized['runtime']['context_time_window_minutes'], 45)
         self.assertEqual(normalized['runtime']['user_message_debounce_seconds'], 2)
         self.assertEqual(normalized['memory']['scene_entry_threshold'], 16)
         self.assertEqual(normalized['memory']['scene_character_threshold'], 10_000)

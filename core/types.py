@@ -1184,12 +1184,17 @@ class NarrativeProvider(Protocol):
 
 
 def empty_story_setting() -> StorySetting:
-    """上游 `emptyStorySetting()`：空剧本设定（默认值逐字照抄）。"""
+    """上游 `emptyStorySetting()`：空剧本设定（默认值逐字照抄）。
+
+    唯一例外是 `style`：上游那里是英文，本移植版把它对齐到
+    `_conf_schema.json` 的中文默认值（v1.9.5，见 `docs/PORTING_NOTES.md` §65）。
+    否则用户把「故事文风」清空时会掉回英文，与配置页显示的默认值不是同一句话。
+    """
     return {
         'character': {'name': 'Unnamed character', 'profile': ''},
         'user': {'display_name': '', 'profile': ''},
         'relationship': '', 'world': '', 'perspective': '', 'supporting_cast': '', 'location': '',
-        'style': 'Realistic, restrained, and centered on ordinary life.',
+        'style': '现实主义日常叙事，情绪克制，关系变化缓慢而具体。',
         'timezone': 'Asia/Shanghai',
     }
 

@@ -669,10 +669,12 @@ class TestPerTurnImageBudget(unittest.IsolatedAsyncioTestCase):
     def _sources(self, count: int) -> list[str]:
         return [self.HOST % index for index in range(1, count + 1)]
 
-    def _host(self, sources: Any, *, vision: Any = None) -> Any:
+    def _host(self, sources: Any, *, vision: Any = None, forward: Any = None) -> Any:
         host = _FlushHost(config={
             'runtime': {'message_separator': '<sep/>'},
             'model': {'vision': {'enabled': True, **(vision or {})}},
+            # v1.9.4：合并转发那一组（单卡 `max_images` 决定每回合上限的**默认值**）。
+            'forward_message': dict(forward) if forward else {},
         })
 
         async def fetch(url: str) -> bytes:
@@ -696,8 +698,8 @@ class TestPerTurnImageBudget(unittest.IsolatedAsyncioTestCase):
         }}
         return host
 
-    async def _flush(self, sources: Any, *, vision: Any = None) -> Any:
-        host = self._host(sources, vision=vision)
+    async def _flush(self, sources: Any, *, vision: Any = None, forward: Any = None) -> Any:
+        host = self._host(sources, vision=vision, forward=forward)
         await ServiceChunk3.flush_buffered_narrative(host, 'k', 3)
         return host
 
@@ -838,6 +840,157 @@ class TestPerTurnImageBudget(unittest.IsolatedAsyncioTestCase):
         host = await self._flush([*direct, *forwarded], vision={'max_per_turn': 4})
         self.assertEqual(len(self._images(host)), 4)
         self.assertIn('[图片×6，本回合仅取前 4 张]', self._message(host))
+
+    async def test_raising_only_the_forward_cap_really_gives_more(self) -> None:
+        """① 只把「单条转发最多读取的图片数」调到 6（每回合上限没动）→ **真的给 6 张**。
+
+        这就是用户那次真机报告的修法：他改的只有那一个键，模型就该真的多看到几张
+        （而不是被一个他没动过的默认 3 削掉）。
+
+        **变异保护（反向）**：把跟随规则删掉 = 两个键各算一份默认值 →
+        `len(self._images(host))` 会回到 3，这条当场红。
+        """
+        host = await self._flush(self._sources(14), forward={'max_images': 6})
+        self.assertEqual(len(self._images(host)), 6, '单卡调到 6，模型就该拿到 6 张')
+        self.assertIn('[图片×14，本回合仅取前 6 张]', self._message(host))
+        self.assertEqual(len(host.calls['try_decide'][17]), 6, 'attachments 同步（不虚报）')
+
+    async def test_an_explicit_turn_cap_still_wins(self) -> None:
+        """反向：本项改成了别的数 → 以本项为准（跟随只管"没改过"的那一档）。"""
+        host = await self._flush(
+            self._sources(14), vision={'max_per_turn': 2}, forward={'max_images': 6},
+        )
+        self.assertEqual(len(self._images(host)), 2)
+        self.assertIn('[图片×14，本回合仅取前 2 张]', self._message(host))
+
+    async def test_the_second_cut_follows_the_same_effective_budget(self) -> None:
+        """第二处下刀（`load_native_images`）也必须跟随同一个有效值。
+
+        不跟随的话 6 张会在那里被削回 3 —— 用户看到的就是"改了配置没用"（真机报告）。
+        """
+        png = _png_bytes()
+        fetched: list[str] = []
+
+        async def fetch(url: str) -> bytes:
+            fetched.append(url)
+            return png + url.encode('utf-8')
+
+        sources = self._sources(8)
+        host = _MediaHost(config={
+            'model': {'vision': {'enabled': True}},
+            'forward_message': {'max_images': 6},
+        })
+        host.transport = FakeTransport(fetch_image=fetch)
+        images = await ServiceChunk3.load_native_images(host, {'id': 's'}, sources, None)
+        self.assertEqual(len(images), 6, '两处下刀必须同源，否则 6 张在这里被削回 3')
+        self.assertEqual(fetched, sources[:6])
+
+
+# =========================================================================== #
+# 4.6 每回合音频预算（v1.9.5）
+# =========================================================================== #
+
+class TestPerTurnAudioBudget(unittest.IsolatedAsyncioTestCase):
+    """v1.9.5：多段视频的音轨被「每个事件音频数上限」切开时**必须可数**。
+
+    多段视频的音轨与直发语音走**同一条**语音通道，`maxPerMessage`（默认 1）以前把
+    第二段起的音轨**静默**切掉：模型不知道有，日志也不说。修法两半共用一处实现
+    （`chunk3.audio_turn_slice`）：线索进当前事件、节流 warn 进日志。
+
+    反向用例：把切片留着、把那句线索删掉 → `test_the_clue_counts_what_was_cut` 红；
+    总开关关掉还硬报"仅取前 0 段" → `test_master_switch_off_is_not_a_budget_cut` 红。
+    """
+
+    #: 三段**互不相同**的内联音频（`flush` 会先去重，同一串重复三次只会剩一段）。
+    AUDIO = 'data:audio/mp3;base64,QUJD'
+
+    def _sources(self, count: int) -> list[str]:
+        return ['data:audio/mp3;base64,%s' % ('QUJD' * (index + 1))
+                for index in range(count)]
+
+    def _host(self, count: int, *, audio: Any = None) -> Any:
+        host = _FlushHost(config={
+            'runtime': {'message_separator': '<sep/>'},
+            'model': {'audio': {'enabled': True, 'maxPerMessage': 1, **(audio or {})}},
+        })
+        host.buffered_narrative_turns = {'k': {
+            'storyId': 's', 'participantId': 'p',
+            'messages': [{
+                'content': '听听', 'occurredAt': NOW,
+                'imageSources': [], 'audioSources': self._sources(count),
+            }],
+            'latestSession': SessionView(
+                platform='onebot', self_id='1', user_id='u', channel_id='private:u',
+                content='听听', media=[],
+            ),
+            'timer': None, 'nextRevision': 3, 'inFlightRequestId': None,
+            'obsoleteRequestIds': set(),
+        }}
+        return host
+
+    async def _flush(self, count: int, *, audio: Any = None) -> Any:
+        host = self._host(count, audio=audio)
+        await ServiceChunk3.flush_buffered_narrative(host, 'k', 3)
+        return host
+
+    @staticmethod
+    def _message(host: Any) -> str:
+        return host.calls['try_decide'][5]
+
+    @staticmethod
+    def _audio(host: Any) -> Any:
+        """`tryDecide` 的第 11 个位置参数 = 本回合进 payload 的原生音频。"""
+        return host.calls['try_decide'][10]
+
+    @staticmethod
+    def _warns(host: Any) -> list[str]:
+        return [
+            entry[-1] for entry in host.logs
+            if isinstance(entry, tuple) and entry and isinstance(entry[-1], str)
+            and '每个事件音频数上限' in entry[-1]
+        ]
+
+    async def test_the_clue_counts_what_was_cut(self) -> None:
+        host = await self._flush(3)
+        self.assertEqual(len(self._audio(host)), 1, '默认上限就是 1 段')
+        self.assertIn('[音轨×3，本回合仅取前 1 段]', self._message(host),
+                      '可数线索必须给模型：一共几段、给了几段')
+        warns = self._warns(host)
+        self.assertEqual(len(warns), 1, '丢内容必须看得见（坑 25）')
+        self.assertIn('本回合收到 3 段音轨', warns[0])
+        self.assertIn('只交给模型前 1 段', warns[0])
+
+    async def test_raising_the_limit_really_reads_more(self) -> None:
+        host = await self._flush(3, audio={'maxPerMessage': 2})
+        self.assertEqual(len(self._audio(host)), 2)
+        self.assertIn('[音轨×3，本回合仅取前 2 段]', self._message(host))
+        self.assertIn('只交给模型前 2 段', self._warns(host)[0])
+
+    async def test_no_clue_when_nothing_was_cut(self) -> None:
+        host = await self._flush(1)
+        self.assertEqual(len(self._audio(host)), 1)
+        self.assertNotIn('[音轨×', self._message(host))
+        self.assertEqual(self._warns(host), [])
+
+    async def test_master_switch_off_is_not_a_budget_cut(self) -> None:
+        host = await self._flush(3, audio={'enabled': False})
+        self.assertEqual(self._audio(host), [], '总开关关着 = 整条语音通道不读')
+        self.assertNotIn('[音轨×', self._message(host), '关着时不许说"仅取前 0 段"')
+        self.assertEqual(self._warns(host), [])
+
+    def test_the_helper_is_the_single_judgement(self) -> None:
+        """切片与线索共用一处：`audio_turn_slice` 的数就是线索里的数。"""
+        from plugin.core.service.chunk3 import (  # noqa: PLC0415
+            audio_turn_budget_note, audio_turn_slice,
+        )
+
+        host = _MediaHost(config={'model': {'audio': {'enabled': True, 'maxPerMessage': 1}}})
+        sources = self._sources(3)
+        to_take, available, granted = audio_turn_slice(host, sources)
+        self.assertEqual((len(to_take), available, granted), (1, 3, 1))
+        self.assertEqual(audio_turn_budget_note(available, granted), '[音轨×3，本回合仅取前 1 段]')
+        self.assertEqual(audio_turn_budget_note(1, 1), '')
+        self.assertEqual(audio_turn_slice(host, []), ([], 0, 0))
 
 
 # =========================================================================== #

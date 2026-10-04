@@ -2671,6 +2671,24 @@ class ForwardMediaIntegrationTests(unittest.TestCase):
         self.assertEqual(bridge.image_budget(), 3)
         self.assertGreaterEqual(bridge.forward_media_turn_cap(), 6)
 
+    def test_raising_only_the_card_cap_reaches_the_bridge(self):
+        """v1.9.4：只把 `forward_message.max_images` 调到 10、`max_per_turn` 没动 →
+        适配层算出来的每回合预算就是 10（与 core 的 `chunk3` 同一个数）。
+
+        变异保护：适配层自己再算一份默认值（不把单卡上限交给
+        `vision_budget.resolve_image_budget`）→ 这条红。
+        """
+        bot = _FakeOneBotClient({'res-1': _forward_image_pages(10)})
+        bridge = _bridge_with_bot({'forward_message': {'max_images': 10}}, bot)
+        self.assertEqual(bridge.image_budget(), 10)
+        self.assertEqual(bridge.forward_media_turn_cap(), 10)
+        # 显式改过每回合上限时以它为准（跟随只管"没改过"的那一档）。
+        other = _bridge_with_bot({
+            'forward_message': {'max_images': 10},
+            'model_center': {'vision': {'enabled': True, 'max_per_turn': 2}},
+        }, _FakeOneBotClient({}))
+        self.assertEqual(other.image_budget(), 2)
+
     def test_forward_images_become_sources_and_attachments_on_the_session(self):
         """端到端那一半：转发的图进 `SessionView.media` → 视觉来源 / 附件原料。"""
         bot = _FakeOneBotClient({'res-1': _forward_image_pages(2)})

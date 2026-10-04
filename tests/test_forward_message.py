@@ -1028,6 +1028,22 @@ class ForwardMediaReadTests(unittest.TestCase):
         self.assertEqual(FORWARD_MEDIA_MAX_PER_TURN, 6)
         self.assertGreaterEqual(FORWARD_MEDIA_MAX_PER_TURN, FORWARD_MEDIA_MAX_PER_FORWARD)
 
+    def test_the_two_keys_share_one_starting_point(self):
+        """v1.9.4（**交叉对账**）：单卡上限与每回合上限的默认值必须是**同一个数**。
+
+        每回合上限（`vision_budget.resolve_image_budget`）在"没被改过"时向上跟随单卡上限
+        —— 这条规则只有两边同一起点才自洽。任何一边单独漂移（这里或
+        `test_configuration.test_the_two_image_keys_share_one_starting_point`）都要红。
+
+        **反向（同一条断言的反面）**：曾经的做法是"两边各算一份默认值"（单卡 3、每回合
+        另一份 3，互不相干）——那时用户把本项调到 6 仍然只拿到 3 张，正是真机报告。
+        """
+        from plugin.core.vision_budget import VISION_IMAGE_BUDGET_DEFAULT  # noqa: PLC0415
+
+        self.assertEqual(FORWARD_MEDIA_MAX_PER_FORWARD, VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(forward_read_limits({}).max_images, VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(forward_read_limits(None).max_images, VISION_IMAGE_BUDGET_DEFAULT)
+
     def test_the_turn_cap_follows_the_per_turn_image_budget(self):
         """v1.9.4：媒体表上限**跟随**每回合图片预算与单卡 `max_images`。
 

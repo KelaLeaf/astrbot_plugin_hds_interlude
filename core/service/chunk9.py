@@ -273,7 +273,7 @@ class ServiceChunk9(ServiceBase):
                 'message': message,
                 'args': list(args or []),
                 'colors': logging_config.get('colors') is not False,
-                'color_theme': logging_config.get('colorTheme') or 'dark',
+                'color_theme': pick(logging_config, 'colorTheme', 'color_theme') or 'dark',
                 'kaomoji': logging_config.get('kaomoji') is not False,
             })
         elif logging_format == 'compact':
@@ -369,7 +369,7 @@ class ServiceChunk9(ServiceBase):
                 'args': list(args or []),
                 'standalone': True,
                 'colors': logging_config.get('colors') is not False,
-                'color_theme': logging_config.get('colorTheme') or 'dark',
+                'color_theme': pick(logging_config, 'colorTheme', 'color_theme') or 'dark',
                 'kaomoji': logging_config.get('kaomoji') is not False,
                 **({'category': category} if category else {}),
             })

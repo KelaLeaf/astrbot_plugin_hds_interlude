@@ -2746,11 +2746,13 @@ class AstrbotTransport:
         html = await self.bridge.http_get_text(target, timeout_ms)
         if not html:
             return None
+        text = _extract_text(html)
+        max_text, max_excerpt = _browser_text_limits(self.bridge)
         return {
             'url': target,
             'title': _extract_title(html),
-            'excerpt': _extract_text(html)[:3_000],
-            'text': _extract_text(html)[:12_000],
+            'excerpt': text[:max_excerpt],
+            'text': text[:max_text],
         }
 
     # ---- typ-0 后台投递出口 ----
@@ -3599,6 +3601,45 @@ def _pick_any(value: Any, *names: str) -> Any:
         if name in value and value[name] is not None:
             return value[name]
     return None
+
+
+#: 网页正文 / 单条观察的**兜底**字符上限（= `_conf_schema.json` 的 browser 默认值）。
+#: 只在配置读不出来时用；正常情况下取 `browser.max_text_characters` /
+#: `max_excerpt_characters`（与 core 侧 `clip()` 同一处判据）。
+_BROWSER_MAX_TEXT_CHARACTERS = 12_000
+_BROWSER_MAX_EXCERPT_CHARACTERS = 3_000
+
+
+def _browser_text_limits(bridge: Any) -> tuple[int, int]:
+    """`(max_text_characters, max_excerpt_characters)`：读 `browser` 段（两种拼写都认）。
+
+    为什么桥这一侧也要读配置：`visit_web()` 是**先发生**的那道截断，core 拿到
+    `text` / `excerpt` 之后才按同一配置再 `clip()` 一次。桥写死 12_000 / 3_000 时，
+    用户把「正文提取字符上限」调大也拿不回被砍掉的正文——"改了没反应"。
+    """
+    section: Any = {}
+    reader = getattr(bridge, 'section', None)
+    if callable(reader):
+        try:
+            data = reader('browser')
+        except Exception:  # noqa: BLE001 - 读配置失败不该让观察失败
+            data = None
+        if isinstance(data, dict):
+            section = data
+    return (
+        _positive_int(pick(section, 'maxTextCharacters', 'max_text_characters'),
+                      _BROWSER_MAX_TEXT_CHARACTERS),
+        _positive_int(pick(section, 'maxExcerptCharacters', 'max_excerpt_characters'),
+                      _BROWSER_MAX_EXCERPT_CHARACTERS),
+    )
+
+
+def _positive_int(value: Any, default: int) -> int:
+    """正整数读取：非数 / bool / ≤ 0 一律回落 `default`。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    number = int(value)
+    return number if number > 0 else default
 
 
 def _normalize_search_results(result: Any, query: str) -> list[dict[str, Any]]:
@@ -5907,12 +5948,16 @@ class AstrbotBridge:
         return {}
 
     def image_budget(self) -> int:
-        """每回合图片预算（v1.9.4）：`model_center.vision.max_per_turn`。
+        """每回合图片预算（v1.9.4；v1.9.4 起默认值向上跟随单卡转发上限）。
 
         段位由 `section()` 归一（schema 是 `model_center.vision`，core 读 `model.vision`），
-        解析与默认值在 `core/vision_budget.py` 一处 —— 这里只负责把配置取出来。
+        解析与**跟随规则**都在 `core/vision_budget.py` 一处 —— 这里只负责把两个段位取出来
+        （`forward_section()` 已经把新旧组名与两种拼写都归一好了）。只把单卡上限调大、
+        没动本项时，`AstrbotBridge.image_budget()` 与 `chunk3` 会算出**同一个**数。
         """
-        return resolve_image_budget(self.section('vision'))
+        return resolve_image_budget(
+            self.section('vision'), forward_read_limits(self.forward_section()).max_images,
+        )
 
     def forward_media_turn_cap(self) -> int:
         """整条消息的转发媒体条目上限（跟随每回合图片预算与单卡 `max_images`）。

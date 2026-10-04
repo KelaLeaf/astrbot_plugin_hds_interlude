@@ -9,6 +9,10 @@
 * **预算可配**：默认 `3`（省成本那侧 —— 维持 v1.9.1 及之前的行为）。
   schema 的 `default` 与 `CONFIG_DEFAULTS['model']['vision']` 都照 `VISION_IMAGE_BUDGET_DEFAULT`
   抄，`test_configuration.py` 三方对账（照 `video_understanding.VIDEO_CONFIG_DEFAULTS` 那套做法）。
+* **不再与单卡上限打架**（v1.9.4）：本项**没被改过**（= 默认 3）时，有效值向上跟随
+  「合并转发 → 单条转发最多读取的图片数」（`forward_message.max_images`）—— 用户只调
+  那一个键，模型就真的能多看到几张。判据仍然只有 `resolve_image_budget()` 一处，
+  转发那一侧只提供**已经夹好的**单卡上限，不重复算一份预算。
 * **截断可见**：`image_budget_note(available, granted)` 给模型一句短、可数的线索
   （`[图片×14，本回合仅取前 3 张]`，沿用既有占位文本的形态）；`note_image_budget_skip()`
   给日志一条**同原因节流**的 warn（丢的是内容，用户要看得到，坑 25）。
@@ -23,7 +27,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 __all__ = [
     'VISION_IMAGE_BUDGET_DEFAULT',
@@ -96,14 +100,43 @@ def normalize_image_budget(value: Any) -> int:
     return max(VISION_IMAGE_BUDGET_MIN, min(VISION_IMAGE_BUDGET_MAX, number))
 
 
-def resolve_image_budget(section: Any) -> int:
+def _forward_limit(forward_limit: Any) -> Optional[int]:
+    """单卡转发上限（调用方给的**已夹取值**）→ 整数；读不出来回 `None`（= 没这条线）。"""
+    if isinstance(forward_limit, bool) or forward_limit is None:
+        return None
+    try:
+        return int(float(forward_limit))
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_image_budget(section: Any, forward_limit: Any = None) -> int:
     """`model_center.vision` 段 → 每回合图片预算（缺键 = 默认 3）。
 
     读不出来（脏值 / bool / 非数）一律回 `VISION_IMAGE_BUDGET_DEFAULT`：用户手改坏了
     配置不该悄悄变成"不限制"或者"一张都不给"。读得出来的值夹到
     `[VISION_IMAGE_BUDGET_MIN, VISION_IMAGE_BUDGET_MAX]`。
+
+    **两张卡不再打架（v1.9.4）**：`forward_limit` 是
+    `forward_message.forward_read_limits(段).max_images`（单条转发最多读取的图片数，
+    0~10，已经由**那一处**夹好；不传 = 老行为，只有本项说了算）。
+
+    规则只有一条 —— **本项没被改过**（读出来等于 `VISION_IMAGE_BUDGET_DEFAULT`）时，
+    有效值向上跟随单卡上限：用户只把「单条转发最多读取的图片数」调到 10，这一回合就
+    真的有 10 个位置，而不是被一个他没动过的默认 3 削掉（"改了配置却还是 3 张"）。
+    本项一旦改成别的值（≠ 3）就以本项为准，单卡上限只管"从卡里取几个坐标"。只向上
+    跟随：把单卡上限调**小**（1 / 0）不会连累直发图的额度。
+
+    "没被改过"的判定是"值等于 schema 默认值"——与全项目其他配置项同一条口径
+    （宿主每次加载都按 schema 补默认值，落盘后的配置分不出"写过 3"与"没写"）。
     """
-    return normalize_image_budget(_pick(section, 'maxPerTurn', 'max_per_turn'))
+    value = normalize_image_budget(_pick(section, 'maxPerTurn', 'max_per_turn'))
+    if value != VISION_IMAGE_BUDGET_DEFAULT:
+        return value
+    limit = _forward_limit(forward_limit)
+    if limit is None:
+        return value
+    return max(value, min(VISION_IMAGE_BUDGET_MAX, limit))
 
 
 # --------------------------------------------------------------------------- #
@@ -144,6 +177,9 @@ def note_image_budget_skip(
     为什么是 warn 而不是 diagnostic（坑 25）：这里是**真的丢了内容** —— 用户只会在
     剧本里看见她少讲了几张图。不给一条可行动的日志，用户就只能猜"是不是模型不听话"。
     节流键里带会话坐标（与 `note_access_skip` 同一套写法），同一条原因 10 分钟一条。
+
+    `budget` 保留在签名里（调用方与既有用例按旧签名传），v1.9.5 起文案不再渲染具体上限
+    —— 用户从「模型中心 → 图片理解」看得到。
     """
     note = getattr(service, 'note_access_skip', None)
     if not callable(note):
@@ -160,12 +196,10 @@ def note_image_budget_skip(
         taken = int(granted)
     except (TypeError, ValueError):
         return False
-    if budget is None:
-        budget = taken
     return bool(note(
         'image-budget|%s|%s|%s' % (platform, self_id, scope),
         VISION_IMAGE_BUDGET_WARN_INTERVAL_MS,
         '本回合收到 %d 张图片，按「每回合图片数上限」只交给模型前 %d 张'
-        '（model_center.vision.max_per_turn = %s；调大后 token / 延迟 / 费用会上升）',
-        total, taken, budget,
+        '（可在「模型中心 → 图片理解」调大）。',
+        total, taken,
     ))

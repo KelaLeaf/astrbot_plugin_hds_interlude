@@ -108,8 +108,8 @@
 
 | 预算 | 位置 | 默认 | 区间 | 理由 |
 | --- | --- | --- | --- | --- |
-| `maxImages`（单条转发最多取几张图） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_images` | **3** | 0~10 | 转发里的图**先过这一道**。它管的是"从这张卡里取出几个坐标"：取 3 而不是 15，省的是原生图 token 与下载时间；取 0 就等于关掉"转发也看图"，是个**合法**配置（用例钉着）。取出多少张由卡上那句 `[图片×15，仅取前 3 张]` 说清 |
-| `maxVideos`（单条转发最多读取几段视频） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_videos` | **1**（一张卡最多看一段） | 0~10 | 视频比图贵一个量级：每读一段就是一次 ffmpeg（抽帧 + 抽音轨）加一次视觉预算占用。默认**1**＝**配了就生效**，同时把单卡的额外成本封在一次以内（用户口径是"可配置单条转发最多读取的视频数"——配了却默认永不生效不算配置）；显式配成 **0** 才是 v1.8.7 的老行为"转发里的视频一段都不读"。取到的坐标交给 `model_center.video` 那条链，受它自己的总开关 / 群聊开关管 |
+| `maxImages`（单条转发最多取几张图） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_images` | **3** | 0~10 | 转发里的图**先过这一道**。它管的是"从这张卡里取出几个坐标"：取 3 而不是 15，省的是原生图 token 与下载时间；取 0 就等于关掉"转发也看图"，是个**合法**配置（用例钉着）。取出多少张由卡上那句 `[图片×15，仅取前 3 张]` 说清。**v1.9.4 起每回合图片预算没改过时跟随本项**（见 `core/vision_budget.py`：只调这一个键，模型就真的多看到几张） |
+| `maxVideos`（单条转发最多读取几段视频） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_videos` | **1** | 0~10 | 视频比图贵一个量级：每读一段就是一次 ffmpeg（抽帧 + 抽音轨）加一次视觉预算占用。"一段" = 一条视频消息段（去重后的坐标）。**同一个数也是一回合真正读取几段的上限**（v1.9.4，`video_understanding.video_read_budget()`）——一句判据管两处，不许第二处再算一份。显式配成 **0** 才是 v1.8.7 的老行为"转发里的视频一段都不读"（转发这一侧连坐标都不收；私聊直发的视频不受这个键管）。取到的坐标交给 `model_center.video` 那条链：私聊只看它的总开关，群聊另看群聊开关 |
 | `forward_media_turn_cap()`（整条消息的转发媒体表上限） | 本模块函数（**不暴露配置**；v1.9.4 起**跟随**每回合图片预算） | `max(6, 每回合图片预算, 单卡 max_images)` | — | 它**不是**第三道视觉预算，只是媒体条目表的安全上限：削在这里，下游就再也说不出"一共几张"。所以取值必须 ≥ 用户配得出来的任何一份（`chunk3` 的每回合预算 / 单卡 `max_images`）。真正的视觉上限由 `chunk3` 那一刀执行，并在当前事件里留 `[图片×14，本回合仅取前 3 张]` |
 | 单张体积上限 | **不加新键**：复用 `stickers.max_file_size_mb`（默认 10MB） | 视觉路径 `chunk3.MAX_NATIVE_IMAGE_BYTES`（4MB）、收藏路径 `store_collected_sticker` 的 `max_file_size_mb` | — | "一张图多大算大"在这个仓库里已经有答案，再写一份就是第二个真相 |
 | 只取前面的 | 节点顺序（含嵌套展开顺序） | — | — | 与三重预算同一条纪律：**排在前面的先拿**，后面的只留线索 |
@@ -193,12 +193,15 @@ class ForwardReadLimits:
 
     `max_images`（v1.8.7）是**第四道预算**：单条合并转发最多取几张图的坐标。
     默认 3（与直发消息的视觉预算同量级）、区间 0~10，理由见模块 docstring。
+    v1.9.4 起，「每回合图片数上限」没被改过时**跟随本项**（`core/vision_budget.py`
+    的 `resolve_image_budget()` 一处判）。
 
-    `max_videos`（v1.9.1）是**第五道预算**：单条合并转发最多读取几段视频。默认
-    **1**（一张卡最多看一段）：配了就生效，同时把单卡的额外成本封在一次以内；
-    区间 0~10，显式配 0 才是 v1.8.7 之前的"一段都不读"。
-    取到的视频坐标随 `SessionView.media`（`kind='video'`）流给
-    `core/video_understanding.py`，由那里的抽帧识别真正"看"（受总开关与群聊开关管）。
+    `max_videos`（v1.9.1）是**第五道预算**：单条合并转发最多读取几段视频（"一段" =
+    一条视频消息段）。默认 **1**，把单卡与单回合的额外成本都封在一次以内；区间 0~10，
+    显式配 0 才是 v1.8.7 之前的"转发里的视频一段都不读"。取到的视频坐标随
+    `SessionView.media`（`kind='video'`）流给 `core/video_understanding.py`，由那里的
+    抽帧识别真正"看"（私聊只看总开关，群聊另看群聊开关）；**同一个数也是那里
+    "一回合真正读取几段"的上限**（`video_read_budget()`，判据一处）。
     """
 
     max_nodes: int = 30
@@ -214,10 +217,12 @@ DEFAULT_LIMITS = ForwardReadLimits()
 #: 单条转发最多取几张图（`ForwardReadLimits.max_images` 的默认值）。
 FORWARD_MEDIA_MAX_PER_FORWARD = DEFAULT_LIMITS.max_images
 
-#: 单条转发最多读取几段视频（`ForwardReadLimits.max_videos` 的默认值）。
-#: **1 = 一张卡最多看一段**：转发里的视频要真的抽帧才看得见，那是 ffmpeg + 视觉预算的
-#: 实打实成本，所以把它封在一次以内（与 `max_images` 默认 3 的差别就在这里：图片本来就
-#: 常在转发的正文里）。显式配 0 = 关掉"转发也看视频"。
+#: 单条转发最多读取几段视频（`ForwardReadLimits.max_videos` 的默认值；"一段" = 一条
+#: 视频消息段）。转发里的视频要真的抽帧才看得见，那是 ffmpeg + 视觉预算的实打实成本，
+#: 所以把它封在一次以内（与 `max_images` 默认 3 的差别就在这里：图片本来就常在转发的
+#: 正文里）。显式配 0 = 关掉"转发也看视频"。
+#: ⚠️ 这个数同时是 `video_understanding.video_read_budget()` 的返回值（一回合真正读取
+#: 几段）——改这里就是改那里，别再在视频那一侧写死一份。
 FORWARD_VIDEO_MAX_PER_FORWARD = DEFAULT_LIMITS.max_videos
 
 #: **整条消息**里所有合并转发的媒体条目总数上限的**下限**（v1.8.7 的常量值）。
@@ -306,8 +311,8 @@ def forward_read_limits(value: Any = None) -> ForwardReadLimits:
         max_images=_limit_value(
             source, 'maxImages', 'max_images', 0, 10, DEFAULT_LIMITS.max_images,
         ),
-        # 视频同理：**默认就是 1**（一张卡最多看一段）——预设成"配了就生效"，
-        # 同时封住单卡的额外成本；显式配 0 才是"转发里的视频一段都不读"。
+        # 视频同理：**默认就是 1** —— 单卡与单回合的额外成本都封在一次以内；
+        # 显式配 0 才是"转发里的视频一段都不读"。
         max_videos=_limit_value(
             source, 'maxVideos', 'max_videos', 0, 10, DEFAULT_LIMITS.max_videos,
         ),
@@ -421,8 +426,8 @@ class ForwardMedia:
       （三档判据仍然只有那一处实现）。**视频也走这张表**（v1.9.1）：`kind='video'` 的条目
       只有坐标与段类型，不带画面——真正"看"它的是抽帧识别（`model_center.video` /
       `core/video_understanding.py`，坐标经 `SessionView.media` 流过去）。读不读由
-      `ForwardReadLimits.max_videos` 决定（默认 1：一张卡最多读一段；配 0 则一段都不读，
-      只留 `[视频×K，未取]`）；
+      `ForwardReadLimits.max_videos` 决定（默认 1：一段；配 0 则一段都不读，
+      只留 `[视频×K，未取]`；这个数同时也是"一回合真正读取几段"的上限）；
     * `source`：可取回的坐标（`https://…` / `file://…` / 裸路径）；
     * `summary`：平台原文（`[动画表情]` 之类）。
     """
@@ -443,7 +448,7 @@ class ForwardMediaBudget:
     """
 
     max_images: int = FORWARD_MEDIA_MAX_PER_FORWARD
-    #: 单条转发最多读取几段视频（默认 1 = 一张卡最多看一段；见 `ForwardReadLimits.max_videos`）。
+    #: 单条转发最多读取几段视频（默认 1；见 `ForwardReadLimits.max_videos`）。
     max_videos: int = FORWARD_VIDEO_MAX_PER_FORWARD
     #: 平台那一侧**见到**的可取回图片数（含超预算没取的）——线索里的那个 N。
     image_count: int = 0

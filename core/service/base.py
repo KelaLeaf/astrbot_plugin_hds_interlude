@@ -1988,7 +1988,11 @@ class ServiceChunk0(ServiceBase):
         config = self._access_config()
         self_id = normalize_account_id(pick(session, 'selfId', 'self_id'))
         user_id = normalize_account_id(pick(session, 'userId', 'user_id'))
-        if pick(config, 'ignoreSelfMessages', 'ignore_self_messages') and self_id and self_id == user_id:
+        # `default=True`：与 `explain_group_access` 和 schema 的默认值同一把尺子。
+        # 早先这里没给默认（缺键 = `None` = 不忽略），同一个键在私聊/群聊两条路上
+        # 能得出相反结论——判据一处。
+        if self._access_flag('ignoreSelfMessages', 'ignore_self_messages', default=True) \
+                and self_id and self_id == user_id:
             return False, '机器人自己发的消息（`ignore_self_messages`）'
         if self._access_flag('botAccountsOnly', 'bot_accounts_only'):
             if not is_enabled_account(pick(config, 'botAccounts', 'bot_accounts'), self_id):
