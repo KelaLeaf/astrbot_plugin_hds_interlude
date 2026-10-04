@@ -353,6 +353,62 @@ class TokenUsageBoundaryTests(unittest.TestCase):
         self.assertEqual(line, '输入=0（缓存 0） 输出=3')
 
 
+class UsageCallCountTests(unittest.IsolatedAsyncioTestCase):
+    """v1.9.4：**调用发生了就要数一次**，哪怕没有任何一方报 token。
+
+    真机症状：模型全部来自 AstrBot Provider，「Token 统计」页连调用次数都是 0——
+    上游只在"有 token 上报"时才 emit，网关不回 `usage` 的机器于是整条被吞掉。
+    """
+
+    def make_narrator(self, http, on_usage=None):
+        return OpenAICompatibleNarrator(
+            http, make_config(), silent_logs=True, on_usage=on_usage,
+        )
+
+    async def test_a_call_without_usage_still_reports_one_call_with_its_identity(self):
+        http = FakeHttpClient(responses=[{
+            'choices': [{'message': {'content': '{"script":"嗯。"}'}}],
+        }])
+        usages: list = []
+        client = self.make_narrator(http, on_usage=usages.append)
+        payload_patch, prompt_patch = stub_prompts()
+        with payload_patch, prompt_patch:
+            decision = await client.decide(make_request())
+        self.assertEqual(decision['script'], '嗯。')
+        # 身份 + 显式 `calls`：账本据此建行（token 三列留 0，页面按"不可用"显示）。
+        self.assertEqual(usages, [{
+            'task': '主叙事', 'provider_label': 'P1', 'model': 'm1', 'calls': 1,
+        }])
+
+    async def test_a_call_that_reported_tokens_does_not_get_an_extra_identity_record(self):
+        http = FakeHttpClient(responses=[{
+            'choices': [{'message': {'content': '{"script":"嗯。"}'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 2},
+        }])
+        usages: list = []
+        client = self.make_narrator(http, on_usage=usages.append)
+        payload_patch, prompt_patch = stub_prompts()
+        with payload_patch, prompt_patch:
+            await client.decide(make_request())
+        self.assertEqual(len(usages), 1, usages)
+        self.assertEqual(usages[0]['input_tokens'], 10)
+        self.assertNotIn('calls', usages[0], '有 token 时仍由账本自己数一次')
+
+    async def test_a_side_task_without_usage_is_counted_under_its_own_task_name(self):
+        """侧任务（压缩）同理：任务名与连接照样记下，不受"没 token"影响。"""
+        http = FakeHttpClient(responses=[{
+            'choices': [{'message': {'content': '{"summary":"压缩结果"}'}}],
+        }])
+        usages: list = []
+        client = self.make_narrator(http, on_usage=usages.append)
+        await client.compact({
+            'entries': [{'kind': 'user-message', 'content': 'x', 'occurred_at': '2026-01-01T00:00:00Z'}],
+        })
+        self.assertEqual(len(usages), 1, usages)
+        self.assertEqual(usages[0]['task'], '压缩')
+        self.assertEqual(usages[0]['calls'], 1)
+
+
 # ======================================================================================
 # streaming-reply.test.ts（逐条移植）
 # ======================================================================================

@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from plugin.core.service import chunk3
+from plugin.core.service.base import ServiceChunk0
 from plugin.core.service.chunk3 import ServiceChunk3, _load_group_batch_audio
 from plugin.core.service.session import SessionView
 from plugin.core.service.transport import NullTransport
@@ -472,9 +473,13 @@ class TestFlushBufferedNarrativeGuards(unittest.IsolatedAsyncioTestCase):
 class _FlushHost(FakeService):
     """把 `flushBufferedNarrative` 的全部跨 mixin 依赖记下来的替身。"""
 
-    def __init__(self) -> None:
+    #: 生产链路上 `note_access_skip`（按原因节流的 warn）来自 Chunk0；本文件的替身只
+    #: 继承 Chunk3，这里把**生产那一份实现**借过来（不另写一套节流，免得替身比生产更宽）。
+    note_access_skip = ServiceChunk0.note_access_skip
+
+    def __init__(self, config: Any = None) -> None:
         super().__init__(
-            config={'runtime': {'message_separator': '<sep/>'}},
+            config=config if config is not None else {'runtime': {'message_separator': '<sep/>'}},
         )
         self.calls: dict[str, Any] = {}
         self.participant = {
@@ -641,6 +646,198 @@ class TestFlushBufferedNarrativePipeline(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('send_outgoing_messages', host.calls)
         self.assertNotIn('persist_decision', host.calls)
         self.assertEqual(host.buffered_narrative_turns, {})
+
+
+# =========================================================================== #
+# 4.5 每回合图片预算（v1.9.4）
+# =========================================================================== #
+
+class TestPerTurnImageBudget(unittest.IsolatedAsyncioTestCase):
+    """v1.9.4：每回合图片预算**可配**，且截断**必须可见**。
+
+    真机现场（用户 2026-10-04）：一条 17 节点的合并转发（节点 2–15 全是图）+ 同批 3 张
+    直发图，模型只拿到 3 张 —— 而上下文里**没有一句"一共几张、给了几张"**：她既看不到
+    其余的，也不知道还有。根因是 `chunk3` 里写死的两处 `[:3]`（flush 与
+    `load_native_images`），转发那道预算（`forward_message.max_images`）调多大都改不动它。
+
+    这几条用例钉住修法的四件事：默认仍是 3、**改配置真的多给**、没截断时闭嘴、
+    截断时线索里两个数（一共 / 给了）都在。
+    """
+
+    HOST = 'https://gchat.qpic.cn/turn/%02d.png'
+
+    def _sources(self, count: int) -> list[str]:
+        return [self.HOST % index for index in range(1, count + 1)]
+
+    def _host(self, sources: Any, *, vision: Any = None) -> Any:
+        host = _FlushHost(config={
+            'runtime': {'message_separator': '<sep/>'},
+            'model': {'vision': {'enabled': True, **(vision or {})}},
+        })
+
+        async def fetch(url: str) -> bytes:
+            # 每张 URL 给一份不同字节的**纯色**图：`image_perceptual_hash` 对纯色图
+            # 返回空串（不参与同图去重），所以这里数的确实是"预算给了几张"。
+            return _png_bytes() + url.encode('utf-8')
+
+        host.transport = FakeTransport(fetch_image=fetch)
+        host.buffered_narrative_turns = {'k': {
+            'storyId': 's', 'participantId': 'p',
+            'messages': [{
+                'content': '你看', 'occurredAt': NOW,
+                'imageSources': list(sources), 'audioSources': [],
+            }],
+            'latestSession': SessionView(
+                platform='onebot', self_id='1', user_id='u', channel_id='private:u',
+                content='你看', media=[],
+            ),
+            'timer': None, 'nextRevision': 3, 'inFlightRequestId': None,
+            'obsoleteRequestIds': set(),
+        }}
+        return host
+
+    async def _flush(self, sources: Any, *, vision: Any = None) -> Any:
+        host = self._host(sources, vision=vision)
+        await ServiceChunk3.flush_buffered_narrative(host, 'k', 3)
+        return host
+
+    @staticmethod
+    def _message(host: Any) -> str:
+        """`tryDecide` 的第 6 个位置参数 = 当前事件正文（`userMessage`）。"""
+        return host.calls['try_decide'][5]
+
+    @staticmethod
+    def _images(host: Any) -> Any:
+        """`tryDecide` 的第 10 个位置参数 = 本回合进 payload 的原生图。"""
+        return host.calls['try_decide'][9]
+
+    @staticmethod
+    def _budget_warns(host: Any) -> list[str]:
+        return [
+            entry[-1] for entry in host.logs
+            if isinstance(entry, tuple) and entry and isinstance(entry[-1], str)
+            and '每回合图片数上限' in entry[-1]
+        ]
+
+    async def test_default_budget_gives_three_and_the_clue_counts_fourteen(self) -> None:
+        """① 预算=3 + 候选 14 张 → 只给 3 张，**且线索里 14 与 3 都在**。"""
+        host = await self._flush(self._sources(14))
+        self.assertEqual(len(self._images(host)), 3, '默认预算就是省成本那侧的 3')
+        self.assertIn('[图片×14，本回合仅取前 3 张]', self._message(host),
+                      '可数线索必须给模型：一共几张、给了几张')
+        warns = self._budget_warns(host)
+        self.assertEqual(len(warns), 1, '日志里也要有一条（丢内容必须看得见）')
+        self.assertIn('14', warns[0])
+        self.assertIn('只交给模型前 3 张', warns[0])
+        # 给了几张，payload 里的 `attachments` / `imageCount` 也必须是几张（不虚报）。
+        self.assertEqual(len(host.calls['try_decide'][17]), 3)
+
+    async def test_raising_the_budget_really_gives_more(self) -> None:
+        """② 预算改成 6 → **真的给 6 张**（证明配置生效，不是摆设）。
+
+        `attachments` 也要跟着变 6：它就是"这条消息带了什么"那张表（先于视频帧算完的
+        那一刀），只改预算而不改它 = 模型看到 6 张图却只被告知带了 3 张。
+        """
+        for spelling in ({'max_per_turn': 6}, {'maxPerTurn': 6}):
+            with self.subTest(spelling=spelling):
+                host = await self._flush(self._sources(14), vision=spelling)
+                self.assertEqual(len(self._images(host)), 6, spelling)
+                self.assertIn('[图片×14，本回合仅取前 6 张]', self._message(host))
+                self.assertEqual(len(host.calls['try_decide'][17]), 6, 'attachments 同步')
+
+    async def test_no_clue_when_nothing_was_cut(self) -> None:
+        """③ 候选 2 张 → **不出现**截断线索（没截断就不许说"仅取前 N"）。"""
+        host = await self._flush(self._sources(2))
+        self.assertEqual(len(self._images(host)), 2)
+        self.assertNotIn('[图片×', self._message(host))
+        self.assertEqual(self._budget_warns(host), [], '也没截断就没这条 warn')
+
+    async def test_no_clue_when_image_understanding_is_off(self) -> None:
+        """③ 反向：图片理解关着时一张都不给模型，就**不许**说"取了前 3 张"。
+
+        那时 `load_native_images` 直接回空表（既有闸），线索说"取了 3 张"就是假话；
+        关着时的正确表述由既有链路管（"没有视觉输入"），这里一个字都不加。
+        """
+        host = _FlushHost(config={
+            'runtime': {'message_separator': '<sep/>'},
+            'model': {'vision': {'enabled': False}},
+        })
+        host.buffered_narrative_turns = {'k': {
+            'storyId': 's', 'participantId': 'p',
+            'messages': [{
+                'content': '你看', 'occurredAt': NOW,
+                'imageSources': self._sources(14), 'audioSources': [],
+            }],
+            'latestSession': 'session', 'timer': None, 'nextRevision': 3,
+            'inFlightRequestId': None, 'obsoleteRequestIds': set(),
+        }}
+        await ServiceChunk3.flush_buffered_narrative(host, 'k', 3)
+        self.assertEqual(self._images(host), [], '关着时一张都没有')
+        self.assertNotIn('[图片×', self._message(host))
+        self.assertEqual(self._budget_warns(host), [])
+
+    async def test_image_understanding_off_still_counts_every_attachment(self) -> None:
+        """① 关识图 + 14 张 → 标签**数得出 14**，且不出现视觉预算线索（v1.9.4 §59）。
+
+        预算管的是"给模型**看**几张"；关着时一张都不看，预算就无权改写"他带了 14 张"
+        这件事实。按截断后的 `image_sources` 列，模型连"一共几张"都数不出来 —— 那正是
+        用户抱怨的那类"她不知道还有更多"。这一档必须按**候选全表**列（事实给全）。
+        """
+        host = await self._flush(self._sources(14), vision={'enabled': False})
+        self.assertEqual(self._images(host), [], '关着时一张都不给模型')
+        attachments = host.calls['try_decide'][17]
+        self.assertEqual(len(attachments), 14, '来了几张是事实，不许被视觉预算削到 3')
+        self.assertEqual([item['index'] for item in attachments], list(range(1, 15)))
+        self.assertNotIn('[图片×', self._message(host), '关着时不许说"仅取前 N"（那是假话）')
+        self.assertEqual(self._budget_warns(host), [], '也没截断就没这条 warn')
+
+    async def test_image_understanding_off_never_inflates_a_small_batch(self) -> None:
+        """①b 关识图 + 2 张 → 就是 2 条（事实给全 ≠ 造一张汇总）。"""
+        host = await self._flush(self._sources(2), vision={'enabled': False})
+        attachments = host.calls['try_decide'][17]
+        self.assertEqual(len(attachments), 2)
+        self.assertEqual([item['index'] for item in attachments], [1, 2])
+
+    async def test_the_truncation_warn_is_throttled_per_reason_and_session(self) -> None:
+        """同一条原因按会话节流：连打两次只有一条 warn（与既有的节流口径一致）。"""
+        from plugin.core.vision_budget import note_image_budget_skip
+
+        host = self._host([])
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='u', channel_id='private:u',
+        )
+        self.assertTrue(note_image_budget_skip(host, session, 14, 3, 3))
+        self.assertFalse(note_image_budget_skip(host, session, 14, 3, 3))
+        self.assertEqual(len(self._budget_warns(host)), 1)
+        # 换会话（另一个 channelId）可以重新报一条。
+        other = SessionView(
+            platform='onebot', self_id='1', user_id='v', channel_id='private:v',
+        )
+        self.assertTrue(note_image_budget_skip(host, other, 9, 3, 3))
+
+    async def test_native_loader_uses_the_same_configured_budget(self) -> None:
+        """第二处截断（`load_native_images`）读的是**同一个**预算，不是写死的 3。"""
+        png = _png_bytes()
+        fetched: list[str] = []
+
+        async def fetch(url: str) -> bytes:
+            fetched.append(url)
+            return png + url.encode('utf-8')
+
+        sources = self._sources(8)
+        host = _MediaHost(config={'model': {'vision': {'enabled': True, 'max_per_turn': 5}}})
+        host.transport = FakeTransport(fetch_image=fetch)
+        images = await ServiceChunk3.load_native_images(host, {'id': 's'}, sources, None)
+        self.assertEqual(len(images), 5, '配置 5 就必须取 5 —— 两处下刀同源')
+        self.assertEqual(fetched, sources[:5], '取的是排在前面的 5 张')
+
+    async def test_forwarded_and_direct_sources_share_one_budget(self) -> None:
+        """转发来的图与直发的图**抢同一个预算**（§53 既有口径，预算只有一道）。"""
+        direct = self._sources(2)
+        forwarded = ['https://gchat.qpic.cn/ft/%d.png' % index for index in (1, 2, 3, 4)]
+        host = await self._flush([*direct, *forwarded], vision={'max_per_turn': 4})
+        self.assertEqual(len(self._images(host)), 4)
+        self.assertIn('[图片×6，本回合仅取前 4 张]', self._message(host))
 
 
 # =========================================================================== #

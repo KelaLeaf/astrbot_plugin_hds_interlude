@@ -98,13 +98,19 @@
 `visualEvidenceMode=none`，视觉观察 / `attachments` / 表情包收藏**一样都拿不到**。
 修法是"把节点里的图片坐标也交出去"，但**不能全交**：一条转发里十几张图如果全塞进
 原生视觉输入，就是一个 token / 延迟 / 成本的黑洞。所以在上游那三重预算（节点数 /
-字符数 / 深度）之外，**再加两道媒体预算**：
+字符数 / 深度）之外，**再加两道媒体预算**。
+
+第二现场（v1.9.4 起因）：转发那道调大了，模型**还是只看到 3 张**——因为下游 `chunk3`
+里还有一道写死的每回合预算，而且截断之后**一个字的线索都没留**（她既看不到其余的，
+也不知道还有）。所以 v1.9.4 把每回合预算做成配置
+（`model_center.vision.max_per_turn`，见 `core/vision_budget.py`）、把媒体表上限改成
+跟随它，并且**每一次截断都必须能被解释**：卡上那句管单卡、当前事件里那句管整回合。
 
 | 预算 | 位置 | 默认 | 区间 | 理由 |
 | --- | --- | --- | --- | --- |
-| `maxImages`（单条转发最多取几张图） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_images` | **3** | 0~10 | 与直发消息的视觉预算**同一个数量级**（`chunk3` 的 `sources[:3]`）：她一次能"看"的图就是这么多。取 3 而不是 15，省的是每回合的原生图 token 与下载时间；取 0 就等于关掉"转发也看图"，是个**合法**配置（用例钉着） |
+| `maxImages`（单条转发最多取几张图） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_images` | **3** | 0~10 | 转发里的图**先过这一道**。它管的是"从这张卡里取出几个坐标"：取 3 而不是 15，省的是原生图 token 与下载时间；取 0 就等于关掉"转发也看图"，是个**合法**配置（用例钉着）。取出多少张由卡上那句 `[图片×15，仅取前 3 张]` 说清 |
 | `maxVideos`（单条转发最多读取几段视频） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_videos` | **1**（一张卡最多看一段） | 0~10 | 视频比图贵一个量级：每读一段就是一次 ffmpeg（抽帧 + 抽音轨）加一次视觉预算占用。默认**1**＝**配了就生效**，同时把单卡的额外成本封在一次以内（用户口径是"可配置单条转发最多读取的视频数"——配了却默认永不生效不算配置）；显式配成 **0** 才是 v1.8.7 的老行为"转发里的视频一段都不读"。取到的坐标交给 `model_center.video` 那条链，受它自己的总开关 / 群聊开关管 |
-| `FORWARD_MEDIA_MAX_PER_TURN`（整条消息的转发媒体总数上限） | 本模块常量（**不暴露配置**） | **6** | — | 一条消息里可能有多张转发卡片，单卡上限管不住总量。6 = 两张卡的默认值之和，够用又封顶；真正的视觉输入上限仍是 `chunk3` 的 3 |
+| `forward_media_turn_cap()`（整条消息的转发媒体表上限） | 本模块函数（**不暴露配置**；v1.9.4 起**跟随**每回合图片预算） | `max(6, 每回合图片预算, 单卡 max_images)` | — | 它**不是**第三道视觉预算，只是媒体条目表的安全上限：削在这里，下游就再也说不出"一共几张"。所以取值必须 ≥ 用户配得出来的任何一份（`chunk3` 的每回合预算 / 单卡 `max_images`）。真正的视觉上限由 `chunk3` 那一刀执行，并在当前事件里留 `[图片×14，本回合仅取前 3 张]` |
 | 单张体积上限 | **不加新键**：复用 `stickers.max_file_size_mb`（默认 10MB） | 视觉路径 `chunk3.MAX_NATIVE_IMAGE_BYTES`（4MB）、收藏路径 `store_collected_sticker` 的 `max_file_size_mb` | — | "一张图多大算大"在这个仓库里已经有答案，再写一份就是第二个真相 |
 | 只取前面的 | 节点顺序（含嵌套展开顺序） | — | — | 与三重预算同一条纪律：**排在前面的先拿**，后面的只留线索 |
 | 去重 | 坐标字面量（这里）与内容 sha256（`store_collected_sticker`） | — | — | 同一张图 / 同一段视频在节点里出现两次只算一次；字节到手的路径上仍按内容哈希去重（那条判据只有一处） |
@@ -115,15 +121,23 @@
 **超预算的可见线索**（短、可数，写在那一行上）：
 
 ```
-[图片×15，仅取前 3 张]      # 按预算取了 3 张
+[图片×15，仅取前 3 张]      # 按预算取了 3 张（**单卡**这一道，写在这张卡上）
 [图片×15，仅取前 0 张]      # 上限配成 0：一张都不取，但仍然数得出来有几张
 [视频×2，仅取前 1 段]        # 默认 1：只读排在最前面的那一段
 [视频×2，未取]              # 显式配成 max_videos=0：一段都不读，只标注
 [视频×5，仅取前 2 段]        # 配成 2：读了 2 段（能不能真看到画面由 model_center.video 决定）
 ```
 
+下游 `chunk3` 的**每回合**预算再截一刀时，写在当前事件里的是同一族的另一句
+（由 `core/vision_budget.image_budget_note()` 产出，只有**真的截了**才有）：
+
+```
+[图片×14，本回合仅取前 3 张]   # 直发 + 转发 + 视频帧合流之后的候选 14 张，给了前 3 张
+```
+
 数值取自**平台响应里的图片 / 视频段数**（不是"成功取回的字节数"）：字节要等下游下载
-才知道，而"她少看了 12 张 / 3 段视频"这件事必须现在就说得出来。
+才知道，而"她少看了 12 张 / 3 段视频"这件事必须现在就说得出来。每回合那一句取的也是
+**候选坐标数**（同上：不是"下载成功的张数"）。
 """
 
 from __future__ import annotations
@@ -138,6 +152,7 @@ __all__ = [
     'FORWARD_FETCH_TIMEOUT_MS',
     'FORWARD_MEDIA_MAX_PER_FORWARD',
     'FORWARD_MEDIA_MAX_PER_TURN',
+    'FORWARD_MEDIA_TURN_CAP_MAX',
     'FORWARD_VIDEO_MAX_PER_FORWARD',
     'ForwardMedia',
     'ForwardMediaBudget',
@@ -151,6 +166,7 @@ __all__ = [
     'failure_result',
     'forward_media_budget',
     'forward_media_note',
+    'forward_media_turn_cap',
     'forward_read_content',
     'forward_read_ids',
     'forward_read_limits',
@@ -204,13 +220,22 @@ FORWARD_MEDIA_MAX_PER_FORWARD = DEFAULT_LIMITS.max_images
 #: 常在转发的正文里）。显式配 0 = 关掉"转发也看视频"。
 FORWARD_VIDEO_MAX_PER_FORWARD = DEFAULT_LIMITS.max_videos
 
-#: **整条消息**里所有合并转发的媒体条目总数上限（v1.8.7）。
+#: **整条消息**里所有合并转发的媒体条目总数上限的**下限**（v1.8.7 的常量值）。
 #:
-#: 为什么不暴露成配置键：它是"一张消息里最多挂几张转发来的图"的硬顶，与单卡
-#: `max_images` 正交（一张卡 3 张 × 两张卡就 6 张）。真正的视觉输入上限在别处
-#: （`chunk3` 的 `sources[:3]`），这里封的是"媒体条目表能长多长"——链路下游
+#: 为什么不暴露成配置键：它封的是"媒体条目表能长多长"——链路下游
 #: （attachments / 视觉来源 / 收藏）都按条数线性增长，不封顶就是把成本交给运气。
+#: 真正的视觉输入上限是**每回合图片预算**（v1.9.4 起可配，见 `core/vision_budget.py`）。
+#:
+#: ⚠️ 它是**下限**而不是实际取值：实际取值由 `forward_media_turn_cap()` 算
+#: （`max(本常量, 每回合图片预算, 单卡 max_images)`）。理由就是用户那次真机报告的
+#: 一半：把 `forward_message.max_images` 调大、却被另一个看不见的常量削回 6 张，
+#: 那等于"改了一个不影响结果的键"。媒体表**不是**执行视觉预算的地方 —— 视觉预算
+#: 由 `chunk3` 那一刀（带可数线索）执行，这里只保证"读到的全都在表里"。
 FORWARD_MEDIA_MAX_PER_TURN = 6
+
+#: `forward_media_turn_cap()` 里预算那一份的夹取上限（**不是**每回合图片预算的上限；
+#: 预算自己的区间在 `core/vision_budget.py`）。这里只防一个荒谬值把表撑爆。
+FORWARD_MEDIA_TURN_CAP_MAX = 64
 
 #: **取字节时**的单张体积上限：**不加新键**，复用表情库的 `stickers.max_file_size_mb`
 #: （默认 10MB）。这里只写一个给读者看的说明性默认值，**不参与判据** —— 真正的体积闸
@@ -454,6 +479,32 @@ def forward_media_budget(limits: Any = None) -> ForwardMediaBudget:
     """从预算里取出媒体那一份（`ForwardReadLimits` / 字典都认）。"""
     resolved = forward_read_limits(limits)
     return ForwardMediaBudget(max_images=resolved.max_images, max_videos=resolved.max_videos)
+
+
+def forward_media_turn_cap(image_budget: Any = None, limits: Any = None) -> int:
+    """整条消息的转发媒体条目上限（v1.9.4 起**跟随每回合图片预算**）。
+
+    三个输入取最大：
+
+    1. `FORWARD_MEDIA_MAX_PER_TURN`（6）—— 历史硬顶，保证"两张默认卡"放得下；
+    2. `image_budget` —— **调用方已经解析好的**每回合图片预算
+       （`model_center.vision.max_per_turn`，解析与默认值在 `core/vision_budget.py`）：
+       用户要 10 张就该有 10 个位置，别让媒体表先把它削掉 —— **削在这里，下游就再也
+       说不出"一共几张"**。`None` / 脏值按 0 算（老调用方不传预算时行为与 v1.8.7 一致）；
+    3. 单卡 `max_images` —— 它本身就是用户配的（0~10），读到的坐标必须都进表。
+
+    这样任何一次截断都只剩两处可解释的闸：**单卡预算**（卡上那句
+    `[图片×15，仅取前 3 张]`）与**每回合预算**（当前事件里那句
+    `[图片×14，本回合仅取前 3 张]`）。媒体表这一道退化成"够用的安全上限"，
+    不再制造第三种解释不了的丢失。
+
+    刻意**不** import `vision_budget`：本模块有一条"按文件路径也能单独导入"的契约
+    （`test_module_is_importable_without_the_package_context`），相对导入会把它打破。
+    默认值只住在 `vision_budget` 一处，由调用方传进来。
+    """
+    resolved = forward_read_limits(limits)
+    budget = clamp_int(image_budget, 0, FORWARD_MEDIA_TURN_CAP_MAX, 0)
+    return max(FORWARD_MEDIA_MAX_PER_TURN, budget, max(0, resolved.max_images))
 
 
 def forward_media_note(budget: ForwardMediaBudget) -> str:

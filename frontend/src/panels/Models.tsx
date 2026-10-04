@@ -48,7 +48,7 @@ export function Models({ storyId, refreshKey }: PanelProps) {
         <Stat label="主叙事连接" value={main.provider_label || '未指定'} hint={`${main.response_format || '默认输出格式'}`} />
         <Stat label="失败切换" value={failover.enabled ? `${failover.strategy} · ${failover.max_attempts} 次` : '已关闭'} hint={`冷却 ${failover.cooldown_minutes} 分钟`} />
         <Stat label="本次会话用量" value={usage.sum.total_tokens.toLocaleString()} hint={`${usage.sum.calls} 次调用（内存统计，重启清零）`} />
-        <Stat label="指名的 AstrBot 模型" value={bound.length} hint={bound.length ? bound.map(([key]) => key).join(' / ') : '全部走默认 Provider'} />
+        <Stat label="用 AstrBot 模型的任务" value={bound.length} hint={bound.length ? bound.map(([, item]) => item.label).join(' / ') : '没有任务指名 AstrBot 模型'} />
       </Grid>
 
       <Panel title="任务 → 模型" icon="models">
@@ -58,9 +58,15 @@ export function Models({ storyId, refreshKey }: PanelProps) {
             {
               key: 'source',
               title: '来源',
-              width: '6rem',
+              width: '7rem',
+              // 文案由后端一处给出（`row.source_label`），这里只按档位着色 ——
+              // 页面自己再翻一遍就会和总览页各说一句（v1.9.4 §60）。
+              // `disabled`（已关闭）是用户自己关的，中性色；warn 留给"没配"。
               render: (row) =>
-                row.source === 'astrbot' ? <Badge tone="accent">AstrBot</Badge> : row.source === 'connection' ? <Badge>连接行</Badge> : <Badge tone="warn">未配置</Badge>,
+                row.source === 'astrbot' ? <Badge tone="accent">{row.source_label}</Badge>
+                  : row.source === 'connection' ? <Badge>{row.source_label}</Badge>
+                    : row.source === 'disabled' ? <Badge>{row.source_label}</Badge>
+                      : <Badge tone="warn">{row.source_label}</Badge>,
             },
             { key: 'provider', title: '连接 / Provider', render: (row) => row.provider_label || '—' },
             { key: 'model', title: '模型', render: (row) => row.model || '—' },

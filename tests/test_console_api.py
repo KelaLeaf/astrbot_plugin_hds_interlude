@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -21,8 +22,10 @@ from unittest import mock
 from plugin.tests.test_astrbot_bridge import (
     TEST_DATA_DIR,
     FakeContext,
+    _FakeTokenUsage,
     _FakeUpload,
     _ProviderStub,
+    _RecordingFakeContext,
     _install_web_request,
     _make_bridge,
     _make_plugin,
@@ -32,6 +35,7 @@ from plugin.adapters import console_api as console_module
 from plugin.adapters.console_api import ConsoleApi, ConsoleError, CONSOLE_TASKS, mask_endpoint
 from plugin.core import platform_actions
 from plugin.core.database import Database
+from plugin.core.narrator import parse_token_usage
 from plugin.core.logging import set_log_sink
 from plugin.core.service import helpers as helpers_module
 from plugin.core.service.base import InterludeContext
@@ -4460,3 +4464,455 @@ class ConsoleStickerGroupTests(unittest.TestCase):
         """闸只装在**动盘**那一侧：只读视图照旧回空列表，不抛、也不写。"""
         self._unavailable_root()
         self.assertEqual(_run(self.service.sticker_group_directories()), [])
+
+
+class _DeclaringProvider:
+    """宿主 Provider 桩：`meta().id` + `provider_config`（模型名与声明的模态）。
+
+    `_ProviderStub` 只有 `meta()`；"能力声明"这一列读的是 `provider_config['modalities']`，
+    所以这条链上的夹具必须两样都给。
+    """
+
+    def __init__(self, provider_id, modalities=(), model=''):
+        self.provider_config = {
+            'id': provider_id,
+            'model': model or provider_id,
+            'modalities': list(modalities),
+        }
+
+    def meta(self):
+        return type('Meta', (), {'id': self.provider_config['id']})()
+
+
+def _bridge_with_providers(config, providers):
+    """`_make_bridge(config)` + 一个装了 `providers`（{id: 模态}）的宿主列表。
+
+    注意顺序：`_make_bridge` 构造时服务就已经解析过路由（合成绑定行走的是配置，
+    与宿主列表无关），这里换掉的只是"读模态"要用的那两份入口。
+    """
+    bridge = _make_bridge(config)
+    stubs = {pid: _DeclaringProvider(pid, mods) for pid, mods in providers.items()}
+    bridge.context.get_all_providers = lambda: list(stubs.values())
+    bridge.provider_by_id = lambda pid: stubs.get(pid)  # type: ignore[method-assign]
+    return bridge
+
+
+class ModelCenterRoutingSourceTests(unittest.TestCase):
+    """「任务 → 模型」表的**来源 / 连接 / 模型 / 能力声明 / 判定**必须同一处判据（v1.9.4）。
+
+    真机症状：时间导演那一行"来源=连接行 + 判定=assigned-provider + 连接写着
+    AstrBot · xxx"三件事互相矛盾。根因不是路由走了另一条轨（它本来就跟随压缩），
+    而是显示层把"来源"另按 `task_model_id(任务)` 算了一份——`timeline` 没有自己的
+    指名键，于是同一行里两套判据各说各话。
+    """
+
+    #: 每个任务被指名的 Provider（夹具里各给一个不同的，好让断言能抓错配）。
+    #: `timeline` 跟随 `compaction`：这是上游的接线（`resolve_model_routing` 里
+    #: timeline 直接复用 compaction 的候选），不是本移植版的自由发挥。
+    NAMED = {
+        'main': 'p-main',
+        'compaction': 'p-compact',
+        'timeline': 'p-compact',
+        'alter': 'p-alter',
+        'embedding': 'p-embed',
+        'stickers': 'p-stickers',
+        'vision': 'p-vision',
+    }
+    MODALITIES = {
+        'p-main': ['text'],
+        'p-compact': ['text', 'tool_use'],
+        'p-alter': ['text'],
+        'p-embed': ['text'],
+        'p-stickers': ['image'],
+        'p-vision': ['image'],
+    }
+
+    def _payload(self):
+        config = {
+            'model_center': {
+                'main_provider_id': 'p-main',
+                'compaction_provider_id': 'p-compact',
+                'alter_provider_id': 'p-alter',
+                'embedding': {'enabled': True, 'provider_id': 'p-embed'},
+                'vision': {'enabled': True, 'mode': 'sidecar', 'provider_id': 'p-vision'},
+                'providers': [],
+            },
+            'stickers': {'provider_id': 'p-stickers'},
+        }
+        bridge = _bridge_with_providers(config, self.MODALITIES)
+        return bridge, _run(ConsoleApi(bridge).models())
+
+    def test_every_task_row_takes_its_source_and_modalities_from_the_route(self):
+        """参数化：**每个**任务（不只时间导演）都用同一条判据推来源与能力声明。"""
+        _, payload = self._payload()
+        rows = {row['task']: row for row in payload['tasks']}
+        self.assertEqual(set(rows), {key for key, _ in CONSOLE_TASKS})
+        for key, provider_id in self.NAMED.items():
+            with self.subTest(task=key):
+                row = rows[key]
+                self.assertEqual(row['source'], 'astrbot', row)
+                self.assertEqual(row['source_label'], 'AstrBot', row)
+                self.assertEqual(row['provider_label'], 'AstrBot · %s' % provider_id, row)
+                self.assertEqual(row['model'], provider_id, row)
+                self.assertEqual(row['reason'], 'assigned-provider', row)
+                self.assertEqual(
+                    payload['task_models'][key]['astrbot_provider'], provider_id,
+                    '来源那一列说 AstrBot，就只能是这个 Provider',
+                )
+                self.assertEqual(
+                    payload['task_models'][key]['modalities'], sorted(self.MODALITIES[provider_id]),
+                    '能力声明必须来自**同一个** Provider',
+                )
+
+    def test_timeline_reports_the_provider_compaction_follows(self):
+        """回归：时间导演与压缩同源（没有独立指名键时不许被报成"连接行"）。"""
+        bridge, payload = self._payload()
+        rows = {row['task']: row for row in payload['tasks']}
+        self.assertEqual(bridge.task_model_id('timeline'), '', '夹具前提：timeline 没有自己的键')
+        self.assertEqual(rows['timeline']['source'], rows['compaction']['source'])
+        self.assertEqual(rows['timeline']['provider_label'], rows['compaction']['provider_label'])
+        self.assertEqual(rows['timeline']['reason'], rows['compaction']['reason'])
+        self.assertEqual(
+            payload['task_models']['timeline']['modalities'],
+            payload['task_models']['compaction']['modalities'],
+        )
+        self.assertEqual(payload['task_models']['timeline']['modalities'], ['text', 'tool_use'])
+
+    def test_a_task_that_only_has_a_connection_row_reports_the_connection(self):
+        """② 只勾连接行 → 来源=连接行（参数化到每个任务）。"""
+        config = {
+            'model_center': {
+                'providers': [{
+                    'label': '直连A', 'enabled': True, 'model': 'demo',
+                    'endpoint': 'https://gw.example.com/v1/chat/completions',
+                    'use_for_main': True, 'use_for_stickers': True, 'use_for_vision': True,
+                }],
+                'embedding': {'enabled': True},
+            },
+        }
+        payload = _run(ConsoleApi(_make_bridge(config)).models())
+        rows = {row['task']: row for row in payload['tasks']}
+        for key, _label in CONSOLE_TASKS:
+            with self.subTest(task=key):
+                self.assertEqual(rows[key]['source'], 'connection', rows[key])
+                self.assertEqual(rows[key]['source_label'], '连接行', rows[key])
+                self.assertEqual(rows[key]['provider_label'], '直连A', rows[key])
+                self.assertEqual(payload['task_models'][key]['astrbot_provider'], '')
+
+    def test_a_task_with_neither_names_nor_connections_is_not_configured(self):
+        """③ 没指名、没连接、**也没被关掉** → **未配置**（参数化到每个任务，断言字面量）。
+
+        这一刻 core 的路由**就是 `unavailable`**（`resolve_route` 只在没有候选时给
+        `available: False`），`create_narrator` 于是交 `SilentNarrator` —— 运行期根本
+        不会去调什么"默认 Provider"。旧断言写的是 `source == 'default'`（前端翻成
+        「默认 Provider」），那正是"界面与运行期相反"；本轮由用户点名改掉。
+
+        ⚠️ 夹具里 `embedding` 没开 → 那一行的判定就是 `disabled`，归第四档「已关闭」
+        （见 `test_explicitly_disabled_features_say_closed_not_unconfigured`）。
+        这里把那一行**显式**钉住再继续，不许写成"跳过 disabled 行"——被跳过的行
+        正是这一档要防的漏网。
+        """
+        payload = _run(ConsoleApi(_make_bridge({'model_center': {'providers': []}})).models())
+        self.assertEqual(
+            {row['task'] for row in payload['tasks']}, {key for key, _ in CONSOLE_TASKS},
+            '参数化覆盖每个任务（不许给时间导演之类单独特判）',
+        )
+        self.assertEqual(
+            [row['task'] for row in payload['tasks'] if row['reason'] == 'disabled'],
+            ['embedding'], '夹具前提：只有没开的 embedding 被显式关掉',
+        )
+        for row in payload['tasks']:
+            with self.subTest(task=row['task']):
+                if row['task'] == 'embedding':
+                    self.assertEqual(row['source'], 'disabled', row)
+                    self.assertEqual(row['source_label'], '已关闭', row)
+                    continue
+                self.assertEqual(row['source'], 'none', row)
+                self.assertEqual(row['source_label'], '未配置', row)
+                self.assertEqual(row['provider_label'], '')
+                self.assertEqual(row['candidates'], 0)
+                self.assertFalse(row['available'], 'core 的判定就是 unavailable')
+        # 这一页一个字都不许再写"默认 Provider"（模型页 / 总览页共用的就是这份 payload）。
+        self.assertNotIn('默认 Provider', json.dumps(payload, ensure_ascii=False))
+
+    def test_explicitly_disabled_features_say_closed_not_unconfigured(self):
+        """④ 显式关掉的功能 → 第四档 **`已关闭`**，同一行不再"两个说法"（v1.9.4 §60）。
+
+        真机症状：`compaction` / `embedding` 关掉后，「来源」列写 `未配置`，同一行的
+        「判定」列却写 `disabled` —— 一行两个说法。判据仍然只有一处：就是这一行路由表里
+        core 已经算好的那个 `reason`，不是另拿配置开关再算一遍。
+        """
+        config = {'model_center': {
+            'providers': [],
+            'compaction': {'enabled': False},
+            'embedding': {'enabled': False},
+        }}
+        payload = _run(ConsoleApi(_make_bridge(config)).models())
+        rows = {row['task']: row for row in payload['tasks']}
+        # 关掉的两个（以及跟随压缩的时间导演）→ 已关闭。
+        for key in ('compaction', 'timeline', 'embedding'):
+            with self.subTest(task=key):
+                self.assertEqual(rows[key]['reason'], 'disabled', rows[key])
+                self.assertEqual(rows[key]['source'], 'disabled', rows[key])
+                self.assertEqual(rows[key]['source_label'], '已关闭', rows[key])
+                self.assertNotEqual(rows[key]['source_label'], '未配置', '一行两个说法就是本轮要修的')
+                self.assertFalse(rows[key]['available'], rows[key])
+                self.assertEqual(rows[key]['candidates'], 0, rows[key])
+        # 没被关掉的普通任务仍然说"未配置"（不许因为这一档而全体改成"已关闭"）。
+        for key in ('main', 'alter', 'stickers', 'vision'):
+            with self.subTest(task=key):
+                self.assertEqual(rows[key]['reason'], 'unavailable', rows[key])
+                self.assertEqual(rows[key]['source'], 'none', rows[key])
+                self.assertEqual(rows[key]['source_label'], '未配置', rows[key])
+        # 总览页与模型页共用这一处（同一个 `_routing_rows()`）——两页不许各说一句。
+        overview = _run(ConsoleApi(_make_bridge(config)).overview())
+        self.assertEqual(
+            {row['task']: row['source_label'] for row in overview['routing']},
+            {row['task']: row['source_label'] for row in payload['tasks']},
+            '总览页 / 模型页来源文案必须同源',
+        )
+
+    def test_each_row_never_says_two_things_about_one_row(self):
+        """⑤ 不变式（参数化到每个任务 × 每种配置）：判定 `disabled` ⇔ 来源 `已关闭`。
+
+        只要判定列说 `disabled`、来源列就必须说「已关闭」；反过来来源说「已关闭」也
+        只能是判定真的 `disabled`。**另一头也钉住**：`embedding` 开着但没有候选
+        （`enabled: True` + 空连接池）是 `unavailable`，仍然说「未配置」——
+        不许把"没配"也塞进「已关闭」。
+        """
+        connection = {
+            'label': '直连A', 'enabled': True, 'model': 'demo',
+            'endpoint': 'https://gw.example.com/v1/chat/completions', 'use_for_main': True,
+        }
+        configs = {
+            '空配置': {'model_center': {'providers': []}},
+            '两个功能关掉': {'model_center': {
+                'providers': [], 'compaction': {'enabled': False}, 'embedding': {'enabled': False},
+            }},
+            'Alter 关掉': {'model_center': {'providers': []}, 'alter_system': {'enabled': False}},
+            '开关开着但没候选': {'model_center': {'providers': [], 'embedding': {'enabled': True}}},
+            '有连接行': {'model_center': {'providers': [connection]}},
+            '关闭 + 有连接行': {'model_center': {
+                'providers': [connection], 'compaction': {'enabled': False},
+            }},
+        }
+        seen: set[str] = set()
+        scenes: list[tuple[str, dict[str, Any]]] = [
+            (name, _run(ConsoleApi(_make_bridge(config)).models()))
+            for name, config in configs.items()
+        ]
+        # 指名 AstrBot Provider 那一档要借夹具的宿主 Provider 桩（`_payload`），
+        # 单靠 `_make_bridge` 造不出合成绑定行。
+        scenes.append(('指名 Provider', self._payload()[1]))
+        for name, payload in scenes:
+            for row in payload['tasks']:
+                with self.subTest(config=name, task=row['task']):
+                    seen.add(row['source'])
+                    disabled = row['reason'] == 'disabled'
+                    self.assertEqual(
+                        row['source'] == 'disabled', disabled,
+                        '判定 disabled ⇔ 来源 已关闭（同一行一个说法）',
+                    )
+                    if disabled:
+                        self.assertEqual(row['source_label'], '已关闭', row)
+                    else:
+                        self.assertNotEqual(row['source_label'], '已关闭', row)
+                    # 文案唯一来源：标签必须就是那张表给这一档的那一个词。
+                    self.assertEqual(
+                        row['source_label'], console_module.ROUTING_SOURCE_LABELS[row['source']], row,
+                    )
+        self.assertEqual(seen, {'astrbot', 'connection', 'disabled', 'none'}, '四档都要被覆盖到')
+
+    def test_the_page_follows_a_config_change_without_a_restart(self):
+        """④ 改完配置 → 这一页（以及真实路由）立刻跟着变（v1.9.4 §61）。
+
+        真机症状：在控制台加 / 改完连接，页面与运行期都还是启动时那份。
+        """
+        bridge = _make_bridge({'model_center': {'providers': []}})
+        rows = {row['task']: row for row in _run(ConsoleApi(bridge).models())['tasks']}
+        self.assertEqual(rows['main']['source'], 'none')
+        self.assertFalse(rows['main']['available'])
+
+        bridge.apply_config({'model_center': {'providers': [{
+            'label': '直连A', 'enabled': True, 'model': 'demo',
+            'endpoint': 'https://gw.example.com/v1/chat/completions',
+            'use_for_main': True,
+        }]}})
+
+        rows = {row['task']: row for row in _run(ConsoleApi(bridge).models())['tasks']}
+        self.assertEqual(rows['main']['source'], 'connection')
+        self.assertEqual(rows['main']['source_label'], '连接行')
+        self.assertTrue(rows['main']['available'])
+        self.assertEqual(rows['main']['reason'], 'assigned-provider')
+        self.assertEqual(rows['main']['candidates'], 1)
+
+    def test_the_source_labels_come_from_one_place(self):
+        """来源文案只有一处：四档 → 四个词，且不含被推翻的那句。
+
+        `disabled` 是第四档（显式关闭），不是第二套判据——它就取自同一行路由表里
+        core 算好的 `reason`。
+        """
+        self.assertEqual(
+            console_module.ROUTING_SOURCE_LABELS,
+            {'astrbot': 'AstrBot', 'connection': '连接行', 'disabled': '已关闭', 'none': '未配置'},
+        )
+        self.assertNotIn('默认 Provider', console_module.ROUTING_SOURCE_LABELS.values())
+        self.assertEqual(
+            len(set(console_module.ROUTING_SOURCE_LABELS.values())),
+            len(console_module.ROUTING_SOURCE_LABELS),
+            '四档四个词，不许两档共用一个词（否则前端画出来还是"两个说法"）',
+        )
+
+    def test_keys_outside_the_seven_task_table_keep_the_bridge_entry_points(self):
+        """`audio` / `works` 不在七任务表里 → 判据仍退回桥接层原入口（双读不破）。
+
+        本轮的第三档改动只动七任务表那一处，不许顺手把这俩也改了。
+        """
+        bridge = _make_bridge({'model_center': {
+            'providers': [],
+            'audio': {'enabled': True, 'provider_id': 'whisper'},
+        }})
+        payload = _run(ConsoleApi(bridge).models())
+        self.assertNotIn('audio', {row['task'] for row in payload['tasks']})
+        self.assertNotIn('works', {row['task'] for row in payload['tasks']})
+        self.assertEqual(payload['task_models']['audio']['astrbot_provider'], 'whisper')
+        self.assertEqual(bridge.task_model_id('audio'), 'whisper', 'audio 仍走原入口')
+        self.assertEqual(
+            ConsoleApi(bridge)._named_provider('audio'), 'whisper',
+            '不在七任务表里的键，判据退回桥接层原入口',
+        )
+        self.assertEqual(payload['task_models']['works']['astrbot_provider'], '')
+
+    def test_the_provider_list_says_which_tasks_actually_use_it(self):
+        """`used_by` 与来源同一处判据：时间导演要算在它真正调用的那个 Provider 上。"""
+        _, payload = self._payload()
+        used = {row['id']: row['used_by'] for row in payload['astrbot_providers']}
+        self.assertIn('时间导演', used['p-compact'])
+        self.assertIn('压缩与总结', used['p-compact'])
+        self.assertIn('主叙事', used['p-main'])
+        self.assertNotIn('时间导演', used['p-main'])
+
+    def test_the_works_writer_keeps_its_dual_read_binding(self):
+        """`works` 不在七任务路由表里 → 仍旧走桥接层的双读判定（老口径不许失效）。"""
+        bridge = _make_bridge({'works': {'enabled': True, 'model_id': 'writer-conn'},
+                               'model_center': {'providers': [
+                                   {'id': 'writer-conn', 'label': '写手连接', 'enabled': True,
+                                    'model': 'w', 'endpoint': 'https://gw.example.com/v1/chat/completions'},
+                               ]}})
+        bridge.context.get_all_providers = lambda: [_ProviderStub('ollama')]
+        payload = _run(ConsoleApi(bridge).models())
+        self.assertEqual(payload['task_models']['works']['astrbot_provider'], '')
+        self.assertEqual(bridge.task_model_id('works'), 'writer-conn', '值本身不动')
+
+
+class TokenStatsAvailabilityTests(unittest.TestCase):
+    """Token 统计页的口径：有调用没 token 时显示「—」，不拿一排 0 冒充统计（v1.9.4）。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.bridge = _make_bridge({})
+        self.database = Database(':memory:')
+        self.addCleanup(self.database.close)
+        self.database.register_tables()
+        self.bridge.db = self.database
+        self.api = ConsoleApi(self.bridge)
+
+    def _insert(self, day, task, model, *, calls, input_tokens=0, output_tokens=0, cached=0, provider=''):
+        self.database.insert('interlude_token_usage', {
+            'day': day, 'storyId': 's1', 'task': task, 'model': model, 'provider': provider,
+            'inputTokens': input_tokens, 'outputTokens': output_tokens, 'cachedTokens': cached,
+            'calls': calls, 'createdAt': '2026-01-01T00:00:00Z', 'updatedAt': '2026-01-01T00:00:00Z',
+        })
+
+    def test_calls_without_tokens_are_counted_and_flagged_unavailable(self):
+        today = datetime.now().date().isoformat()
+        self._insert(today, '主叙事', 'AstrBot · p', calls=4, provider='AstrBot · p')
+        payload = _run(self.api.token_stats('week'))
+        self.assertEqual(payload['totals']['calls'], 4, '经宿主 Provider 的调用次数必须数上')
+        self.assertFalse(payload['totals']['hasTokens'])
+        self.assertFalse(payload['byTask'][0]['hasTokens'])
+        self.assertFalse(payload['byModel'][0]['hasTokens'])
+        self.assertFalse(payload['series'][-1]['hasTokens'])
+        self.assertEqual(payload['byTask'][0]['task'], '主叙事')
+        self.assertEqual(payload['byModel'][0]['provider'], 'AstrBot · p')
+
+    def test_token_rows_keep_their_numbers(self):
+        today = datetime.now().date().isoformat()
+        self._insert(today, '主叙事', 'm', calls=2, input_tokens=1000, output_tokens=200, cached=400)
+        payload = _run(self.api.token_stats('week'))
+        self.assertTrue(payload['totals']['hasTokens'])
+        self.assertEqual(payload['totals']['inputTokens'], 1000)
+        self.assertEqual(payload['totals']['calls'], 2)
+        self.assertTrue(payload['byTask'][0]['hasTokens'])
+
+    def test_a_day_without_calls_is_zero_not_unavailable(self):
+        """空白天补的 0 是真 0（那天没调用），不该被当成"拿不到用量"。"""
+        payload = _run(self.api.token_stats('week'))
+        self.assertEqual(payload['totals']['calls'], 0)
+        self.assertFalse(payload['totals']['hasTokens'])
+        self.assertEqual(payload['series'][0]['calls'], 0)
+
+    def test_mixed_rows_report_availability_per_row(self):
+        today = datetime.now().date().isoformat()
+        self._insert(today, '主叙事', 'm', calls=1, input_tokens=10)
+        self._insert(today, '压缩', 'AstrBot · p', calls=3)
+        payload = _run(self.api.token_stats('week'))
+        self.assertTrue(payload['totals']['hasTokens'])
+        by_task = {row['task']: row for row in payload['byTask']}
+        self.assertTrue(by_task['主叙事']['hasTokens'])
+        self.assertFalse(by_task['压缩']['hasTokens'], '这一桶只有次数、没有 token')
+        self.assertEqual(by_task['压缩']['calls'], 3)
+
+
+class UsageLedgerFromProviderCallTests(unittest.TestCase):
+    """端到端：**经宿主 Provider 的一次调用** → 账本一行 → 页面上的具体数字（v1.9.4）。
+
+    这条链以前断在两处：宿主的 `TokenUsage` 字段名读不到（token 全 0），以及
+    "没有 token 就不 emit"（次数也 0）。这里从传输层一路走到「Token 统计」页。
+    """
+
+    def _bridge(self, usage):
+        context = _RecordingFakeContext(usage=usage)
+        bridge = _make_bridge(
+            {'model_center': {'main_provider_id': 'ollama', 'providers': []}},
+            context=context,
+        )
+        database = Database(':memory:')
+        self.addCleanup(database.close)
+        database.register_tables()
+        bridge.db = database
+        bridge.service.db = database
+        return bridge
+
+    def _call_and_record(self, bridge):
+        body = {'model': 'ollama', 'messages': [{'role': 'user', 'content': 'hi'}]}
+        response = _run(bridge.http_client.post_json('', None, body, None, task='main'))
+        # core 交给账本的那条增量：`_emit_usage` 组装、`report_token_usage` 收到的就是它。
+        record = {
+            'task': '主叙事', 'provider_label': 'AstrBot · ollama',
+            'model': response['model'], **parse_token_usage(response['usage']), 'calls': 1,
+        }
+        self.assertTrue(_run(bridge.service.record_token_usage(record, 's1')))
+        return response
+
+    def test_a_call_without_usage_is_still_counted_on_the_page(self):
+        bridge = self._bridge({})
+        self._call_and_record(bridge)
+        payload = _run(ConsoleApi(bridge).token_stats('week'))
+        self.assertEqual(payload['totals']['calls'], 1, '连次数都是 0 就是这次要修的硬缺陷')
+        self.assertEqual(payload['byTask'][0]['task'], '主叙事')
+        self.assertEqual(payload['byModel'][0]['model'], 'ollama')
+        self.assertEqual(payload['byModel'][0]['provider'], 'AstrBot · ollama', '目标也要记上')
+        self.assertFalse(payload['totals']['hasTokens'], '没回用量 → 页面显示不可用，不冒充 0')
+
+    def test_a_call_with_host_usage_lands_with_its_tokens(self):
+        bridge = self._bridge(_FakeTokenUsage(input_other=30, input_cached=70, output=12))
+        self._call_and_record(bridge)
+        payload = _run(ConsoleApi(bridge).token_stats('week'))
+        self.assertEqual(payload['totals']['calls'], 1)
+        self.assertEqual(payload['totals']['inputTokens'], 100, 'prompt_tokens 含缓存')
+        self.assertEqual(payload['totals']['outputTokens'], 12)
+        self.assertEqual(payload['totals']['cachedTokens'], 70)
+        self.assertAlmostEqual(payload['totals']['hitRate'], 0.7)
+        self.assertTrue(payload['totals']['hasTokens'])

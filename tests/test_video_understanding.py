@@ -1152,11 +1152,18 @@ class MutationTests(unittest.TestCase):
             '\n    async def advance_story', 1,
         )[0]
         self.assertIn('collect_video_sources(self,', body)
-        merge_image = 'image_sources = _unique(list(image_sources) + list(video_media.image_sources))'
+        # v1.9.4：帧并进来源表那一行现在叫 `available_images`（候选 = 直发 / 转发来源 +
+        # 帧，之后按**每回合图片预算**取前 N 张）。行名变了，但这条守卫守的两件事没变：
+        # ① 帧必须并进**既有的**来源表（不是另造通道）；② 并进去之后才交给
+        # `load_native_images`，且附件（"消息自带了什么"）在合并之前就算完。
+        merge_image = 'available_images = _unique(image_candidates + list(video_media.image_sources))'
+        budget_cut = 'image_sources = available_images[:image_budget]'
         merge_audio = '] + list(video_media.audio_sources))'
         self.assertIn(merge_image, body)
+        self.assertIn(budget_cut, body, '取交集必须用同一个每回合图片预算（判据一处）')
         self.assertIn(merge_audio, body)
-        # 顺序：先并进来源表，再交给那两条通道（并反了就白搭）。
+        # 顺序：先并进来源表、再按预算取前 N 张、最后交给那两条通道（并反了就白搭）。
+        self.assertLess(body.index(merge_image), body.index(budget_cut))
         self.assertLess(body.index(merge_image), body.index('loaded_images = await self.load_native_images('))
         self.assertLess(body.index(merge_audio), body.index('audio = await self.load_native_audio('))
         # 附件（"消息自带了什么"）在合并之前就算完了：派生帧不该被标成三张图片。

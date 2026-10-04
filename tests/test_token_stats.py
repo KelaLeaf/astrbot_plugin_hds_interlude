@@ -73,6 +73,20 @@ class RecordTests(unittest.TestCase):
         self.assertIsNone(normalize_usage_record({'task': 'main', 'model': 'm'}))
         self.assertIsNone(normalize_usage_record('junk'))
 
+    def test_a_call_without_tokens_is_recorded_when_it_says_how_many_calls(self):
+        """v1.9.4：网关 / 经宿主 Provider 的调用不回 token，但这一次调用要数上。
+
+        真机症状：模型全部来自 AstrBot Provider 时「Token 统计」页连调用次数都是 0。
+        """
+        record = normalize_usage_record({'task': '主叙事', 'model': 'm', 'calls': 1})
+        self.assertIsNotNone(record)
+        self.assertEqual(
+            (record['inputTokens'], record['outputTokens'], record['cachedTokens'], record['calls']),
+            (0, 0, 0, 1),
+        )
+        # 只说"没 token"、又不说调了几次 → 仍然无效（上游那条纯身份记录不许凭空建行）。
+        self.assertIsNone(normalize_usage_record({'task': '主叙事', 'model': 'm', 'calls': 0}))
+
     def test_a_record_always_counts_one_call_and_accepts_both_spellings(self):
         record = normalize_usage_record(
             {'task': '压缩', 'model': 'deepseek-chat', 'provider_label': '连接A',
@@ -215,6 +229,17 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
             {'task': '主叙事', 'model': 'm', 'input_tokens': 1}, 's1',
         ))
         self.assertTrue(any('记账失败' in message for _level, message in broken.reports), broken.reports)
+
+    async def test_a_call_without_tokens_lands_in_the_ledger_with_its_count(self):
+        """v1.9.4：没有 token 也要有"这一天这个任务调了几次"。"""
+        host = self._Host()
+        record = {'task': '主叙事', 'model': 'm', 'provider_label': 'AstrBot · p', 'calls': 1}
+        self.assertTrue(await host.record_token_usage(record, 's1'))
+        self.assertTrue(await host.record_token_usage(record, 's1'))
+        self.assertEqual(len(host.rows), 1)
+        self.assertEqual(host.rows[0]['calls'], 2)
+        self.assertEqual(host.rows[0]['inputTokens'], 0)
+        self.assertEqual(host.rows[0]['provider'], 'AstrBot · p')
 
 
 if __name__ == '__main__':

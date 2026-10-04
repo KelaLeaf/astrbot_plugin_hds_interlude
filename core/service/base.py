@@ -635,6 +635,21 @@ class ServiceBase:
     cached_browser_config: Any
     model_routing: Any
 
+    #: 按 `self.config` 派生、可作废的实例级缓存（`_config_cache()` 写、`_invalidate_config_caches()` 清）。
+    #: 新增 `cached_*` 段时**必须**登记在这里，否则配置重载后它还是旧值（§61）。
+    CONFIG_CACHE_ATTRIBUTES: tuple[str, ...] = (
+        'cached_audio_config',
+        'cached_sticker_config',
+        'cached_alter_system_config',
+        'cached_agency_config',
+        'cached_schedule_preplan_config',
+        'cached_blind_mode_config',
+        'cached_auto_advance_config',
+        'cached_shared_story_config',
+        'cached_memory_config',
+        'cached_browser_config',
+    )
+
     # ---- 迁移诊断与桌面桥（`src/service.ts:702-715`） ----
 
     reported_state_migrations: set[str]
@@ -740,6 +755,9 @@ class ServiceBase:
         self.cached_browser_config = None
         # 上游 `resolveModelRouting(config.model, config.alterSystem)`。
         self.model_routing = self._resolve_model_routing()
+        #: 配置重载时的重建闸门与快照（v1.9.4 §61，见 `refresh_model_routing`）。
+        self._model_refresh_running = False
+        self._providers_model_config = None
 
         # ---- 迁移诊断与桌面桥 ----
         self.reported_state_migrations = set()
@@ -833,6 +851,52 @@ class ServiceBase:
                 log_fallback('warn', '模型提供者创建失败 工厂=%s 错误=%s', factory_name, error)
                 continue
             setattr(self, attribute, provider)
+        #: 造这批 provider 时用的 `config.model` **快照**（v1.9.4 §61）：配置重载时拿它
+        #: 比一比，一样就一个对象都不动（重复保存同一份配置 = 真幂等，进行中的回合
+        #: 连"换了实例"这件事都不会发生）。
+        self._providers_model_config = model_config
+
+    def _invalidate_config_caches(self) -> None:
+        """把按 `self.config` 派生的实例级缓存清空（配置换了就必须重读）。
+
+        `_config_cache()` 缓存的是"第一次读到的那个段"；只换 `self.config` 而不清这里，
+        用户在控制台改完开关仍然读到启动时那份（与 §61 的"路由不重算"同一个病根）。
+        """
+        for attribute in self.CONFIG_CACHE_ATTRIBUTES:
+            setattr(self, attribute, None)
+
+    def refresh_model_routing(self) -> bool:
+        """配置变更后重算路由 → 作废配置缓存 → **按需**重建 provider（v1.9.4 §61）。
+
+        返回是否真的重建了 provider（路由与 `config.model` 都没变 → `False`，一个对象
+        都不动）。
+
+        为什么是**同步、一次做完**的：调用方（`AstrbotBridge.apply_config`）在事件循环里
+        调它，函数体里没有任何 `await`，所以进行中的回合不会看到"配置换了、provider 还没换"
+        的中间态。已经发起的那次模型调用手里攥着旧实例的**强引用**，Python 不会把它抽走
+        —— 那一跳照旧跑完，路由/模型是它发起时的那一份；同一回合**后面**的调用用新实例。
+        重建失败会在桥接层留一条可见 warn（不假装已生效）。
+        """
+        if getattr(self, '_model_refresh_running', False):
+            return False
+        self._model_refresh_running = True
+        try:
+            self._invalidate_config_caches()
+            resolved = self._resolve_model_routing()
+            model_config = _config_section(self.config, 'model')
+            routing_changed = bool(self.model_routing) and resolved != self.model_routing
+            providers_changed = model_config != getattr(self, '_providers_model_config', None)
+            if not routing_changed and not providers_changed:
+                return False
+            self.model_routing = resolved
+            if providers_changed:
+                self._create_providers()
+        finally:
+            self._model_refresh_running = False
+        self.report_standalone_operation(
+            'summary', 'info', '模型路由已按新配置重算 %s', self._format_model_routing(),
+        )
+        return True
 
     # ------------------------------------------------------------------ #
     # 配置段访问（`cachedXxxConfig` 的惰性解析）

@@ -133,8 +133,9 @@ __all__ = [
 VIDEO_FRAME_INTERVAL_SECONDS = 4
 #: 平均抽帧：整段平均抽几帧（`frame_average_count` 的默认值）。
 VIDEO_AVERAGE_FRAMES = 3
-#: 一条视频最多抽几帧。**等于直发视觉预算**（`chunk3.load_native_images` 的
-#: `sources[:3]`）——两者同量级是刻意的：视频帧和直发图片抢同一个 3 张预算。
+#: 一条视频最多抽几帧。**与每回合图片预算同量级**（`model_center.vision.max_per_turn`，
+#: 默认 3；v1.9.4 起可配，见 `core/vision_budget.py`）——两者同量级是刻意的：
+#: 视频帧和直发 / 转发的图片抢**同一个**预算，而这一条是帧自己的硬顶。
 #: `frame_average_count` 的**上限**也是它：多抽的帧到不了模型，只是白花时间。
 VIDEO_MAX_FRAMES = 3
 #: 一条视频最多处理多长（秒）；超出部分只留可数线索，不再抽帧。
@@ -661,8 +662,8 @@ def _frame_filter(
     * `average`：整段均分 N 帧 → `fps=N/时长`，上限 = N。时长**探不到**时退回连续
       抽帧那条 fps（不猜时长），上限仍然是 N。
 
-    两个模式都受同一件事实约束：**多抽的帧到不了模型**（`chunk3.load_native_images`
-    的 `sources[:3]`），所以平均抽帧的 N 上限就是 `VIDEO_MAX_FRAMES`。
+    两个模式都受同一件事实约束：**多抽的帧到不了模型**（帧和图片抢同一个每回合预算，
+    见 `core/vision_budget.py`），所以平均抽帧的 N 上限就是 `VIDEO_MAX_FRAMES`。
     """
     frames_cap = max(1, int(average_frames)) if frame_mode == 'average' else VIDEO_MAX_FRAMES
     if frame_mode == 'average':
@@ -1076,7 +1077,8 @@ class VideoMedia:
     """一次视频理解的产物（调用方只认这三个字段 + `note`）。
 
     * `image_sources`：抽出来的帧，作为**现有图像理解通道**的来源
-      （`load_native_images`，与直发图片共用那一个 3 张预算）；
+      （`load_native_images`，与直发 / 转发的图片共用**同一个**每回合预算，
+      见 `core/vision_budget.py`）；
     * `audio_sources`：抽出来的音轨，作为**现有语音理解通道**的来源
       （`load_native_audio` 认的 `data:audio/<fmt>;base64,…`）；
     * `note`：进当前事件的正文事实（空串 = 一个字都不加）；

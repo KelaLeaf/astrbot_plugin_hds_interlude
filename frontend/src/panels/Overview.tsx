@@ -139,13 +139,17 @@ export function Overview({ storyId, onStoryChange, refreshKey }: PanelProps) {
                 {
                   key: 'source',
                   title: '来源',
+                  // 文案由后端一处给出（`row.source_label`），与模型页显示同一句。
+                  // `disabled`（已关闭）是用户自己关的，中性色；warn 留给"没配"。
                   render: (row) =>
                     row.source === 'astrbot' ? (
-                      <Badge tone="accent">AstrBot</Badge>
+                      <Badge tone="accent">{row.source_label}</Badge>
                     ) : row.source === 'connection' ? (
-                      <Badge>连接行</Badge>
+                      <Badge>{row.source_label}</Badge>
+                    ) : row.source === 'disabled' ? (
+                      <Badge>{row.source_label}</Badge>
                     ) : (
-                      <Badge tone="warn">未配置</Badge>
+                      <Badge tone="warn">{row.source_label}</Badge>
                     ),
                 },
                 { key: 'model', title: '模型', render: (row) => row.model || '—' },

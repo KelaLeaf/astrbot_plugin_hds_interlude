@@ -100,17 +100,24 @@ def day_key(moment: Any = None, timezone_offset: Any = None) -> str:
 
 
 def normalize_usage_record(record: Any, moment: Any = None, story_id: str = '') -> Optional[dict[str, Any]]:
-    """把一次模型调用的用量记录转成账本增量；**没有任何 token 字段时返回 None**。
+    """把一次模型调用的用量记录转成账本增量；**既没有 token 字段、也没说调用次数时返回 None**。
 
-    `calls` 恒为 1（一次调用），即使某些网关不回 token 数也记账——面板上的
-    "调用次数"因此不会因为网关不报用量而失真。
+    两条入口：
+
+    - **有 token**：token 三列照记，`calls` 恒为 1（一次调用）。
+    - **没有 token**（网关 / 经宿主 Provider 的调用不回用量）：调用方显式带 `calls`
+      时照记——"这个任务今天调了几次"本身是能数到的数据，不能因为拿不到 token 就
+      整条丢掉（真机症状：Token 统计页连调用次数都是 0）。
+
+    只有"既没 token 又没说调了几次"（例如上游那条纯身份记录）才算无效。
     """
     if not isinstance(record, Mapping):
         return None
     input_tokens = _pick(record, 'input_tokens', 'inputTokens')
     output_tokens = _pick(record, 'output_tokens', 'outputTokens')
     cached_tokens = _pick(record, 'cached_input_tokens', 'cachedInputTokens', 'cached_tokens')
-    if input_tokens is None and output_tokens is None and cached_tokens is None:
+    calls = _pick(record, 'calls')
+    if input_tokens is None and output_tokens is None and cached_tokens is None and not calls:
         return None
     model = str(_pick(record, 'model') or '').strip()
     provider = str(_pick(record, 'provider_label', 'providerLabel', 'provider') or '').strip()
@@ -124,7 +131,7 @@ def normalize_usage_record(record: Any, moment: Any = None, story_id: str = '') 
         'inputTokens': _as_int(input_tokens),
         'outputTokens': _as_int(output_tokens),
         'cachedTokens': _as_int(cached_tokens),
-        'calls': 1,
+        'calls': max(1, _as_int(calls)),
     }
 
 

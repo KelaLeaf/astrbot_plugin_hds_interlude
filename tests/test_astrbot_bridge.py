@@ -425,6 +425,8 @@ from plugin.adapters.astrbot_bridge import (  # noqa: E402
     session_view,
 )
 from plugin import main as main_module  # noqa: E402
+#: 用量形状的判据在 core：宿主的 `TokenUsage` 映射对不对，最终由它来判（别在夹具里另写一套）。
+from plugin.core.narrator import parse_token_usage  # noqa: E402
 
 
 # =========================================================================== #
@@ -2627,6 +2629,48 @@ class ForwardMediaIntegrationTests(unittest.TestCase):
                          ['https://gchat.qpic.cn/ft/1', 'https://gchat.qpic.cn/ft/2',
                           'https://gchat.qpic.cn/ft/3'])
 
+    def test_the_merge_cap_follows_the_configured_image_budget(self):
+        """v1.9.4 反向：`max_images` 调到 10 时，媒体表**不许**被老常量 6 削回 6 张。
+
+        用户那次真机报告的另一半：改了 `forward_message.max_images` 却"没用"。
+        媒体表削掉的条目下游连"一共几张"都数不出来，所以上限必须跟着预算走。
+        """
+        forwarded = [{'source': 'https://gchat.qpic.cn/ft/%d' % i, 'kind': 'image'} for i in range(1, 11)]
+        # 老常量单用会削掉 4 张 —— 那正是要堵的现场。
+        self.assertEqual(len(bridge_module.merge_forward_media([], forwarded, 6)), 6)
+        cap = bridge_module.forward_media_turn_cap(3, {'maxImages': 10})
+        self.assertEqual(cap, 10)
+        self.assertEqual(len(bridge_module.merge_forward_media([], forwarded, cap)), 10)
+
+    def test_the_bridge_reads_the_per_turn_image_budget_from_the_schema_group(self):
+        """`model_center.vision.max_per_turn` 真的接到适配层（三处同改里的读取侧）。"""
+        bot = _FakeOneBotClient({'res-1': _forward_image_pages(10)})
+        config = {
+            'forward_message': {'max_images': 10},
+            'model_center': {'vision': {'enabled': True, 'max_per_turn': 10}},
+        }
+        bridge = _bridge_with_bot(config, bot)
+        self.assertEqual(bridge.image_budget(), 10)
+        self.assertEqual(bridge.forward_media_turn_cap(), 10, '媒体表上限跟着预算走')
+        event = FakeMessageEvent(message='', components=[Forward(id='res-1')], raw_message={
+            'post_type': 'message', 'message': [{'type': 'forward', 'data': {'id': 'res-1'}}],
+        })
+        received = []
+
+        async def fake_receive(session):
+            received.append(session)
+            return True
+
+        bridge.service.receive = fake_receive
+        asyncio.run(bridge.handle_event(event))
+        self.assertEqual(len(received[0].media), 10, '十张读到的图全都进媒体表，一张不丢')
+
+    def test_the_budget_default_reaches_the_bridge_when_the_key_is_absent(self):
+        """没配新键 → 3（省成本那侧），媒体表上限不因此变小。"""
+        bridge = _bridge_with_bot({'forward_message': {'max_images': 3}}, _FakeOneBotClient({}))
+        self.assertEqual(bridge.image_budget(), 3)
+        self.assertGreaterEqual(bridge.forward_media_turn_cap(), 6)
+
     def test_forward_images_become_sources_and_attachments_on_the_session(self):
         """端到端那一半：转发的图进 `SessionView.media` → 视觉来源 / 附件原料。"""
         bot = _FakeOneBotClient({'res-1': _forward_image_pages(2)})
@@ -3898,12 +3942,131 @@ class RoutingRowInjectionTests(unittest.TestCase):
         self.assertNotIn('audio', by_task)
 
 
+class ApplyConfigRecomputesRoutingTests(unittest.TestCase):
+    """改完配置要**重算路由**并按需重建 provider（v1.9.4 §61）。
+
+    真机症状：在控制台加 / 改完模型连接，模型中心那一页与真实路由还是启动时那份 ——
+    `apply_config` / `reload_config` 只换了 `service.config`，`service.model_routing`
+    与 narrator / compactor 一个都没动。
+    """
+
+    @staticmethod
+    def _connection(label: str = '直连A') -> dict[str, Any]:
+        return {
+            'label': label, 'enabled': True, 'model': 'demo',
+            'endpoint': 'https://gw.example.com/v1/chat/completions',
+            'use_for_main': True,
+        }
+
+    def test_applying_a_config_recomputes_the_route_and_its_candidates(self):
+        """① 改配置 → 路由表**真的变了**（断言新的候选与判定），provider 跟着重建。"""
+        bridge = _make_bridge({'model_center': {'providers': []}})
+        service = bridge.service
+        self.assertFalse(service.model_routing['main']['available'])
+        self.assertEqual(service.model_routing['main']['reason'], 'unavailable')
+        self.assertEqual(service.model_routing['main']['providers'], [])
+        before = service.narrator
+
+        bridge.apply_config({'model_center': {'providers': [self._connection()]}})
+
+        route = service.model_routing['main']
+        self.assertTrue(route['available'], route)
+        self.assertEqual(route['reason'], 'assigned-provider', '勾了 use_for_main 的连接行')
+        self.assertEqual([row['label'] for row in route['providers']], ['直连A'])
+        from plugin.core.narrator import SilentNarrator  # noqa: PLC0415
+
+        self.assertIsInstance(before, SilentNarrator, '改造前：没有可用路由')
+        self.assertIsNot(service.narrator, before, 'provider 必须跟着路由重建')
+        self.assertNotIsInstance(service.narrator, SilentNarrator, '改造后：真实客户端')
+
+    def test_the_provider_a_turn_already_started_is_never_yanked_away(self):
+        """② 进行中的那一跳不受影响：它手里那份实例带着**发起时**的路由。
+
+        重建是同步、原子的（`refresh_model_routing` 里没有 `await`），旧实例由发起那次
+        调用的强引用兜住，既不会被清空也不会被改写 —— 这一支刻意选"进行中不受影响"
+        （另一支"明确失败并可见"见下面那条 warn 用例），文档 §61 写明。
+        """
+        bridge = _make_bridge({'model_center': {'providers': [self._connection()]}})
+        service = bridge.service
+        in_flight = service.narrator
+        self.assertEqual(in_flight.routing['main']['reason'], 'assigned-provider')
+
+        bridge.apply_config({'model_center': {'providers': []}})
+
+        self.assertEqual(service.model_routing['main']['reason'], 'unavailable', '新配置已生效')
+        self.assertEqual(
+            in_flight.routing['main']['reason'], 'assigned-provider',
+            '进行中那一跳的实例没被抽走 / 改写',
+        )
+        self.assertEqual(
+            [row['label'] for row in in_flight.routing['main']['providers']], ['直连A'],
+        )
+
+    def test_repeated_apply_is_idempotent(self):
+        """③ 重复 apply 幂等：路由不变、对象不换、合成行不堆叠。"""
+        config = {'model_center': {'main_provider_id': 'ollama', 'providers': []}}
+        bridge = _make_bridge(config)
+        service = bridge.service
+        narrator = service.narrator
+        route = service.model_routing['main']
+
+        bridge.apply_config(config)
+        self.assertIs(service.narrator, narrator, '第一遍就不该动（配置没变）')
+        bridge.apply_config(config)
+        self.assertIs(service.narrator, narrator, '第二遍同样不动任何对象')
+        self.assertEqual(service.model_routing['main'], route)
+        self.assertEqual(len(bridge.routing_config()['model']['providers']), 1, '合成行不重复堆叠')
+
+    def test_a_failed_refresh_is_visible_and_never_pretends_it_worked(self):
+        """④ 重算失败 → 一条可见 warn + 旧路由继续用（不许假装已生效）。"""
+        bridge = _make_bridge({'model_center': {'providers': []}})
+        old_route = bridge.service.model_routing['main']
+
+        def boom() -> bool:
+            raise RuntimeError('boom')
+
+        bridge.service.refresh_model_routing = boom  # type: ignore[method-assign]
+        with mock.patch.object(bridge_module, 'log_fallback') as fallback:
+            bridge.apply_config({'model_center': {'providers': [self._connection()]}})
+
+        self.assertTrue(fallback.called, '失败必须留痕')
+        self.assertEqual(fallback.call_args[0][0], 'warn')
+        self.assertIn('模型路由重算失败', fallback.call_args[0][1])
+        self.assertEqual(
+            bridge.service.model_routing['main'], old_route,
+            '旧路由继续用（不是假装新配置生效）',
+        )
+
+
+class _FakeTokenUsage:
+    """AstrBot 4.28 `TokenUsage` 的最小桩：字段名逐字（`input_other` / `input_cached` / `output`）。
+
+    真身：`astrbot/core/provider/entities.py` 的 `TokenUsage`；`LLMResponse.usage` 装的就是它。
+    夹具要用**宿主真名**——这里换成 OpenAI 的名字，测出来的就不是真机行为了。
+    """
+
+    def __init__(self, input_other=0, input_cached=0, output=0):
+        self.input_other = input_other
+        self.input_cached = input_cached
+        self.output = output
+
+    @property
+    def total(self):
+        return self.input_other + self.input_cached + self.output
+
+    @property
+    def input(self):
+        return self.input_other + self.input_cached
+
+
 class _RecordingFakeContext(FakeContext):
     """真桥 + 真 `AstrbotHttpClient` 用的桩宿主：记下 `llm_generate` 收到的 Provider。"""
 
-    def __init__(self, provider_id='session-default'):
+    def __init__(self, provider_id='session-default', usage=None, completion_text='写手草稿'):
         super().__init__()
         self.provider_id = provider_id
+        self.usage = usage if usage is not None else {}
+        self.completion_text = completion_text
         self.calls: list[dict] = []
 
     def get_provider_by_id(self, provider_id):
@@ -3914,12 +4077,16 @@ class _RecordingFakeContext(FakeContext):
 
     async def llm_generate(self, **kwargs):
         self.calls.append(kwargs)
+        completion_text = self.completion_text
+        usage = self.usage
 
         class _Response:
-            completion_text = '写手草稿'
-            usage = {}
+            pass
 
-        return _Response()
+        response = _Response()
+        response.completion_text = completion_text
+        response.usage = usage
+        return response
 
 
 class _ProviderStub:
@@ -4563,6 +4730,110 @@ class QzoneEndToEndTests(unittest.TestCase):
         # CGI 那一页真的被打了，且带上了由 p_skey 算出的 g_tk。
         self.assertEqual(len(http_calls), 1)
         self.assertIn('feeds3_html_more', http_calls[0]['url'])
+
+
+class HostProviderUsageTests(unittest.TestCase):
+    """经宿主 Provider 的调用：token 要读得到、次数要数得上（v1.9.4）。
+
+    真机症状：模型全部来自 AstrBot Provider 时，「Token 统计」页连**调用次数**都是 0。
+    两个根因各有一条守卫：① 只按 OpenAI 的字段名读 AstrBot 的 `TokenUsage`（读到 0）；
+    ② 没有 usage 就整条不记（次数也丢）。
+    """
+
+    def _bridge(self, context, provider_id='ollama'):
+        return _make_bridge(
+            {'model_center': {
+                'main_provider_id': provider_id,
+                'compaction_provider_id': provider_id,
+                'providers': [],
+            }},
+            context=context,
+        )
+
+    def _call(self, client, provider_id='ollama', task='main'):
+        body = {'model': provider_id, 'messages': [{'role': 'user', 'content': '写点什么'}]}
+        return asyncio.run(client.post_json('', None, body, None, task=task))
+
+    def test_the_host_token_usage_is_mapped_to_the_openai_shape(self):
+        """宿主的 `input_other` / `input_cached` / `output` → `prompt_tokens`（含缓存）/ 缓存明细。"""
+        context = _RecordingFakeContext(usage=_FakeTokenUsage(input_other=10, input_cached=90, output=5))
+        bridge = self._bridge(context)
+        response = self._call(bridge_module.AstrbotHttpClient(bridge))
+        # core 的 `parse_token_usage` 只认这一种形状：映射错了，账本三列就永远是 0。
+        self.assertEqual(
+            parse_token_usage(response['usage']),
+            {'input_tokens': 100, 'output_tokens': 5, 'cached_input_tokens': 90},
+        )
+
+    def test_an_older_host_usage_shape_is_still_read(self):
+        context = _RecordingFakeContext(usage={'prompt_tokens': 7, 'completion_tokens': 2})
+        bridge = self._bridge(context)
+        response = self._call(bridge_module.AstrbotHttpClient(bridge))
+        self.assertEqual(
+            parse_token_usage(response['usage']),
+            {'input_tokens': 7, 'output_tokens': 2},
+        )
+
+    def test_a_provider_call_is_counted_even_when_no_usage_comes_back(self):
+        """网关不回 usage：token 三列是 0，但这一次调用**必须在**。"""
+        context = _RecordingFakeContext(usage={})
+        bridge = self._bridge(context)
+        response = self._call(bridge_module.AstrbotHttpClient(bridge))
+        self.assertEqual(response['usage']['prompt_tokens'], 0)
+        records = list(bridge.usage_records)
+        self.assertEqual(len(records), 1, records)
+        self.assertEqual(records[0]['task'], 'main')
+        self.assertEqual(records[0]['target'], 'AstrBot · ollama')
+        self.assertIs(records[0]['ok'], True)
+        self.assertIn('ms', records[0])
+        self.assertEqual(records[0]['total_tokens'], 0, '拿不到就留 0，页面按不可用显示')
+
+    def test_two_calls_are_two_records_with_their_tokens(self):
+        context = _RecordingFakeContext(usage=_FakeTokenUsage(input_other=3, input_cached=0, output=1))
+        bridge = self._bridge(context)
+        client = bridge_module.AstrbotHttpClient(bridge)
+        self._call(client)
+        self._call(client, task='compaction')
+        records = list(bridge.usage_records)
+        self.assertEqual(len(records), 2)
+        self.assertEqual([item['task'] for item in records], ['main', 'compaction'])
+        self.assertEqual([item['total_tokens'] for item in records], [4, 4])
+
+    def test_the_direct_endpoint_still_records_its_tokens(self):
+        """直连那条路（自带 usage）口径不变。"""
+
+        class _Fallback:
+            async def post_json(self, url, headers=None, body=None, timeout=None):  # noqa: ARG002
+                return {
+                    'model': 'demo', 'usage': {'prompt_tokens': 12, 'completion_tokens': 3,
+                                               'total_tokens': 15},
+                }
+
+        bridge = _make_bridge({'model_center': {'providers': []}})
+        body = {'model': 'demo', 'messages': [{'role': 'user', 'content': 'x'}]}
+        response = asyncio.run(bridge_module.AstrbotHttpClient(bridge, fallback=_Fallback()).post_json(
+            'https://gw.example.com/v1/chat/completions', None, body, None, task='main',
+        ))
+        self.assertEqual(parse_token_usage(response['usage'])['input_tokens'], 12)
+        records = list(bridge.usage_records)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['target'], 'https://gw.example.com', 'query 里的密钥不进缓冲')
+        self.assertEqual(records[0]['total_tokens'], 15)
+
+    def test_a_failed_direct_call_is_recorded_as_failed(self):
+        class _Broken:
+            async def post_json(self, url, headers=None, body=None, timeout=None):  # noqa: ARG002
+                raise RuntimeError('网关挂了')
+
+        bridge = _make_bridge({'model_center': {'providers': []}})
+        body = {'model': 'demo', 'messages': [{'role': 'user', 'content': 'x'}]}
+        with self.assertRaises(RuntimeError):
+            asyncio.run(bridge_module.AstrbotHttpClient(bridge, fallback=_Broken()).post_json(
+                'https://gw.example.com/v1/chat/completions', None, body, None, task='main',
+            ))
+        records = list(bridge.usage_records)
+        self.assertEqual(len(records), 1)
+        self.assertIs(records[0]['ok'], False)
 
 
 if __name__ == '__main__':

@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 
 from plugin.core.narrator_prompts import (
     compact_prompt_entries,
+    compaction_prompt,
     prompt_visible_message_content,
     recent_script_ownership,
     sticker_description_instruction,
@@ -813,6 +814,117 @@ class VoiceMarkerPromptTests(unittest.TestCase):
         self.assertIn(BUBBLE_VOICE_DISABLED, affordances)
         self.assertNotIn('<sep/>', affordances)
         self.assertNotIn('<tts/>', affordances)
+
+
+class DeliveryRealityFactTests(unittest.TestCase):
+    """逐段投递事实：计划被取消 / 没确认送达时，下一回合必须读得到"哪句真发了、哪句没有"。
+
+    受控偏离见 `docs/PORTING_NOTES.md` §58。上游 `ongoingThreads.deliveryReality`
+    的每一段只有英语 `outcome` 枚举（`cancelled` / `not-confirmed`），模型读到的是枚举，
+    不是"这句没发出去"，于是照自己正文里的「发出去，屏幕按灭」继续写。这里为每段补一行
+    极短中文事实（状态词 + 原文）；文案判据只有 `core/script/delivery_reality.segment_fact`。
+    """
+
+    #: 真机上她写下的那句正文——它就是"两句都发出去了"的来源。
+    PROSE = '她把两句话打了出来，发出去，屏幕按灭。'
+
+    @staticmethod
+    def _entry(entry_id: int, segments: list[tuple[str, str]], prose: str,
+               commit_id: str = 'c1') -> dict:
+        """一条带 M6.1 账本的剧本条目（夹具用生产写入方的形状：`delivery_actions` snake_case）。"""
+        return {
+            'id': entry_id, 'story_id': 'story', 'participant_id': 'participant',
+            'kind': 'script', 'actor': 'narrator', 'content': prose,
+            'occurred_at': NOW - timedelta(minutes=5), 'created_at': NOW - timedelta(minutes=5),
+            'metadata': {
+                'commit_id': commit_id, 'narrative_authority': 'original-v2',
+                'delivery_actions': [{
+                    'commit_id': commit_id, 'event_id': f'{commit_id}:e1',
+                    'event_kind': 'outgoing-message', 'participant_id': 'participant',
+                    'status': 'partial',
+                    'segments': [
+                        {'index': index, 'kind': 'message', 'content': text, 'status': status}
+                        for index, (text, status) in enumerate(segments)
+                    ],
+                    'updated_at': NOW.isoformat(),
+                }],
+            },
+        }
+
+    def _payload(self, entries: list[dict]) -> dict:
+        """走真实入口（`to_prompt_payload`）拿下一回合给模型的 payload。"""
+        return to_prompt_payload(request(entries, '在吗', {'participant': {'id': 'participant'}}))
+
+    def _facts(self, entries: list[dict]) -> list[str]:
+        reality = self._payload(entries)['ongoingThreads']['deliveryReality']
+        return [segment['fact'] for item in reality for segment in item['segments']]
+
+    def test_a_cancelled_segment_next_to_a_delivered_one_reaches_the_next_turn_with_its_text(self) -> None:
+        """① 一回合两段：一段 delivered、一段 cancelled → 逐段状态 + 原文都在 payload 里。"""
+        entry = self._entry(1, [('唔，那不算摸鱼咯', 'delivered'),
+                                ('……难怪叫鸡场悟道', 'cancelled')], self.PROSE)
+        self.assertEqual(
+            [segment['fact'] for segment in
+             self._payload([entry])['ongoingThreads']['deliveryReality'][0]['segments']],
+            ['已送达：唔，那不算摸鱼咯', '已取消（没发出去）：……难怪叫鸡场悟道'],
+        )
+        rendered = stringify(self._payload([entry]))
+        self.assertIn('已送达：唔，那不算摸鱼咯', rendered)
+        self.assertIn('已取消（没发出去）：……难怪叫鸡场悟道', rendered)
+
+    def test_a_segment_the_platform_never_confirmed_stays_unconfirmed(self) -> None:
+        """真机另一种现场：两句里第二句 `pending`（未确认送达），不许写成已送达。"""
+        entry = self._entry(1, [('唔，那不算摸鱼咯', 'delivered'),
+                                ('……就着那些下饭啊', 'pending')], self.PROSE)
+        self.assertEqual(self._facts([entry]),
+                         ['已送达：唔，那不算摸鱼咯', '未确认送达：……就着那些下饭啊'])
+
+    def test_each_segment_fact_names_what_actually_happened(self) -> None:
+        """③ 判据表：四种段状态各自的事实词，且没发出去 / 没确认的不许写成已送达。"""
+        for status, label in (('delivered', '已送达'), ('pending', '未确认送达'),
+                              ('failed', '未确认送达（出错）'),
+                              ('cancelled', '已取消（没发出去）')):
+            with self.subTest(status=status):
+                # 全 delivered 的行动按上游规则整条不进上下文，因此给被测那段配一个
+                # 尚未确认的兄弟段，让它真的出现在 payload 里。
+                entry = self._entry(1, [('那句原文', status), ('尚未确认的另一句', 'pending')],
+                                    self.PROSE)
+                facts = self._facts([entry])
+                self.assertEqual(facts[0], f'{label}：那句原文')
+                if status != 'delivered':
+                    self.assertNotIn('已送达', facts[0], '没发出去 / 没确认的不许写成已送达')
+
+    def test_a_fully_delivered_turn_adds_no_noise(self) -> None:
+        """② 全部 delivered → 不出现"未送达 / 已取消"这类噪音。"""
+        entry = self._entry(1, [('唔，那不算摸鱼咯', 'delivered'),
+                                ('……就着那些下饭啊', 'delivered')], self.PROSE)
+        payload = self._payload([entry])
+        self.assertEqual(payload['ongoingThreads']['deliveryReality'], [])
+        rendered = stringify(payload)
+        for word in ('已送达', '未确认送达', '已取消', 'not-confirmed', 'cancelled',
+                     'delivery-not-confirmed-after-error'):
+            self.assertNotIn(word, rendered)
+
+
+class DeliveryDisciplinePromptTests(unittest.TestCase):
+    """提示词纪律：不许把已取消的分段写成"发出去 / 说出去了"（`docs/PORTING_NOTES.md` §58）。"""
+
+    def test_the_writing_prompt_forbids_narrating_a_cancelled_segment_as_sent(self) -> None:
+        for phase in ('user-message', 'advance'):
+            with self.subTest(phase=phase):
+                prompt = system_prompt_6(phase)
+                self.assertIn('Never write a cancelled segment as sent or spoken', prompt)
+                self.assertIn('never write a not-confirmed segment as confirmed', prompt)
+                # 纪律必须把三个状态词与事实行绑在一起，模型才认得出 payload 里的中文。
+                self.assertIn('已送达 = platform-accepted', prompt)
+                self.assertIn('未确认送达 = receipt unknown', prompt)
+                self.assertIn('已取消（没发出去）= never sent', prompt)
+
+    def test_the_compaction_prompt_never_freezes_a_cancelled_segment_as_sent(self) -> None:
+        """压缩提示词也要守同一条纪律：摘要是**跨回合活下来**的那份记录。"""
+        prompt = compaction_prompt('')
+        self.assertIn('never carry a cancelled segment into a summary or fact as sent', prompt)
+        self.assertIn('keep an unconfirmed one unconfirmed', prompt)
 
 
 if __name__ == '__main__':

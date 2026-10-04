@@ -282,6 +282,11 @@ DEEP_DEFAULTS = [
     (("model_center", "vision"), "mode", "native"),
     (("model_center", "vision"), "detail", "auto"),
     (("model_center", "vision"), "max_image_dimension", 1024),
+    # v1.9.4：每回合图片预算（直发 + 转发 + 视频帧**合流之后**的上限）。默认取省成本那侧
+    # = 3（维持 v1.9.1 及之前的行为）；core 那一份只有一处真相
+    # （`core/vision_budget.VISION_IMAGE_BUDGET_DEFAULT`），
+    # `test_the_per_turn_image_budget_tracks_the_core_constant` 三方对账。
+    (("model_center", "vision"), "max_per_turn", 3),
     (("model_center", "audio"), "enabled", False),
     (("model_center", "audio"), "out_format", "mp3"),
     (("model_center", "audio"), "max_file_size_mb", 10),
@@ -1216,6 +1221,25 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertEqual(node["default"], FORWARD_VIDEO_MAX_PER_FORWARD)
         self.assertEqual(node["default"], 1)
 
+    def test_the_per_turn_image_budget_tracks_the_core_constant(self):
+        """`vision.max_per_turn`（v1.9.4）：schema / core 默认值 / `CONFIG_DEFAULTS` 三方一致。
+
+        默认值只有一处真相：`core/vision_budget.VISION_IMAGE_BUDGET_DEFAULT`。
+        schema 的 `default` 与 `CONFIG_DEFAULTS['model']['vision']['max_per_turn']` 都照
+        它抄（照 `VIDEO_CONFIG_DEFAULTS` 那套做法）——这是用户那次真机报告的正中间：
+        「改了配置却还是 3 张」的前提就是"3"这个数在两处各写各的。
+        """
+        from plugin.core.service.config import CONFIG_DEFAULTS  # noqa: PLC0415
+        from plugin.core.vision_budget import VISION_IMAGE_BUDGET_DEFAULT  # noqa: PLC0415
+
+        node = self.schema["model_center"]["items"]["vision"]["items"]["max_per_turn"]
+        self.assertEqual(node["default"], VISION_IMAGE_BUDGET_DEFAULT)
+        self.assertEqual(
+            CONFIG_DEFAULTS["model"]["vision"]["max_per_turn"], VISION_IMAGE_BUDGET_DEFAULT,
+        )
+        # 默认取省成本那侧：与 v1.9.1 及之前的写死 3 逐字一致（升级即无感）。
+        self.assertEqual(VISION_IMAGE_BUDGET_DEFAULT, 3)
+
     def test_deep_sections_are_complete(self):
         model = self.section("model_center")
         prompts = self.section("prompts")
@@ -1734,9 +1758,52 @@ class ConfigurationSchemaTest(unittest.TestCase):
             self.assertIn("type", spec, f"{key} 缺少 type")
 
 
+class ImageBudgetConfigTests(unittest.TestCase):
+    """v1.9.4：每回合图片预算的**解析**（双拼写 / 脏值 / 夹取），判据只住在 core 一处。"""
+
+    def test_defaults_and_clamping(self):
+        from plugin.core.vision_budget import (  # noqa: PLC0415
+            VISION_IMAGE_BUDGET_DEFAULT,
+            VISION_IMAGE_BUDGET_MAX,
+            VISION_IMAGE_BUDGET_MIN,
+            resolve_image_budget,
+        )
+
+        self.assertEqual(VISION_IMAGE_BUDGET_DEFAULT, 3)
+        self.assertEqual(VISION_IMAGE_BUDGET_MIN, 1)
+        self.assertEqual(VISION_IMAGE_BUDGET_MAX, 20)
+        cases = (
+            ({}, 3, '缺键 = 默认'),
+            (None, 3, '整段缺失'),
+            ({'max_per_turn': 6}, 6, 'snake'),
+            ({'maxPerTurn': 6}, 6, 'camel（core 读上游拼写）'),
+            ({'max_per_turn': '7'}, 7, '字符串数字'),
+            ({'max_per_turn': 0}, 1, '下限 1：关掉图片走 `vision.enabled`，不在这里再开一个入口'),
+            ({'max_per_turn': -5}, 1, '下限'),
+            ({'max_per_turn': 99}, 20, '上限'),
+            ({'max_per_turn': 'abc'}, 3, '脏值回默认'),
+            ({'max_per_turn': True}, 3, 'bool 不是数字'),
+            ({'max_per_turn': None}, 3, '显式 null = 没写'),
+        )
+        for section, expected, label in cases:
+            with self.subTest(label=label):
+                self.assertEqual(resolve_image_budget(section), expected)
+
+    def test_the_clue_only_speaks_when_something_was_cut(self):
+        from plugin.core.vision_budget import image_budget_note  # noqa: PLC0415
+
+        self.assertEqual(image_budget_note(14, 3), '[图片×14，本回合仅取前 3 张]')
+        self.assertEqual(image_budget_note(4, 3), '[图片×4，本回合仅取前 3 张]')
+        # 没截断 / 没有候选图 → 一个字都不写（没截断就不许说"仅取前 N"）。
+        self.assertEqual(image_budget_note(3, 3), '')
+        self.assertEqual(image_budget_note(2, 2), '')
+        self.assertEqual(image_budget_note(0, 0), '')
+        self.assertEqual(image_budget_note(None, 3), '')
+        self.assertEqual(image_budget_note('abc', 3), '')
+
+
 class LegacyActionSectionMergeTest(unittest.TestCase):
     """**升级不丢配置**：旧格式（动作开关落在旧分组里）在读取侧仍然读得到。
-
     这是 v1.7.2 起三次分组收敛的核心验收（v1.7.2 十组→三组、v1.7.3 取消风险组、
     v1.7.4 三组→一个父组 `robot_actions`）：分组名变了，但用户配过的值还在磁盘上的
     旧键里；读取侧靠 `LEGACY_SECTION_MERGES` 的 N:1 归并把它读出来，写方向只写新路径

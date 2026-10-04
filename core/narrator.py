@@ -2151,11 +2151,14 @@ class OpenAICompatibleNarrator:
     def _collect_usage(
         self, usages: list[TokenUsageRecord], task: str, provider: ProviderConfig, model: str, raw: Any,
     ) -> None:
-        """记录一次服务商响应的 token 用量（如果服务商报告了的话）。"""
+        """记录一次服务商响应（**无论它有没有报 token**）。
+
+        v1.9.4：以前这里"没报 token 就不入列"，于是 `_emit_usage` 连这次调用都
+        看不见——经宿主 Provider、网关不回 `usage` 的机器在 Token 统计页上永远是 0。
+        身份（任务 / 连接 / 模型）本来就在手上，先记下；token 有没有是下一步的事。
+        """
         parsed = parse_token_usage(raw)
         record: TokenUsageRecord = {'task': task, 'provider_label': provider.get('label'), 'model': model, **parsed}
-        if not has_usage_fields(record):
-            return
         usages.append({
             **record,
             'price_input': provider.get('price_input'),
@@ -2167,9 +2170,19 @@ class OpenAICompatibleNarrator:
         if self._on_usage is None or not usages:
             return
         aggregated = aggregate_token_usages([{**item, 'task': task} for item in usages])
-        if not aggregated or not has_usage_fields(aggregated):
+        if aggregated is not None and has_usage_fields(aggregated):
+            self._on_usage(aggregated)
             return
-        self._on_usage(aggregated)
+        # v1.9.4：这一次调用确实发生了，但没有任何一方报 token。账本要数的"调用次数"
+        # 不能因为 token 缺失而丢失，所以补一条**只有身份**的记录（`calls` 显式写出，
+        # `normalize_usage_record` 据此建行；token 三列留 0，页面按"不可用"显示）。
+        last = usages[-1]
+        self._on_usage({
+            'task': task,
+            'provider_label': last.get('provider_label'),
+            'model': last.get('model'),
+            'calls': 1,
+        })
 
 
 # ========== 工厂 ==========

@@ -74,6 +74,9 @@ from .astrbot_bridge import (
     NESTED_MODEL_SECTIONS,
     PLUGIN_NAME,
     _plugin_version,
+    #: 合成绑定行的身份解析：来源 / 连接 / 能力声明 / 判定**共用这一处判据**
+    #: （v1.9.4，见 `_routing_rows`）。
+    routing_row_provider_id,
     #: 无实例上下文处的降级日志（`core/service/base.py` 的实现，桥接层转出）。
     #: 控制台自己也要留痕（"按哈希找回"必须**可见**），所以从桥接层引入同一份实现，
     #: 而不是在本模块再包一层 `logging`（两份 sink = 一半日志进不了控制台缓冲）。
@@ -81,10 +84,12 @@ from .astrbot_bridge import (
 )
 
 __all__ = ['ConsoleApi', 'ConsoleError', 'CONSOLE_TASKS', 'CONNECTION_TASK_LABELS',
-           'CONTEXT_SECTION_LABELS', 'INTERNAL_INTENT_TYPES', 'StickerFileMissing',
+           'CONTEXT_SECTION_LABELS', 'INTERNAL_INTENT_TYPES', 'ROUTING_SOURCE_LABELS',
+           'StickerFileMissing',
            'mask_endpoint', 'load_config_schema', 'coerce_schema_value',
-           'effective_field_value', 'shorten_path', 'sticker_file_diagnostics',
-           'sticker_path_candidates', 'sticker_relative_file', 'STICKER_PATH_KEEP']
+           'effective_field_value', 'shorten_path', 'mark_token_availability',
+           'sticker_file_diagnostics', 'sticker_path_candidates', 'sticker_relative_file',
+           'STICKER_PATH_KEEP']
 
 #: 控制台「模型」页展示的任务顺序与中文名（与 `model_routing` 的任务键一致）。
 #: ⚠️ 这是**路由任务表**（谁在跑哪个任务），不是连接行的「用途」徽章表——
@@ -140,6 +145,32 @@ CONTEXT_SECTION_LABELS = {
 }
 
 INTERNAL_INTENT_TYPES: frozenset[str] = frozenset({'split-message', 'narrative-retry'})
+
+#: 「任务 → 模型」表里"来源"那一档的**唯一**文案（v1.9.4 §60）。
+#:
+#: 四档与 core 路由表一一对应，判据在 `_routing_rows()` 一处：
+#:
+#: * `astrbot`   → 首个候选是合成绑定行（任务在 `model_center.<任务>_provider_id` 里
+#:                 指了 AstrBot Provider）；
+#: * `connection`→ 首个候选是一条真连接行（`model_center.providers` 里勾了用途）；
+#: * `disabled`  → 同一行的判定**就是 `disabled`**（`model_routing.disabled_route()`：
+#:                 功能被显式关掉，例如 `compaction` / `embedding` 关着）；
+#: * `none`      → 其余情况（`unavailable` / 没有候选）—— 这一刻 core 的路由**就是
+#:                 `unavailable`（`resolve_route` 只在没有候选时给 `available: False`），
+#:                 `create_narrator` 于是交 `SilentNarrator`，根本不会去调什么默认 Provider。
+#:
+#: 以前这一档在**后端**叫 `default`、在**模型页前端**翻成「默认 Provider」，而总览页同一档
+#: 翻成「未配置」—— 同一份数据两个页面两句话，且"默认 Provider"是句假话（运行期用不了）。
+#: 现在文案只在这里一份，前端只负责把它画出来（谁也别自己再翻一遍）。
+#:
+#: `disabled` 这一档是后补的：显式关闭的功能原先也落在 `none` 上，同一行的「判定」列写着
+#: `disabled`、「来源」列却写「未配置」——**一行两个说法**，又一处"界面与运行期相反"。
+ROUTING_SOURCE_LABELS: dict[str, str] = {
+    'astrbot': 'AstrBot',
+    'connection': '连接行',
+    'disabled': '已关闭',
+    'none': '未配置',
+}
 
 # ===================================================================== #
 # 控制台「表情库」面板（v1.8.0）
@@ -257,6 +288,29 @@ def shorten_path(path: Any, keep: int = STICKER_PATH_KEEP) -> str:
     if len(parts) <= max(1, int(keep)):
         return text
     return '…/' + '/'.join(parts[-max(1, int(keep)):])
+
+
+def mark_token_availability(summary: Any) -> Any:
+    """给 Token 汇总补 `hasTokens`：这一行到底有没有 token 数据。
+
+    v1.9.4：经宿主 Provider 的调用有时只数得到次数（网关不回用量），账本里就是
+    "calls > 0 而 token 三列全 0"。页面据此显示 `—`，不拿一排 0 冒充统计数据。
+    判据只写在这里**一处**（总数 / 按模型 / 按任务 / 按天同一套），前端只读结果。
+    """
+    if not isinstance(summary, dict):
+        return summary
+
+    def flag(row: Any) -> None:
+        if isinstance(row, dict):
+            row['hasTokens'] = bool(
+                row.get('inputTokens') or row.get('outputTokens') or row.get('cachedTokens'),
+            )
+
+    flag(summary.get('totals'))
+    for group in ('byModel', 'byTask', 'series'):
+        for row in summary.get(group) or []:
+            flag(row)
+    return summary
 
 
 class StickerFileMissing(FileNotFoundError):
@@ -927,7 +981,7 @@ class ConsoleApi:
         database = self.bridge.db
         bounds = range_bounds(kind, datetime.now(), from_value, to_value)
         rows = _safe_all(database, 'interlude_token_usage', None, 'day DESC', 5_000)
-        summary = summarize_usage(rows, bounds)
+        summary = mark_token_availability(summarize_usage(rows, bounds))
         return {
             'range': normalize_range(kind),
             'from': bounds['from'],
@@ -1081,21 +1135,17 @@ class ConsoleApi:
         vision = section.get('vision') or {}
         audio = section.get('audio') or {}
 
+        # `astrbot_provider` / `modalities` 与「任务 → 模型」表里的来源、能力声明
+        # **同一处判据**（`_named_provider`：路由表首个候选是不是合成绑定行，v1.9.4）。
+        # 以前这里另按 `task_model_id(key)` 读一遍配置，`timeline`（跟随压缩、没有
+        # 自己的指名键）于是被报成"没指名、未声明"，与它那一行的判定自相矛盾。
         task_models = {
-            key: {
-                'label': label,
-                'astrbot_provider': self.bridge.task_model_id(key),
-                'modalities': sorted(self.bridge.task_provider_modalities(key)),
-            }
+            key: self._task_model_view(key, label)
             for key, label in (*CONSOLE_TASKS, ('audio', '语音转写'))
         }
-        # v1.7.9：共同作品的独立写手也能指名 AstrBot Provider，但它的值还有一套
-        # "点名连接行"的老口径——所以这里用双读判定，老口径的值不会被报成 Provider。
-        task_models['works'] = {
-            'label': '共同作品写手',
-            'astrbot_provider': self.bridge.works_writer_named_provider(),
-            'modalities': sorted(self.bridge.task_provider_modalities('works')),
-        }
+        # v1.7.9：共同作品的独立写手也进这一页；它不在七任务路由表里，
+        # `_named_provider` 会退回桥接层的双读判定（老口径的值不许被报成 Provider）。
+        task_models['works'] = self._task_model_view('works', '共同作品写手')
 
         return {
             'tasks': self._routing_rows(),
@@ -3713,7 +3763,26 @@ class ConsoleApi:
         }
 
     def _routing_rows(self) -> list[dict[str, Any]]:
-        """每个任务当前实际指向哪个模型。"""
+        """每个任务当前实际指向哪个模型。
+
+        **一行里的每一列都从路由表这一处推导**（v1.9.4）：来源 / 连接 / 模型 / 候选 /
+        判定 /（下游的）能力声明。以前"来源"另按 `task_model_id(任务)` 算一份，而
+        `timeline` 没有独立的指名键（上游让时间导演跟随压缩），于是同一行出现
+        "来源=连接行、判定=assigned-provider、连接却写着 AstrBot · xxx"的自相矛盾
+        ——两处判据各算一份，必然在 `timeline` 这种"跟随别人"的任务上打架。
+
+        **第三档叫 `none`（未配置），不叫 `default`**（v1.9.4 §60）：既没指名 Provider、
+        也没有连接行时，core 的路由是 `unavailable`（`SilentNarrator`），界面上说
+        "默认 Provider"就是"界面与运行期相反"。`source_label` 与 `source` 同源产出，
+        前端（模型页 / 总览页）只画不翻，两个页面不会再各说一句。
+
+        **第四档 `disabled`（已关闭）**（v1.9.4 §60）：功能被显式关掉时（core
+        `disabled_route()`），这一行的判定就是 `disabled`，来源也必须说"已关闭" ——
+        判据还是**本行这一处**：`reason == 'disabled'` 就是 core 写进这张表的那一个值，
+        不是另算一遍配置开关。候选行优先于它没有意义（`disabled_route()` 的 `providers`
+        恒为空），但顺序仍然把 `disabled` 放在最前，好让"判定 disabled ⇒ 来源已关闭"
+        这条不变式不受候选行影响。
+        """
         table = getattr(getattr(self.bridge, 'service', None), 'model_routing', None) or {}
         rows: list[dict[str, Any]] = []
         for key, label in CONSOLE_TASKS:
@@ -3722,20 +3791,63 @@ class ConsoleApi:
             providers = route.get('providers') if isinstance(route.get('providers'), list) else []
             first = providers[0] if providers and isinstance(providers[0], dict) else {}
             target = route.get('target') if isinstance(route.get('target'), dict) else {}
-            bound = self.bridge.task_model_id(key)
-            source = 'astrbot' if bound else ('connection' if first else 'none')
+            named = routing_row_provider_id(first)
+            reason = _text(route.get('reason'))
+            if reason == 'disabled':
+                source = 'disabled'
+            elif named:
+                source = 'astrbot'
+            elif first:
+                source = 'connection'
+            else:
+                source = 'none'
             rows.append({
                 'task': key,
                 'label': label,
                 'source': source,
-                'provider_label': _text(first.get('label')) or (f'AstrBot · {bound}' if bound else ''),
-                'model': _text(target.get('model')) or _text(first.get('model')) or bound,
+                'source_label': ROUTING_SOURCE_LABELS[source],
+                'provider_label': _text(first.get('label')) or (f'AstrBot · {named}' if named else ''),
+                'model': _text(target.get('model')) or _text(first.get('model')) or named,
                 'assigned': bool(route.get('assigned')),
                 'available': bool(route.get('available')),
-                'reason': _text(route.get('reason')),
+                'reason': reason,
                 'candidates': len(providers),
             })
         return rows
+
+    def _task_model_view(self, task: str, label: str) -> dict[str, Any]:
+        """`task_models[task]` 的形状：这个任务实际用的 Provider + 它声明的模态。
+
+        两列都出自 `_named_provider` 这一处判据——与「任务 → 模型」表里的来源同一份，
+        免得"表里说 AstrBot、能力声明却来自另一处"。
+        """
+        provider_id = self._named_provider(task)
+        return {
+            'label': label,
+            'astrbot_provider': provider_id,
+            'modalities': sorted(self.bridge.provider_modalities_by_id(provider_id)),
+        }
+
+    def _named_provider(self, task: str) -> str:
+        """该任务当前实际用的 AstrBot Provider id（没有则空串）。
+
+        路由表里有这个任务（七任务表）时判据只有一条：**首个候选是不是合成绑定行**
+        （`routing_row_provider_id`）。`timeline` 复用压缩的候选，所以它答的是压缩的那个
+        Provider——与它真正会调用的模型一致。
+
+        不在七任务表里的两个键退回桥接层：`audio` 是转写模型（不参与叙事路由），
+        `works` 是旁路写手且另有一套"点名连接行"的老口径（双读判定在
+        `works_writer_named_provider`）。
+        """
+        table = getattr(getattr(self.bridge, 'service', None), 'model_routing', None) or {}
+        route = table.get(task) if isinstance(table, dict) else None
+        if isinstance(route, dict):
+            providers = route.get('providers') if isinstance(route.get('providers'), list) else []
+            first = providers[0] if providers and isinstance(providers[0], dict) else None
+            return routing_row_provider_id(first)
+        if task == 'works':
+            return self.bridge.works_writer_named_provider()
+        return self.bridge.task_model_id(task)
 
     def _astrbot_providers(self) -> list[dict[str, Any]]:
         getter = getattr(self.bridge.context, 'get_all_providers', None)
@@ -3771,12 +3883,10 @@ class ConsoleApi:
     def _task_uses_provider(self, task: str, identifier: str) -> bool:
         """该任务是不是指名了这个 AstrBot Provider（`used_by` 用）。
 
-        `works` 要过双读判定：它的值还有一套"点名连接行"的老口径，那种值不该被算成
-        "用了某个 AstrBot Provider"（否则控制台会指着一个不存在的东西说它在用）。
+        与「任务 → 模型」表同一处判据（`_named_provider`）；`works` 那套"点名连接行"
+        的老口径在那个函数里已经过了一次双读判定，这里不再特判。
         """
-        if task == 'works':
-            return bool(identifier) and self.bridge.works_writer_named_provider() == identifier
-        return self.bridge.task_model_id(task) == identifier
+        return bool(identifier) and self._named_provider(task) == identifier
 
     def _note(self, kind: str) -> str:
         try:

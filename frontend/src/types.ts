@@ -38,7 +38,14 @@ export interface StoryListPayload {
 export interface RoutingRow {
   task: string
   label: string
-  source: 'astrbot' | 'connection' | 'none'
+  /**
+   * `disabled` = 这一行的判定就是 `disabled`（功能被显式关掉，如 `compaction` / `embedding`）；
+   * `none` = 没指名 Provider、也没有连接行 —— 此刻 core 路由是 `unavailable`
+   * （`SilentNarrator`），**不是**"走 AstrBot 默认 Provider"（v1.9.4 §60）。
+   */
+  source: 'astrbot' | 'connection' | 'disabled' | 'none'
+  /** 「来源」那一档的显示文案（后端 `ROUTING_SOURCE_LABELS` 一处给出，前端只画不翻）。 */
+  source_label: string
   provider_label: string
   model: string
   assigned: boolean
@@ -465,6 +472,8 @@ export interface TokenUsageBucket {
   totalTokens: number
   calls: number
   hitRate: number
+  /** 这一桶有没有 token 数据（false 且 calls>0 = 这些调用没回用量，显示 `—`）。 */
+  hasTokens: boolean
 }
 
 export interface TokenUsageDay {
@@ -474,6 +483,7 @@ export interface TokenUsageDay {
   cachedTokens: number
   calls: number
   hitRate: number
+  hasTokens: boolean
 }
 
 export interface TokenStatsPayload {
@@ -488,6 +498,7 @@ export interface TokenStatsPayload {
     totalTokens: number
     calls: number
     hitRate: number
+    hasTokens: boolean
   }
   byModel: TokenUsageBucket[]
   byTask: TokenUsageBucket[]

@@ -50,6 +50,7 @@ import inspect
 import json
 import os
 import re
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,9 +82,13 @@ from ..core.forward_message import (
     ForwardReadResult,
     extract_forward_ids,
     failure_result as forward_failure_result,
+    forward_media_turn_cap,
     forward_read_limits,
     forward_read_with_media,
 )
+#: 每回合图片预算（v1.9.4）：适配层只是**读**它（转发媒体表的上限要跟随它），
+#: 判据与默认值都在 `core/vision_budget.py`。
+from ..core.vision_budget import resolve_image_budget
 from ..core.model_routing import match_usable_connection_row
 from ..core.narrator import HttpxHttpClient
 from ..core.schedule_preplan import resolve_schedule_preplan_config, schedule_preplan_window
@@ -1122,6 +1127,7 @@ def session_view(
     endpoint: Optional[AstrbotEndpoint] = None,
     forward_read: Optional[ForwardReadResult] = None,
     forward_media: Any = None,
+    media_max_per_turn: Optional[int] = None,
 ) -> SessionView:
     """把 `AstrMessageEvent` 翻成 `SessionView`（`plugin/core/service/session.py`）。
 
@@ -1151,6 +1157,11 @@ def session_view(
     （`forward_message.ForwardMedia` 的序列）：并进 `SessionView.media` 的末位，
     直发媒体保持在前。这样 `currentEvent.attachments`、视觉 `sources` 与表情包收藏
     **共用同一条结构化媒体链路**（§46），不必再新造第二套。
+
+    `media_max_per_turn`（v1.9.4）是那条链路的**条目表上限**（`None` = 用
+    `FORWARD_MEDIA_MAX_PER_TURN`）。`handle_event()` 传的是
+    `forward_media_turn_cap()`（跟随每回合图片预算）：媒体表**不许**比用户配得出来的
+    额度更小，否则"一共几张"在下游就再也说不出来（用户那次真机报告的另一半）。
     """
     resolved = endpoint if endpoint is not None else endpoint_for_event(event)
     hints = raw_media_hints(event)
@@ -1195,7 +1206,11 @@ def session_view(
             elements = [{'type': 'text', 'attrs': {'content': content}, 'children': []}]
     # 转发媒体（v1.8.7）：与直发媒体**同一条链路**（`SessionView.media`），只是排在末位。
     # 读不到正文 / 一条媒体都没收到时这里什么都不做——`media` 的取值（含 `None`）不变。
-    media = merge_forward_media(media, forward_media)
+    # 上限（v1.9.4）跟随每回合图片预算：媒体表只封"表能多长"，视觉预算由 core 执行。
+    media = merge_forward_media(
+        media, forward_media,
+        FORWARD_MEDIA_MAX_PER_TURN if media_max_per_turn is None else int(media_max_per_turn),
+    )
     return SessionView(
         platform=resolved.platform,
         self_id=resolved.self_id,
@@ -1325,10 +1340,13 @@ def merge_forward_media(
 
     规则（每条都有用例钉着）：
 
-    1. **直发媒体原样在前**：`sources[:3]`（视觉路径）与 `attachments` 都按顺序取，
+    1. **直发媒体原样在前**：视觉 `sources` 与 `attachments` 都按顺序取，
        所以直发的图先占位——转发来的图**不许挤掉**她本来就在看的那几张；
     2. 转发条目的额度 = `max_per_turn`（整条消息上限，默认 6）**减去**直发里已有的图片
-       条数，余额为 0 或负数就一条都不加（配成 `max_images=0` 时这里天然是空）；
+       条数，余额为 0 或负数就一条都不加（配成 `max_images=0` 时这里天然是空）。
+       ⚠️ v1.9.4：`session_view()` 传进来的是 `forward_media_turn_cap()`，它跟随
+       `model_center.vision.max_per_turn` 与单卡 `max_images` —— 这里**不是**视觉预算的
+       执行点，削在这里下游就再也说不出"一共几张"；
     3. 按**坐标去重**（与直发媒体同一个字面量就跳过）——同一张图既直发又在转发里出现
        只算一次；
     4. 卡片（`kind == 'card'`）不占图片额度（它没有可下载来源，也不花视觉 token）。
@@ -3752,46 +3770,69 @@ class AstrbotHttpClient:
         bound = self.bridge.task_model_id(task)
         explicit_endpoint = isinstance(url, str) and url.strip().lower().startswith(('http://', 'https://'))
         if 'messages' in payload and (bound or not explicit_endpoint):
+            started = time.monotonic()
             routed = await self._chat(payload, timeout, task=task, provider_id=bound)
             if routed is not None:
-                self._record_usage(task, routed)
+                self._record_usage(
+                    task, routed, target='AstrBot · %s' % (_text(routed.get('model')) or bound),
+                    started=started,
+                )
                 return routed
         if 'input' in payload and ('model' in payload or 'dimensions' in payload) and not explicit_endpoint:
+            started = time.monotonic()
             routed = await self._embedding(payload)
             if routed is not None:
+                self._record_usage(task, routed, target=_text(routed.get('model')), started=started)
                 return routed
-        response = await self._fallback.post_json(url, headers, body, timeout)
-        self._record_usage(task, response)
+        started = time.monotonic()
+        try:
+            response = await self._fallback.post_json(url, headers, body, timeout)
+        except Exception:
+            # 这条请求失败了也要留下"调过一次"的痕迹（`ok` 为假），否则面板上
+            # 只能看见成功的那些。
+            self._record_usage(task, None, target=_endpoint_target(url), started=started, ok=False)
+            raise
+        self._record_usage(task, response, target=_endpoint_target(url), started=started)
         return response
 
-    def _record_usage(self, task: Optional[str], response: Any) -> None:
-        """把响应里的 `usage` 记进控制台的内存环形缓冲（**只做展示，不参与计费**）。
+    def _record_usage(
+        self, task: Optional[str], response: Any, *, target: str = '', started: Optional[float] = None,
+        ok: bool = True,
+    ) -> None:
+        """把一次模型调用记进控制台的内存环形缓冲（**只做展示，不参与计费**）。
 
-        放在传输层是有意的：无论请求走的是 AstrBot Provider 还是插件自己的连接，
-        都会经过 `post_json`，所以这一处就能覆盖两条路。真正给用户看的 token 用量
-        与费用仍由 core 的 `report_token_usage` 负责；这里只是让 WebUI 有个"刚刚花了多少"
-        的即时视图，重启即清空。
+        v1.9.4：**无论响应里有没有 `usage` 都记一行**。"这个任务刚刚调了几次、用了
+        哪个目标、成没成、花了多久"本来就在手上；以前"没 usage 就整条不记"会让经
+        宿主 Provider 的调用连次数都不显示（真机症状）。token 三列在没有 usage 时
+        留 0——页面按"不可用"呈现，这里不编造。
 
-        拿不到 usage（很多网关不报）就什么都不记，不编造数据。
+        放在传输层是有意的：无论请求走 AstrBot Provider 还是插件自己的连接，都会经过
+        `post_json`，所以这一处就能覆盖两条路。真正给用户看的账本（跨重启）由 core 的
+        `report_token_usage` 负责；这里只是让 WebUI 有个"刚刚花了多少"的即时视图，
+        重启即清空。
         """
-        if not isinstance(response, dict):
-            return
-        usage = response.get('usage')
-        if not isinstance(usage, dict):
-            return
+        record = response if isinstance(response, dict) else {}
+        usage = record.get('usage') if isinstance(record.get('usage'), dict) else {}
         prompt = _usage_field(usage, 'prompt_tokens', 'input_tokens')
         completion = _usage_field(usage, 'completion_tokens', 'output_tokens')
         total = _usage_field(usage, 'total_tokens') or (prompt + completion)
-        if not (prompt or completion or total):
-            return
+        elapsed = 0
+        if started is not None:
+            try:
+                elapsed = max(0, int((time.monotonic() - started) * 1000))
+            except Exception:  # pragma: no cover - 计时失败不影响记账
+                elapsed = 0
         try:
             self.bridge.usage_records.append({
                 'at': _now_iso(),
                 'task': task or '',
-                'model': _text(response.get('model')),
+                'target': target,
+                'model': _text(record.get('model')),
                 'prompt_tokens': prompt,
                 'completion_tokens': completion,
                 'total_tokens': total,
+                'ok': bool(ok),
+                'ms': elapsed,
             })
         except Exception:  # pragma: no cover - 记账失败不能影响请求
             pass
@@ -3939,11 +3980,7 @@ class AstrbotHttpClient:
             'object': 'chat.completion',
             'model': provider_id,
             'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': text}, 'finish_reason': 'stop'}],
-            'usage': {
-                'prompt_tokens': _usage_field(usage, 'prompt_tokens', 'input_tokens'),
-                'completion_tokens': _usage_field(usage, 'completion_tokens', 'output_tokens'),
-                'total_tokens': _usage_field(usage, 'total_tokens'),
-            },
+            'usage': _openai_usage(usage),
         }
 
     def _known_modalities(self, provider_id: str) -> Optional[set[str]]:
@@ -4096,6 +4133,21 @@ def _now_iso() -> str:
         return ''
 
 
+def _endpoint_target(url: Any) -> str:
+    """直连请求在"本次会话用量"里的展示目标：只留 `scheme://主机`。
+
+    为什么不带路径与 query：endpoint 上可能挂着 `?api_key=…`（控制台的连接池就见过
+    这种写法），整条塞进面板等于把密钥回显到浏览器。主机名足够分清是哪条连接。
+    """
+    text = _text(url)
+    if not text:
+        return ''
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return '%s://%s' % (parsed.scheme, parsed.netloc)
+    return text.split('?', 1)[0]
+
+
 #: 剥掉分层日志里的 ANSI 色码（WebUI 渲染不了 256 色转义序列）。
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
@@ -4120,6 +4172,27 @@ def is_routing_row(provider: Any) -> bool:
     return isinstance(provider, dict) and _text(provider.get('id')).startswith(ROUTING_ROW_PREFIX)
 
 
+#: 合成绑定行里 `transport_target` 的前缀。**与 `_binding_row()` 的合成处同一份定义**
+#: （v1.9.4）：控制台要反推"这一行代表哪个 AstrBot Provider"，读取侧再写一遍字符串
+#: 解析就是两处真相——前缀改一个字母，两边立刻不一致。
+ROUTING_TARGET_PREFIX = 'astrbot:'
+
+
+def routing_row_provider_id(row: Any) -> str:
+    """一条候选连接行是「指名 AstrBot Provider」的合成行时，返回那个 Provider id。
+
+    不是合成行（真连接行 / 空）返回空串。判定只认 `transport_target`——它由
+    `_binding_row()` 写入，是这行唯一的结构化身份；`label` 只是给人看的。
+    """
+    if not isinstance(row, dict):
+        return ''
+    target = _text(row.get('transport_target'))
+    if not target.startswith(ROUTING_TARGET_PREFIX):
+        return ''
+    return target[len(ROUTING_TARGET_PREFIX):].strip()
+
+
+
 def _audio_data_uri(audio: dict[str, Any]) -> str:
     """`input_audio` 分段 → data URI，喂给 AstrBot 的 `audio_urls`。
 
@@ -4141,6 +4214,40 @@ def _usage_field(usage: Any, *names: str) -> int:
         if isinstance(value, (int, float)):
             return int(value)
     return 0
+
+
+def _openai_usage(usage: Any) -> dict[str, Any]:
+    """把一次响应的 `usage` 归一成 core 认的 OpenAI 形状。
+
+    AstrBot 自己的 `TokenUsage`（`astrbot/core/provider/entities.py`）字段是
+    `input_other`（**不含缓存**的输入）/ `input_cached` / `output`，宿主 4.28 的
+    `LLMResponse.usage` 就是它；只按 OpenAI 的名字读会**一路读到 0**（真机症状：
+    经宿主 Provider 的调用在「Token 统计」页全是 0）。
+
+    按 OpenAI 口径合成 `prompt_tokens`（含缓存的总输入）与
+    `prompt_tokens_details.cached_tokens`（core 的 `parse_token_usage` 读它）；
+    认不出 AstrBot 形状时按老形状（`prompt_tokens` 等）原样取。
+    """
+    input_other = _usage_field(usage, 'input_other')
+    input_cached = _usage_field(usage, 'input_cached')
+    output = _usage_field(usage, 'output')
+    if input_other or input_cached or output:
+        prompt = input_other + input_cached
+        result: dict[str, Any] = {
+            'prompt_tokens': prompt,
+            'completion_tokens': output,
+            'total_tokens': prompt + output,
+        }
+        if input_cached:
+            result['prompt_tokens_details'] = {'cached_tokens': input_cached}
+        return result
+    prompt = _usage_field(usage, 'prompt_tokens', 'input_tokens')
+    completion = _usage_field(usage, 'completion_tokens', 'output_tokens')
+    return {
+        'prompt_tokens': prompt,
+        'completion_tokens': completion,
+        'total_tokens': _usage_field(usage, 'total_tokens') or (prompt + completion),
+    }
 
 
 def _normalize_embeddings(result: Any, expected: int) -> Optional[list[list[float]]]:
@@ -4797,7 +4904,7 @@ class AstrbotBridge:
             'enabled': True,
             'mode': 'openai-compatible',
             'endpoint': '',
-            'transport_target': 'astrbot:%s' % provider_id,
+            'transport_target': ROUTING_TARGET_PREFIX + provider_id,
             'api_key': '',
             # `model` 必须非空，否则 core 的候选筛选同样会跳过这一行。
             'model': self.provider_model_name(provider_id) or provider_id,
@@ -4964,10 +5071,19 @@ class AstrbotBridge:
 
     def task_provider_modalities(self, task: Optional[str]) -> set[str]:
         """该任务指名的 AstrBot Provider 声明的模态（没指名 / 拿不到 → 空集合）。"""
-        provider_id = self.task_model_id(task)
-        if not provider_id:
+        return self.provider_modalities_by_id(self.task_model_id(task))
+
+    def provider_modalities_by_id(self, provider_id: Any) -> set[str]:
+        """按 Provider id 读它声明的模态（没给 id / 拿不到 → 空集合）。
+
+        v1.9.4：控制台「任务 → 模型」的**能力声明**改从路由表那一行推出来的
+        Provider id 取（与它的"来源 / 判定"同一处判据），所以这里要有一个按 id
+        取模态的入口——`task_provider_modalities` 也走它，一份实现。
+        """
+        identifier = _text(provider_id)
+        if not identifier:
             return set()
-        return self.provider_modalities(self.provider_by_id(provider_id))
+        return self.provider_modalities(self.provider_by_id(identifier))
 
     def vision_mode_native(self) -> bool:
         """`model_center.vision.mode` 是不是 `native`（默认就是 native）。"""
@@ -5790,6 +5906,23 @@ class AstrbotBridge:
                 return _forward_section_keys(data)
         return {}
 
+    def image_budget(self) -> int:
+        """每回合图片预算（v1.9.4）：`model_center.vision.max_per_turn`。
+
+        段位由 `section()` 归一（schema 是 `model_center.vision`，core 读 `model.vision`），
+        解析与默认值在 `core/vision_budget.py` 一处 —— 这里只负责把配置取出来。
+        """
+        return resolve_image_budget(self.section('vision'))
+
+    def forward_media_turn_cap(self) -> int:
+        """整条消息的转发媒体条目上限（跟随每回合图片预算与单卡 `max_images`）。
+
+        为什么必须跟随：用户把 `forward_message.max_images` 调大、或者把每回合预算调大，
+        媒体表却还按老常量 6 削 —— 那正是"改了一个键却被另一个隐形常量卡住"，
+        被削掉的图连"一共几张"都数不出来（core 的 `forward_media_turn_cap` 有完整理由）。
+        """
+        return forward_media_turn_cap(self.image_budget(), self.forward_section())
+
     def forward_ids_for_event(self, event: AstrMessageEvent) -> list[str]:
         """一条入站事件里的合并转发资源 id（按"先原始段、后消息标记"排好序）。
 
@@ -5944,7 +6077,9 @@ class AstrbotBridge:
         # 带上注入内容。两次构建只差那几个字段，比让登记与读取互相依赖划算。
         self.remember_event(event, session_view(event, endpoint), endpoint)
         forward_read = await self.read_forward_for_event(event)
-        session = session_view(event, endpoint, forward_read, self._forward_media)
+        session = session_view(
+            event, endpoint, forward_read, self._forward_media, self.forward_media_turn_cap(),
+        )
         content = session.content
 
         if not content.strip() and not self._has_voice(session):
@@ -6346,12 +6481,32 @@ class AstrbotBridge:
 
         `self.config` 始终是干净配置（不含 `routing_config()` 合成的连接行），
         交给服务的是补过合成行的副本——与 `__init__` 保持一致。
+
+        v1.9.4 §61：换完 `service.config` **还要重算路由 / 按需重建 provider**。以前只换
+        `service.config`，`service.model_routing` 与 narrator / compactor 还是启动时那五个
+        —— 用户在控制台改完连接（或改完模型参数），模型中心那一页与实际路由纹丝不动。
         """
         self.config = normalize_bridge_config(config)
         try:
             self.service.config = self.routing_config()
         except Exception:  # noqa: BLE001 - 服务未就绪时忽略
             pass
+        self._refresh_model_providers()
+
+    def _refresh_model_providers(self) -> None:
+        """让服务按当前 `service.config` 重算路由并**按需**重建 provider（§61）。
+
+        失败**不许假装已生效**：配置已经落盘了，这一跳抛异常也只留一条可见 warn
+        （旧路由继续用），绝不把"保存成功"整个带崩。
+        """
+        service = getattr(self, 'service', None)
+        refresh = getattr(service, 'refresh_model_routing', None)
+        if not callable(refresh):
+            return
+        try:
+            refresh()
+        except Exception as error:  # noqa: BLE001 - 见 docstring
+            log_fallback('warn', '模型路由重算失败，仍在用上一份路由：%s', error)
 
     def reload_config(self) -> None:
         """按**当前磁盘上的配置**重建内存副本，并交给服务。"""

@@ -44,6 +44,7 @@ from plugin.core.forward_message import (
     extract_forward_media,
     failure_result,
     forward_media_note,
+    forward_media_turn_cap,
     forward_read_content,
     forward_read_ids,
     forward_read_limits,
@@ -1026,6 +1027,43 @@ class ForwardMediaReadTests(unittest.TestCase):
         """整条消息的转发媒体总数上限是一个 core 常量（不暴露配置）。"""
         self.assertEqual(FORWARD_MEDIA_MAX_PER_TURN, 6)
         self.assertGreaterEqual(FORWARD_MEDIA_MAX_PER_TURN, FORWARD_MEDIA_MAX_PER_FORWARD)
+
+    def test_the_turn_cap_follows_the_per_turn_image_budget(self):
+        """v1.9.4：媒体表上限**跟随**每回合图片预算与单卡 `max_images`。
+
+        真机报告的另一半：用户把 `forward_message.max_images` 调大，媒体表却还按老常量
+        6 削 —— 削在这里，下游连"一共几张"都数不出来（用户看到的就是"改了配置没用"）。
+        """
+        # 不传预算（老调用方）= v1.8.7 的行为，逐字不变。
+        self.assertEqual(forward_media_turn_cap(), FORWARD_MEDIA_MAX_PER_TURN)
+        # 预算调大 → 位置上跟着放大；`None` / 脏值按 0 算。
+        self.assertEqual(forward_media_turn_cap(10), 10)
+        self.assertEqual(forward_media_turn_cap(3), FORWARD_MEDIA_MAX_PER_TURN)
+        self.assertEqual(forward_media_turn_cap(None), FORWARD_MEDIA_MAX_PER_TURN)
+        self.assertEqual(forward_media_turn_cap('abc'), FORWARD_MEDIA_MAX_PER_TURN)
+        # 单卡预算本身就是用户配的：它取多少张，表里就得有那么多位置。
+        self.assertEqual(forward_media_turn_cap(3, {'maxImages': 10}), 10)
+        self.assertEqual(forward_media_turn_cap(10, {'maxImages': 2}), 10)
+        self.assertEqual(forward_media_turn_cap(3, {'max_images': 0}), FORWARD_MEDIA_MAX_PER_TURN)
+
+    def test_a_raised_card_cap_is_not_shadowed_by_the_turn_cap(self):
+        """反向：单卡读到多少张，就该有多少条进媒体表（一道闸不许遮蔽另一道）。"""
+        limits = ForwardReadLimits(max_images=10)
+        segments = _node(message=[
+            _image_segment('https://gchat.qpic.cn/a/%d' % index) for index in range(1, 11)
+        ])
+        budget = ForwardMediaBudget(
+            max_images=limits.max_images, max_videos=limits.max_videos,
+        )
+        media = extract_forward_media(segments, budget)
+        self.assertEqual(len(media), 10, '单卡配了 10，就该取出 10 个坐标')
+        self.assertEqual(budget.taken, 10)
+        self.assertEqual(forward_media_note(budget), '', '单卡内没有截断，不写线索')
+        # 表上限必须放得下这 10 条 —— 老常量 6 会削掉 4 张（那正是要堵的现场）。
+        cap = forward_media_turn_cap(3, limits)
+        self.assertEqual(cap, 10)
+        self.assertLess(FORWARD_MEDIA_MAX_PER_TURN, len(media),
+                        '这条用例只有在上限**大于**老常量 6 时才有意义')
 
 
 # =========================================================================== #

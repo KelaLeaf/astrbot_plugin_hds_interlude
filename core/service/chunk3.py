@@ -87,6 +87,9 @@ from ..script.intent_lifecycle import consumed_live_intent_ids, live_narrative_i
 from ..story_state import decode_story_state, encode_story_state
 from ..time import dt_ms, format_log_time, iso, parse_dt
 from ..video_understanding import VideoMedia, collect_video_sources
+#: 每回合图片预算（v1.9.4）：默认值 / 解析 / 截断线索都只住在 `core/vision_budget.py`
+#: 一处（`forward_message` 的媒体表上限也照它算）。
+from ..vision_budget import image_budget_note, note_image_budget_skip, resolve_image_budget
 from .base import ServiceBase, pick
 from .config import RECALLABLE_ENTRY_KINDS, is_trusted_image_host
 from .helpers import (
@@ -1193,9 +1196,16 @@ class ServiceChunk3(ServiceBase):
         `media` 是本移植版追加的末位可选参数：本轮每张图的**媒体种类**
         （照片 / 表情包 / 动画表情），随图一起带走，供提示词区分
         「他发了张实拍照片」和「他甩了个表情包」。
+
+        取几张由**每回合图片预算**说了算（v1.9.4，`model_center.vision.max_per_turn`，
+        见 `core/vision_budget.py`）。上游在这里写死 3；本移植版把它配置化，但**判据
+        仍然只有一处**：这里的下刀与 `flush_buffered_narrative` 里那一次用的是同一个
+        `resolve_image_budget()`，所以「改了配置却还是 3 张」不会再出现。
+        截断线索由调用方（flush）写，因为只有那里知道**候选总数**。
         """
         if not _value(_vision_config(self), 'enabled', False) or not sources:
             return []
+        image_budget = resolve_image_budget(_vision_config(self))
         kind_by_source: dict[str, dict[str, Any]] = {}
         for item in media or []:
             key = _text(pick(item, 'source'))
@@ -1203,7 +1213,7 @@ class ServiceChunk3(ServiceBase):
                 kind_by_source[key] = item
         images: list[Any] = []
         turn_hashes: list[str] = []
-        for index, source in enumerate(sources[:3]):
+        for index, source in enumerate(sources[:image_budget]):
             try:
                 image = await self.fetch_native_image(source, _member(session, 'bot'))
                 if image:
@@ -1607,10 +1617,19 @@ class ServiceChunk3(ServiceBase):
             sticker_catalog = sticker_selection['assets']
             sticker_groups = sticker_selection['groups']
             chat_capabilities = self.private_chat_capabilities(latest_session)
-            image_sources = _unique([
+            # 每回合图片预算（v1.9.4，`model_center.vision.max_per_turn`）：直发媒体与
+            # 转发媒体在这里**合流**，预算也在这一处成立 —— 上游写死的 `[:3]` 改成
+            # 同一个 `resolve_image_budget()`（与 `load_native_images` 里那一刀同源，
+            # 见 `core/vision_budget.py`，判据只有一处）。
+            # 截断**必须可见**：候选总数只有这里知道，所以可数线索也在这里写。
+            # 开关只读一次（v1.9.4 §59）：下面 `attachments` 与那句线索都用它。
+            vision_enabled = bool(_value(_vision_config(self), 'enabled', False))
+            image_budget = resolve_image_budget(_vision_config(self))
+            image_candidates = _unique([
                 source for message in batch
                 for source in (_turn_get(message, 'imageSources', 'image_sources') or [])
-            ])[:3]
+            ])
+            image_sources = image_candidates[:image_budget]
             # 视频理解（v1.9.0，`model_center.video`）：抽帧识别把帧与音轨的**来源**
             # 算出来，下面并进**本来就有的**那两条来源表 —— 帧走 `load_native_images`、
             # 音轨走 `load_native_audio`，一条判据、一套实现，这里不另造通道。
@@ -1642,6 +1661,14 @@ class ServiceChunk3(ServiceBase):
                         media_cards.append(item)
             # `attachments` 描述的是"这条消息带了什么"：派生出来的帧不算消息自带的媒体，
             # 所以它在**并进来源表之前**就用完了（否则三帧会被标成三张 `[图片]`）。
+            #
+            # ⚠️ 预算管的是"**给模型看几张**"，不是"来了几张"（v1.9.4 §59）。图片理解
+            # **关着**时这一回合没有任何视觉输入，预算就无权改写"他带了 N 张图"这件事实
+            # —— 按 `image_sources`（已截到前 N）列，模型连"一共几张"都数不出来，正是
+            # 用户抱怨的那类"她不知道还有更多"。所以那一档按**候选全表**列（不改写事实，
+            # 也不留"仅取前 N"那种视觉预算线索：那话在关着时是假的，由 `image_note`
+            # 的既有前置挡住）。开着识图时维持原样：预算截断 + 线索，两处都不动。
+            attachment_sources = image_sources if vision_enabled else image_candidates
             attachments = [
                 {
                     'index': index + 1,
@@ -1649,13 +1676,16 @@ class ServiceChunk3(ServiceBase):
                     'label': _text(pick(media_by_source.get(source), 'label')) or '[图片]',
                     'summary': _text(pick(media_by_source.get(source), 'summary')),
                 }
-                for index, source in enumerate(image_sources)
+                for index, source in enumerate(attachment_sources)
             ]
             attachments.extend(
                 {'index': 0, 'kind': 'card', 'label': _text(pick(card, 'label')) or '[分享卡片]', 'summary': ''}
                 for card in media_cards
             )
-            image_sources = _unique(list(image_sources) + list(video_media.image_sources))
+            # 视频帧与直发 / 转发的图**抢同一个预算**（§53 的既有口径）：所以取交集
+            # 只在最后做一次 —— 帧排在候选之后，前面已经占满就轮不到它们。
+            available_images = _unique(image_candidates + list(video_media.image_sources))
+            image_sources = available_images[:image_budget]
             try:
                 loaded_images = await self.load_native_images(
                     snapshot['story'], image_sources, latest_session, list(media_by_source.values()),
@@ -1678,6 +1708,19 @@ class ServiceChunk3(ServiceBase):
                 for source in (_turn_get(message, 'audioSources', 'audio_sources') or [])
             ] + list(video_media.audio_sources))
             audio = await self.load_native_audio(snapshot['story'], audio_sources, latest_session)
+            # 图片预算的截断线索（v1.9.4）：**给模型的可数事实**（"一共几张、给了几张"）
+            # 进当前事件；同一件事再给日志一条节流 warn（丢内容必须让人看见，坑 25）。
+            # 两道前置：① 只有真的截了才有这句（没截断时一个字都不写，见 `image_budget_note`）；
+            # ② 图片理解**关着**时一个字都不说 —— 那时 `load_native_images` 一张都不取，
+            # 说"取了前 3 张"是假话（关着时的正确表述是"没有视觉输入"，由既有链路管）。
+            image_note = ''
+            if vision_enabled:
+                image_note = image_budget_note(len(available_images), len(image_sources))
+            if image_note:
+                user_message = '%s\n%s' % (user_message, image_note)
+                note_image_budget_skip(
+                    self, latest_session, len(available_images), len(image_sources), image_budget,
+                )
             if video_media.note:
                 # 视频事实进**当前事件**（与 `visual_observations` 同一处叙事观察）：
                 # 顺带带上"抽了几帧 / 有没有截断"这些可数线索。

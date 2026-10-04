@@ -44,6 +44,9 @@ from ..time import dt_ms, iso, parse_dt, utc_now
 #: 视频理解的默认值（v1.9.1：预算可配之后，那份默认值只住在
 #: `core/video_understanding.py` 一处，这里与 schema 都照它抄）。
 from ..video_understanding import VIDEO_CONFIG_DEFAULTS
+#: 每回合图片预算（v1.9.4）：默认值同样只住在 `core/vision_budget.py` 一处
+#: （schema 的 `default` 也照它抄，`test_configuration.py` 三方对账）。
+from ..vision_budget import VISION_IMAGE_BUDGET_DEFAULT
 
 __all__ = [
     # ---- 1–258 行：常量与桌面投影纯函数 ----
@@ -1791,7 +1794,12 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     },
     # ---- 【必填 2】model（index.ts Model） ----
     'model': {
-        'vision': {'enabled': False, 'mode': 'native', 'detail': 'auto', 'max_image_dimension': 1024},
+        # v1.9.4：每回合图片预算（直发 + 转发 + 视频帧合流之后的上限）。默认值只有
+        # 一处真相：`vision_budget.VISION_IMAGE_BUDGET_DEFAULT`（= 3，省成本那侧）。
+        'vision': {
+            'enabled': False, 'mode': 'native', 'detail': 'auto', 'max_image_dimension': 1024,
+            'max_per_turn': VISION_IMAGE_BUDGET_DEFAULT,
+        },
         'audio': {
             'enabled': False, 'out_format': 'mp3', 'max_file_size_mb': 10, 'max_per_message': 1,
             # v1.7.7：文字转语音总开关（正文 `<tts/>` 标记 + `send_voice` 动作共用）。

@@ -9,7 +9,7 @@ import { useState } from 'preact/hooks'
 import { useQuery } from '../query'
 import type { PanelProps } from '../main'
 import type { TokenStatsPayload } from '../types'
-import { Badge, Button, Empty, ErrorNote, Field, Grid, Input, Loading, Meter, Panel, Select, Stack, Stat, Table } from '../components/ui'
+import { Badge, Button, Empty, ErrorNote, Field, Grid, Input, Loading, Meter, Note, Panel, Select, Stack, Stat, Table } from '../components/ui'
 
 type RangeKey = 'day' | 'week' | 'month' | 'custom'
 
@@ -27,8 +27,13 @@ function compact(value: number) {
   return value.toLocaleString()
 }
 
-function percent(value: number) {
-  return `${(value * 100).toFixed(1)}%`
+/** token 列：这一行有 token 数据才报数，否则 `—`（不拿 0 冒充统计）。 */
+function tokens(value: number, hasTokens: boolean) {
+  return hasTokens ? compact(value) : '—'
+}
+
+function percent(value: number, hasTokens = true) {
+  return hasTokens ? `${(value * 100).toFixed(1)}%` : '—'
 }
 
 /** 本地今天的 `YYYY-MM-DD`（自选范围的默认值）。 */
@@ -54,6 +59,8 @@ export function TokenStats({ refreshKey }: PanelProps) {
   const totals = data?.totals
   const series = data?.series ?? []
   const peak = Math.max(1, ...series.map((item) => item.inputTokens + item.outputTokens))
+  // 有调用、却一条 token 都没有 → 说明这些调用没回用量（网关不报 / 经宿主 Provider）。
+  const noUsage = Boolean(totals && totals.calls > 0 && !totals.hasTokens)
 
   return (
     <Stack>
@@ -90,20 +97,28 @@ export function TokenStats({ refreshKey }: PanelProps) {
       ) : (
         <>
           <Grid cols={4}>
-            <Stat label="输入 tokens" value={compact(totals.inputTokens)} hint="含缓存命中部分" />
-            <Stat label="输出 tokens" value={compact(totals.outputTokens)} />
-            <Stat label="缓存命中率" value={percent(totals.hitRate)} hint={`缓存 ${compact(totals.cachedTokens)}`} />
+            <Stat label="输入 tokens" value={tokens(totals.inputTokens, totals.hasTokens)} hint="含缓存命中部分" />
+            <Stat label="输出 tokens" value={tokens(totals.outputTokens, totals.hasTokens)} />
+            <Stat
+              label="缓存命中率"
+              value={percent(totals.hitRate, totals.hasTokens)}
+              hint={totals.hasTokens ? `缓存 ${compact(totals.cachedTokens)}` : '不可用'}
+            />
             <Stat label="调用次数" value={totals.calls.toLocaleString()} hint="含压缩 / 识图 / 播种等侧端任务" />
           </Grid>
+
+          {noUsage ? (
+            <Note tone="warn">这些调用没回 token 用量，只记了次数。要统计 token，请在「模型」页给连接填直连 endpoint。</Note>
+          ) : null}
 
           <Panel title="按天" icon="script">
             <Table
               columns={[
                 { key: 'day', title: '日期', width: '8rem', render: (row) => <span class="font-mono text-[11px]">{row.day}</span> },
-                { key: 'input', title: '输入', width: '7rem', render: (row) => compact(row.inputTokens) },
-                { key: 'output', title: '输出', width: '7rem', render: (row) => compact(row.outputTokens) },
-                { key: 'cached', title: '缓存', width: '7rem', render: (row) => compact(row.cachedTokens) },
-                { key: 'rate', title: '命中率', width: '6rem', render: (row) => percent(row.hitRate) },
+                { key: 'input', title: '输入', width: '7rem', render: (row) => tokens(row.inputTokens, row.hasTokens) },
+                { key: 'output', title: '输出', width: '7rem', render: (row) => tokens(row.outputTokens, row.hasTokens) },
+                { key: 'cached', title: '缓存', width: '7rem', render: (row) => tokens(row.cachedTokens, row.hasTokens) },
+                { key: 'rate', title: '命中率', width: '6rem', render: (row) => percent(row.hitRate, row.hasTokens) },
                 { key: 'calls', title: '次数', width: '5rem', render: (row) => row.calls },
                 {
                   key: 'meter',
@@ -123,10 +138,10 @@ export function TokenStats({ refreshKey }: PanelProps) {
               columns={[
                 { key: 'model', title: '模型', render: (row) => <span class="font-mono text-[11px]">{row.model ?? '—'}</span> },
                 { key: 'provider', title: '连接', width: '10rem', render: (row) => row.provider || '—' },
-                { key: 'input', title: '输入', width: '7rem', render: (row) => compact(row.inputTokens) },
-                { key: 'output', title: '输出', width: '7rem', render: (row) => compact(row.outputTokens) },
-                { key: 'cached', title: '缓存', width: '7rem', render: (row) => compact(row.cachedTokens) },
-                { key: 'rate', title: '命中率', width: '6rem', render: (row) => percent(row.hitRate) },
+                { key: 'input', title: '输入', width: '7rem', render: (row) => tokens(row.inputTokens, row.hasTokens) },
+                { key: 'output', title: '输出', width: '7rem', render: (row) => tokens(row.outputTokens, row.hasTokens) },
+                { key: 'cached', title: '缓存', width: '7rem', render: (row) => tokens(row.cachedTokens, row.hasTokens) },
+                { key: 'rate', title: '命中率', width: '6rem', render: (row) => percent(row.hitRate, row.hasTokens) },
                 { key: 'calls', title: '次数', width: '5rem', render: (row) => row.calls },
               ]}
               rows={data.byModel}
@@ -140,10 +155,10 @@ export function TokenStats({ refreshKey }: PanelProps) {
             <Table
               columns={[
                 { key: 'task', title: '任务', render: (row) => row.task ?? '—' },
-                { key: 'input', title: '输入', width: '7rem', render: (row) => compact(row.inputTokens) },
-                { key: 'output', title: '输出', width: '7rem', render: (row) => compact(row.outputTokens) },
-                { key: 'cached', title: '缓存', width: '7rem', render: (row) => compact(row.cachedTokens) },
-                { key: 'rate', title: '命中率', width: '6rem', render: (row) => percent(row.hitRate) },
+                { key: 'input', title: '输入', width: '7rem', render: (row) => tokens(row.inputTokens, row.hasTokens) },
+                { key: 'output', title: '输出', width: '7rem', render: (row) => tokens(row.outputTokens, row.hasTokens) },
+                { key: 'cached', title: '缓存', width: '7rem', render: (row) => tokens(row.cachedTokens, row.hasTokens) },
+                { key: 'rate', title: '命中率', width: '6rem', render: (row) => percent(row.hitRate, row.hasTokens) },
                 { key: 'calls', title: '次数', width: '5rem', render: (row) => row.calls },
                 {
                   key: 'share',
