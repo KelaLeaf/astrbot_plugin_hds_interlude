@@ -306,6 +306,58 @@ merge_setting = _prefer_helper('merge_setting', _fallback_merge_setting)
 normalize_database_row = _prefer_helper('normalize_database_row', _fallback_normalize_database_row)
 
 
+#: 管理权限被拒的层名（上游 `ManageSessionDenial.layer`）。
+MANAGE_DENIAL_ONEBOT = 'onebot'
+MANAGE_DENIAL_MANAGERS = 'managers'
+
+#: 名单层拒绝的可行动指引（用户可见文案：状态词 + 去哪改，一句；排障只要下一选项）。
+_ACCESS_DENIAL_GUIDANCE = '下一步：在「幕间控制台 → 配置 → 接入与名单」放行该账号。'
+
+#: 非 OneBot 环境的补充说明（Console 沙盒等环境的账号不是 QQ 号）。
+_NON_ONEBOT_MANAGER_NOTE = '（当前不是 OneBot 环境，账号不是 QQ 号——请用 QQ 私聊执行，或把该环境账号加进列表）'
+
+
+def manage_session_denial_reason(
+    *,
+    platform: Any = '',
+    user_id: Any = '',
+    access_denial: Any = '',
+    managers: Any = (),
+) -> Optional[dict[str, str]]:
+    """管理权限判定的纯函数核心（上游 `manageSessionDenialReason`，`src/service.ts:10482`）。
+
+    返回 `None` = 允许；否则 `{'layer', 'detail'}`。两层失败**分开报**：
+
+    * `onebot`：互动名单（`bot_accounts` / `user_accounts` / `ignore_self_messages`）拒绝。
+      原因串由 `explain_session_access` 给出（**判据一处**），这里只补可行动指引；
+    * `managers`：`shared_story.manager_accounts` 不匹配。
+
+    此前两层共用一句"HDSI 管理员权限"，用户明明给了管理员仍被拒时排障方向完全被带偏
+    （rc34）。名单层优先于管理员层：名单没放行时，说"不在管理员名单"是误导。
+    """
+    denied = str(access_denial or '').strip()
+    if denied:
+        return {
+            'layer': MANAGE_DENIAL_ONEBOT,
+            'detail': '%s。%s' % (denied, _ACCESS_DENIAL_GUIDANCE),
+        }
+    listed = [str(value if value is not None else '').strip() for value in (managers or [])]
+    listed = [value for value in listed if value]
+    if not listed:
+        return None
+    if any(normalize_account_id(value) == normalize_account_id(user_id) for value in listed):
+        return None
+    note = '' if is_one_bot_platform(platform) else _NON_ONEBOT_MANAGER_NOTE
+    return {
+        'layer': MANAGE_DENIAL_MANAGERS,
+        'detail': (
+            '当前账号 %s 不在“【结构 4】共享主剧本 → 管理员账号”里（现有：%s）%s。'
+            '下一步：在「幕间控制台 → 配置 → 共享主剧本 → 管理员账号」加上它（留空表示不限制）。'
+            % (normalize_account_id(user_id) or '(空)', '、'.join(listed), note)
+        ),
+    }
+
+
 def log_fallback(level: str, message: str, *args: Any, category: str = '') -> None:
     """无实例上下文处的降级日志（`NullTransport` / 构造期错误）。
 
@@ -2162,25 +2214,34 @@ class ServiceChunk0(ServiceBase):
         """
         return self.explain_session_access(participant)[0]
 
-    def can_manage_session(self, session: Any) -> bool:
-        """上游 `canManageSession(session)`（`src/service.ts:981`）逐条移植。"""
-        if not self.can_handle_session(session):
-            self.report_standalone_operation(
-                'diagnostic', 'debug', '私聊被接入名单拦截 平台=%s 机器人ID=%s 用户ID=%s',
-                pick(session, 'platform'), pick(session, 'selfId', 'self_id'), pick(session, 'userId', 'user_id'),
-            )
-            return False
-        managers = [
-            str(value if value is not None else '').strip()
-            for value in (pick(self.shared_story_config, 'managerAccounts', 'manager_accounts') or [])
-        ]
-        managers = [value for value in managers if value]
-        if not managers:
-            return True
-        return any(
-            normalize_account_id(value) == normalize_account_id(pick(session, 'userId', 'user_id'))
-            for value in managers
+    def manage_session_denial(self, session: Any) -> Optional[dict[str, str]]:
+        """上游 `manageSessionDenial(session)`（`src/service.ts:1249`）：拒绝原因（两层）。
+
+        rc34：拒绝日志升到 **standard** 级（`warn`）。此前两层失败共用一句"需要 HDSI
+        管理员权限"，而"到底哪一层拒的"只藏在 `diagnostic` debug 里——新部署排障时
+        日志里一个字都看不到，用户给了管理员仍被拒也不知道为什么。
+        """
+        allowed, access_reason = self.explain_session_access(session)
+        denial = manage_session_denial_reason(
+            platform=pick(session, 'platform'),
+            user_id=pick(session, 'userId', 'user_id'),
+            access_denial='' if allowed else access_reason,
+            managers=pick(self.shared_story_config, 'managerAccounts', 'manager_accounts') or [],
         )
+        if denial:
+            self.report_standalone_operation(
+                'standard', 'warn', '管理命令被拒 层=%s 平台=%s 机器人ID=%s 用户ID=%s 原因=%s',
+                denial['layer'], pick(session, 'platform'), pick(session, 'selfId', 'self_id'),
+                pick(session, 'userId', 'user_id'), denial['detail'],
+            )
+        return denial
+
+    def can_manage_session(self, session: Any) -> bool:
+        """上游 `canManageSession(session)`（`src/service.ts:981`）逐条移植。
+
+        布尔语义保持不变（既有调用方不受影响）；原因走 `manage_session_denial`。
+        """
+        return self.manage_session_denial(session) is None
 
     def can_handle_story(self, story: Any) -> bool:
         """上游 `canHandleStory(story)`（`src/service.ts:991`）：后台生活更新只要求机器人账号仍启用。
@@ -2420,6 +2481,10 @@ class ServiceChunk0(ServiceBase):
         warnings: list[str] = []
         if not self.can_handle_session(session):
             blockers.append('当前机器人账号或用户账号未通过 OneBot 白名单。')
+        # rc34：doctor 增加管理权限检查项（上游同一位置：白名单判定之后、档案字段之前）。
+        manage_denial = self.manage_session_denial(session)
+        if manage_denial:
+            warnings.append('当前会话无管理权限：%s' % manage_denial['detail'])
         character = pick(setting, 'character') or {}
         if not str(pick(character, 'name') or '').strip():
             blockers.append('storyDefaults.characterName 为空。')

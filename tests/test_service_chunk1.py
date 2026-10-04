@@ -61,6 +61,7 @@ try:  # pragma: no cover - 取决于并行分块的落地顺序
         _quotes_bot,
         _same_platform_family,
         _targetable_message_id,
+        resolve_script_context_budget,
     )
     _IMPORT_ERROR: Optional[BaseException] = None
 except Exception as exc:  # pragma: no cover
@@ -429,17 +430,68 @@ class Chunk1ModuleHelperTests(ServiceHarness):
 
 
 # =========================================================================== #
-# recentEntriesForPrompt（上游 `:1248`）
+# recentEntriesForPrompt（上游 `:1248`；rc35 的预算判定纯函数 `:10465`）
 # =========================================================================== #
 
 class RecentEntriesForPromptTests(ServiceHarness):
+    """rc35：**`Math.max(35, …)` 硬地板已移除**；条数与时间窗是**叠加**关系（窗口只加不减）。
+
+    上游对账：`upstream/test/permission-gate.test.ts:92-101`（`resolveScriptContextBudget`
+    的四条断言）与 `upstream/src/service.ts:1604`（两次查询按 id 去重合并）。
+    """
+
+    def test_pure_function_matches_upstream_contract(self) -> None:
+        """上游 `resolveScriptContextBudget`（`src/service.ts:10465`）逐条对账。"""
+        # 尊重用户设置：显式调小必须生效（旧实现被 `max(50, …)` 地板抬走）。
+        self.assertEqual(
+            resolve_script_context_budget({'contextEntryLimit': 15, 'contextTimeWindowMinutes': 0}), (15, 0),
+        )
+        self.assertEqual(
+            resolve_script_context_budget({'contextEntryLimit': 5, 'contextTimeWindowMinutes': 10}), (5, 10),
+        )
+        # 缺省回落 schema 默认 35 条 / 45 分钟（不是旧的 50 条地板，也不是旧的 20/60）。
+        self.assertEqual(resolve_script_context_budget({}), (35, 45))
+        # 边界钳制。
+        self.assertEqual(
+            resolve_script_context_budget({'contextEntryLimit': 999, 'contextTimeWindowMinutes': 9_999}),
+            (200, 1_440),
+        )
+        self.assertEqual(resolve_script_context_budget({'contextEntryLimit': 0})[0], 1)
+        self.assertEqual(resolve_script_context_budget({'contextTimeWindowMinutes': -5})[1], 0)
+        # 键名法：snake_case 一样认（配置归一前后都能读）。
+        self.assertEqual(
+            resolve_script_context_budget({'context_entry_limit': 7, 'context_time_window_minutes': 3}), (7, 3),
+        )
 
     @needs('recent_entries_for_prompt')
-    async def test_count_floor_and_time_window_are_merged_and_deduplicated(self) -> None:
+    async def test_entry_limit_at_15_really_returns_15_entries(self) -> None:
+        """用例①：`contextEntryLimit=15` 真的只取 15 条（不再被地板抬成 50）。"""
+        service = self.make_service(make_config(runtime={
+            'contextEntryLimit': 15, 'contextTimeWindowMinutes': 0,
+        }))
+        # 40 条，id=40 最新（now），间隔 1 分钟。
+        for index in range(1, 41):
+            self.make_entry(entry_id=index, occurred_at=STORY_TIME - timedelta(minutes=40 - index))
+        rows = await service.recent_entries_for_prompt(PRIVATE_STORY_ID, STORY_TIME)
+        self.assertEqual(len(rows), 15)
+        self.assertEqual([row['id'] for row in rows], list(range(26, 41)))
+
+    @needs('recent_entries_for_prompt')
+    async def test_missing_entry_limit_uses_schema_default_35(self) -> None:
+        """用例②：缺 `contextEntryLimit` → schema 默认 35（旧实现的 `max(50, …)` 会变 50）。"""
+        service = self.make_service(make_config(runtime={'contextTimeWindowMinutes': 0}))
+        for index in range(1, 61):
+            self.make_entry(entry_id=index, occurred_at=STORY_TIME - timedelta(minutes=60 - index))
+        rows = await service.recent_entries_for_prompt(PRIVATE_STORY_ID, STORY_TIME)
+        self.assertEqual(len(rows), 35)
+        self.assertEqual([row['id'] for row in rows], list(range(26, 61)))
+
+    @needs('recent_entries_for_prompt')
+    async def test_count_and_time_window_are_merged_and_deduplicated(self) -> None:
         service = self.make_service(make_config(runtime={
             'contextEntryLimit': 20, 'contextTimeWindowMinutes': 60,
         }))
-        # 60 条：id=1 最早（now-590min），id=60 最新（now-10min），间隔 10 分钟。
+        # 60 条：id=1 最早（now-590min），id=60 最新（now-0min），间隔 10 分钟。
         for index in range(1, 61):
             self.make_entry(
                 entry_id=index, content='e%d' % index,
@@ -447,10 +499,36 @@ class RecentEntriesForPromptTests(ServiceHarness):
             )
         rows = await service.recent_entries_for_prompt(PRIVATE_STORY_ID, STORY_TIME)
         ids = [row['id'] for row in rows]
-        # count 下限 50（< 配置的 20）∪ 60 分钟窗口（id 54..60）→ id 11..60。
-        self.assertEqual(ids, list(range(11, 61)))
+        # 条数 20（id 41..60）∪ 60 分钟窗口（id 54..60）→ id 41..60（窗口只加不减）。
+        self.assertEqual(ids, list(range(41, 61)))
         self.assertEqual(len(set(ids)), len(ids))  # 去重
         self.assertEqual(ids, sorted(ids))         # occurredAt 升序
+
+    @needs('recent_entries_for_prompt')
+    async def test_window_entries_are_merged_even_below_the_limit(self) -> None:
+        """用例③-a：窗口内 12 条、上限 15 → 12 条全进（并集是 16..30）。"""
+        service = self.make_service(make_config(runtime={
+            'contextEntryLimit': 15, 'contextTimeWindowMinutes': 110,
+        }))
+        # 30 条，id=30 最新（now），间隔 10 分钟：窗口（110 分钟）内 = id 19..30（12 条）。
+        for index in range(1, 31):
+            self.make_entry(entry_id=index, occurred_at=STORY_TIME - timedelta(minutes=(30 - index) * 10))
+        rows = await service.recent_entries_for_prompt(PRIVATE_STORY_ID, STORY_TIME)
+        ids = [row['id'] for row in rows]
+        self.assertTrue(set(range(19, 31)) <= set(ids), ids)      # 12 条窗口条目一条不落
+        self.assertEqual(ids, list(range(16, 31)))                # 并上条数取的 16..18
+
+    @needs('recent_entries_for_prompt')
+    async def test_window_entries_are_merged_even_above_the_limit(self) -> None:
+        """用例③-b（叠加的判据）：窗口内 40 条、上限 15 → 40 条全进；窗口只加不减。"""
+        service = self.make_service(make_config(runtime={
+            'contextEntryLimit': 15, 'contextTimeWindowMinutes': 1_000,
+        }))
+        for index in range(1, 41):
+            self.make_entry(entry_id=index, occurred_at=STORY_TIME - timedelta(minutes=(40 - index) * 10))
+        rows = await service.recent_entries_for_prompt(PRIVATE_STORY_ID, STORY_TIME)
+        # 收缩要两者配合：时间窗（1000 分钟）覆盖全部 40 条时，条数上限 15 不生效。
+        self.assertEqual([row['id'] for row in rows], list(range(1, 41)))
 
     @needs('recent_entries_for_prompt')
     async def test_zero_minutes_disables_the_time_window_only(self) -> None:
@@ -463,7 +541,8 @@ class RecentEntriesForPromptTests(ServiceHarness):
                 occurred_at=STORY_TIME - timedelta(minutes=(60 - index) * 10),
             )
         rows = await service.recent_entries_for_prompt(PRIVATE_STORY_ID, STORY_TIME)
-        self.assertEqual([row['id'] for row in rows], list(range(11, 61)))
+        # 窗口关掉后才只剩条数：最近 5 条 = id 56..60。
+        self.assertEqual([row['id'] for row in rows], list(range(56, 61)))
 
     @needs('recent_entries_for_prompt')
     async def test_settings_are_clamped_to_upstream_bounds(self) -> None:

@@ -43,6 +43,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 from ..endpoints import endpoint_account_key
 from ..qzone import (
@@ -55,20 +56,36 @@ from ..qzone import (
     QZONE_COOKIE_DOMAINS,
     QzoneCgiUnavailable,
     evaluate_qzone_gate,
-    match_qzone_feed_content,
     normalize_qzone_feed_entry,
     normalize_qzone_msg_entry,
     probe_qzone_available,
     qzone_action_label,
     qzone_feed_candidates,
+    qzone_feed_content_lookup,
     qzone_intent_from_payload,
+    qzone_media_limit_note,
+    qzone_media_limit_warning,
     qzone_records_for_endpoint,
     qzone_visible_value,
     qzone_visibility_label,
     resolve_qzone_config,
 )
 from ..time import dt_ms, iso, parse_dt
+#: 动态里的图片 / 视频走的是**既有**那两条链：`_vision_config` / `_image_budget` 是
+#: 图片理解那两处判据（chunk3），`collect_video_sources` / `video_config` 是视频理解
+#: 那两处判据（`core/video_understanding.py`）。这里只**读结果**，一份都不重算——
+#: 所以"判据一处"在动态这条路上也成立。
+#: ⚠️ **不读 `forward_message`**：那是"合并转发"的键，与 QQ 空间动态无关（v1.9.6 解开
+#: 的耦合——`min(feed_video_cap, forward_message.max_videos)` 曾让"只调本组上限"照样
+#: 只取 1 段）。动态视频段数的第二道闸是**每回合视觉预算**（`_image_budget`，帧与图片
+#: 共用同一条视觉通道），不是转发键。
+#: chunk3 不 import chunk13（与 chunk1 → chunk3 同一条依据），这条模块级依赖不成环。
+from ..video_understanding import (
+    collect_video_sources,
+    video_config,
+)
 from .base import ServiceBase, pick
+from .chunk3 import _image_budget, _vision_config
 from .helpers import clip
 
 __all__ = ['ServiceChunk13']
@@ -102,8 +119,48 @@ QZONE_VISIBILITY_GUARD_FILE = 'qzone_visibility_guard.json'
 QZONE_COMMENT_SUMMARY_CHARS = 80
 #: 「好友动态只拿到元数据、正文没取到」这条说明的节流间隔（毫秒，§55）。
 QZONE_FEED_CONTENT_NOTE_INTERVAL_MS = 30 * 60 * 1000
+#: 动态媒体（图片 / 视频）识别相关说明的节流间隔（毫秒）。与 `VISION_IMAGE_BUDGET_WARN_INTERVAL_MS`
+#: / `VIDEO_WARN_INTERVAL_MS` 同档：能力缺失与截断都必须让人看见，但不能刷屏。
+QZONE_FEED_MEDIA_NOTE_INTERVAL_MS = 10 * 60 * 1000
 
 _MILLISECONDS_PER_MINUTE = 60_000
+
+
+def qzone_feed_media_capability(service: Any) -> dict[str, Any]:
+    """动态媒体识别的能力判据（**唯一一处**）：不新增"是否识图"开关。
+
+    读的是**既有**的两个总开关，一个字都不另造：
+
+    * **图片**：`model_center.vision.enabled` 开着 **且** 有可用的识图模型
+      （`service.vision_describer.available()`，即连接池里勾了「用于侧端识图」的那条）。
+      两者缺一，动态里的图片就**不调用**任何模型——如实标注 + （只在"开着但没配模型"时）
+      一条可行动的 warn。"图片理解关着"不是故障，不刷 warn。
+    * **视频**：`model_center.video.enabled` 开着。模式（抽帧 / 原生 / 外挂）、ffmpeg 有没有、
+      群聊那道路径**都交给既有视频链自己判**（`collect_video_sources` 开头那四道闸），
+      这里不预判——预判就是第二套判据。
+
+    返回 `{'images', 'image_reason', 'videos', 'video_reason'}`：`*_reason` 是给人看的
+    一句"为什么没做"（能力真缺时进 warn，关着时只作内部记录）。
+    """
+    vision = _vision_config(service)
+    vision_on = pick(vision, 'enabled') is True
+    describer = getattr(service, 'vision_describer', None)
+    available = getattr(describer, 'available', None)
+    images_ready = bool(vision_on and callable(available) and available())
+    if not vision_on:
+        image_reason = '「图片理解」没开（模型中心 → 图片理解）'
+    elif not images_ready:
+        image_reason = '没有可用的识图模型（模型中心 → 图片理解 → 图片解析模型）'
+    else:
+        image_reason = ''
+    video = video_config(service)
+    videos_on = pick(video, 'enabled') is True
+    return {
+        'images': images_ready,
+        'image_reason': image_reason,
+        'videos': videos_on,
+        'video_reason': '' if videos_on else '「视频理解」没开（模型中心 → 视频理解）',
+    }
 
 
 def _qzone_config_section(config: Any) -> Any:
@@ -185,30 +242,93 @@ def _target_uin_param(value: Any) -> Any:
     return int(number)
 
 
-def _qzone_feed_observation(owner: Any, content: Any, published_at: Any = '') -> str:
-    """一条好友动态进剧本时的**观察措辞**（唯一实现，§55）。
+def _note_qzone_feed_media(service: Any, key: str, message: str, *args: Any) -> bool:
+    """动态媒体那条**可见**说明的出口（节流优先；返回是否说出了口）。
 
-    这一条要同时满足两件事，所以措辞不能随便改：
+    与 `video_understanding._warn()` 同一条纪律：宿主 / 替身没给节流口时**照样要说话**
+    （退化成一条裸 warn）——绝不能因为"节流口不在"就把能力缺失吞成静默（坑 25）。
+    """
+    note = getattr(service, 'note_access_skip', None)
+    if callable(note):
+        return bool(note(key, QZONE_FEED_MEDIA_NOTE_INTERVAL_MS, message, *args))
+    report = getattr(service, 'report_standalone', None)
+    if callable(report):
+        report('warn', message % args if args else message)
+        return True
+    return False
+
+
+def _note_qzone_media_limit(
+    service: Any, key: str, kind: str, available: Any, granted: Any, source: str,
+) -> bool:
+    """截断那条**节流可行动** warn（说清楚是哪一道闸、去哪儿调大；返回是否打了）。
+
+    与 `vision_budget.note_image_budget_skip()` 同一条纪律：丢的是内容，用户只能从
+    剧本里看出"她少看了几张"，不给日志就只剩猜（坑 25）。节流键带这条原因本身。
+    """
+    text = qzone_media_limit_warning(kind, available, granted, source)
+    if not text:
+        return False
+    return _note_qzone_feed_media(service, key, '%s', text)
+
+
+def _qzone_feed_observation(
+    owner: Any, facts: Any, published_at: Any = '', media: Any = None,
+) -> str:
+    """一条好友动态进剧本时的**观察措辞**（唯一实现，§55 / §70）。
+
+    这一条要同时满足三件事，所以措辞不能随便改：
 
     1. **她确实看到的**内容要写成观察（"她刷到了…：<正文>"）——系统提示词把
        `actor=system` 的条目解释成"插件记账"，光写"某好友发布了说说"，模型就不会
        把它当成她的见闻（真机症状：动态抓到了、正文也有，剧本里却完全没有
        "她看到了什么"）。
-    2. **没看到就别声称看到**：正文没取到（`正文: 无` / 拉取失败）时只记"有这么
-       一条说说"，一个字的正文都不许编，也不许写成"她看到了内容"。
+    2. **没看到就别声称看到**：正文没取到（列表里没有这条 tid / 拉取失败）时只记
+       "有这么一条说说"，一个字的正文都不许编，也不许写成"她看到了内容"。
+    3. **"她没有文字"与"我们没取到"是两件事**（§70 真机）：只有图片的说说、
+       转发动态本来就没有自己的文字——那种情况写"只有图片"/"转发的说说"，
+       **不许**写"正文没取到"（那会把用户引去查登录态）。
+
+    `facts` 是 `qzone.qzone_feed_content_lookup` 的产出（判据只有那一处）：
+    `found` / `content` / `images` / `videos` / `forward`。转发链上有原文时优先把它当正文
+    （"原内容是什么"是这条事实的重点）；原文与附言都拿不到就如实说"原内容没取到"。
 
     `published_at` 是说说**自己的**发布时间：它不再当条目的 `occurredAt`
     （见 `qzone_feed_sweep` 的说明），所以放在正文里保留这一条事实。
+
+    `media` 是 `_qzone_feed_media_lines()` 的产出（一个字符串列表）：图片 / 视频那几条
+    事实与线索**接在同一段观察后面**（同一个条目、同一处措辞判据）——图片和视频不是
+    另一条动态，分成两个条目会让模型以为她刷到了两条。
     """
     name = str(owner if owner is not None else '').strip() or '一位好友'
     published = str(published_at if published_at is not None else '').strip()
     stamp = '（发布 %s）' % published if published else ''
-    text = str(content if content is not None else '').strip()
+    data = facts if isinstance(facts, Mapping) else {}
+    text = str(data.get('content') or '').strip()
+    images = _rows(data.get('images'))
+    forward = data.get('forward') if isinstance(data.get('forward'), Mapping) else None
+    lines = [
+        str(item).strip() for item in _rows(media) if str(item or '').strip()
+    ]
+    tail = ('\n' + '\n'.join(lines)) if lines else ''
+    if forward is not None:
+        original = str(pick(forward, 'content') or '').strip()
+        if original or text:
+            return '[好友动态] 她刷到了 %s 转发的说说%s：%s%s' % (
+                name, stamp, clip(original or text, QZONE_COMMENT_SUMMARY_CHARS), tail,
+            )
+        if images:
+            return '[好友动态] 她刷到了 %s 转发的说说%s，只有图片%s' % (name, stamp, tail)
+        return '[好友动态] 她刷到了 %s 转发的说说%s，原内容没取到%s' % (name, stamp, tail)
     if text:
-        return '[好友动态] 她刷到了 %s 的说说%s：%s' % (
-            name, stamp, clip(text, QZONE_COMMENT_SUMMARY_CHARS),
+        return '[好友动态] 她刷到了 %s 的说说%s：%s%s' % (
+            name, stamp, clip(text, QZONE_COMMENT_SUMMARY_CHARS), tail,
         )
-    return '[好友动态] 她刷到了 %s 的一条说说%s，但正文没取到' % (name, stamp)
+    if images:
+        return '[好友动态] 她刷到了 %s 的一条说说%s，只有图片%s' % (name, stamp, tail)
+    if data.get('found'):
+        return '[好友动态] 她刷到了 %s 的一条说说%s，没有文字%s' % (name, stamp, tail)
+    return '[好友动态] 她刷到了 %s 的一条说说%s，但正文没取到%s' % (name, stamp, tail)
 
 
 def _qzone_feed_row(raw: Any) -> dict[str, Any]:
@@ -457,7 +577,7 @@ class ServiceChunk13(ServiceBase):
         payload = dict(_mapping(input))
         runtime = self.qzone_runtime()
         if not runtime.get('enabled'):
-            return {'ok': False, 'tid': '', 'error': 'QQ 空间通道未启用（Console → 扩展 → QQ 空间）。'}
+            return {'ok': False, 'tid': '', 'error': 'QQ 空间通道未启用（「幕间控制台 → 配置 → QQ 空间」）。'}
         address = await self._qzone_address(story, prefer_self_id)
         if address is None:
             return {
@@ -1033,6 +1153,152 @@ class ServiceChunk13(ServiceBase):
         window = int(self.qzone_runtime().get('feed_window_minutes') or 120)
         return min(60, max(15, _js_round(window / 2.0)))
 
+    async def _qzone_feed_media_lines(self, story: Any, facts: Any, text: str) -> list[str]:
+        """一条动态里图片 / 视频的识别（**失败绝不阻断入账**）。
+
+        返回接在该条观察后面的那几行（可数线索 + 事实 + 观察）；一行都没有就回空表。
+        判据全在既有处，这里一份都不重算：
+
+        * **要不要做**：`qzone_feed_media_capability()`（本文件唯一一处能力判据）；
+        * **取几张 / 几段**：`qzone.feed_image_cap` / `qzone.feed_video_cap` 与既有的
+          **每回合视觉预算**（`chunk3._image_budget()`）取**小**——两道闸谁拦下的
+          都点名在线索与 warn 里（"只调了一个键却还是 N 张"必须一眼看得出）。
+          **本条路不读 `forward_message`**（合并转发的键，与动态无关，v1.9.6 解开）；
+        * **怎么取**：图片走既有视觉通道（`load_native_images` → `describe_current_images`，
+          下载 / 白名单 / 感知哈希去重 / 降采样都是它那一套）；视频走既有视频链
+          （`collect_video_sources`：抽帧 + 音轨、模式与降级都由它判），抽出的帧再进
+          同一条视觉通道。**不另造媒体通道**。
+
+        `text` 是给识图模型的上下文（这条动态的正文），与回合里那句
+        `describe_current_images(story, images, user_message)` 同一个参数位。
+        """
+        images = [str(item).strip() for item in _rows(facts.get('images')) if str(item or '').strip()]
+        videos = [str(item).strip() for item in _rows(facts.get('videos')) if str(item or '').strip()]
+        if not images and not videos:
+            return []
+        capability = qzone_feed_media_capability(self)
+        runtime = self.qzone_runtime()
+        lines: list[str] = []
+        if images:
+            lines.extend(
+                await self._qzone_feed_image_lines(
+                    story, images, text, capability, int(runtime.get('feed_image_cap') or 1),
+                )
+            )
+        if videos:
+            lines.extend(
+                await self._qzone_feed_video_lines(
+                    story, videos, text, capability, int(runtime.get('feed_video_cap') or 1),
+                )
+            )
+        return lines
+
+    async def _qzone_feed_image_lines(
+        self, story: Any, images: list[str], text: str, capability: Mapping[str, Any], cap: int,
+    ) -> list[str]:
+        """动态里的图片：进既有视觉通道，或者如实标注"没识别"。"""
+        if not capability.get('images'):
+            # 能力关着 = 这不是故障（不刷 warn），但"有几张、没看"必须留下来
+            # （与 `[视频×K，未取]` 同一族的可数事实）。
+            if capability.get('image_reason') and pick(_vision_config(self), 'enabled') is True:
+                # **开着却没配识图模型**：这是配置缺口，必须可见 + 可行动（坑 25）。
+                _note_qzone_feed_media(
+                    self, 'qzone-feed-image-no-vision',
+                    '好友动态里有图片，但%s，这次没有识别：这条动态照常入账，'
+                    '剧本里只有"有几张图"这条事实。',
+                    capability.get('image_reason'),
+                )
+            return ['[图片×%d，未识别]' % len(images)]
+        budget = _image_budget(self)
+        taken = max(1, min(int(cap), int(budget)))
+        sources = images[:taken]
+        loaded = await self.load_native_images(story, sources, None, None)
+        observations = await self.describe_current_images(story, loaded, text) or []
+        lines = [
+            '[图片观察] %s' % str(item).strip()
+            for item in _rows(observations) if str(item or '').strip()
+        ]
+        if sources and not loaded:
+            # **一张都没取回来**：能力开着、也调了模型，却没有任何画面可看。这件事
+            # 必须可见（坑 25），而且要说清"下一次该看哪儿"——取图域名不在白名单 /
+            # 直链过期 / 下载失败，三种现场看这句 + 宿主的取图日志分得开。
+            host = urlsplit(str(sources[0])).hostname
+            _note_qzone_feed_media(
+                self, 'qzone-feed-image-unreadable',
+                '好友动态的图片没取回来（%d 张）：这条动态照常入账，这次没有画面'
+                '（图片来源 %s）。',
+                len(sources), host or str(sources[0])[:80],
+            )
+            lines.insert(0, '[图片×%d，未识别]' % len(images))
+        if len(images) > len(sources):
+            note = qzone_media_limit_note('image', len(images), len(sources))
+            if note:
+                lines.append(note)
+                _note_qzone_media_limit(
+                    self, 'qzone-feed-image-limit', 'image',
+                    len(images), len(sources), 'cap' if int(cap) <= int(budget) else 'budget',
+                )
+        return lines
+
+    async def _qzone_feed_video_lines(
+        self, story: Any, videos: list[str], text: str, capability: Mapping[str, Any], cap: int,
+    ) -> list[str]:
+        """动态里的视频：走既有视频链（抽帧 + 音轨），帧再进同一条视觉通道。
+
+        段数 = `min(qzone.feed_video_cap, 每回合视觉预算)`：第二道闸是
+        `chunk3._image_budget()`（帧与图片共用同一条视觉通道），**不是**合并转发那个键
+        ——`forward_message.max_videos` 一个字都不读（v1.9.6 解开的耦合）。
+        """
+        if not capability.get('videos'):
+            return ['[视频×%d，未识别]' % len(videos)]
+        budget = _image_budget(self)
+        taken = max(1, min(int(cap), int(budget)))
+        sources = videos[:taken]
+        # 合成一份"入站媒体表"：合并转发里的视频正是这么进来的（`kind='video'` 的
+        # `SessionView.media` 条目）——所以这条链的判据与私聊转发**逐字同一条**。
+        # 缺 `is_direct` 按私聊处理（只有总开关生效），抽帧/音轨/降级全由链自己判。
+        # `limit=taken` 让链按本组的上限截断：不给它的话链会拿 `forward_message.max_videos`
+        # 再砍一刀，还会留一条点名转发键的 warn。
+        media_session = {'media': [{'kind': 'video', 'source': url} for url in sources]}
+        video_media = await collect_video_sources(self, story, media_session, limit=taken)
+        lines: list[str] = []
+        try:
+            if video_media.note:
+                lines.append(str(video_media.note).strip())
+            frames = _rows(video_media.image_sources)
+            if frames and capability.get('images'):
+                loaded = await self.load_native_images(story, frames, None, None)
+                observations = await self.describe_current_images(story, loaded, text) or []
+                lines.extend(
+                    '[视频观察] %s' % str(item).strip()
+                    for item in _rows(observations) if str(item or '').strip()
+                )
+            elif frames:
+                # 抽帧白抽了：视频理解开着、图片理解关着，帧**没有通道可去**
+                # （与群回合那条 `GROUP_NO_VISION_REASON` 同一条尺子：帧丢掉要说出来，
+                # 不能让模型以为她看见了画面）。帧照旧丢掉，但留事实 + 一条可行动 warn。
+                _note_qzone_feed_media(
+                    self, 'qzone-feed-video-frames-no-vision',
+                    '好友动态的视频抽好了 %d 帧，但%s，这次没有识别：帧没有交给任何模型'
+                    '（抽帧本身照常完成）。',
+                    len(frames), capability.get('image_reason') or '没有可用的识图模型',
+                )
+                lines.append('[图片×%d，未识别]' % len(frames))
+        finally:
+            # 帧字节已经读进内存（音轨是 data: URI，本处没有语音通道，不交给任何模型）。
+            # 放 finally：那一跳抛异常也不留临时目录垃圾。
+            video_media.cleanup()
+        if len(videos) > len(sources):
+            note = qzone_media_limit_note('video', len(videos), len(sources))
+            if note:
+                lines.append(note)
+                _note_qzone_media_limit(
+                    self, 'qzone-feed-video-limit', 'video',
+                    len(videos), len(sources),
+                    'cap' if int(cap) <= int(budget) else 'budget',
+                )
+        return lines
+
     async def qzone_feed_sweep(self) -> None:
         """好友动态轮询（上游 `qzoneFeedSweep`）：感知零模型调用——新鲜说说写成
         `[好友动态]` 条目，反应留给回合内决策。
@@ -1115,7 +1381,13 @@ class ServiceChunk13(ServiceBase):
                 if key:
                     seen_keys.add(key)
             for feed in qzone_feed_candidates(feeds, seen_keys, runtime, now):
-                content = ''
+                feed_key = str(pick(feed, 'key') or '')
+                # 正文对位的事实（`qzone_feed_content_lookup` 是唯一判据）：
+                # `found=False`（列表里没有这条 tid）与"命中了、只是没有文字"必须分开。
+                facts: dict[str, Any] = {
+                    'found': False, 'content': '', 'images': [], 'videos': [], 'forward': None,
+                }
+                entries: list[Any] = []
                 content_error: Any = None
                 try:
                     # 同一条口径：正文对齐也走 CGI 优先的读通道（NapCat 没有
@@ -1133,41 +1405,92 @@ class ServiceChunk13(ServiceBase):
                             for item in _rows(pick(list_raw, 'msglist', 'posts'))
                         ) if entry
                     ]
-                    content = match_qzone_feed_content(entries, feed)
+                    facts = qzone_feed_content_lookup(entries, feed)
                 except Exception as error:  # noqa: BLE001 - 正文拉取失败按元数据处理
                     # **不许静默**（§55）：正文拉不到是"她只看到有这条动态、没看到内容"，
                     # 这件事必须可见——下面按条给一条可行动的 warn，措辞里也不许声称她看到了。
-                    content = ''
                     content_error = error
                 owner = pick(feed, 'nickname') or 'QQ %s' % pick(feed, 'uin')
                 published_at = iso(pick(feed, 'time'))
+                images = _rows(facts.get('images'))
+                videos = _rows(facts.get('videos'))
+                forward = facts.get('forward') if isinstance(facts.get('forward'), Mapping) else None
+                has_text = bool(
+                    str(facts.get('content') or '').strip()
+                    or str(pick(forward, 'content') or '').strip()
+                )
+                # 图片 / 视频的识别（v1.9.6）：按**已配置的模型能力**自动决定做不做，
+                # 走的是既有视觉通道与既有视频链（判据一处，见 `_qzone_feed_media_lines`）。
+                # **失败不阻断入账**：这一步出任何岔子，这条动态照常写进剧本。
+                media_lines: list[str] = []
+                if images or videos:
+                    try:
+                        media_lines = await self._qzone_feed_media_lines(
+                            story, facts, _qzone_feed_observation(owner, facts, published_at),
+                        )
+                    except Exception as error:  # noqa: BLE001 - 附加能力绝不许带崩动态入账
+                        _note_qzone_feed_media(
+                            self, 'qzone-feed-media-failed',
+                            '好友动态的图片 / 视频识别失败（%s）：这条动态照常入账，'
+                            '这次没有画面可看。', error,
+                        )
+                metadata: dict[str, Any] = {
+                    'qzone_feed_key': pick(feed, 'key'),
+                    'qzone_feed_uin': pick(feed, 'uin'),
+                    'qzone_feed_nickname': pick(feed, 'nickname'),
+                    'qzone_feed_time': published_at,
+                }
+                # 有图片 / 视频 / 是转发就把这几条事实留在条目上（与 `qzone_feed_time` 同一个
+                # 槽；**没有**另造媒体通道——结构化媒体表是回合入站媒体的）。
+                if images:
+                    metadata['qzone_feed_images'] = images
+                if videos:
+                    metadata['qzone_feed_videos'] = videos
+                if forward is not None and str(pick(forward, 'tid') or '').strip():
+                    metadata['qzone_feed_forward_tid'] = pick(forward, 'tid')
                 await self.append_entry(story_id, {
                     'kind': 'friend-feed', 'actor': 'system',
                     # 措辞判据只有一处（`_qzone_feed_observation`）：有正文 = 她确实看到了
-                    # 什么；没正文 = 只记"有这么一条说说"，一个字的正文都不编。
-                    'content': _qzone_feed_observation(owner, content, published_at),
+                    # 什么；没正文也要分清"这条本来就没文字"与"我们没取到"；媒体那几行
+                    # 接在同一段观察后面（同一处措辞判据）。
+                    'content': _qzone_feed_observation(owner, facts, published_at, media_lines),
                     # ⚠️ `occurredAt` 是**她刷到这条动态的时刻**，不是说说自己的发布时间（§55）。
                     # 上游写的是 `feed.time`，而本插件按"故事时间"倒序的两处消费方都会因此
                     # 把它排到旧位置：模型侧的 `recent_entries_for_prompt`（前 50 条 + 60 分钟窗）
                     # 取不到它 → 她压根不知道刷到过；控制台 `console/script` 首页（60 条）
                     # 也看不到 → 用户以为"动态没进剧本"。说说的发布时间改放正文与 metadata。
                     'occurredAt': iso(now),
-                    'metadata': {
-                        'qzone_feed_key': pick(feed, 'key'),
-                        'qzone_feed_uin': pick(feed, 'uin'),
-                        'qzone_feed_nickname': pick(feed, 'nickname'),
-                        'qzone_feed_time': published_at,
-                    },
+                    'metadata': metadata,
                 }, now)
-                if not content:
-                    self.note_access_skip(
-                        'qzone-feed-content-missing', QZONE_FEED_CONTENT_NOTE_INTERVAL_MS,
-                        '好友动态只拿到「谁发了说说」，正文没取到（%s）：她已经知道%s有这条动态，'
-                        '但**没看到内容**，剧本里也不会写成"她看到了"。下一步：确认 NapCat 登录态与 '
-                        'QZone 读通道（get_qzone_msg_list / emotion_cgi_msglist_v6）能返回该好友的'
-                        '说说列表；同一原因 30 分钟内只报一次。',
-                        content_error if content_error is not None else '说说不含这条 tid', owner,
-                    )
+                if not has_text:
+                    if facts.get('found'):
+                        # ① 命中了，只是**这条说说本身没有文字**（只有图片 / 转发）——
+                        # 这不是故障：留事实（措辞 + metadata）与一条 debug，**不刷 warn**
+                        # （§70 真机：一条只有图片的转发动态被报成"说说不含这条 tid"，
+                        # 用户照着去查 NapCat 登录态）。
+                        self.report_standalone(
+                            'debug', '好友动态条目没有文字 归属=%s tid=%s 图片=%d 转发=%s',
+                            owner, feed_key, len(images), '是' if forward is not None else '否',
+                        )
+                    else:
+                        # ② 列表里**确实没有这条 tid**（或这一条 CGI 失败）：查的是哪个 tid、
+                        # 列表里有几条，必须写进 warn——否则用户无从判断该去修哪一头。
+                        if content_error is not None:
+                            reason = str(content_error)
+                            next_step = ('确认 NapCat 登录态与 QZone 读通道'
+                                         '（emotion_cgi_msglist_v6）能返回该好友的说说列表')
+                        else:
+                            reason = '查的 tid=%s，该好友最近 %d 条说说里没有它' % (
+                                feed_key, len(entries),
+                            )
+                            next_step = ('确认 QZone 读通道（emotion_cgi_msglist_v6）返回的'
+                                         '说说列表里有这条 tid')
+                        self.note_access_skip(
+                            'qzone-feed-content-missing', QZONE_FEED_CONTENT_NOTE_INTERVAL_MS,
+                            '好友动态没拿到正文（%s）：她已经知道%s有这条动态，但没看到内容，'
+                            '剧本里也不会写成"她看到了"。下一步：%s。',
+                            reason, owner, next_step,
+                        )
                 seen_row: dict[str, Any] = {
                     'storyId': story_id,
                     'kind': 'feed-seen',
@@ -1180,9 +1503,15 @@ class ServiceChunk13(ServiceBase):
                 if sweep_endpoint_id:
                     seen_row['endpointId'] = sweep_endpoint_id
                 await self.db_create('interlude_qzone_post', seen_row)
+                if media_lines:
+                    self.report_standalone(
+                        'debug', '好友动态媒体已处理 归属=%s 图片=%d 视频=%d 事实行=%d',
+                        owner, len(images), len(videos), len(media_lines),
+                    )
                 self.report_operation(
                     'standard', 'info', story, 'advance',
-                    '好友动态已入账 归属=%s 正文=%s', owner, '有' if content else '无',
+                    '好友动态已入账 归属=%s 正文=%s', owner,
+                    '有' if has_text else ('只有图片' if images else '无'),
                 )
         except Exception as error:  # noqa: BLE001 - 轮询绝不上抛
             self.report_standalone('warn', 'QQ 空间动态轮询失败 错误=%s', error)

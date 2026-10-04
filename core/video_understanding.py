@@ -89,6 +89,8 @@ Provider 的是**视频直链文本（URL）**，不是字节：宿主出站部�
   `extract_session_video_sources()` 顺带收媒体表里的视频坐标。**v1.9.4 起同一个数也是
   "一回合真正读取几段"的上限**（`video_read_budget()`）：配几段就真读几段，来源比预算多
   时在当前事件里留 `[视频×5，本回合仅取前 1 段]` 并打一条节流的可行动 warn。
+  ⚠️ **QQ 空间动态那条路是例外**（v1.9.6）：它自己的上限（`qzone.feed_video_cap` ×
+  每回合视觉预算）经 `collect_video_sources(..., limit=…)` 交给这里，**不读本键**。
 * **群聊开关只认会话**：`group_enabled` 只管群会话（`_is_group_session()` 读事件的
   `is_direct`）——私聊里**转发**来的视频与它无关，只看总开关。它只管"群里的视频要不要花
   一次 ffmpeg 把声音取出来"，抽出的帧与图片共用**同一个**每回合图片预算。
@@ -1332,7 +1334,7 @@ async def _collect_external(
 
 
 async def collect_video_sources(
-    service: Any, story: Any, session: Any,
+    service: Any, story: Any, session: Any, *, limit: Any = None,
 ) -> VideoMedia:
     """抽帧识别（主路）：拿到帧与音轨的**来源坐标**，交给现有那两条通道去取。
 
@@ -1347,9 +1349,15 @@ async def collect_video_sources(
     3. **群聊且 `group_enabled=False`** → 回空（群聊独立开关，默认关=省成本）。
        ⚠️ 这条只看**会话是不是群聊**（`is_direct`）：私聊里转发来的视频与群聊开关无关
        （私聊只看总开关）；
-    4. 一回合真正读取的视频段数 = `forward_message.max_videos`（v1.9.4，
-       `video_read_budget()`）：第 N 段之后的坐标在这里截断，**线索与 warn 都可见**
+    4. 一回合真正读取的视频段数：缺省 = `forward_message.max_videos`（v1.9.4，
+       `video_read_budget()`），第 N 段之后的坐标在这里截断，**线索与 warn 都可见**
        —— 早先写死 `sources[0]`，于是"配了 3 段也只读第 1 段"。
+
+    `limit`（关键字，可省）是**调用方自带的那道闸**：QQ 空间动态那条路的上限由
+    `qzone.feed_video_cap` × 每回合视觉预算决定（`chunk13._qzone_feed_video_lines`），
+    与合并转发没有任何关系。给了它就用它截断，并且**不在这里留线索 / warn**——
+    调用方自己会点名真正生效的那一道闸（这里再报一遍就会指向一个与本条路无关的键）。
+    它只夹下限（`max(1, …)`），上限由调用方的配置区间负责。
 
     配置只在这里读一次（`video_config`），下面全部按它传参。
     """
@@ -1371,22 +1379,32 @@ async def collect_video_sources(
         _warn(service, story, result.reason)
         return result
 
-    # 一回合真正读取的视频段数（判据一处：`video_read_budget()`）。多段按顺序读，
-    # 帧与音轨都并进同一份结果；截断时正文里留条数、日志里留一条可行动的 warn。
+    # 一回合真正读取的视频段数（缺省判据一处：`video_read_budget()`；调用方自带 `limit`
+    # 时以它为准，见 docstring）。多段按顺序读，帧与音轨都并进同一份结果；截断时正文里
+    # 留条数、日志里留一条可行动的 warn。
     #
     # 计数只算**取得到坐标**的来源：正文里那些 `text:` 坐标永不取回（用户可写），
     # 把它们算进"本回合有几段视频"会报出一个假条数（同一个视频既在元素里、又在正文里
     # 出现时尤其明显）。
     readable = [source for source in sources if video_input_target(source)[1]]
-    targets = readable[:video_read_budget(service)]
+    owns_note = limit is None
+    if owns_note:
+        budget = video_read_budget(service)
+    else:
+        try:
+            budget = max(1, int(limit))
+        except (TypeError, ValueError):
+            budget = 1
+    targets = readable[:budget]
     notes: list[str] = []
-    turn_note = video_turn_budget_note(len(readable), len(targets))
-    if turn_note:
-        notes.append(turn_note)
-        _warn(
-            service, story, video_turn_budget_reason(len(readable), len(targets)),
-            video_turn_budget_warning(len(readable), len(targets)),
-        )
+    if owns_note:
+        turn_note = video_turn_budget_note(len(readable), len(targets))
+        if turn_note:
+            notes.append(turn_note)
+            _warn(
+                service, story, video_turn_budget_reason(len(readable), len(targets)),
+                video_turn_budget_warning(len(readable), len(targets)),
+            )
     for source in targets:
         one = await _collect_one_video(service, story, config, source)
         result.image_sources.extend(one.image_sources)

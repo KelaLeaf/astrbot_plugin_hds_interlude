@@ -104,6 +104,27 @@ class FormatLayeredLogTests(unittest.TestCase):
         })
         self.assertRegex(output, r"ᕙ\( •̀ ᗜ •́ \)ᕗ")
 
+    def test_a_field_value_may_contain_an_equals_sign(self):
+        """`key=value` 的值里带 `=` 时照旧渲染成字段。
+
+        回归：`_RE_FIELD` 原用 `[^=]*?` 取值，值里一旦出现 `=`（拒绝原因里的
+        `（userId=20002）` 就是），**整条字段连值一起静默消失**——"原因"这类最该看见的
+        信息反而永远打不出来。
+        """
+        output = format_layered_log({
+            "level": "warn", "protagonist": "HDSI", "standalone": True, "colors": False,
+            "message": "管理命令被拒 层=%s 用户ID=%s 原因=%s",
+            "args": [
+                "onebot", "20002",
+                "「仅处理名单内的用户」开着，而发送者（userId=20002）不在 `user_accounts` 里。",
+            ],
+        })
+        self.assertIn("管理命令被拒", output)
+        self.assertIn("层: onebot", output)
+        self.assertIn("用户ID: 20002", output)
+        self.assertIn("原因: 「仅处理名单内的用户」开着", output)
+        self.assertIn("userId=20002", output)  # 值没被 `=` 截断
+
 
 class RenderLogMessageTests(unittest.TestCase):
     """`render_log_message` 对齐 Node `util.format` 的插值语义。"""

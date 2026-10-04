@@ -1898,7 +1898,7 @@ class CommandCopyLocalizationTests(unittest.TestCase):
         import asyncio
 
         plugin = self._plugin_with(
-            can_manage_session=lambda session: True,  # noqa: ARG005
+            manage_session_denial=lambda session: None,  # noqa: ARG005
             story_start_readiness=_async_return({
                 'existing': {
                     'status': 'paused',
@@ -1915,7 +1915,7 @@ class CommandCopyLocalizationTests(unittest.TestCase):
         import asyncio
 
         plugin = self._plugin_with(
-            can_manage_session=lambda session: True,  # noqa: ARG005
+            manage_session_denial=lambda session: None,  # noqa: ARG005
             story_start_readiness=_async_return({
                 'existing': {
                     'status': 'active',

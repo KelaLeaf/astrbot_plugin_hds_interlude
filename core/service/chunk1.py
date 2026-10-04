@@ -4,7 +4,7 @@
 
 | 上游行 | 成员 | 主题 |
 | --- | --- | --- |
-| 1248 | `recentEntriesForPrompt` | 条数下限 + 近日时间窗双取，按 id 去重合并 |
+| 1248 | `recentEntriesForPrompt` | 条数 × 近日时间窗**叠加**双取，按 id 去重合并（rc35 起无硬地板） |
 | 1264 | `memories` | 长期记忆读取（参与者过滤 + 相关性排序） |
 | 1277 | `adminFacts` | 管理视图：活跃长期事实 |
 | 1284 | `adminPendingIntents` | 管理视图：待办意图 |
@@ -58,6 +58,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any, Optional
 
 from ..time import dt_ms, format_log_time, iso, parse_dt
@@ -102,7 +103,7 @@ from .chunk3 import (
 # `video_understanding.collect_group_video_media`，本文件只做群回合这一跳）。
 from ..video_understanding import collect_group_video_media
 
-__all__ = ['ServiceChunk1']
+__all__ = ['ServiceChunk1', 'resolve_script_context_budget']
 
 #: JS `Time.hour` / `Time.second`（Koishi `Time` 的单位毫秒）。
 _HOUR_MS = 3_600_000
@@ -415,6 +416,46 @@ async def _group_video_audio(
 
 
 # =========================================================================== #
+# 剧本历史注入预算（上游 `src/service.ts:10465` 的模块级纯函数）
+# =========================================================================== #
+
+def _bounded_budget(raw: Any, default: int, low: int, high: int) -> int:
+    """配置项 → `Math.floor` + 上下界钳制；取值不可解析时回落 `default`。
+
+    上游是 `Math.max(low, Math.min(Math.floor(value ?? default), high))`。
+    """
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        number = float(default)
+    if not math.isfinite(number):
+        number = float(default)
+    return max(low, min(math.floor(number), high))
+
+
+def resolve_script_context_budget(runtime: Any) -> tuple[int, int]:
+    """上游 `resolveScriptContextBudget(runtime)`（`src/service.ts:10465`）逐条移植。
+
+    rc35：**`Math.max(35, …)` 的硬地板已整条移除**——M4.1 为连续性加的这道地板，
+    副作用是 Console 里把 `contextEntryLimit` 调到 35 以下完全无效（小模型没法收缩
+    历史），连 schema 默认 35 都被抬成 50。现在尊重用户设置：默认 35 只保留在
+    **默认值**里，不再参与判定。
+
+    条数与时间窗是**叠加**关系：时间窗只**加**不**减**——窗口内的条目全部并入
+    （即使条数已经取满），所以收缩上下文要两个值配合（`contextTimeWindowMinutes`
+    设 0 即关掉窗口）。默认值取 schema 默认（35 条 / 45 分钟）。
+    """
+    count = _bounded_budget(
+        _config_limit(runtime, 'contextEntryLimit', 'context_entry_limit', 35), 35, 1, 200,
+    )
+    minutes = _bounded_budget(
+        _config_limit(runtime, 'contextTimeWindowMinutes', 'context_time_window_minutes', 45),
+        45, 0, 1_440,
+    )
+    return count, minutes
+
+
+# =========================================================================== #
 # ServiceChunk1
 # =========================================================================== #
 
@@ -428,19 +469,17 @@ class ServiceChunk1(ServiceBase):
     async def recent_entries_for_prompt(self, story_id: str, now: Any) -> list[Any]:
         """上游 `recentEntriesForPrompt(storyId, now)`（`src/service.ts:1248`）。
 
-        实时叙事同时保**条数下限**与**近期墙钟窗口**：一串密集对话可以超出名义回合数，
-        却不会立刻抹掉同一小时内更早说过的话。两次查询按 id 去重后，按
-        `occurredAt` 升序、`id` 升序返回。
+        **条数 × 时间窗是叠加关系**：先按条数上限取最近 N 条，再并上时间窗内的全部条目
+        （两者按 id 去重）；窗口只会加、不会减——窗口内条目数超过条数上限时，结果就是
+        窗口内的全部条目。收缩上下文要两个值配合（窗口设 0 即关掉窗口）。
+        预算判定在 `resolve_script_context_budget`（rc35 起**没有 35 条硬地板**）。
 
         移植说明：上游用 `occurredAt: { $gte }` 做范围查询，本移植版的
         `Database.all()` 只支持等值 where（`base.py:db_get` 对算子显式报错），
         因此改成「先按 occurredAt 倒序取 500 行，再在 Python 侧按 cutoff 过滤」——
         与上游取到的是同一批行（窗口内最新的至多 500 行）。
         """
-        raw_count = _config_limit(self.runtime_config, 'contextEntryLimit', 'context_entry_limit', 20)
-        count = max(50, min(int(raw_count), 200))
-        raw_minutes = _config_limit(self.runtime_config, 'contextTimeWindowMinutes', 'context_time_window_minutes', 60)
-        minutes = max(0.0, min(float(raw_minutes), 1_440.0))
+        count, minutes = resolve_script_context_budget(self.runtime_config)
         moment = parse_dt(now) or self.now()
         cutoff_ms = dt_ms(moment) - int(minutes * 60_000)
 

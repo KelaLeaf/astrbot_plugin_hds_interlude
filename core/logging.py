@@ -291,7 +291,9 @@ _RE_DONE_WORDS = re.compile(r"完成|成功|已就绪|已启动")
 _RE_ADVANCE = re.compile(r"推进|后台扫描")
 _RE_WAITING = re.compile(r"等待|计时器|排队")
 
-_RE_FIELD = re.compile(r"(?:^|\s)([\w-]+)=([^=]*?)(?=\s+[\w-]+=|$)")
+#: `key=value` 字段轨迹。值里**允许出现 `=`**：拒绝原因那类文案常含
+#: `（selfId=10001）`，早先的 `[^=]*?` 会让整条字段（连值一起）静默消失。
+_RE_FIELD = re.compile(r"(?:^|\s)([\w-]+)=(.*?)(?=\s+[\w-]+=|$)")
 _RE_TRAILING_PUNCT = re.compile(r"[：:，,]+$")
 
 _RE_CATEGORY_ALTER = re.compile(r"Alter|情绪偏移")

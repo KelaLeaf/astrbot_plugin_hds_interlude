@@ -109,7 +109,7 @@
 | 预算 | 位置 | 默认 | 区间 | 理由 |
 | --- | --- | --- | --- | --- |
 | `maxImages`（单条转发最多取几张图） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_images` | **3** | 0~10 | 转发里的图**先过这一道**。它管的是"从这张卡里取出几个坐标"：取 3 而不是 15，省的是原生图 token 与下载时间；取 0 就等于关掉"转发也看图"，是个**合法**配置（用例钉着）。取出多少张由卡上那句 `[图片×15，仅取前 3 张]` 说清。**v1.9.4 起每回合图片预算没改过时跟随本项**（见 `core/vision_budget.py`：只调这一个键，模型就真的多看到几张） |
-| `maxVideos`（单条转发最多读取几段视频） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_videos` | **1** | 0~10 | 视频比图贵一个量级：每读一段就是一次 ffmpeg（抽帧 + 抽音轨）加一次视觉预算占用。"一段" = 一条视频消息段（去重后的坐标）。**同一个数也是一回合真正读取几段的上限**（v1.9.4，`video_understanding.video_read_budget()`）——一句判据管两处，不许第二处再算一份。显式配成 **0** 才是 v1.8.7 的老行为"转发里的视频一段都不读"（转发这一侧连坐标都不收；私聊直发的视频不受这个键管）。取到的坐标交给 `model_center.video` 那条链：私聊只看它的总开关，群聊另看群聊开关 |
+| `maxVideos`（单条转发最多读取几段视频） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_videos` | **1** | 0~10 | 视频比图贵一个量级：每读一段就是一次 ffmpeg（抽帧 + 抽音轨）加一次视觉预算占用。"一段" = 一条视频消息段（去重后的坐标）。**同一个数也是一回合真正读取几段的上限**（v1.9.4，`video_understanding.video_read_budget()`）——一句判据管两处，不许第二处再算一份。**例外只有 QQ 空间动态那条路**（v1.9.6）：它的段数由 `qzone.feed_video_cap` × 每回合视觉预算决定，**不读本键**（`chunk13._qzone_feed_video_lines` 把上限经 `collect_video_sources(limit=…)` 交给链；转发键与动态无关，早先取小过一次，用户"只调本组的键"照样只取 1 段）。显式配成 **0** 才是 v1.8.7 的老行为"转发里的视频一段都不读"（转发这一侧连坐标都不收；私聊直发的视频不受这个键管）。取到的坐标交给 `model_center.video` 那条链：私聊只看它的总开关，群聊另看群聊开关 |
 | `forward_media_turn_cap()`（整条消息的转发媒体表上限） | 本模块函数（**不暴露配置**；v1.9.4 起**跟随**每回合图片预算） | `max(6, 每回合图片预算, 单卡 max_images)` | — | 它**不是**第三道视觉预算，只是媒体条目表的安全上限：削在这里，下游就再也说不出"一共几张"。所以取值必须 ≥ 用户配得出来的任何一份（`chunk3` 的每回合预算 / 单卡 `max_images`）。真正的视觉上限由 `chunk3` 那一刀执行，并在当前事件里留 `[图片×14，本回合仅取前 3 张]` |
 | 单张体积上限 | **不加新键**：复用 `stickers.max_file_size_mb`（默认 10MB） | 视觉路径 `chunk3.MAX_NATIVE_IMAGE_BYTES`（4MB）、收藏路径 `store_collected_sticker` 的 `max_file_size_mb` | — | "一张图多大算大"在这个仓库里已经有答案，再写一份就是第二个真相 |
 | 只取前面的 | 节点顺序（含嵌套展开顺序） | — | — | 与三重预算同一条纪律：**排在前面的先拿**，后面的只留线索 |
@@ -201,7 +201,8 @@ class ForwardReadLimits:
     显式配 0 才是 v1.8.7 之前的"转发里的视频一段都不读"。取到的视频坐标随
     `SessionView.media`（`kind='video'`）流给 `core/video_understanding.py`，由那里的
     抽帧识别真正"看"（私聊只看总开关，群聊另看群聊开关）；**同一个数也是那里
-    "一回合真正读取几段"的上限**（`video_read_budget()`，判据一处）。
+    "一回合真正读取几段"的上限**（`video_read_budget()`，判据一处）——**只有 QQ 空间
+    动态那条路例外**（v1.9.6：它用自己的 `qzone.feed_video_cap`，不读本键）。
     """
 
     max_nodes: int = 30
@@ -222,7 +223,8 @@ FORWARD_MEDIA_MAX_PER_FORWARD = DEFAULT_LIMITS.max_images
 #: 所以把它封在一次以内（与 `max_images` 默认 3 的差别就在这里：图片本来就常在转发的
 #: 正文里）。显式配 0 = 关掉"转发也看视频"。
 #: ⚠️ 这个数同时是 `video_understanding.video_read_budget()` 的返回值（一回合真正读取
-#: 几段）——改这里就是改那里，别再在视频那一侧写死一份。
+#: 几段）——改这里就是改那里，别再在视频那一侧写死一份。**QQ 空间动态那条路不读它**
+#: （v1.9.6：`chunk13._qzone_feed_video_lines` 自带上限，判据与合并转发无关）。
 FORWARD_VIDEO_MAX_PER_FORWARD = DEFAULT_LIMITS.max_videos
 
 #: **整条消息**里所有合并转发的媒体条目总数上限的**下限**（v1.8.7 的常量值）。

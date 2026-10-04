@@ -47,6 +47,7 @@ from plugin.core.service import (
 from plugin.core.service.base import (
     is_enabled_account as base_is_enabled_account,
     is_one_bot_platform as base_is_one_bot_platform,
+    manage_session_denial_reason,
     normalize_account_id as base_normalize_account_id,
     normalize_database_row,
 )
@@ -207,6 +208,29 @@ class OneBotPlatformTests(unittest.TestCase):
 
     def test_matches_base_module_export(self) -> None:
         self.assertIs(base_is_one_bot_platform, is_one_bot_platform)
+
+
+class TrustedImageHostTests(unittest.TestCase):
+    """`config._TRUSTED_IMAGE_DOMAINS`：只信已知 CDN，**不放宽成"任意地址"**。
+
+    v1.9.6 追加 `qpic.cn` / `photo.store.qq.com`（腾讯自有 CDN）是"动态图片进视觉通道"
+    真能取回字节的前提（理由与边界见 `docs/PORTING_NOTES.md` §72.6.2）。
+
+    反向：外部站点照旧被拦；后缀匹配不许被 `qpic.cn.evil.example.com` / `notqpic.cn`
+    这类域名骗过去（放行的是一条条域名，不是通配）。
+    """
+
+    def test_qzone_cdn_hosts_are_trusted(self) -> None:
+        from plugin.core.service.config import is_trusted_image_host  # noqa: PLC0415
+        for host in ('qpic.cn', 'a1.qpic.cn', 'b1.qpic.cn', 'm.qpic.cn',
+                     'photo.store.qq.com', 'gchat.qpic.cn', 'qpic.cn.'):
+            self.assertTrue(is_trusted_image_host(host), host)
+
+    def test_external_hosts_stay_blocked(self) -> None:
+        from plugin.core.service.config import is_trusted_image_host  # noqa: PLC0415
+        for host in ('evil.example.com', 'qpic.cn.evil.example.com', 'notqpic.cn',
+                     'qq.com', 'photo.store.qq.com.evil.example.com', ''):
+            self.assertFalse(is_trusted_image_host(host), host)
 
 
 class EnabledAccountTests(unittest.TestCase):
@@ -835,7 +859,7 @@ class Chunk0LifecycleTests(ServiceTestCase):
             'desktop_runtime_snapshot', 'desktop_timeline_snapshot', 'desktop_purge_range',
             'desktop_timeline_range', 'set_desktop_cursor_at', 'receive_desktop_event',
             'can_handle_session', 'can_handle_group_session', 'group_rule',
-            'can_handle_participant', 'can_manage_session', 'can_handle_story',
+            'can_handle_participant', 'can_manage_session', 'manage_session_denial', 'can_handle_story',
             'find_story', 'get_paused_story', 'get_canonical_story', 'find_participant',
             'participants', 'create_story', 'story_start_readiness', 'ensure_participant',
             'update_setting', 'set_status', 'recent_entries',
@@ -1326,9 +1350,175 @@ class CanManageSessionTests(ServiceTestCase):
         self.assertTrue(service.can_manage_session(SessionView(platform='onebot', self_id='1', user_id='2')))
 
     def test_denied_session_is_rejected_and_logged(self) -> None:
-        service = self.make_service(onebot_config(botAccounts=[{'qq': '1'}], userAccountsOnly=True))
+        service = self.make_service(onebot_config(
+            botAccounts=[{'qq': '1'}], userAccountsOnly=True,
+            logging={'level': 'debug', 'verbosity': 'diagnostic', 'format': 'layered', 'colors': False},
+        ))
         self.assertFalse(service.can_manage_session(SessionView(platform='onebot', self_id='1', user_id='2')))
-        self.assertIn('私聊被接入名单拦截', self.sink.text())
+        # rc34：拒绝日志升到 standard 级，且**原因**必须排到日志里
+        # （旧文案 "私聊被接入名单拦截" 只在 diagnostic 下可见、且没有原因）。
+        self.assertIn('管理命令被拒', self.sink.text())
+        self.assertIn('层: onebot', self.sink.text())
+        self.assertIn('user_accounts', self.sink.text())
+
+
+class ManageSessionDenialTests(ServiceTestCase):
+    """上游 rc34 权限门：`manageSessionDenialReason`（`src/service.ts:10482`）。
+
+    七条逐条对账 `upstream/test/permission-gate.test.ts:8-90`。另加两条守卫：
+    两层原因不许退回同一句话、拒绝日志必须在**生产默认的 standard 档**可见。
+    """
+
+    def _denial(self, service: Any, *, platform: str = 'onebot', self_id: str = '10001', user_id: str = '20002') -> Any:
+        return service.manage_session_denial(SessionView(platform=platform, self_id=self_id, user_id=user_id))
+
+    # -- 上游 :8 --------------------------------------------------------- #
+
+    def test_open_lists_and_empty_managers_allow_everyone(self) -> None:
+        service = self.make_service(onebot_config(
+            botAccounts=[{'qq': '10001'}], userAccounts=[{'qq': '20002'}], sharedStory={},
+        ))
+        self.assertIsNone(self._denial(service))
+        self.assertTrue(service.can_manage_session(SessionView(platform='onebot', self_id='10001', user_id='20002')))
+        # 第二条断言：`managers` 键整个缺失也放行。
+        self.assertIsNone(self._denial(self.make_service()))
+
+    # -- 上游 :13 -------------------------------------------------------- #
+
+    def test_whitelist_denial_names_bot_or_user_account(self) -> None:
+        bot = self.make_service(onebot_config(
+            botAccountsOnly=True, botAccounts=[{'qq': '99999'}], userAccounts=[{'qq': '20002'}],
+        ))
+        denial_bot = self._denial(bot)
+        self.assertEqual(denial_bot.get('layer'), 'onebot')
+        self.assertIn('bot_accounts', denial_bot['detail'])
+        self.assertIn('10001', denial_bot['detail'])
+
+        user = self.make_service(onebot_config(
+            userAccountsOnly=True, botAccounts=[{'qq': '10001'}], userAccounts=[],
+        ))
+        denial_user = self._denial(user)
+        self.assertEqual(denial_user.get('layer'), 'onebot')
+        self.assertIn('user_accounts', denial_user['detail'])
+        self.assertIn('20002', denial_user['detail'])
+        # 反向守卫：退回"统一一句需要管理员权限"时这条也红。
+        self.assertNotEqual(denial_bot['detail'], denial_user['detail'])
+
+    # -- 上游 :27 -------------------------------------------------------- #
+
+    def test_manager_mismatch_names_current_account_and_list(self) -> None:
+        service = self.make_service(onebot_config(
+            botAccounts=[{'qq': '10001'}], userAccounts=[{'qq': '20002'}],
+            sharedStory={'managerAccounts': ['30003']},
+        ))
+        denial = self._denial(service)
+        self.assertEqual(denial.get('layer'), 'managers')
+        self.assertIn('20002', denial['detail'])
+        self.assertIn('30003', denial['detail'])
+        self.assertIn('管理员账号', denial['detail'])
+
+    # -- 上游 :37 -------------------------------------------------------- #
+
+    def test_manager_match_accepts_transport_prefixed_ids(self) -> None:
+        service = self.make_service(onebot_config(
+            botAccounts=[{'qq': '10001'}], userAccounts=[{'qq': '20002'}],
+            sharedStory={'managerAccounts': ['QQ:20002']},
+        ))
+        self.assertIsNone(self._denial(service, user_id='onebot:20002'))
+
+    # -- 上游 :47 -------------------------------------------------------- #
+
+    def test_non_onebot_environment_gets_the_note(self) -> None:
+        service = self.make_service(onebot_config(sharedStory={'managerAccounts': ['20002']}))
+        denial = self._denial(service, platform='sandbox', self_id='', user_id='root')
+        self.assertEqual(denial.get('layer'), 'managers')
+        self.assertIn('不是 OneBot 环境', denial['detail'])
+        self.assertIn('root', denial['detail'])
+
+    # -- 上游 :57 -------------------------------------------------------- #
+
+    def test_whitelist_denial_outranks_the_manager_check(self) -> None:
+        # 用户账号没进白名单、但 managers 匹配：必须报名单层——修复"给了管理员仍说权限不足"。
+        service = self.make_service(onebot_config(
+            userAccountsOnly=True, userAccounts=[], sharedStory={'managerAccounts': ['20002']},
+        ))
+        denial = self._denial(service)
+        self.assertEqual(denial.get('layer'), 'onebot')
+        self.assertNotIn('管理员账号', denial['detail'])
+
+    # -- 上游 :66 -------------------------------------------------------- #
+
+    def test_ignore_self_messages_filters_bot_self_messages(self) -> None:
+        service = self.make_service(onebot_config(
+            botAccounts=[{'qq': '10001'}], userAccounts=[{'qq': '10001'}],
+        ))
+        denial = self._denial(service, user_id='10001')
+        self.assertEqual(denial.get('layer'), 'onebot')
+        self.assertIn('ignore_self_messages', denial['detail'])
+
+    # -- 守卫：日志档位 -------------------------------------------------- #
+
+    def test_denial_is_logged_at_production_default_verbosity(self) -> None:
+        service = self.make_service(onebot_config(
+            userAccountsOnly=True, userAccounts=[],
+            logging={'level': 'info', 'verbosity': 'standard', 'format': 'layered', 'colors': False},
+        ))
+        self.assertEqual(self._denial(service).get('layer'), 'onebot')
+        text = self.sink.text()
+        self.assertIn('管理命令被拒', text)
+        self.assertIn('层: onebot', text)
+        self.assertIn('原因:', text)     # 原因与两层区分必须真的打进日志
+        self.assertIn('10001', text)     # 机器人 ID
+        self.assertIn('20002', text)     # 用户 ID
+
+    # -- 守卫：纯函数的两层合成 ------------------------------------------ #
+
+    def test_pure_function_composes_the_two_layers(self) -> None:
+        # 名单层：原因串由 `explain_session_access` 给（判据一处），这里只补可行动指引。
+        onebot_layer = manage_session_denial_reason(access_denial='名单拒绝（示例）', managers=[])
+        self.assertEqual(onebot_layer.get('layer'), 'onebot')
+        self.assertIn('接入与名单', onebot_layer['detail'])
+        # 管理员层：含当前账号、现有列表与"留空表示不限制"。
+        managers_layer = manage_session_denial_reason(user_id='20002', managers=['30003'])
+        self.assertEqual(managers_layer.get('layer'), 'managers')
+        self.assertIn('20002', managers_layer['detail'])
+        self.assertIn('30003', managers_layer['detail'])
+        self.assertIn('留空', managers_layer['detail'])
+        # 匹配（含传输前缀）→ 放行；名单空 → 放行。
+        self.assertIsNone(manage_session_denial_reason(user_id='qq:20002', managers=['20002']))
+        self.assertIsNone(manage_session_denial_reason(user_id='20002', managers=[]))
+        # 名单层优先于管理员层。
+        both = manage_session_denial_reason(user_id='20002', access_denial='名单拒绝', managers=['20002'])
+        self.assertEqual(both.get('layer'), 'onebot')
+
+    def test_denial_copy_is_the_short_approved_sentence(self) -> None:
+        """两句拒绝文案逐字钉死（v1.9.6 定稿）：只留事实 + 一个"下一步"，不给第二选项。
+
+        名单层删掉了"或关掉对应的『仅处理名单内』开关"（排障不需要第二选项），管理员层
+        删掉了分号后的解释（"留空即放行所有已授权账号"改写成括号里的"留空表示不限制"）。
+        非 OneBot 环境那句真信息保留。
+
+        反向（变异）：任一句改回旧文案 → 这条红（用户可见文案改动必须在这条测试里留痕）。
+        """
+        onebot_layer = manage_session_denial_reason(access_denial='名单拒绝（示例）', managers=[])
+        self.assertEqual(
+            onebot_layer['detail'],
+            '名单拒绝（示例）。下一步：在「幕间控制台 → 配置 → 接入与名单」放行该账号。',
+        )
+        self.assertNotIn('或关掉', onebot_layer['detail'], '排障不需要第二个选项')
+        managers_layer = manage_session_denial_reason(
+            platform='onebot', user_id='20002', managers=['30003'],
+        )
+        self.assertEqual(
+            managers_layer['detail'],
+            '当前账号 20002 不在“【结构 4】共享主剧本 → 管理员账号”里（现有：30003）。'
+            '下一步：在「幕间控制台 → 配置 → 共享主剧本 → 管理员账号」加上它（留空表示不限制）。',
+        )
+        self.assertNotIn('留空即放行', managers_layer['detail'], '解释性内容已删')
+        # 非 OneBot 环境那条真信息照旧跟着（它在"下一步"之前）。
+        sandbox = manage_session_denial_reason(platform='sandbox', user_id='root', managers=['20002'])
+        self.assertIn('不是 OneBot 环境', sandbox['detail'])
+        self.assertIn('下一步：', sandbox['detail'])
 
 
 # =========================================================================== #

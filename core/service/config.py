@@ -168,9 +168,17 @@ TIMELINE_DIRECTOR_FUSE_COOLDOWN = 2 * 60 * 60 * 1000
 STICKER_DESCRIPTION_RETRY_COOLDOWN = 30 * 60 * 1000
 
 #: 上游 `isTrustedImageHost` 允许的 QQ / OneBot CDN 域（根域 + 子域匹配）。
+#:
+#: v1.9.6 追加两项：**QQ 空间的相册 CDN**（`qpic.cn` 根域覆盖 `a1.` / `b1.` / `m.` 等
+#: 全部子域，`photo.store.qq.com` 是老式相册直链）。动态里的图片坐标来自 QZone CGI
+#: 回执（`pic[].url1`），不在这里放行的话，"动态里的图片进视觉通道"在真机上会一张都
+#: 取不回来（`fetch_native_image` 对不在白名单的域名直接回 `None`）。
+#: 两个域都是腾讯自有 CDN，**不是**把白名单放开成"任意地址"：好友动态里指向外部站点
+#: 的图片（转发文章封面那种）照旧被拦下——那条纪律（§46.8）一个字没松。
 _TRUSTED_IMAGE_DOMAINS: tuple[str, ...] = (
     'gchat.qpic.cn', 'c2cpicdw.qpic.cn', 'multimedia.nt.qq.com.cn',
     'thirdqq.qlogo.cn', 'q.qlogo.cn',
+    'qpic.cn', 'photo.store.qq.com',
 )
 
 #: 上游 `desktopTimelineTrackForEntry` 的 `/message|chat|reply/u`。

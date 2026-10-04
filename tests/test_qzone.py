@@ -38,8 +38,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import json
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -293,6 +295,68 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(q.normalize_qzone_msg_entry({'tid': 't'})['comment_num'], 0)
         self.assertIsNone(q.normalize_qzone_msg_entry('junk'))
 
+    def test_msg_entry_reads_the_raw_cgi_spellings_for_images_and_forwards(self):
+        """§70：归一化层必须认得**原始 QZone CGI** 的拼写。
+
+        上游那份是照 SnowLuma 的字段表写的（`time` / `images`），而真机走 CGI
+        （`created_time` / `pic` / `rt_con` / `rt_tid`）。只认一种拼写的后果不是报错，
+        而是"一条只有图片的转发说说"在这里被削成"没有正文的空条目"。
+        """
+        entry = q.normalize_qzone_msg_entry({
+            'tid': 'k1', 'content': '', 'created_time': 1_760_000_000,
+            'pic': [{'url1': 'https://example.invalid/a.jpg', 'width': 1, 'height': 1}],
+            'rt_tid': 'ORIG-1', 'rt_uin': '10009', 'rt_con': {'content': '原说说正文'},
+        })
+        self.assertEqual(entry['time'].timestamp() * 1000, 1_760_000_000_000)
+        self.assertEqual(entry['images'], ['https://example.invalid/a.jpg'])
+        self.assertEqual(entry['forward'], {'content': '原说说正文', 'tid': 'ORIG-1'})
+        # 两种拼写混在一行也要都能用（判据只有这一处，别处不许再各读一份）
+        mixed = q.normalize_qzone_msg_entry({
+            'tid': 't', 'images': ['s1'], 'pic': [{'url1': 'c1'}], 'rt_content': '扁平原文',
+        })
+        self.assertEqual(mixed['images'], ['s1', 'c1'])
+        self.assertEqual(mixed['forward']['content'], '扁平原文')
+        # 不是转发 → None（不是空字典）；图片仍然封顶 9 个
+        plain = q.normalize_qzone_msg_entry({'tid': 't', 'pic': [{'url1': 'u%d' % i} for i in range(20)]})
+        self.assertIsNone(plain['forward'])
+        self.assertEqual(len(plain['images']), 9)
+
+    def test_msg_entry_reads_the_raw_cgi_video_field(self):
+        """`video`（v1.9.6）：与 `pic` 同一条纪律——**不读它，发视频的说说在这里就只剩正文**。
+
+        形状取自参考实现 `qzone_api-1.1.0/qzone_api/utils/html_parser.py::parse_feed_data`
+        对 `msg['video']` 的处理（`url3` 是播放直链、`url1` 是封面），也就是
+        `qzone_cgi.parse_mood` 已经解析出来的那六个字段（v1.7.9）。
+        封面 `url1` **不进** `videos`（那是图片，混进来会被当成"还有一张图"）。
+        """
+        from plugin.core.qzone_cgi import parse_mood  # noqa: PLC0415
+
+        raw = {
+            'tid': 'k1', 'content': '看这个', 'created_time': 1_760_000_000,
+            'video': [{
+                'url3': 'https://video.invalid/v.mp4', 'url1': 'https://video.invalid/c.jpg',
+                'video_id': 'VID-1', 'video_time': '12345',
+            }],
+        }
+        # 真链路：CGI 原始回执 → parse_mood → normalize（夹具造生产真的写的东西）
+        entry = q.normalize_qzone_msg_entry(parse_mood(raw))
+        self.assertEqual(entry['videos'], ['https://video.invalid/v.mp4'])
+        self.assertEqual(entry['images'], [], '封面是图片不是视频，但也不在 pic 里')
+        # 扁平回执的拼写（`videos`，元素直接是 URL 字符串）也要认
+        flat = q.normalize_qzone_msg_entry({'tid': 't', 'videos': ['https://v/1.mp4']})
+        self.assertEqual(flat['videos'], ['https://v/1.mp4'])
+        # 坏形状一律收成空表（不是列表 / 元素不是 dict 都不许抛）
+        for value in (None, 'x', 3, [None, 7, {}]):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    q.normalize_qzone_msg_entry({'tid': 't', 'video': value})['videos'], [],
+                )
+        # 封顶 3 段（一条说说装不下更多；多出来只是重复抽帧）
+        many = q.normalize_qzone_msg_entry(
+            {'tid': 't', 'video': [{'url3': 'https://v/%d.mp4' % i} for i in range(5)]},
+        )
+        self.assertEqual(len(many['videos']), 3)
+
     def test_feed_entry_keeps_structural_fields_and_fresh_feeds_filters_by_window(self):
         now = local(29, 15, 0)
         feed = q.normalize_qzone_feed_entry(
@@ -459,6 +523,33 @@ class FeedFilterTests(unittest.TestCase):
         self.assertEqual(
             q.match_qzone_feed_content(near_miss + [self._msg('feedkey', '精确命中', 0)], feed), '精确命中',
         )
+
+    def test_lookup_separates_a_missing_tid_from_a_post_without_text(self):
+        """§70 的**唯一判据**：`found=False`（列表里没有这条 tid）与"命中了、只是这条
+        说说本身没有文字"必须分开。
+
+        上游那个只回字符串的版本把两者都压成 `''`，真机上一条只有图片的转发动态因此
+        被报成「说说不含这条 tid」——用户照着去查 NapCat 登录态（完全查错了方向）。
+        """
+        feed = {'uin': '10001', 'nickname': 'a', 'time': NOW, 'appid': 311, 'key': 'feedkey'}
+        self.assertEqual(
+            q.qzone_feed_content_lookup([], feed),
+            {'found': False, 'content': '', 'images': [], 'videos': [], 'forward': None},
+        )
+        # key 为空 → 一样算"没对上"（不许把空 key 当成命中）
+        self.assertIs(q.qzone_feed_content_lookup([self._msg('', '', 0)], {'key': ''})['found'], False)
+        matched = q.qzone_feed_content_lookup([self._msg('feedkey', '', -1)], feed)
+        self.assertIs(matched['found'], True)
+        self.assertEqual(matched['content'], '')
+        forwarded = q.qzone_feed_content_lookup([dict(
+            self._msg('feedkey', '', -1), forward={'content': '原说说', 'tid': 'ORIG-1'},
+        )], feed)
+        self.assertIs(forwarded['found'], True)
+        self.assertEqual(forwarded['forward']['content'], '原说说')
+        # 兼容外壳回**取得到的那段文字**（自己的正文优先，其次转发原文）
+        self.assertEqual(q.match_qzone_feed_content(
+            [dict(self._msg('feedkey', '', -1), forward={'content': '原说说', 'tid': 'O'})], feed,
+        ), '原说说')
 
     @staticmethod
     def _msg(tid: str, content: str, minutes_ago: float) -> dict[str, Any]:
@@ -697,7 +788,7 @@ class StrategyModuleHygieneTests(unittest.TestCase):
             'normalize_qzone_msg_entry', 'normalize_qzone_feed_entry', 'fresh_qzone_feeds',
             'qzone_records_for_endpoint', 'QZONE_FEED_APPID_TALK', 'qzone_visibility_label',
             'qzone_intent_from_payload', 'TID_PATTERN', 'qzone_feed_candidates',
-            'match_qzone_feed_content', 'QZONE_ACTION_KINDS',
+            'match_qzone_feed_content', 'qzone_feed_content_lookup', 'QZONE_ACTION_KINDS',
         ):
             with self.subTest(name=name):
                 self.assertTrue(hasattr(q, name), name)
@@ -1249,12 +1340,16 @@ def _cgi_moods_text(rows: list[dict[str, Any]]) -> str:
     return '_preloadCallback(%s);' % json.dumps({'code': 0, 'msglist': rows}, ensure_ascii=False)
 
 
-def _raw_msg(tid: str, content: str, seconds_ago: int = 1200) -> dict[str, Any]:
-    """CGI 说说列表里的一条（`created_time` 是秒级时间戳）。"""
-    return {
+def _raw_msg(tid: str, content: str, seconds_ago: int = 1200, **extra: Any) -> dict[str, Any]:
+    """CGI 说说列表里的一条（`created_time` 是秒级时间戳）。
+
+    `extra` 用来补**真实回执里本来就有的**字段：图片在 `pic[]`，转发链在
+    `rt_con` / `rt_tid`（依据见 `docs/PORTING_NOTES.md` §70，不是我们自己编的形状）。
+    """
+    return dict({
         'tid': tid, 'content': content, 'created_time': int(NOW.timestamp() - seconds_ago),
         'cmtnum': 0,
-    }
+    }, **extra)
 
 
 def _sweep_http(feed_text: str, moods_text: str) -> Any:
@@ -1394,16 +1489,90 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('正文没取到', host.entries[0]['content'])
         self.assertNotIn('她刷到了 好友A 的说说：', host.entries[0]['content'])
         self.assertEqual(len(host.rows), 1, '正文拉不到也要记 feed-seen，避免下轮重复')
+        warned = [text for level, text in host.standalone if level == 'warn']
         self.assertTrue(
-            any('没看到内容' in message for _level, message in host.standalone),
+            any('没看到内容' in message for message in warned),
             '异常原文要跟着可见 warn 一起出来（不许静默吞掉）',
         )
+        self.assertTrue(any('request timeout' in message for message in warned),
+                        'warn 里要带上真实原因，别只说"没取到"')
 
     async def test_nickname_is_optional_and_uin_is_the_fallback_owner(self):
         transport = self._sweep_transport([_cgi_feed_text('k1', '10002')])
         host = _Host(transport=transport)
         await host.qzone_feed_sweep()
         self.assertIn('[好友动态] 她刷到了 QQ 10002 的一条说说', host.entries[0]['content'])
+
+    async def test_a_forwarded_feed_takes_the_original_content(self):
+        """② 转发动态：转发链上有原内容 → **原内容进事实**，并标明"这是一条转发"。
+
+        反向：把转发链的读取去掉（归一化只认 `images`、不看 `rt_con`/`rt_tid`），
+        这条当场红——转发的人自己没有附言，只剩"只有图片 / 原内容没取到"。
+        """
+        mood = _raw_msg('k1', '', **{
+            'rt_tid': 'ORIG-1', 'rt_uin': '10009', 'rt_uinname': '广告墙',
+            'rt_con': {'content': '广告原文'},
+        })
+        host = _Host(transport=self._sweep_transport(
+            [_cgi_feed_text('k1', '10002', nickname='好友A')], [mood],
+        ))
+        await host.qzone_feed_sweep()
+        content = host.entries[0]['content']
+        self.assertIn('[好友动态] 她刷到了 好友A 转发的说说', content)
+        self.assertIn('广告原文', content)
+        self.assertNotIn('正文没取到', content)
+        self.assertEqual(host.entries[0]['metadata']['qzone_feed_forward_tid'], 'ORIG-1')
+        self.assertEqual(
+            [text for level, text in host.standalone if level == 'warn'], [],
+            '转发原文取到了 = 不是故障，一条 warn 都不该有',
+        )
+        self.assertTrue(any('正文=有' in item[-1] for item in host.reports))
+
+    async def test_an_image_only_feed_is_a_fact_not_a_missing_content(self):
+        """③ 只有图片的说说 → 记「只有图片」这条事实，**不许**说"取不到正文"，**没有 warn**。
+
+        反向：把它也当"取不到正文"处理（`facts['found']` 那一档走 warn 分支），这条当场红。
+        """
+        mood = _raw_msg('k1', '', **{
+            'pic': [{'url1': 'https://example.invalid/ad.jpg', 'width': 1, 'height': 1}],
+        })
+        host = _Host(transport=self._sweep_transport(
+            [_cgi_feed_text('k1', '10002', nickname='好友A')], [mood],
+        ))
+        await host.qzone_feed_sweep()
+        content = host.entries[0]['content']
+        self.assertIn('[好友动态] 她刷到了 好友A 的一条说说', content)
+        self.assertIn('只有图片', content)
+        self.assertNotIn('正文没取到', content, '这条本来就没有文字，不是"没取到"')
+        self.assertEqual(
+            [text for level, text in host.standalone if level == 'warn'], [],
+            '一条只有图片的说说不是故障：不许刷 warn（真机就是被这句引去查登录态的）',
+        )
+        self.assertEqual(
+            host.entries[0]['metadata']['qzone_feed_images'], ['https://example.invalid/ad.jpg'],
+            '图片引用要留在条目上（同一个 metadata 槽，没另造媒体通道）',
+        )
+        self.assertTrue(
+            any(level == 'debug' and '没有文字' in text for level, text in host.standalone),
+            '不是故障也要留一条 debug（事实 + 一条 debug，不刷 warn）',
+        )
+        self.assertTrue(any('正文=只有图片' in item[-1] for item in host.reports))
+
+    async def test_a_tid_that_is_not_in_the_list_warns_with_the_tid_it_looked_up(self):
+        """④ tid 对不上：warn 里必须读得出**查的是哪个 tid、列表里有几条**。"""
+        host = _Host(transport=self._sweep_transport(
+            [_cgi_feed_text('k1', '10002', nickname='好友A')],
+            [_raw_msg('other', '别人的正文'), _raw_msg('other-2', '还有一条')],
+        ))
+        await host.qzone_feed_sweep()
+        self.assertIn('正文没取到', host.entries[0]['content'])
+        self.assertNotIn('别人的正文', host.entries[0]['content'], '没看到就别声称看到')
+        warned = [text for level, text in host.standalone if level == 'warn']
+        self.assertTrue(warned, '列表里没有这条 tid 是能力缺失，必须可见')
+        self.assertIn('tid=k1', warned[0])
+        self.assertIn('最近 2 条说说里没有它', warned[0])
+        self.assertNotIn('qzone_feed_images', host.entries[0]['metadata'])
+        self.assertTrue(any('正文=无' in item[-1] for item in host.reports))
 
     async def test_seen_keys_within_seven_days_are_not_reingested(self):
         rows = [record(kind='feed-seen', tid='k1', status='confirmed', createdAt=NOW - timedelta(days=1))]
@@ -1571,11 +1740,12 @@ def _moods_text_at(now: datetime, rows: list[dict[str, Any]]) -> str:
     return '_preloadCallback(%s);' % json.dumps({'code': 0, 'msglist': rows}, ensure_ascii=False)
 
 
-def _mood_at(now: datetime, tid: str, content: str, *, seconds_ago: int = 600) -> dict[str, Any]:
-    return {
+def _mood_at(now: datetime, tid: str, content: str, *, seconds_ago: int = 600,
+             **extra: Any) -> dict[str, Any]:
+    return dict({
         'tid': tid, 'content': content,
         'created_time': int(now.timestamp() - seconds_ago), 'cmtnum': 0,
-    }
+    }, **extra)
 
 
 class ServiceFeedObservationPipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -1736,6 +1906,616 @@ class ServiceFeedObservationPipelineTests(unittest.IsolatedAsyncioTestCase):
             iso((now - timedelta(seconds=self.FEED_AGE_SECONDS)).replace(microsecond=0)),
             '说说自己的时间进 metadata',
         )
+
+    async def test_an_image_only_feed_reaches_the_payload_as_a_fact(self):
+        """③ 端到端：只有图片的转发动态进到模型 payload 时说的是「只有图片」/转发事实，
+        **不是**"取不到正文"，也没有 warn（§70：这不是故障）。
+
+        反向：把它当"取不到正文"处理 → 这里会读到"正文没取到"且出现 warn。
+        """
+        service, database, now = self._service()
+        warned: list[str] = []
+        service.note_access_skip = lambda key, interval, message, *args, **kwargs: (  # type: ignore[assignment]
+            warned.append(message % args if args else message) or True
+        )
+        service.transport = self._sweep_transport(
+            now, [('k1', '10002', '青屿')],
+            [_mood_at(now, 'k1', '', pic=[{'url1': 'https://example.invalid/ad.jpg'}])],
+        )
+        await self._busy_story(service, now)
+        await service.qzone_feed_sweep()
+        stored = [row for row in database.all('interlude_script_entry', {'storyId': STORY['id']})
+                  if row['kind'] == 'friend-feed']
+        self.assertEqual(len(stored), 1)
+        self.assertIn('只有图片', stored[0]['content'])
+        self.assertNotIn('正文没取到', stored[0]['content'])
+        self.assertEqual(stored[0]['metadata']['qzone_feed_images'],
+                         ['https://example.invalid/ad.jpg'])
+        script = await self._recent_script(service, database, now)
+        feed_items = [item for item in script if item['kind'] == 'friend-feed']
+        self.assertEqual(len(feed_items), 1, '只有图片的说说也要进 payload（她确实刷到了）')
+        self.assertIn('只有图片', feed_items[0]['content'])
+        self.assertEqual(warned, [], '只有图片不是故障：不许刷 warn')
+
+    async def test_a_forwarded_feed_reaches_the_payload_with_the_original_content(self):
+        """② 端到端：转发链上的原内容进 payload，并且标明"这是一条转发"。"""
+        service, database, now = self._service()
+        service.transport = self._sweep_transport(
+            now, [('k1', '10002', '青屿')],
+            [_mood_at(now, 'k1', '', rt_tid='ORIG-1', rt_uin='10009',
+                      rt_con={'content': '转发来的原内容'})],
+        )
+        await self._busy_story(service, now)
+        await service.qzone_feed_sweep()
+        script = await self._recent_script(service, database, now)
+        feed_items = [item for item in script if item['kind'] == 'friend-feed']
+        self.assertEqual(len(feed_items), 1)
+        self.assertIn('青屿 转发的说说', feed_items[0]['content'])
+        self.assertIn('转发来的原内容', feed_items[0]['content'])
+
+
+# --------------------------------------------------------------------------- #
+# v1.9.6：动态里的图片 / 视频按已配置的模型能力自动识别
+# --------------------------------------------------------------------------- #
+
+#: 一张 1×1 的**真** PNG（走的是生产那条 `transport.fetch_image → image_bytes_to_native`
+#: 的下载 / 转码路；不编一个假 dict 冒充"图片进了视觉通道"）。
+_TINY_PNG = base64.b64decode(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+)
+
+
+class _RecordingDescriber:
+    """识图模型替身：记下**每一批**收到的图片，回一句可断言的观察。"""
+
+    def __init__(self) -> None:
+        self.batches: list[list[dict[str, Any]]] = []
+
+    def available(self) -> bool:
+        return True
+
+    async def describe_images(self, images: Any, user_text: str = '', detail: str = 'auto',
+                              kinds: Any = None) -> list[str]:
+        batch = [dict(item) for item in images]
+        self.batches.append(batch)
+        return ['第 %d 张：一只橘猫' % index for index in range(1, len(batch) + 1)]
+
+
+class _MediaTransport(_StubTransport):
+    """既有 CGI / OneBot 替身 + **一条** `fetch_image`（动态图片的下载口）。"""
+
+    def __init__(self, handler: Any = None, http: Any = None,
+                 image: Optional[bytes] = None) -> None:
+        super().__init__(handler, http)
+        self.image = image
+        self.image_urls: list[str] = []
+
+    async def fetch_image(self, url: str) -> Optional[bytes]:
+        self.image_urls.append(url)
+        return self.image
+
+
+class ServiceFeedMediaRecognitionTests(unittest.IsolatedAsyncioTestCase):
+    """动态媒体识别：**按已配置的能力自动决定做不做**，走既有的两条链（v1.9.6）。
+
+    跑的是**真实 `InterludeService`**：`load_native_images` / `describe_current_images` /
+    `collect_video_sources` 全是生产实现，唯一的替身是传输层（CGI + 取图）与识图模型。
+    所以这些用例证明的是"图片真的进了既有视觉通道"，而不是"我们调了一个桩"。
+
+    判据只有一处（`chunk13.qzone_feed_media_capability`），读的是既有总开关：
+    图片 = `model_center.vision.enabled` + 有可用识图模型；视频 = `model_center.video.enabled`。
+    """
+
+    FEED_AGE_SECONDS = 90 * 60
+    PIC = 'https://a1.qpic.cn/psc?/V1/photo%d.jpg'
+
+    def _service(self, *, vision: bool = False, video: bool = False,
+                 vision_mode: str = 'sidecar', video_mode: str = 'frames',
+                 model: Optional[dict[str, Any]] = None,
+                 forward: Optional[dict[str, Any]] = None,
+                 **qzone: Any) -> tuple[Any, Any, datetime]:
+        tmp = tempfile.TemporaryDirectory(prefix='hdsi_qzone_media_')
+        self.addCleanup(tmp.cleanup)
+        database = Database(':memory:')
+        self.addCleanup(database.close)
+        database.register_tables()
+        config: dict[str, Any] = {
+            'qzone': {
+                'enabled': True, 'auto_feed': True, 'feed_window_minutes': 120,
+                'daily_post_cap': 3, 'daily_comment_cap': 6, 'daily_like_cap': 12,
+                'min_interval_minutes': 90, **qzone,
+            },
+            'model': dict({
+                'vision': {'enabled': vision, 'mode': vision_mode, 'max_per_turn': 3},
+                'video': {'enabled': video, 'mode': video_mode},
+            }, **(model or {})),
+            # `forward_message` 只是**夹具默认值**：v1.9.6 起动态那条路一个字都不读它
+            # （曾经的 `min(feed_video_cap, max_videos)` 耦合已解开，见 §74）。
+            'forward_message': {'max_videos': 1, **(forward or {})},
+        }
+        service = InterludeService(
+            InterludeContext(base_dir=tmp.name, database=database), config, database, None,
+        )
+        now = service.now()
+        database.insert('interlude_story', {
+            'id': STORY['id'], 'platform': 'onebot', 'selfId': '10001', 'userId': '',
+            'channelId': '', 'status': 'active',
+            'setting': {'timezone': 'Asia/Shanghai'}, 'state': {},
+            'cursorAt': now, 'createdAt': now, 'updatedAt': now,
+        })
+        return service, database, now
+
+    def _sweep_transport(self, now: datetime, *, feeds: list[tuple[str, str, str]],
+                         moods: list[dict[str, Any]], image: Optional[bytes] = None) -> _MediaTransport:
+        text = ''.join(
+            _feed_text_at(now, key, uin, nickname=nick, seconds_ago=self.FEED_AGE_SECONDS)
+            for key, uin, nick in feeds
+        )
+        body = _moods_text_at(now, [
+            dict(row, created_time=int(now.timestamp() - self.FEED_AGE_SECONDS))
+            for row in moods
+        ])
+        return _MediaTransport(
+            _sweep_handler(), http=_sweep_http(text, body),
+            image=_TINY_PNG if image is None else image,
+        )
+
+    def _warnings(self, service: Any) -> list[str]:
+        """把节流口换成收集器（生产里它是 logger；`note_access_skip` 就是 warn 的出口）。"""
+        warned: list[str] = []
+        service.note_access_skip = lambda key, interval, message, *args, **kwargs: (  # type: ignore[assignment]
+            warned.append(message % args if args else message) or True
+        )
+        return warned
+
+    async def _feed_entry(self, service: Any, database: Any) -> dict[str, Any]:
+        rows = [row for row in database.all('interlude_script_entry', {'storyId': STORY['id']})
+                if row['kind'] == 'friend-feed']
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    # ---- ① 识图开着 + 动态带图 ------------------------------------------- #
+
+    async def test_images_enter_the_existing_vision_channel_clipped_by_the_cap(self):
+        """① 图片理解开着 + 配了识图模型 → 动态里的图片**真进既有视觉通道**。
+
+        "真进"的证据有两处，缺一不可：**取图口收到的是哪几个坐标**（前 2 张，不是 3 张）
+        与**识图模型收到几张**（2 张）。上限来自本组的新键（`feed_image_cap`），
+        而"每回合图片数上限"（默认 3）在同一处判据里跟着生效。
+
+        反向（变异）：把上限写死成常量（`taken = 1` 或 `taken = len(images)`，不读配置），
+        这条当场红——取图坐标与识图张数都会跟配置对不上。
+        """
+        service, database, now = self._service(vision=True, feed_image_cap=2)
+        warned = self._warnings(service)
+        describer = _RecordingDescriber()
+        service.vision_describer = describer
+        transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '今天天气很好', pic=[
+                {'url1': self.PIC % index} for index in (1, 2, 3)
+            ])],
+        )
+        service.transport = transport
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        # 取回来的坐标 = 配置的上限（2），顺序与 CGI 给的一致
+        self.assertEqual(transport.image_urls, [self.PIC % 1, self.PIC % 2])
+        # 识图模型收到的就是这 2 张（走的是生产那条 fetch → 转 native 的路）
+        self.assertEqual([len(batch) for batch in describer.batches], [2])
+        self.assertTrue(all(item.get('data_uri', '').startswith('data:image/')
+                            for item in describer.batches[0]))
+        # 观察以事实的形式进条目（她自己"看到"了什么）
+        self.assertIn('[图片观察] 第 1 张：一只橘猫', entry['content'])
+        self.assertIn('[图片观察] 第 2 张：一只橘猫', entry['content'])
+        # 线索可数：一共有 3 张、这次只看了前 2 张
+        self.assertIn('[图片×3，单次仅取前 2 张]', entry['content'])
+        # 截断要有一条**可行动**的 warn，并且点名是哪一道闸
+        self.assertTrue(warned, '截断必须可见（丢的是内容）')
+        self.assertIn('单次识别图片上限', warned[0])
+        self.assertIn('QQ 空间', warned[0])
+        # 三条图片引用照样全部留在条目上（事实不许被上限改写）
+        self.assertEqual(
+            entry['metadata']['qzone_feed_images'], [self.PIC % index for index in (1, 2, 3)],
+        )
+
+    async def test_the_per_turn_budget_can_be_the_binding_gate(self):
+        """④（第二道闸）「每回合图片数上限」更小时，warn 点的是**它**——两道闸不许互相遮蔽。
+
+        反向：只按本组的新键算（忽略 `max_per_turn`），这里会取到 9 张、warn 也会指错键，
+        于是"改了每回合上限也不生效"这类现场就再也查不出来（用户今天刚被这个坑过一次）。
+        """
+        service, database, now = self._service(
+            vision=True, feed_image_cap=9,
+            model={'vision': {'enabled': True, 'mode': 'sidecar', 'max_per_turn': 2}},
+        )
+        warned = self._warnings(service)
+        describer = _RecordingDescriber()
+        service.vision_describer = describer
+        transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '出去玩', pic=[
+                {'url1': self.PIC % index} for index in range(1, 5)
+            ])],
+        )
+        service.transport = transport
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertEqual(transport.image_urls, [self.PIC % index for index in (1, 2)])
+        self.assertIn('[图片×4，单次仅取前 2 张]', entry['content'])
+        self.assertIn('每回合图片数上限', warned[0])
+        self.assertIn('图片理解', warned[0])
+        self.assertNotIn('单次识别图片上限', warned[0])
+
+    # ---- ② 能力关着 / 没配模型 ------------------------------------------- #
+
+    async def test_images_stay_a_fact_without_any_call_when_vision_is_off(self):
+        """② 图片理解**关着** → 不调用、如实标注、**没有 warn**（这不是故障）。
+
+        反向（变异）：把"关着也调用"（去掉能力判据）→ 这条红：取图口会有坐标、
+        识图模型会被叫到，而用户明明把开关关了。
+        """
+        service, database, now = self._service(vision=False)
+        warned = self._warnings(service)
+        describer = _RecordingDescriber()
+        service.vision_describer = describer
+        transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '今天天气很好', pic=[
+                {'url1': self.PIC % index} for index in (1, 2, 3)
+            ])],
+        )
+        service.transport = transport
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertEqual(transport.image_urls, [], '关着就一个坐标都不许取')
+        self.assertEqual(describer.batches, [], '关着就一次识图都不许调')
+        self.assertIn('[图片×3，未识别]', entry['content'], '如实标注：有几张、没看')
+        self.assertEqual(warned, [], '关掉不是故障：一条 warn 都不该有')
+        # 动态照常入账（能力缺失不影响"她刷到了什么"这件事）
+        seen = [row for row in database.all('interlude_qzone_post', {'storyId': STORY['id']})
+                if row.get('kind') == 'feed-seen']
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(entry['metadata']['qzone_feed_images']), 3)
+
+    async def test_vision_on_without_a_vision_model_warns_actionably(self):
+        """能力**开着却没配识图模型**：不调用、如实标注，并且有一条可行动的 warn。
+
+        这条与上面那条的区别就是"这不是用户关的，是配漏了"——所以必须可见。
+        """
+        service, database, now = self._service(vision=True)
+        warned = self._warnings(service)
+        service.vision_describer = None
+        service.transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '', pic=[{'url1': self.PIC % 1}])],
+        )
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertIn('[图片×1，未识别]', entry['content'])
+        self.assertTrue(warned, '配漏了识图模型必须让人看见')
+        self.assertIn('识图模型', warned[0])
+
+    async def test_an_image_that_cannot_be_fetched_is_reported_not_silent(self):
+        """能力开着、模型也有，但图片**一张都没取回来** → 不许静默。
+
+        （真机现场：QZone 相册 CDN 之外的图片域名会被取图白名单拦下。）
+        """
+        service, database, now = self._service(vision=True, feed_image_cap=2)
+        warned = self._warnings(service)
+        service.vision_describer = _RecordingDescriber()
+        transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '', pic=[{'url1': 'https://photo.invalid/x.jpg'}])],
+            image=None,
+        )
+        transport.image = None
+        service.transport = transport
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertIn('[图片×1，未识别]', entry['content'])
+        self.assertTrue(warned, '取不回来也是能力缺失，必须可见')
+        self.assertIn('没取回来', warned[0])
+
+    # ---- ③ 视频 ----------------------------------------------------------- #
+
+    async def test_videos_run_the_existing_video_chain(self):
+        """③ 视频理解开着 + 动态带视频 → 走**既有视频链**（同一个判据）。
+
+        这里让链自己给出确定性的降级（`mode=native`：宿主没有原生视频通路），
+        证据是：条目的正文里出现了**视频链自己那句事实**（`[视频：…`）与它的 warn——
+        说明这条坐标真的进了 `collect_video_sources`，而不是我们在 chunk13 里另写一套。
+        """
+        from plugin.core.video_understanding import NATIVE_UNSUPPORTED_REASON  # noqa: PLC0415
+
+        service, database, now = self._service(video=True, video_mode='native')
+        warned = self._warnings(service)
+        service.transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '看这个', video=[
+                {'url3': 'https://video.invalid/v.mp4', 'url1': 'https://video.invalid/c.jpg',
+                 'video_id': 'VID-1'},
+            ])],
+        )
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertIn('[视频：', entry['content'])
+        self.assertIn(NATIVE_UNSUPPORTED_REASON[:24], entry['content'])
+        self.assertEqual(entry['metadata']['qzone_feed_videos'], ['https://video.invalid/v.mp4'])
+        self.assertTrue(any('视频' in message for message in warned),
+                        '视频链的降级说明必须可见（走的是它自己那条 warn）')
+
+    async def test_video_frames_join_the_same_vision_channel(self):
+        """③ 视频链抽出的帧**再进同一条视觉通道**（判据仍是 `capability['images']`）。"""
+        from unittest import mock  # noqa: PLC0415
+
+        import plugin.core.video_understanding as video  # noqa: PLC0415
+
+        service, database, now = self._service(vision=True, video=True)
+        self._warnings(service)
+        describer = _RecordingDescriber()
+        service.vision_describer = describer
+        service.transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '看这个', video=[
+                {'url3': 'https://video.invalid/v.mp4', 'video_id': 'VID-1'},
+            ])],
+        )
+        frame_dir = tempfile.mkdtemp(prefix='hdsi_qzone_frames_')
+        self.addCleanup(lambda: shutil.rmtree(frame_dir, ignore_errors=True))
+        frame = pathlib.Path(frame_dir) / 'frame-1.png'
+        frame.write_bytes(_TINY_PNG)
+        extraction = video.VideoExtraction(frames=(str(frame),), workdir=frame_dir)
+        with mock.patch.object(video, 'ffmpeg_available', lambda: True), \
+                mock.patch.object(video, 'extract_video', lambda *a, **k: extraction):
+            await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        # 帧走的是同一个视觉通道：识图模型收到了那 1 帧，观察写明来自视频
+        self.assertEqual([len(batch) for batch in describer.batches], [1])
+        self.assertIn('[视频观察] 第 1 张：一只橘猫', entry['content'])
+
+    async def test_video_frames_without_a_vision_channel_are_reported(self):
+        """视频开着、图片理解关着 → 帧**没有通道可去**：丢掉，但要留事实 + 一条可行动 warn。
+
+        依据与群回合那条 `GROUP_NO_VISION_REASON` 同一条尺子：抽帧花了钱却没人看，
+        不许静默（否则模型会以为她看见了画面）。
+        """
+        from unittest import mock  # noqa: PLC0415
+
+        import plugin.core.video_understanding as video  # noqa: PLC0415
+
+        service, database, now = self._service(vision=False, video=True)
+        warned = self._warnings(service)
+        service.transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '看这个', video=[
+                {'url3': 'https://video.invalid/v.mp4', 'video_id': 'VID-1'},
+            ])],
+        )
+        frame_dir = tempfile.mkdtemp(prefix='hdsi_qzone_frames_')
+        self.addCleanup(lambda: shutil.rmtree(frame_dir, ignore_errors=True))
+        frame = pathlib.Path(frame_dir) / 'frame-1.png'
+        frame.write_bytes(_TINY_PNG)
+        extraction = video.VideoExtraction(frames=(str(frame),), workdir=frame_dir)
+        with mock.patch.object(video, 'ffmpeg_available', lambda: True), \
+                mock.patch.object(video, 'extract_video', lambda *a, **k: extraction):
+            await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertIn('[图片×1，未识别]', entry['content'])
+        self.assertTrue(any('帧没有交给任何模型' in message for message in warned))
+
+    async def test_more_videos_than_the_cap_are_counted_and_warned(self):
+        """④ 视频截断：线索含总数与取数 + 一条点名「单次获取视频上限」的节流 warn。
+
+        反向（变异）：把上限写死成 1（不读 `feed_video_cap`）→ 这条红：线索会变成
+        "仅取前 1 段"，而这条动态按配置该取 2 段。
+        """
+        service, database, now = self._service(
+            video=True, video_mode='native', feed_video_cap=2,
+        )
+        warned = self._warnings(service)
+        service.transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '三段', video=[
+                {'url3': 'https://video.invalid/a.mp4', 'video_id': 'A'},
+                {'url3': 'https://video.invalid/b.mp4', 'video_id': 'B'},
+                {'url3': 'https://video.invalid/c.mp4', 'video_id': 'C'},
+            ])],
+        )
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertIn('[视频×3，单次仅取前 2 段]', entry['content'])
+        self.assertTrue(any('单次获取视频上限' in message for message in warned))
+        self.assertFalse(any('单条转发' in message for message in warned))
+
+    async def test_the_video_cap_alone_decides_how_many_segments_are_read(self):
+        """① 只调「单次获取视频上限」=3（`forward_message` 一个字不动）→ **真的读 3 段**。
+
+        v1.9.6 解开的耦合：早先有效段数 = `min(feed_video_cap, forward_message.max_videos)`，
+        而后者默认 1，于是"只调本组的键"照样只取 1 段。证据是 ffmpeg 真的被叫了 3 次
+        （`extract_video` 的调用次数），不是"我们算出来 3 段"。
+
+        反向（变异）：把 `min(..., video_read_budget(self))` 加回去 → 这条红：
+        `forward_message.max_videos` 默认 1，只会抽 1 次帧。
+        """
+        from unittest import mock  # noqa: PLC0415
+
+        import plugin.core.video_understanding as video  # noqa: PLC0415
+
+        service, database, now = self._service(video=True, feed_video_cap=3)
+        self._warnings(service)
+        service.transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '三段', video=[
+                {'url3': 'https://video.invalid/a.mp4', 'video_id': 'A'},
+                {'url3': 'https://video.invalid/b.mp4', 'video_id': 'B'},
+                {'url3': 'https://video.invalid/c.mp4', 'video_id': 'C'},
+            ])],
+        )
+        frame_dir = tempfile.mkdtemp(prefix='hdsi_qzone_frames_')
+        self.addCleanup(lambda: shutil.rmtree(frame_dir, ignore_errors=True))
+        frame = pathlib.Path(frame_dir) / 'frame-1.png'
+        frame.write_bytes(_TINY_PNG)
+        extraction = video.VideoExtraction(frames=(str(frame),), workdir=frame_dir)
+        calls: list[int] = []
+
+        def _extract(*args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            return extraction
+
+        with mock.patch.object(video, 'ffmpeg_available', lambda: True), \
+                mock.patch.object(video, 'extract_video', _extract):
+            await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertEqual(len(calls), 3, '配置 3 段就要真的抽 3 次帧（转发键不再是上限）')
+        self.assertNotIn('单次仅取前', entry['content'], '按配置全取了，就不该有截断线索')
+
+    async def test_the_per_turn_vision_budget_can_be_the_binding_gate_for_videos(self):
+        """④（第二道闸）「每回合图片数上限」更小时，warn 点的是**它**。
+
+        视频帧与图片共用同一条视觉通道，所以那道预算也是动态视频的上限——但它是
+        **每回合视觉预算**，不是合并转发那个键（v1.9.6 起动态这条路不读 `forward_message`）。
+        """
+        service, database, now = self._service(
+            video=True, video_mode='native', feed_video_cap=3,
+            model={'vision': {'enabled': False, 'mode': 'sidecar', 'max_per_turn': 1}},
+        )
+        warned = self._warnings(service)
+        service.transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '三段', video=[
+                {'url3': 'https://video.invalid/a.mp4', 'video_id': 'A'},
+                {'url3': 'https://video.invalid/b.mp4', 'video_id': 'B'},
+                {'url3': 'https://video.invalid/c.mp4', 'video_id': 'C'},
+            ])],
+        )
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertIn('[视频×3，单次仅取前 1 段]', entry['content'])
+        self.assertTrue(any('每回合图片数上限' in message for message in warned))
+        self.assertTrue(any('图片理解' in message for message in warned))
+        self.assertFalse(any('单条转发' in message for message in warned))
+
+    async def test_forward_message_keys_never_touch_the_qzone_feed_path(self):
+        """④ `forward_message` 段一个字都不读：把它调成 0 也不影响动态。
+
+        合并转发是"聊天记录卡片"的键，与 QQ 空间动态没有任何关系（v1.9.6 解开的
+        "逻辑串味"）。这条把两个键都设成 0（转发那一侧的"一段都不读 / 一张都不取"），
+        动态照旧按本组上限取满：图片 3 张、视频 3 段。
+
+        反向（变异）：把任一处 `min(..., forward_message.max_*)` 加回去 → 这条红
+        （取数会掉到 0 或 1）。
+        """
+        from unittest import mock  # noqa: PLC0415
+
+        import plugin.core.video_understanding as video  # noqa: PLC0415
+
+        service, database, now = self._service(
+            vision=True, video=True, feed_image_cap=3, feed_video_cap=3,
+            forward={'max_videos': 0, 'max_images': 0},
+        )
+        warned = self._warnings(service)
+        describer = _RecordingDescriber()
+        service.vision_describer = describer
+        transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '全都要', pic=[
+                {'url1': self.PIC % index} for index in (1, 2, 3)
+            ], video=[
+                {'url3': 'https://video.invalid/a.mp4', 'video_id': 'A'},
+                {'url3': 'https://video.invalid/b.mp4', 'video_id': 'B'},
+                {'url3': 'https://video.invalid/c.mp4', 'video_id': 'C'},
+            ])],
+        )
+        service.transport = transport
+        frame_dir = tempfile.mkdtemp(prefix='hdsi_qzone_frames_')
+        self.addCleanup(lambda: shutil.rmtree(frame_dir, ignore_errors=True))
+        frame = pathlib.Path(frame_dir) / 'frame-1.png'
+        frame.write_bytes(_TINY_PNG)
+        extraction = video.VideoExtraction(frames=(str(frame),), workdir=frame_dir)
+        calls: list[int] = []
+
+        def _extract(*args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            return extraction
+
+        with mock.patch.object(video, 'ffmpeg_available', lambda: True), \
+                mock.patch.object(video, 'extract_video', _extract):
+            await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertEqual(transport.image_urls, [self.PIC % index for index in (1, 2, 3)])
+        self.assertEqual(len(calls), 3, '转发键设成 0 也拦不住动态视频（这条路不读它）')
+        self.assertNotIn('单次仅取前', entry['content'])
+        self.assertFalse(any('单条转发' in message for message in warned))
+        self.assertFalse(any('合并转发' in message for message in warned))
+
+    async def test_videos_are_marked_as_unread_when_video_understanding_is_off(self):
+        """视频能力关着 → 不调用、如实标注、无 warn（与图片那条同一条尺子）。"""
+        service, database, now = self._service(video=False)
+        warned = self._warnings(service)
+        service.transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '看这个', video=[
+                {'url3': 'https://video.invalid/v.mp4', 'video_id': 'VID-1'},
+            ])],
+        )
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertIn('[视频×1，未识别]', entry['content'])
+        self.assertEqual(warned, [])
+        self.assertEqual(len(entry['metadata']['qzone_feed_videos']), 1)
+
+    # ---- 失败不阻断 / 能力判据一处 --------------------------------------- #
+
+    async def test_a_recognition_failure_never_blocks_the_entry(self):
+        """识别这一步出任何岔子，动态**照常入账**，并留一条可见 warn。"""
+        service, database, now = self._service(vision=True)
+        warned = self._warnings(service)
+        service.vision_describer = _RecordingDescriber()
+        service.transport = self._sweep_transport(
+            now, feeds=[('k1', '10002', '青屿')],
+            moods=[_mood_at(now, 'k1', '今天天气很好', pic=[{'url1': self.PIC % 1}])],
+        )
+
+        async def boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError('识图通道炸了')
+
+        service._qzone_feed_media_lines = boom  # type: ignore[assignment]
+        await service.qzone_feed_sweep()
+        entry = await self._feed_entry(service, database)
+        self.assertIn('今天天气很好', entry['content'])
+        self.assertEqual(len(entry['metadata']['qzone_feed_images']), 1)
+        self.assertTrue(any('识别失败' in message for message in warned))
+
+    def test_the_capability_judgement_reads_the_existing_switches(self):
+        """能力判据只有一处，读的是既有总开关 / 既有判据，**不新增"是否识图"开关**。"""
+
+        class _Stub:
+            config = {'model': {'vision': {'enabled': True}, 'video': {'enabled': True}}}
+            vision_describer = None
+
+        from plugin.core.service.chunk13 import qzone_feed_media_capability  # noqa: PLC0415
+
+        stub = _Stub()
+        # 图片理解开着但没配识图模型 → 图片那一半**不做**，并且说得清为什么
+        off = qzone_feed_media_capability(stub)
+        self.assertIs(off['images'], False)
+        self.assertIn('识图模型', off['image_reason'])
+        self.assertIs(off['videos'], True)
+        stub.vision_describer = _RecordingDescriber()
+        on = qzone_feed_media_capability(stub)
+        self.assertIs(on['images'], True)
+        self.assertEqual(on['image_reason'], '')
+        # 两个开关都关 → 两半都不做
+        class _Off:
+            config = {'model': {'vision': {'enabled': False}, 'video': {'enabled': False}}}
+            vision_describer = _RecordingDescriber()
+
+        both_off = qzone_feed_media_capability(_Off())
+        self.assertIs(both_off['images'], False)
+        self.assertIs(both_off['videos'], False)
+        self.assertIn('图片理解', both_off['image_reason'])
+        self.assertIn('视频理解', both_off['video_reason'])
 
 
 if __name__ == '__main__':

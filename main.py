@@ -211,7 +211,7 @@ CONFIRMATION_YES_RE = re.compile(r'^(?:y|yes)$', re.IGNORECASE)
 NO_MANAGER = '当前 QQ 没有共享主剧本的管理权限。'
 NO_MANAGER_DETAIL = (
     '当前 QQ 没有共享主剧本的管理权限。'
-    '请在 Console 的 sharedStory.managerAccounts 中添加此 QQ，或留空允许所有获授权账号。'
+    '请在「幕间控制台 → 配置 → 共享主剧本 → 管理员账号」中添加此 QQ，或留空允许所有获授权账号。'
 )
 NO_ADMIN = '无权限：当前账号不是 HDSI 管理员。'
 CANCELLED = '操作已取消。'
@@ -1246,6 +1246,14 @@ class HDSInterludePlugin(Star):
         """上游 `requireManager(service, session)` → `service.canManageSession(session)`。"""
         return bool(self.bridge.service.can_manage_session(session))
 
+    def _manage_denial(self, session: Any) -> Any:
+        """上游 `manageSessionDenial(service, session)`：拒绝原因（`None` = 有权限）。
+
+        rc34：`canManageSession` 只回 bool，两层失败（互动名单 / 管理员名单）此前共用
+        一句"需要 HDSI 管理员权限"——用户给了管理员却被拒时说不出为什么。原因版走这里。
+        """
+        return self.bridge.service.manage_session_denial(session)
+
     async def _require_story(self, session: Any) -> Any:
         """上游 `requireStory(service, session)`（`upstream/src/index.ts:896`）。
 
@@ -1257,7 +1265,7 @@ class HDSInterludePlugin(Star):
         service = self.bridge.service
         if not service.can_handle_session(session):
             return (
-                '当前 QQ 账号未获 HDSI 互动授权。请在 Console 的“NapCat / OneBot QQ 账号控制”中'
+                '当前 QQ 账号未获 HDSI 互动授权。请在「幕间控制台 → 配置 → 接入与名单」中'
                 '检查机器人 QQ 号、用户 QQ 白名单和启用状态。'
             )
         story = await service.find_story(session)
@@ -1356,8 +1364,9 @@ class HDSInterludePlugin(Star):
     ) -> str:
         """上游 `startStoryFromConsole(session, legacyName?)`（`upstream/src/index.ts:523`）。"""
         service = self.bridge.service
-        if not self._is_manager(session):
-            return '无权限：手动启动共享主剧本需要 HDSI 管理员权限。'
+        denial = self._manage_denial(session)
+        if denial:
+            return '无权限：手动启动共享主剧本需要 HDSI 管理员权限。%s' % (denial.get('detail') or '')
         readiness = await service.story_start_readiness(session)
         existing = readiness.get('existing') if isinstance(readiness, dict) else None
         if existing:
@@ -2319,7 +2328,7 @@ class HDSInterludePlugin(Star):
         await self.bridge.service.clear_database()
         await self.bridge.service.purge_all_story_data(_pick(story, 'id'))
         yield event.plain_result(
-            '已完全重置。数据库已清空，角色设定已回到 Console 故事档案（storyDefaults）模板。\n'
+            '已完全重置。数据库已清空，角色设定已回到「幕间控制台 → 配置 → 故事档案」模板。\n'
             '如需更换角色身份，请在 Console 修改故事档案后重新开始。'
         )
 

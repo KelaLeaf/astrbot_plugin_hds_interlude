@@ -70,6 +70,9 @@ __all__ = [
     'normalize_qzone_msg_entry',
     'probe_qzone_available',
     'qzone_feed_candidates',
+    'qzone_feed_content_lookup',
+    'qzone_media_limit_note',
+    'qzone_media_limit_warning',
     'qzone_intent_from_payload',
     'qzone_records_for_endpoint',
     'qzone_visibility_label',
@@ -104,9 +107,14 @@ TID_PATTERN = re.compile(r'^[A-Za-z0-9_-]{4,64}$')
 #: appid=311 是说说；6600 是广告位、5000 是官方号、202 等为杂项，全部排除。
 QZONE_FEED_APPID_TALK = 311
 
-#: 未配置时的保守默认（上游 `DEFAULT_QZONE_CONFIG` + 本移植版新增的 `auto_feed`）。
-#: 数值键走 `QZONE_CONFIG_BOUNDS` 夹取；`enabled` / `auto_feed` 是布尔键，只认
-#: **严格 `true`**（`1` / `'true'` 都不算），不进边界表。
+#: 未配置时的保守默认（上游 `DEFAULT_QZONE_CONFIG` + 本移植版新增的 `auto_feed` /
+#: 两个动态媒体读取上限）。数值键走 `QZONE_CONFIG_BOUNDS` 夹取；`enabled` / `auto_feed`
+#: 是布尔键，只认**严格 `true`**（`1` / `'true'` 都不算），不进边界表。
+#:
+#: `feed_image_cap` / `feed_video_cap`（本移植版新增）：**一次动态读取**里最多识别几张图 /
+#: 取几段视频。默认都取 **1** = 省成本那侧（一次轮询最多几条动态，每张图一次识图调用、
+#: 每段视频一次 ffmpeg + 一次识图）；**下限定 1 刻意不是 0** —— "一张都不识"的语义由
+#: 既有的图片理解 / 视频理解总开关表达，再开一个"关掉"的入口就是第二个真相。
 DEFAULT_QZONE_CONFIG: dict[str, Any] = {
     'enabled': False,
     'daily_post_cap': 3,
@@ -115,15 +123,21 @@ DEFAULT_QZONE_CONFIG: dict[str, Any] = {
     'min_interval_minutes': 90,
     'feed_window_minutes': 120,
     'auto_feed': False,
+    'feed_image_cap': 1,
+    'feed_video_cap': 1,
 }
 
 #: 配置夹取边界（上游 `CONFIG_BOUNDS`，键名转 snake_case）。
+#: 动态媒体那两个键的上限取"一条说说装得下的量"：图片 9（`_qzone_msg_image_refs`
+#: 自己的去重上限就是 9）、视频 3（QZone 说说视频的实际量级，再多也只是重复抽帧）。
 QZONE_CONFIG_BOUNDS: dict[str, tuple[int, int]] = {
     'daily_post_cap': (0, 20),
     'daily_comment_cap': (0, 60),
     'daily_like_cap': (0, 120),
     'min_interval_minutes': (10, 1440),
     'feed_window_minutes': (15, 720),
+    'feed_image_cap': (1, 9),
+    'feed_video_cap': (1, 3),
 }
 
 #: 配置键的两种拼写（camelCase 优先，snake_case 兜底）。
@@ -133,6 +147,8 @@ _CONFIG_KEY_SPELLINGS: dict[str, str] = {
     'daily_like_cap': 'dailyLikeCap',
     'min_interval_minutes': 'minIntervalMinutes',
     'feed_window_minutes': 'feedWindowMinutes',
+    'feed_image_cap': 'feedImageCap',
+    'feed_video_cap': 'feedVideoCap',
 }
 
 #: `Transport.call_onebot` 把"传输异常 / 超时"和"服务端显式失败帧"收敛成同一种
@@ -415,39 +431,140 @@ def evaluate_qzone_gate(
 # --------------------------------------------------------------------------- #
 
 
+def _qzone_msg_image_refs(raw: Mapping[str, Any]) -> list[str]:
+    """条目里的图片引用：**两种拼写都认**（§70，唯一一处读图片）。
+
+    * SnowLuma 的 `images`（上游 `normalizeQzoneMsgEntry` 认的那个）；
+    * 原始 QZone CGI 的 `pic`（`parse_mood` 的产出：`{'url','smallurl','width','height'}`）。
+      真实回执里图片在 `pic`，元素取最大可用变体（`url1`/`url2`/`url3`）。
+
+    去重后最多 9 个（与上游一致）。
+    """
+    refs: list[str] = []
+
+    def add(text: str) -> None:
+        if text and text not in refs and len(refs) < 9:
+            refs.append(text)
+
+    images_raw = raw.get('images')
+    if isinstance(images_raw, (list, tuple)):
+        for image in images_raw:
+            add(_js_string(image))
+    pic_raw = raw.get('pic')
+    if isinstance(pic_raw, (list, tuple)):
+        for picture in pic_raw:
+            if _is_mapping(picture):
+                for key in ('url', 'url1', 'url2', 'url3', 'smallurl'):
+                    text = _nullish_string(picture.get(key)).strip()
+                    if text:
+                        add(text)
+                        break
+            else:
+                add(_js_string(picture))
+    return refs
+
+
+def _qzone_msg_video_refs(raw: Mapping[str, Any]) -> list[str]:
+    """条目里的**视频**引用：**两种拼写都认**（唯一一处读视频）。
+
+    * 原始 QZone CGI 的 `video`（`qzone_cgi.parse_mood` 的产出，逐字照抄参考实现
+      `qzone_api/utils/html_parser.py::parse_feed_data`：`url` 来自 `url3`、另有
+      `cover` / `video_id` / `duration_ms`）。发视频的说说长这样：
+      `{"tid": "…", "content": "…", "video": [{"url3": "https://…/v.mp4",
+      "url1": "https://…/cover.jpg", "video_id": "…", "video_time": "12345"}]}`
+      —— 和 `pic` 一样**不在正文里**，不看这个字段就完全看不见视频；
+    * 扁平回执的 `videos`（元素直接是 URL 字符串，或带 `url` / `url3` / `src` 的字典）。
+
+    只收**播放直链**（`video` 元素里的 `url` = CGI 的 `url3`）：封面 `url1` 是图片，
+    混进来会被下游当成"这条说说还有一张图"。**形状不像来源的一律不收**
+    （`null` / 数字 / 空字典——与图片那半的宽容不同，这里是刻意的：`videos` 的数就是
+    "这条动态有几段视频"那个数，它要进线索与 warn 的可数事实）。去重后最多 3 个。
+    """
+    refs: list[str] = []
+
+    def add(text: str) -> None:
+        if not text or text in refs or len(refs) >= 3:
+            return
+        # 与 `video_understanding._trusted_video_source` 同一套"形状像来源"的判据
+        # （不 import 那个模块：本模块是纯策略层，只按形状认）。
+        if not (
+            re.match(r'^https?://', text, re.IGNORECASE)
+            or text.lower().startswith('file://')
+            or re.match(r'^(?:[A-Za-z]:[\\/]|/)', text)
+        ):
+            return
+        refs.append(text)
+
+    for key in ('video', 'videos'):
+        raw_list = raw.get(key)
+        if not isinstance(raw_list, (list, tuple)):
+            continue
+        for item in raw_list:
+            if _is_mapping(item):
+                for field in ('url', 'url3', 'src'):
+                    text = _nullish_string(item.get(field)).strip()
+                    if text:
+                        add(text)
+                        break
+            else:
+                add(_js_string(item))
+    return refs
+
+
+def _qzone_msg_forward(raw: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    """转发链上的原说说（§70）：`rt_con.content` 是原文，`rt_tid` 是原说说 tid。
+
+    两种拼写都认：原始 CGI（`parse_mood`）给 `rt_con` 嵌套字典，扁平回执可能给
+    `rt_content`。原内容与原 tid 都拿不到时返回 `None`（**不是转发**）。
+    """
+    content = ''
+    rt_con = raw.get('rt_con')
+    if _is_mapping(rt_con):
+        content = _nullish_string(rt_con.get('content')).strip()
+    if not content:
+        content = _nullish_string(raw.get('rt_content')).strip()
+    tid = _nullish_string(raw.get('rt_tid')).strip()
+    if not content and not tid:
+        return None
+    return {'content': content, 'tid': tid}
+
+
 def normalize_qzone_msg_entry(raw: Any) -> Optional[dict[str, Any]]:
     """`get_qzone_msg_list` 条目归一化（上游 `normalizeQzoneMsgEntry`）：坏行丢弃。
 
     字段强转：`tid` 空串即丢；`time` 是**秒**级时间戳，非法时塌成 epoch；
     `comment_num` 走 `Number(x) || 0`；`is_private` 只认严格 `true`；
     `images` 取字符串化后的前 9 个非空值。
+
+    **受控偏离（§70）**：时间、图片、转发链**两种拼写都读**——上游那份是照着
+    SnowLuma 的字段表写的（`time` / `images`），而真机走的是原始 QZone CGI
+    （`created_time` / `pic` / `rt_con` / `rt_tid`）。只认一种拼写的后果不是报错，
+    而是"一条只有图片的转发说说"在归一化层被削成"没有正文的空条目"。
+
+    `videos`（本移植版新增，与 `images` 同一条纪律）来自 CGI 的 `video`——
+    不读它，一条发视频的说说在这里就只剩正文。
     """
     if not _is_mapping(raw):
         return None
     tid = _nullish_string(raw.get('tid')).strip()
     if not tid:
         return None
-    seconds = _js_number(raw.get('time')) if 'time' in raw else 0.0
+    # 时间的两种拼写（SnowLuma 的 `time` / 原始 CGI 的 `created_time`）走同一套取值口径。
+    stamp = _pick(raw, 'time', 'created_time')
+    seconds = _js_number(stamp) if stamp is not None else 0.0
     moment = _from_ms(seconds * 1000)
     if moment is None:
         moment = datetime.fromtimestamp(0, tz=timezone.utc)
     comment = raw['comment_num'] if 'comment_num' in raw else raw.get('commentNum')
-    images_raw = raw.get('images')
-    images: list[str] = []
-    if isinstance(images_raw, (list, tuple)):
-        for image in images_raw:
-            text = _js_string(image)
-            if text:
-                images.append(text)
-            if len(images) >= 9:
-                break
     return {
         'tid': tid,
         'content': _nullish_string(raw.get('content')),
         'time': moment,
         'comment_num': _js_int_or(comment),
         'is_private': _pick(raw, 'is_private', 'isPrivate') is True,
-        'images': images,
+        'images': _qzone_msg_image_refs(raw),
+        'videos': _qzone_msg_video_refs(raw),
+        'forward': _qzone_msg_forward(raw),
     }
 
 
@@ -1121,14 +1238,134 @@ def qzone_feed_candidates(
     return candidates
 
 
+def qzone_feed_content_lookup(entries: Sequence[Any], feed: Any) -> dict[str, Any]:
+    """在好友自己的说说列表里按 tid 对位，回**事实**（唯一判据，§70）。
+
+    `feed['key']` 是动态列表项自己的定位句柄，我们拿它当 tid 去好友的说说列表里找
+    同一条说说——这也是这份 tid 的唯一来源（转发链上的 `rt_tid` **不参与**对位）。
+    **只认 tid 精确命中**：连发多条时按时间近似配对会错配正文，错的内容比没有更糟。
+
+    返回 `{'found', 'content', 'images', 'videos', 'forward'}`。关键是 **`found=False`（列表里
+    没有这条 tid）与 `found=True` 但这条说说本身没有文字（只有图片 / 只有转发原文）
+    是两件事**：上游那个只回字符串的版本把两者都压成 `''`，于是真机上一条"只有图片的
+    转发动态"被报成「说说不含这条 tid」，用户照着去查登录态（§70 现场）。
+
+    `videos`（本移植版新增）与 `images` 同一个来源、同一条纪律：CGI 的 `video` 字段
+    （`url3` 播放直链）——不在这里带出来，动态里的视频就永远看不见。
+    """
+    key = _nullish_string(_pick(feed, 'key')).strip()
+    missing: dict[str, Any] = {
+        'found': False, 'content': '', 'images': [], 'videos': [], 'forward': None,
+    }
+    if not key:
+        return missing
+    for entry in entries or ():
+        if _nullish_string(_pick(entry, 'tid')).strip() != key:
+            continue
+        images = _pick(entry, 'images')
+        videos = _pick(entry, 'videos')
+        forward = _pick(entry, 'forward')
+        return {
+            'found': True,
+            'content': _nullish_string(_pick(entry, 'content')),
+            'images': list(images) if isinstance(images, (list, tuple)) else [],
+            'videos': list(videos) if isinstance(videos, (list, tuple)) else [],
+            'forward': forward if _is_mapping(forward) else None,
+        }
+    return missing
+
+
 def match_qzone_feed_content(entries: Sequence[Any], feed: Any) -> str:
     """用好友自己的说说列表对齐 feed 正文（上游 `matchQzoneFeedContent`）。
 
     **只认 tid 精确命中**——连发多条时按时间近似配对会错配正文，宁可只记元数据
     （空串），错的内容比没有内容更糟。
+
+    兼容外壳：上游这个函数只回正文文本，新调用方一律用 `qzone_feed_content_lookup`
+    拿事实（`found` / 图片 / 视频 / 转发链）——判据只有那一份，这里不重算。
     """
-    key = _pick(feed, 'key')
-    for entry in entries:
-        if _pick(entry, 'tid') == key:
-            return _nullish_string(_pick(entry, 'content'))
-    return ''
+    facts = qzone_feed_content_lookup(entries, feed)
+    if facts['content']:
+        return facts['content']
+    forward = facts.get('forward') or {}
+    return str(forward.get('content') or '')
+
+
+# --------------------------------------------------------------------------- #
+# 动态媒体读取上限：可数线索（给模型）+ 节流 warn（给人）
+# --------------------------------------------------------------------------- #
+
+#: 动态媒体读取上限的两种口径名（**唯一一处**）：`cap` = 本组那两个"单次…上限"，
+#: `budget` = 既有的**每回合视觉预算**（图片与视频帧共用同一条视觉通道）。
+#: 两条线索的措辞就靠它分流——用户看完就知道该去调哪一个键（"改了配置却还是 3 张"
+#: 那次就是没说出来）。
+#: ⚠️ 视频的 `budget` 一侧**不是**「单条转发最多读取的视频数」（v1.9.6 起动态这条路
+#: 不再读 `forward_message`；点名一个不生效的键比不点名更坏）。
+QZONE_MEDIA_LIMIT_SOURCES: dict[str, dict[str, str]] = {
+    'image': {
+        'label': '图片',
+        'cap': '单次识别图片上限',
+        'budget': '每回合图片数上限',
+        'where_cap': '「幕间控制台 → 配置 → QQ 空间」',
+        'where_budget': '「幕间控制台 → 配置 → 模型中心 → 图片理解」',
+        'unit': '张',
+        'verb': '看',
+    },
+    'video': {
+        'label': '视频',
+        'cap': '单次获取视频上限',
+        'budget': '每回合图片数上限',
+        'where_cap': '「幕间控制台 → 配置 → QQ 空间」',
+        'where_budget': '「幕间控制台 → 配置 → 模型中心 → 图片理解」',
+        'unit': '段',
+        'verb': '取',
+    },
+}
+
+
+def qzone_media_limit_note(kind: Any, available: Any, granted: Any) -> str:
+    """动态里媒体被上限截断时的**可数线索**（短；只有真的截了才说）。
+
+    与 `vision_budget.image_budget_note()` / `video_turn_budget_note()` 同一族，
+    只是限定词换成"单次"（这里管的是**一次动态读取**，不是一个回合）：
+    `[图片×9，单次仅取前 1 张]` / `[视频×2，单次仅取前 1 段]`。
+    """
+    spec = QZONE_MEDIA_LIMIT_SOURCES.get(_js_string(kind))
+    if spec is None:
+        return ''
+    try:
+        total = int(available)
+        taken = int(granted)
+    except (TypeError, ValueError):
+        return ''
+    if total <= 0 or taken >= total:
+        return ''
+    return '[%s×%d，单次仅取前 %d %s]' % (
+        spec['label'], total, max(0, taken), spec['unit'],
+    )
+
+
+def qzone_media_limit_warning(
+    kind: Any, available: Any, granted: Any, source: Any = 'cap',
+) -> str:
+    """截断那条**节流可行动** warn 的正文（说清楚是哪一道闸拦下的）。
+
+    `source` 是两道闸里真正生效的那一道（`cap` = 本组那两个"单次…上限"，
+    `budget` = 既有的每回合预算）。两句都点名"去哪儿调大"——两道闸并存时，
+    "只调了一个键却没变化"必须能从日志里读出来（用户今天刚被这个坑过一次）。
+    """
+    spec = QZONE_MEDIA_LIMIT_SOURCES.get(_js_string(kind))
+    if spec is None:
+        return ''
+    budget_side = _js_string(source) == 'budget'
+    try:
+        total = int(available)
+        taken = int(granted)
+    except (TypeError, ValueError):
+        return ''
+    return '这次动态里有 %d %s%s，按「%s」只%s了前 %d %s（在%s调大）。' % (
+        total, spec['unit'], spec['label'],
+        spec['budget'] if budget_side else spec['cap'],
+        spec['verb'], max(0, taken), spec['unit'],
+        spec['where_budget'] if budget_side else spec['where_cap'],
+    )

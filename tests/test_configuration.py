@@ -764,7 +764,7 @@ class ConfigurationSchemaTest(unittest.TestCase):
     def test_runtime_and_plugin_exports_share_one_version_constant(self):
         # 上游：`version === HDS_INTERLUDE_VERSION`。v2 起本插件跟进上游 1.0.1-rc28。
         # 本插件 `plugin/_conf_schema.json` 不再是版本的载体，等价物是 core/meta.py。
-        self.assertEqual(load_meta_version(), "1.0.1-rc28")
+        self.assertEqual(load_meta_version(), "1.0.1-rc36")
         self.assertIn("HDS_INTERLUDE_VERSION", read(META_PY_PATH))
 
     # -- 上游第 7 条：layered colored logs are the Console default --------------
@@ -924,6 +924,26 @@ class ConfigurationSchemaTest(unittest.TestCase):
         runtime = self.section("runtime")
         self.assertEqual(runtime["context_entry_limit"]["default"], 35)
         self.assertEqual(runtime["context_time_window_minutes"]["default"], 45)
+
+    def test_recent_context_copy_states_the_rc35_semantics(self):
+        """文案即规格：条数说明不许再写"最低条数"（那正是被删掉的硬地板）。
+
+        rc35 之后条数与时间窗是**叠加**关系（窗口只加不减），所以文案必须点明可填区间、
+        叠加语义，以及"窗口填 0 = 只按条数上限"。用户可见文案见 `docs/CONFIG_MAP.md` 同两行。
+
+        反向（变异）：把 description 改回"近期原始记录最低条数" → 这条红。
+        """
+        runtime = self.section("runtime")
+        entry = runtime["context_entry_limit"]
+        self.assertNotIn("最低", entry["description"], "rc35 已删掉硬地板，'最低'是旧语义")
+        self.assertIn("35", entry["description"])
+        self.assertIn("1~200", entry["description"])
+        self.assertIn("叠加", entry["description"])
+        window = runtime["context_time_window_minutes"]
+        self.assertIn("45", window["description"])
+        self.assertIn("0~1440", window["description"])
+        self.assertIn("叠加", window["description"])
+        self.assertIn("只按条数上限", window["hint"], "窗口填 0 的语义必须写出来")
 
     # -- 上游第 16 条：separate optional perspective layer ----------------------
 
@@ -1147,7 +1167,11 @@ class ConfigurationSchemaTest(unittest.TestCase):
             "context_metrics_enabled",
         },
         # v1.6.0：QQ 空间转正后多出来的那个"自动刷动态"开关（上游 qzone 只有六个键）。
-        "qzone": {"auto_feed"},
+        # v1.9.6：再加"一次动态读取"的两个媒体上限（识别图片 / 获取视频）。它们是
+        # **感知预算**，与既有那两个总开关（图片理解 / 视频理解）配套；默认值只有一处
+        # 真相在 `core/qzone.DEFAULT_QZONE_CONFIG`，下面
+        # `test_the_dynamic_media_caps_track_the_core_constant` 三方对账。
+        "qzone": {"auto_feed", "feed_image_cap", "feed_video_cap"},
         # v1.8.7：合并转发节点里的图片坐标也要交给模型，于是多了**第四道预算**
         # （单条转发最多取几张图，默认 3、区间 0~10）。上游 `forwardMessage` 组只有
         # 三重预算（节点 / 字符 / 深度），这一项由本移植版新增；整条消息的转发媒体
@@ -1257,6 +1281,42 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertEqual(vision["default"], VISION_IMAGE_BUDGET_DEFAULT)
         self.assertEqual(forward_read_limits({}).max_images, VISION_IMAGE_BUDGET_DEFAULT)
         self.assertEqual(FORWARD_MEDIA_MAX_PER_FORWARD, VISION_IMAGE_BUDGET_DEFAULT)
+
+    def test_the_dynamic_media_caps_track_the_core_constant(self):
+        """`qzone.feed_image_cap` / `feed_video_cap`（v1.9.6）：schema / core 默认值三方一致。
+
+        默认值只有一处真相：`core/qzone.DEFAULT_QZONE_CONFIG`。schema 的 `default` 与
+        `resolve_qzone_config()` 的产出都照它抄（照 `VIDEO_CONFIG_DEFAULTS` /
+        `VISION_IMAGE_BUDGET_DEFAULT` 那套做法）——两边各写各的，用户就会看见
+        "界面上是 1、实际按 3 跑"（用户那次真机报告的正中间）。
+
+        顺带把**区间**也对上：schema 的 slider 就是 `QZONE_CONFIG_BOUNDS`，
+        改了 core 的边界而忘了 schema，配置页会允许填一个马上被夹掉的值。
+        """
+        from plugin.core.qzone import (  # noqa: PLC0415
+            DEFAULT_QZONE_CONFIG,
+            QZONE_CONFIG_BOUNDS,
+            resolve_qzone_config,
+        )
+
+        resolved = resolve_qzone_config({"enabled": True})
+        for key in ("feed_image_cap", "feed_video_cap"):
+            with self.subTest(key=key):
+                node = self.schema["qzone"]["items"][key]
+                self.assertEqual(node["default"], DEFAULT_QZONE_CONFIG[key])
+                self.assertEqual(resolved[key], DEFAULT_QZONE_CONFIG[key])
+                self.assertEqual(
+                    (node["slider"]["min"], node["slider"]["max"]), QZONE_CONFIG_BOUNDS[key],
+                    "schema 的 slider 与 core 的边界必须是同一段（单边漂移就红）",
+                )
+        # 默认取**省成本**那侧：一次动态读取只识别 1 张图 / 取 1 段视频
+        # （与既有「单条转发最多读取的视频数」的默认 1 同量级）。
+        self.assertEqual(DEFAULT_QZONE_CONFIG["feed_image_cap"], 1)
+        self.assertEqual(DEFAULT_QZONE_CONFIG["feed_video_cap"], 1)
+        # 下限刻意不是 0：「一张都不识」由既有的图片理解 / 视频理解总开关表达，
+        # 再开一个"关掉"的入口就是同一把闸的第二处判据。
+        self.assertEqual(QZONE_CONFIG_BOUNDS["feed_image_cap"][0], 1)
+        self.assertEqual(QZONE_CONFIG_BOUNDS["feed_video_cap"][0], 1)
 
     def test_deep_sections_are_complete(self):
         model = self.section("model_center")
@@ -2298,9 +2358,9 @@ class ReleaseConsistencyTest(unittest.TestCase):
         self.assertRegex(metadata, r"astrbot_version:\s*\"?[><=~!]", "必须声明 astrbot_version")
 
     def test_upstream_version_constant_records_the_snapshot_version(self):
-        self.assertEqual(self.meta_version, "1.0.1-rc28")
+        self.assertEqual(self.meta_version, "1.0.1-rc36")
         self.assertRegex(read(META_PY_PATH),
-                         r'HDS_INTERLUDE_VERSION\s*=\s*["\']1\.0\.1-rc28["\']')
+                         r'HDS_INTERLUDE_VERSION\s*=\s*["\']1\.0\.1-rc36["\']')
 
     def test_upstream_package_json_matches_the_snapshot_version(self):
         with open(UPSTREAM_PACKAGE_PATH, encoding="utf-8") as fp:
