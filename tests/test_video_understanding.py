@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import shutil
@@ -245,7 +246,13 @@ def video_session(target: str = 'https://cdn.example.com/v.mp4', *, is_direct: b
 
 
 class FakeNarrator:
-    """`narrator._side_task_json` 的替身：记下每次调用，可设成失败。"""
+    """`narrator._side_task_json` 的替身：记下每次调用，可设成失败。
+
+    两条 `build_body` 都探一遍（`capped=True` 首轮 / `capped=False` 降级重试）：
+    "首轮带 cap、重试放开"是旁路任务家族的共同形状，只探一条就看不见反过来的实现
+    （v1.9.7 现场：外挂视频那支写成 `if not capped`，探针只调 `build_body(True)`
+    时它看起来完全正常）。替身比生产更严，不是更宽。
+    """
 
     def __init__(self, answer: str = '画面里是一只猫', error: Exception | None = None) -> None:
         self.answer = answer
@@ -257,7 +264,10 @@ class FakeNarrator:
         build_body: Any, parse: Any, *rest: Any, **kwargs: Any,
     ) -> Any:
         body = build_body(True)
-        self.calls.append({'task': task, 'model': model, 'provider': provider, 'body': body})
+        self.calls.append({
+            'task': task, 'model': model, 'provider': provider, 'body': body,
+            'body_without_cap': build_body(False),
+        })
         if self.error is not None:
             raise self.error
         return parse(self.answer)
@@ -271,26 +281,60 @@ class VideoTestCase(unittest.IsolatedAsyncioTestCase):
     """视频用例的公共底座：模块状态归零 + **临时目录清扫**。
 
     抽帧会在 `tempfile.gettempdir()` 下建 `hdsi-video-*`；生产里由调用方在读完帧字节后
-    删掉（`VideoMedia.cleanup()`），用例里则统一在这里扫尾——顺带让"这一回合有没有留垃圾"
-    这条断言（`TurnLevelWiringTests`）有干净的基准。
+    删掉（`VideoMedia.cleanup()`）。用例里**只认本进程自己建的那几个**（记录式），
+    不去"扫整个 `/tmp` 再取差集"——`/tmp` 是共享的，别的测试进程 / 上一次崩掉的运行
+    留下的 `hdsi-video-case-*` 会被算到这一条用例头上，于是"清理干净"随环境偶发变红
+    （见 `docs/PORTING_NOTES.md` §84；根因取证的用例是 `TempDirIsolationTests`）。
     """
 
     def setUp(self) -> None:
         video.reset_ffmpeg_probe()
         video.reset_video_runtime_state()
-        self._tmp_before = set(os.listdir(tempfile.gettempdir()))
+        self._created_temp_dirs: list[str] = []
+        self._mkdtemp = tempfile.mkdtemp
+        self._mkdtemp_patch = mock.patch.object(tempfile, 'mkdtemp', self._recording_mkdtemp)
+        self._mkdtemp_patch.start()
+
+    def _recording_mkdtemp(self, *args: Any, **kwargs: Any) -> str:
+        path = self._mkdtemp(*args, **kwargs)
+        self._created_temp_dirs.append(path)
+        return path
 
     def tearDown(self) -> None:
+        self._mkdtemp_patch.stop()
         video.reset_ffmpeg_probe()
         video.reset_video_runtime_state()
-        for name in set(os.listdir(tempfile.gettempdir())) - self._tmp_before:
-            if name.startswith('hdsi-video-'):
-                shutil.rmtree(os.path.join(tempfile.gettempdir(), name), ignore_errors=True)
+        for path in self._created_temp_dirs:
+            shutil.rmtree(path, ignore_errors=True)
 
     def new_temp_dirs(self) -> list[str]:
-        return sorted(
-            name for name in set(os.listdir(tempfile.gettempdir())) - self._tmp_before
-            if name.startswith('hdsi-video-')
+        """本用例期间真的建过、**现在还留在盘上**的临时目录（= 没被清理的那些）。"""
+        return sorted(path for path in self._created_temp_dirs if os.path.exists(path))
+
+    @contextlib.contextmanager
+    def video_slot_guard(self) -> Any:
+        """本回合的**每一次** `_acquire_slot()` 都必须成功。
+
+        视频并发上限（`VIDEO_MAX_CONCURRENCY=1`）是**进程级**共享状态：同一个事件循环里
+        只要还有另一条视频收集在跑，本回合就会静默少读几段——那正是"配了 3 段只读 2 段"
+        唯一的来源。顺序 await 的单回合绝不可能自己撞自己，所以这条不变量必须成立；
+        它一旦破了，要在**这里**以清楚的文案红，而不是让下面的条数断言漂移。
+        """
+        refused: list[int] = []
+        original = video._acquire_slot
+
+        def tracked() -> bool:
+            granted = original()
+            if not granted:
+                refused.append(len(refused) + 1)
+            return granted
+
+        with mock.patch.object(video, '_acquire_slot', tracked):
+            yield refused
+        self.assertEqual(
+            refused, [],
+            '本回合有视频被并发闸拒了 %d 次：说明同一个事件循环里另有一条视频收集在跑'
+            '（进程级共享状态），条数断言会因此漂移' % len(refused),
         )
 
 
@@ -537,9 +581,115 @@ class FfmpegStatusTests(unittest.TestCase):
                 with mock.patch.object(video, '_FFMPEG_PATH', ''):
                     self.assertEqual(video.apply_ffmpeg_status_hint(schema), '⚠️ 未发现 FFmpeg')
 
+    # ------------------------------------------------------------------ #
+    # 本轮（v1.9.8）：用户报"配置页上根本看不到 FFmpeg 状态"
+    # ------------------------------------------------------------------ #
+
+    def test_the_status_lands_on_both_the_mode_and_the_master_switch(self) -> None:
+        """**同一份状态文本、同一处判据**，贴两处：识别模式 + 总开关。
+
+        用户报"看不见"的直接原因之一：只贴在「识别模式」一个子项上，
+        而"视频理解到底开没开"的第一眼位置是总开关。
+        """
+        with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            schema = json.load(handle)
+        enabled_static = schema['model_center']['items']['video']['items']['enabled']['hint']
+        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
+            self.assertEqual(video.apply_ffmpeg_status_hint(schema), '✅ FFmpeg 已识别')
+        items = schema['model_center']['items']['video']['items']
+        self.assertEqual(items['mode']['hint'], '✅ FFmpeg 已识别。' + video.VIDEO_MODE_HINT)
+        # 总开关那一处接的是它**自己**的静态 hint（不复制第二份文案）。
+        self.assertEqual(items['enabled']['hint'], '✅ FFmpeg 已识别。' + enabled_static)
+
+    def test_the_two_labels_are_the_only_text_that_follows_the_state(self) -> None:
+        """有 / 无 ffmpeg 两种状态各自渲染出的**字面量**。"""
+        with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            schema = json.load(handle)
+        with mock.patch.object(video, '_FFMPEG_PATH', ''):
+            video.apply_ffmpeg_status_hint(schema)
+        items = schema['model_center']['items']['video']['items']
+        self.assertTrue(items['mode']['hint'].startswith('⚠️ 未发现 FFmpeg。'))
+        self.assertTrue(items['enabled']['hint'].startswith('⚠️ 未发现 FFmpeg。'))
+        # 判据一处：这两句的前缀就是 `ffmpeg_status_label()` 当时返回的那个串。
+        with mock.patch.object(video, '_FFMPEG_PATH', ''):
+            self.assertEqual(video.ffmpeg_status_label(), '⚠️ 未发现 FFmpeg')
+        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
+            video.apply_ffmpeg_status_hint(schema)
+            self.assertEqual(video.ffmpeg_status_label(), '✅ FFmpeg 已识别')
+        self.assertTrue(items['mode']['hint'].startswith('✅ FFmpeg 已识别。'))
+        self.assertTrue(items['enabled']['hint'].startswith('✅ FFmpeg 已识别。'))
+        self.assertNotIn('⚠️', items['mode']['hint'], '旧状态必须被剥掉，不许两句并存')
+
+    def test_writing_twice_does_not_stack_the_status(self) -> None:
+        """每个刷新点都会重写；重写必须幂等（否则配置页会「⚠️。⚠️。⚠️。」）。"""
+        with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            schema = json.load(handle)
+        with mock.patch.object(video, '_FFMPEG_PATH', ''):
+            for _ in range(3):
+                video.apply_ffmpeg_status_hint(schema)
+        items = schema['model_center']['items']['video']['items']
+        self.assertEqual(items['mode']['hint'], '⚠️ 未发现 FFmpeg。' + video.VIDEO_MODE_HINT)
+        self.assertEqual(
+            items['enabled']['hint'].count('⚠️ 未发现 FFmpeg'), 1,
+            '状态词只许出现一次',
+        )
+
+    def test_a_broken_schema_returns_the_label_plus_a_visible_reason(self) -> None:
+        """缺节点不许再**静默**（v1.9.0 那版是 `except (KeyError, TypeError): pass`）。
+
+        反向：把原因吞掉（回空串）→ 本条红。
+        """
+        with mock.patch.object(video, '_FFMPEG_PATH', ''):
+            label, problem = video.apply_ffmpeg_status_hint_or_problem(None)
+        self.assertEqual(label, '⚠️ 未发现 FFmpeg', '写不进去也要把状态串交出去')
+        self.assertTrue(problem, '写不进去必须给出一句可读的原因（不许静默）')
+        self.assertIn('schema', problem)
+
+        with mock.patch.object(video, '_FFMPEG_PATH', ''):
+            label, problem = video.apply_ffmpeg_status_hint_or_problem({'model_center': {}})
+        self.assertEqual(label, '⚠️ 未发现 FFmpeg')
+        # 原因要点名**缺了哪几个节点**（用户/维护者据此知道是宿主形状变了）。
+        self.assertIn('model_center.video.mode', problem)
+        self.assertIn('model_center.video.enabled', problem)
+
+        with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            ok_schema = json.load(handle)
+        with mock.patch.object(video, '_FFMPEG_PATH', ''):
+            label, problem = video.apply_ffmpeg_status_hint_or_problem(ok_schema)
+        self.assertEqual(problem, '', '正常 schema 上不该报问题')
+        self.assertEqual(label, '⚠️ 未发现 FFmpeg')
+
+    def test_the_silent_swallow_is_gone(self) -> None:
+        """源码级守卫：那个 `except (KeyError, TypeError): pass` 不许回来。"""
+        code = _code_only(_read('core/video_understanding.py'))
+        self.assertNotIn('except (KeyError, TypeError)', code)
+        self.assertIn('apply_ffmpeg_status_hint_or_problem', code)
+
+    def test_the_plugin_refreshes_the_hint_at_every_chance_it_gets(self) -> None:
+        """不许退回"初始化时写一次就完"：能拿到 schema 的时机都要补写。
+
+        反向：删掉 `page_console_config` 里那一句 → 本条红。
+        """
+        source = _read('main.py')
+        self.assertIn('def _refresh_ffmpeg_status_hint(', source)
+        self.assertIn('self.video_ffmpeg_status = self._refresh_ffmpeg_status_hint()', source)
+        page = source.split('async def page_console_config(self):', 1)
+        self.assertEqual(len(page), 2, 'page_console_config 必须还在')
+        head = page[1].split('async def ', 1)[0]
+        self.assertIn('_refresh_ffmpeg_status_hint(refresh=True)', head,
+                      '打开控制台配置页时要补写一次（并重探 ffmpeg）')
+
+    def test_the_plugin_warns_when_the_hint_cannot_be_written(self) -> None:
+        """写不进去要有一条**用户可见**的 warn（坑 25），且同一条原因只打一次。"""
+        source = _read('main.py')
+        self.assertIn('未能把 FFmpeg 状态写进宿主配置页提示', source)
+        self.assertIn('logger.warning(', source)
+        body = source.split('def _refresh_ffmpeg_status_hint(', 1)[1].split('async def initialize', 1)[0]
+        self.assertIn('problem != self._ffmpeg_hint_problem', body, '同一条原因要节流')
+
     def test_the_plugin_applies_the_patch_at_load_and_logs_one_line(self) -> None:
         source = _read('main.py')
-        self.assertIn('apply_ffmpeg_status_hint(', source)
+        self.assertIn('apply_ffmpeg_status_hint_or_problem(', source)
         self.assertIn('getattr(self.config, \'schema\', None)', source)
         self.assertIn('视频抽帧识别', source)
 
@@ -945,7 +1095,9 @@ class TurnLevelWiringTests(VideoTestCase):
             'inFlightRequestId': None, 'obsoleteRequestIds': set(),
         }
         host.buffered_narrative_turns = {'k': turn}
-        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
+        self.assertEqual(video._VIDEO_IN_FLIGHT, 0, '进这一条时不许有别的收集占着闸')
+        with self.video_slot_guard(), \
+                mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
                 mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg):
             await ServiceChunk3.flush_buffered_narrative(host, 'k', 3)
 
@@ -1134,6 +1286,10 @@ class ExternalModeTests(VideoTestCase):
         self.assertEqual(call['model'], 'qwen-vl-max')
         prompt = call['body']['messages'][-1]['content']
         self.assertIn('https://cdn.example.com/v.mp4', prompt, '外挂拿到的是**直链文本**')
+        # 首轮带输出预算、降级重试放开（与同族所有 `build_body` 同一形状）。
+        # 反向：把这一支写成 `if not capped`（v1.9.7 的现场）→ 本条立刻红。
+        self.assertEqual(call['body']['max_tokens'], 1_200, '首轮要带输出预算')
+        self.assertNotIn('max_tokens', call['body_without_cap'], '重试那一趟要放开预算')
         # 不许自造宿主链路上不存在的视频部件（那会被静默丢掉）。
         self.assertNotIn('video_url', json.dumps(call['body'], ensure_ascii=False))
         self.assertIn('橘猫', result.note)
@@ -1394,8 +1550,8 @@ class BudgetConfigTests(VideoTestCase):
         })
         self.assertEqual(resolved['frame_mode'], 'average')
         self.assertEqual(resolved['frame_interval_seconds'], 3)
-        self.assertEqual(resolved['frame_average_count'], video.VIDEO_MAX_FRAMES,
-                         '帧数上限 = 视觉预算，多配了也只能夹到它')
+        self.assertEqual(resolved['frame_average_count'], 99,
+                         'v1.9.7 起没有上界：多配的帧由每回合图片预算那道可见的闸去裁')
         self.assertEqual(resolved['out_format'], 'mp3')
         self.assertEqual(resolved['audio_duration'], 'unlimited')
         self.assertEqual(resolved['audio_duration_seconds'], 1, '脏值回默认再夹到下限')
@@ -1475,11 +1631,17 @@ class MultiVideoBudgetTests(VideoTestCase):
             return await video.collect_video_sources(host, {'id': 's'}, session)
 
     async def test_every_video_in_the_turn_is_really_read(self) -> None:
-        """① 配 3 段 + 会话里 3 段 → **三次抽帧、三段音轨**（不是只读第一段）。"""
+        """① 配 3 段 + 会话里 3 段 → **三次抽帧、三段音轨**（不是只读第一段）。
+
+        `video_slot_guard()` 把"单回合不会被并发闸自己撞到"这条不变量钉在这一条上：
+        历史 flake「2 != 3」唯一可能的来源就是它被别的收集占住（§84）。
+        """
         ffmpeg = FakeFfmpeg()
         host = Host(config=self._config(3))
         session = self._session(*['https://cdn.example.com/v%d.mp4' % index for index in (1, 2, 3)])
-        result = await self._collect(host, session, ffmpeg)
+        self.assertEqual(video._VIDEO_IN_FLIGHT, 0, '进这一条时不许有别的收集占着闸')
+        with self.video_slot_guard():
+            result = await self._collect(host, session, ffmpeg)
 
         self.assertEqual(len(ffmpeg.argvs('frames')), 3, '三段视频 = 三次抽帧命令')
         self.assertEqual(len(ffmpeg.argvs('audio')), 3, '每段各抽一条音轨')
@@ -1531,7 +1693,7 @@ class MultiVideoBudgetTests(VideoTestCase):
         self.assertEqual(budget({'max_videos': 3}), 3)
         self.assertEqual(budget({'maxVideos': 4}), 4, '两种拼写都认')
         self.assertEqual(budget({}), 1, '缺键 = 默认 1')
-        self.assertEqual(budget({'max_videos': 99}), 10, '夹到上限 10（夹取只住在 forward_message）')
+        self.assertEqual(budget({'max_videos': 99}), 99, 'v1.9.7 起没有上界（夹取只住在 forward_message）')
         self.assertEqual(budget({'max_videos': -5}), 1, '夹到下限 0 之后按 1 算')
         self.assertEqual(budget({'max_videos': 'abc'}), 1, '脏值回默认')
         self.assertEqual(budget({'max_videos': 0}), 1, '0 = 转发里不读；直发仍按 1')
@@ -1544,6 +1706,105 @@ class MultiVideoBudgetTests(VideoTestCase):
         self.assertEqual(chunk3_module._FORWARD_SECTION_NAMES, expected)
         bridge = _read('adapters/astrbot_bridge.py')
         self.assertIn('FORWARD_SECTION_NAMES: tuple[str, ...] = %r' % (expected,), bridge)
+
+
+# =========================================================================== #
+# 4.5.5d flaky 收口（v1.9.7）：/tmp 隔离 + 并发闸不变量（§84）
+# =========================================================================== #
+
+class TempDirIsolationTests(VideoTestCase):
+    """两条历史 flaky 的**根因取证**与守卫。
+
+    `test_every_video_in_the_turn_is_really_read` 的「2 != 3」与
+    `test_three_forwarded_videos_really_take_three_ffmpeg_runs` 的「残留
+    `hdsi-video-case-*`」单独跑都绿、全量偶红。查完的结论是**环境耦合**，不是产品缺陷：
+    两条都只是把"这一回合没留垃圾 / 三段都读了"钉在**进程外共享状态**上——前者钉在
+    `/tmp` 的全局差集、后者钉在进程级并发闸 `_VIDEO_IN_FLIGHT`。这里的用例把两件事
+    各自隔离成**只跟本用例有关**的判据，并留下反向证据。
+    """
+
+    async def _collect(self, host: Any, session: Any, ffmpeg: FakeFfmpeg) -> video.VideoMedia:
+        with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
+                mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg):
+            return await video.collect_video_sources(host, {'id': 's'}, session)
+
+    async def test_a_foreign_temp_dir_does_not_pollute_the_leftover_check(self) -> None:
+        """**反向（旧写法）**：`/tmp` 是共享的，别的进程留下的 `hdsi-video-*` 不许算到我们头上。
+
+        旧写法是"setUp 拍一张 `/tmp` 快照、测试后再取差集"，于是任何外来目录（并发的
+        另一次测试运行、上一次崩掉/被杀掉的运行留下的 `hdsi-video-case-*`）都会让
+        「这一回合没留垃圾」这条断言红 —— 那正是"残留临时目录"那条偶发的真身。
+        改回旧写法 → 这条立刻红。
+        """
+        foreign = os.path.join(tempfile.gettempdir(), 'hdsi-video-foreign-0')
+        os.makedirs(foreign, exist_ok=True)
+        self.addCleanup(shutil.rmtree, foreign, True)
+
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=video_config())
+        result = await self._collect(host, video_session(), ffmpeg)
+        result.cleanup()
+
+        self.assertEqual(len(ffmpeg.argvs('frames')), 1)
+        self.assertEqual(self.new_temp_dirs(), [], '外来目录不是我们的垃圾')
+
+    async def test_a_single_refused_slot_costs_a_whole_video(self) -> None:
+        """根因取证：并发闸被占一次 → 这一回合**少读一整段视频**（"配 3 段只读 2 段"）。
+
+        `_VIDEO_IN_FLIGHT` 是**进程级**的（`VIDEO_MAX_CONCURRENCY=1`）。顺序 await 的
+        单回合不会自己撞自己，所以历史 flake 的「2 != 3」只可能来自"同一个事件循环里
+        另有一条收集在跑"。这不是产品缺陷（那道闸是故意的、也有可见 warn），但必须
+        让它在测试里**可见**：`video_slot_guard()` 就是那条不变量。
+        """
+        ffmpeg = FakeFfmpeg()
+        config = video_config()
+        config['forward_message'] = {'max_videos': 3}
+        host = Host(config=config)
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='2', is_direct=True,
+            content=' '.join('<video src="https://cdn.example.com/v%d.mp4"/>' % index for index in (1, 2, 3)),
+            elements=[
+                {'type': 'video', 'attrs': {'src': 'https://cdn.example.com/v%d.mp4' % index}, 'children': []}
+                for index in (1, 2, 3)
+            ],
+            media=[],
+        )
+        calls = {'n': 0}
+        original = video._acquire_slot
+
+        def refuse_the_third() -> bool:
+            calls['n'] += 1
+            if calls['n'] == 3:
+                return False
+            return original()
+
+        with mock.patch.object(video, '_acquire_slot', refuse_the_third):
+            result = await self._collect(host, session, ffmpeg)
+
+        self.assertEqual(len(ffmpeg.argvs('frames')), 2, '第三段被闸掉 = 只读了两段（就是那个 2 != 3）')
+        self.assertIn(video.VIDEO_BUSY_REASON, result.note, '丢了一段必须说出来')
+
+    async def test_the_slot_guard_flags_contention_instead_of_letting_counts_drift(self) -> None:
+        """守卫有牙：本回合真被闸拒一次时，`video_slot_guard()` 必须红（不是静默少读）。"""
+        ffmpeg = FakeFfmpeg()
+        host = Host(config=video_config())
+        leaked = video._acquire_slot()  # 模拟另一条收集占着闸
+        try:
+            with self.assertRaises(AssertionError) as ctx:
+                with self.video_slot_guard():
+                    await self._collect(host, video_session(), ffmpeg)
+            self.assertIn('并发闸拒了', str(ctx.exception))
+        finally:
+            if leaked:
+                video._release_slot()
+
+    def test_the_leftover_check_no_longer_scans_the_shared_temp_root(self) -> None:
+        """判据一处：清扫/判"留没留垃圾"只认本进程建过的目录，不再 `listdir` 整个 `/tmp`。"""
+        self.assertEqual(self.new_temp_dirs(), [])
+        created = tempfile.mkdtemp(prefix='hdsi-video-case-')
+        self.assertEqual([created], self.new_temp_dirs(), '自己建的必须算进"留在盘上的"')
+        shutil.rmtree(created, ignore_errors=True)
+        self.assertEqual(self.new_temp_dirs(), [])
 
 
 # =========================================================================== #

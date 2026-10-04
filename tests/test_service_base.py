@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from typing import Any
+from unittest import mock
 
 from plugin.core import logging as interlude_logging
 from plugin.core.database import Database
@@ -979,6 +980,89 @@ class Chunk0AsyncLifecycleTests(AsyncServiceTestCase):
             await service.desktop_timeline_snapshot(),
             {'storyId': '', 'entries': [], 'scenes': [], 'facts': []},
         )
+
+
+class _SeederHost(ServiceChunk0):
+    """**只挂 base** 的宿主 + 世界播种器那三个接口（`docs/PORTING_NOTES.md` §84）。
+
+    生产里 `world_seeder_runtime()` 来自 `chunk10`，而 `write_standalone` 的同名方法
+    在 `chunk9`（MRO 在前）——所以完整服务的这条错位分支被盖住、今天不发作。这个替身
+    刻意只挂 base（+ 一份播种器接口），复现"任何只挂 base 的宿主一旦有
+    `world_seeder_runtime`"这一档，守 `report_standalone` 的有界调用。
+    """
+
+    def __init__(
+        self, ctx: Any, config: Any, db: Any, transport: Any, *,
+        seeder_enabled: bool = False, cadence_minutes: int = 45,
+    ) -> None:
+        # 先于 `super().__init__` 就位：构造期末尾自己会走一次 `report_standalone_operation`。
+        self._seeder_enabled = seeder_enabled
+        self._seeder_cadence = cadence_minutes
+        super().__init__(ctx, config, db, transport)
+
+    def world_seeder_runtime(self) -> dict[str, Any]:
+        return {'enabled': self._seeder_enabled, 'cadence_minutes': self._seeder_cadence}
+
+    def explain_world_seeder_state(self) -> str:
+        if self._seeder_enabled:
+            return '世界播种器已启用 间隔=%d分钟' % self._seeder_cadence
+        return '世界播种器未启用：没有连接勾选「用于世界播种」'
+
+    async def world_seeder_sweep(self) -> None:  # pragma: no cover - 定时器从不真的触发
+        return None
+
+
+class WorldSeederStartupWiringTests(AsyncServiceTestCase):
+    """世界播种器的启动代码**只许住在 `start_background_tasks()`**（§84）。
+
+    它原先错放在 `write_standalone` 里：`report_standalone` → `write_standalone` →
+    又 `report_standalone` = 无限递归，而且**每一条** standalone 日志都会被它拦一次。
+    """
+
+    async def test_report_standalone_never_recurses_when_only_base_is_mounted(self) -> None:
+        host = _SeederHost(
+            self.make_context(), make_config(), self.db, NullTransport(), seeder_enabled=False,
+        )
+        with mock.patch.object(
+            ServiceChunk0, 'write_standalone', autospec=True,
+            wraps=ServiceChunk0.write_standalone,
+        ) as counted:
+            host.report_standalone('warn', '一条普通日志')
+        # 有界调用：一次 `report_standalone` 恰好一次 `write_standalone`。
+        # 反向：把播种器那一段放回 `write_standalone` → 这里先是 RecursionError。
+        self.assertEqual(counted.call_count, 1, 'standalone 日志被播种器那段递归了')
+        self.assertIn('一条普通日志', self.sink.text())
+
+    async def test_the_seeder_timer_is_registered_by_start_background_tasks(self) -> None:
+        host = _SeederHost(
+            self.make_context(), make_config(), self.db, NullTransport(), seeder_enabled=True,
+        )
+        await asyncio.sleep(0)  # `call_soon(start_background_tasks)`
+        self.assertIsNotNone(host._world_seeder_timer, '启用时定时器必须挂上')
+        # 启动结论只有一条：不是每条 standalone 日志都报一遍。
+        self.assertEqual(self.sink.text().count('世界播种器已启用'), 1, self.sink.text())
+        host._sweep_timer.cancel()
+        host._world_seeder_timer.cancel()
+
+    async def test_a_disabled_seeder_registers_no_timer_and_says_why_once(self) -> None:
+        host = _SeederHost(
+            self.make_context(), make_config(), self.db, NullTransport(), seeder_enabled=False,
+        )
+        await asyncio.sleep(0)
+        self.assertIsNone(host._world_seeder_timer, '没启用就连定时器都不注册（零成本）')
+        self.assertEqual(
+            self.sink.text().count('世界播种器未启用：没有连接勾选「用于世界播种」'), 1,
+            self.sink.text(),
+        )
+        host._sweep_timer.cancel()
+
+    async def test_a_base_only_host_without_the_seeder_interface_is_untouched(self) -> None:
+        """反向：**没有** `world_seeder_runtime` 的宿主（纯 base）照旧，一段都不进。"""
+        service = ServiceChunk0(self.make_context(), make_config(), self.db, NullTransport())
+        await asyncio.sleep(0)
+        self.assertIsNone(service._world_seeder_timer)
+        self.assertNotIn('世界播种器', self.sink.text())
+        service._sweep_timer.cancel()
 
 
 # =========================================================================== #

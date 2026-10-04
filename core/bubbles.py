@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 __all__ = [
@@ -51,6 +52,10 @@ VOICE_MARKER = '<tts/>'
 
 #: 分隔符缺失时的兜底（与 `commit_builder._DEFAULT_SEPARATOR` / 上游默认值一致）。
 DEFAULT_SEPARATOR = '<sep/>'
+
+#: 换行运行（含单个换行与 CRLF），逐字 = 上游 `splitVisibleReplyBubbles` 的 `/\r?\n+/g`。
+#: 连续换行算**一个**边界：`replace` 一次吃掉整段运行，不产生空投递段。
+_NEWLINE_RUN_RE = re.compile(r'\r?\n+')
 
 
 def _pick(mapping: Any, *keys: str, default: Any = None) -> Any:
@@ -73,11 +78,18 @@ def strip_voice_marker(text: Any) -> tuple[str, bool]:
     return value.replace(VOICE_MARKER, ''), True
 
 
+def _single_segment(text: str, voice_enabled: bool) -> dict[str, Any]:
+    """整条一个分段（`<tts/>` 照样删，开关关着时 `voice` 恒 False）。"""
+    cleaned, voice = strip_voice_marker(text)
+    return {'content': cleaned, 'voice': bool(voice and voice_enabled)}
+
+
 def split_bubble_segments(
     content: Any,
     separator: Optional[str] = DEFAULT_SEPARATOR,
     enabled: bool = True,
     voice_enabled: bool = True,
+    newline_as_separator: bool = False,
 ) -> list[dict[str, Any]]:
     """把一条可见回复切成气泡段：`[{'content': str, 'voice': bool}, ...]`。
 
@@ -86,21 +98,37 @@ def split_bubble_segments(
     分隔符时，整条就是一个分段；切出的空段丢掉；一段都切不出来时（内容全是分隔符）
     返回空列表——投递层按既有的"首段为空则放弃投递"处理。
 
+    `newline_as_separator=True`（上游 1.0.1-rc36 `convertNewlineToSeparator`）：
+    模型没按合约给分隔符、而是用**换行**分条时，把换行运行（单个换行与 CRLF 都算、
+    连续换行只当**一个**边界）视作气泡边界再发送。两个上游守卫逐字保留：
+    ① **内容已含显式分隔符时不转换**（模型自己写了 `<sep/>` 就尊重原样）；
+    ② 拆分关闭（`enabled=False`）时该开关无效。转换后一段都切不出来时（内容本身
+    只有换行）退回**原样一条**——上游 `parts.length ? parts : [content]`，否则纯换行
+    的回复会被这个开关整条删掉。显式分隔符那条老路径仍返回空列表（既有口径）。
+
     每个分段里字面 `<tts/>` 被删掉，`voice` 记录该段是否要求语音；
     `voice_enabled=False` 时 `voice` 恒为 `False`（标记仍然删）。
     """
     text = content if isinstance(content, str) else ''
-    if not enabled or not separator or separator not in text:
-        cleaned, voice = strip_voice_marker(text)
-        return [{'content': cleaned, 'voice': bool(voice and voice_enabled)}]
+    if not enabled or not separator:
+        return [_single_segment(text, voice_enabled)]
+    normalized = text
+    converted = False
+    if newline_as_separator and separator not in normalized and _NEWLINE_RUN_RE.search(normalized):
+        normalized = _NEWLINE_RUN_RE.sub(separator, normalized)
+        converted = True
+    if separator not in normalized:
+        return [_single_segment(text, voice_enabled)]
     segments: list[dict[str, Any]] = []
-    for part in text.split(separator):
+    for part in normalized.split(separator):
         cleaned, voice = strip_voice_marker(part)
         cleaned = cleaned.strip()
         if not cleaned:
             continue
         segments.append({'content': cleaned, 'voice': bool(voice and voice_enabled)})
-    return segments
+    if segments or not converted:
+        return segments
+    return [_single_segment(text, voice_enabled)]
 
 
 def bubble_texts(
@@ -132,13 +160,20 @@ def runtime_bubble_segments(
     （`messageSeparator` 空/缺失 → `<sep/>`；关掉分条 → 整条一段）。
     这个函数把**配置读取**收在一处，免得每个调用方各写一遍默认值——
     发群的 Chunk2 与私聊投递的 Chunk6 都走它。
+
+    1.0.1-rc36 的 `convertNewlineToSeparator` 也在这里读（上游 `=== true`：只有
+    显式真值才开，默认关）。**开启才会把换行当边界**，关着时与 rc36 之前逐字一致。
     """
     section = runtime if isinstance(runtime, dict) else {}
     enabled = _pick(section, 'splitReplyMessages', 'split_reply_messages', True) is not False
     separator = _pick(section, 'messageSeparator', 'message_separator', '')
     separator = separator.strip() if isinstance(separator, str) else ''
+    newline_as_separator = _pick(
+        section, 'convertNewlineToSeparator', 'convert_newline_to_separator', False,
+    ) is True
     return split_bubble_segments(
         content, separator or DEFAULT_SEPARATOR, enabled, bool(voice_enabled),
+        newline_as_separator,
     )
 
 

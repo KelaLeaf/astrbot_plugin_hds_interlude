@@ -31,9 +31,12 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from unittest import mock
 
 from plugin.core import logging as interlude_logging
+from plugin.core import narrator as narrator_module
 from plugin.core.database import Database
+from plugin.core.script.authored_actions import resolve_authored_actions
 from plugin.core.script.commit_builder import decision_to_script_commit
 from plugin.core.service import (
     InterludeContext,
@@ -1570,6 +1573,364 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         # 游标推进到 now（真实墙钟时间由 advance_unlocked 写入）。
         current = await self.service.get_story(STORY_ID)
         self.assertEqual(dt_ms(current['cursorAt']), dt_ms(NOW))
+
+
+# =========================================================================== #
+# 真机回归（2026-10-04）：合法 interaction 不许被丢弃 / 浏览结果要回到上下文
+# =========================================================================== #
+
+#: 真机第一版草稿里的那一条合法可见回复（逐字）。
+_REAL_INTERACTION = {
+    'seen': True,
+    'reply': {'mode': 'immediate', 'content': '唔，你还有个妹妹啊，搜着呢'},
+}
+
+#: 真机第一版草稿里的浏览意图（复数数组拼写）。
+_DEFERRED_SEARCH = {'mode': 'search', 'query': '妹妹', 'purpose': '想看看他妹妹是谁', 'timing': 'deferred'}
+
+#: 假页面正文：断言"取回的内容真的进了下一回合的 webContext"。
+_PAGE_EXCERPT = '他妹妹叫小雨，今年刚上高一。'
+
+
+class _BrowseTransport(NullTransport):
+    """`Transport.search_web` / `visit_web` 的最小替身（无宿主搜索 API → 回落到模板 URL）。"""
+
+    def __init__(self, page: bool = True) -> None:
+        self.page = page
+        self.calls: list[tuple[str, Any]] = []
+
+    async def search_web(self, query: str, timeout_ms: int) -> list[dict[str, Any]]:
+        self.calls.append(('search', query))
+        return []
+
+    async def visit_web(self, url: str, timeout_ms: int) -> Any:
+        self.calls.append(('visit', url))
+        if not self.page:
+            return None
+        return {'url': url, 'title': '妹妹是谁 - 搜索', 'text': _PAGE_EXCERPT * 20}
+
+
+def browser_service_config() -> dict[str, Any]:
+    """打开网页观察的最小配置（夹具照生产写法写全，见坑 39/66）。"""
+    config = make_service_config()
+    config['browser'] = {
+        'enabled': True, 'allowSearch': True, 'allowVisit': True,
+        'searchUrlTemplate': 'https://cn.bing.com/search?q={query}',
+        'mode': 'deferred-only', 'maxObservationsInPrompt': 1,
+    }
+    return config
+
+
+class LegalInteractionTests(unittest.IsolatedAsyncioTestCase):
+    """① 的回归面：合法 `interaction` 绝不丢弃；真的缺了才重写。"""
+
+    def setUp(self) -> None:
+        self.sink = _Sink()
+        interlude_logging.set_log_sink(self.sink)
+        self.addCleanup(interlude_logging.set_log_sink, interlude_logging._default_sink)
+        self.db = Database(':memory:')
+        self.addCleanup(self.db.close)
+        self.db.register_tables()
+        self.ctx = InterludeContext(logger=None, database=self.db, clock=lambda: NOW)
+        self.service = InterludeService(self.ctx, make_service_config(), self.db, NullTransport())
+        # 闸门只在"主模型可用"时才上膛（`initial_visible_recovery = main_available and …`）：
+        # 不设这一条，下面的用例会因为闸门没开而假绿。
+        self.service.model_routing = {'main': {'available': True}}
+        self.db.insert('interlude_story', {
+            'id': STORY_ID, 'platform': 'test', 'selfId': '1', 'userId': '1',
+            'channelId': 'private:1', 'status': 'active',
+            'setting': make_setting(), 'state': encode_story_state(empty_story_state()),
+            'cursorAt': FROM, 'createdAt': FROM, 'updatedAt': FROM,
+        })
+        self.db.insert('interlude_participant', {
+            'id': PARTICIPANT_ID, 'storyId': STORY_ID, 'platform': 'test', 'selfId': '1',
+            'userId': '2', 'channelId': 'private:2', 'personId': 'person:2',
+            'displayName': 'Kela', 'profile': '', 'relationship': '',
+            'state': {'openThreads': [], 'relationshipNotes': []}, 'status': 'active',
+            'createdAt': FROM, 'updatedAt': FROM,
+        })
+
+    def discarded_drafts(self) -> list[str]:
+        return [text for level, text in self.sink.records
+                if level == 'warn' and '被抛弃草稿的结构化回复字段' in text]
+
+    async def test_a_legal_interaction_is_never_discarded(self) -> None:
+        """真机第一版草稿：合法 `interaction` + 复数数组浏览意图 + 多余 `platform` 键。
+
+        这三样都是**非致命差异**；整篇剧本不许因此被扔掉重写（双倍 token + 近两分钟）。
+        """
+        self.service.narrator = _FakeNarrator({
+            'script': '她翻了翻手机，指尖停在搜索框上。',
+            'interaction': {**_REAL_INTERACTION, 'reply': {**_REAL_INTERACTION['reply'], 'platform': 'qq'}},
+            'browserIntents': [_DEFERRED_SEARCH],
+        })
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+        )
+        self.assertTrue(result['succeeded'])
+        self.assertEqual(len(self.service.narrator.requests), 1, '合法草稿只该问模型一次')
+        self.assertEqual(self.discarded_drafts(), [])
+        self.assertEqual(result['decision']['interaction']['reply']['content'], '唔，你还有个妹妹啊，搜着呢')
+
+    async def test_a_near_miss_json_draft_reaches_the_gate_intact(self) -> None:
+        """真机整条链：模型文本（多一个尾随逗号）→ 解析 → 判据，一次调用、不丢弃。
+
+        这里用一个**真的过解析器**的替身（与 `narrator._request_provider` 的路径一致），
+        钉住"判据读到的就是模型写的那份 decision"——不是被解析层截出来的片段。
+        """
+        text = (
+            '{\n'
+            '  "script": "她翻了翻手机，指尖停在搜索框上。",\n'
+            '  "interaction": {"seen": true, "reply": {"mode": "immediate", "content": "唔，你还有个妹妹啊，搜着呢"}},\n'
+            '  "browserIntents": [{"mode": "search", "query": "妹妹", "purpose": "想看看他妹妹是谁", "timing": "deferred"}],\n'
+            '}'
+        )
+
+        class _ParsingNarrator:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            async def decide(self, request: dict[str, Any]) -> dict[str, Any]:
+                self.requests.append(request)
+                parsed = narrator_module.parse_json_response(text, 'Narrative provider')
+                return resolve_authored_actions(narrator_module.narrative_decision_root(parsed), False, '<sep/>')
+
+        self.service.narrator = _ParsingNarrator()
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+        )
+        self.assertTrue(result['succeeded'])
+        self.assertEqual(len(self.service.narrator.requests), 1)
+        self.assertEqual(self.discarded_drafts(), [])
+        self.assertEqual(result['decision']['interaction']['reply']['content'], '唔，你还有个妹妹啊，搜着呢')
+        self.assertEqual(len(result['decision']['browserIntents']), 1)
+
+    async def test_a_non_fatal_mode_spelling_does_not_burn_a_rewrite(self) -> None:
+        """`mode` 写成 `text`（rc15 宽容）时归一化照常发消息，判定也必须照常放过。"""
+        self.service.narrator = _FakeNarrator({
+            'script': '她放下手机。',
+            'interaction': {'seen': True, 'reply': {'mode': 'text', 'content': '在的。'}},
+        })
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+        )
+        self.assertTrue(result['succeeded'])
+        self.assertEqual(len(self.service.narrator.requests), 1)
+        self.assertEqual(self.discarded_drafts(), [])
+
+    async def test_the_discard_gate_still_fires_when_the_reply_is_really_missing(self) -> None:
+        """反向（严格方向）：真的没有结构化回复时必须照旧重写一次。
+
+        少了这一条，把判据改成"永远不缺"的变异也能全绿——闸门就成了摆设。
+        """
+        self.service.narrator = _FakeNarrator({'script': '她只是看了一眼，没有回。'})
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+        )
+        self.assertTrue(result['succeeded'])
+        self.assertEqual(len(self.service.narrator.requests), 2, '缺结构化回复 → 重写一次')
+        self.assertEqual(len(self.discarded_drafts()), 1)
+        # 真机看到的正是这两行（分层日志把 `interaction=%s` 渲染成字段行）。
+        self.assertIn('interaction:', self.discarded_drafts()[0])
+        self.assertIn('undefined', self.discarded_drafts()[0])
+        self.assertIn('残留say标记', self.discarded_drafts()[0])
+
+    async def test_a_delayed_reply_is_not_mistaken_for_a_missing_one(self) -> None:
+        """`mode=delayed` 是合法可见回复（她稍后发），不该进重写环。"""
+        send_at = iso(NOW + timedelta(minutes=5))
+        self.service.narrator = _FakeNarrator({
+            'script': '她把要说的话存进了草稿箱。',
+            'interaction': {'seen': True, 'reply': {'mode': 'delayed', 'content': '晚点说。', 'sendAt': send_at}},
+        })
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+        )
+        self.assertTrue(result['succeeded'])
+        self.assertEqual(len(self.service.narrator.requests), 1)
+        self.assertEqual(self.discarded_drafts(), [])
+
+
+class DeferredBrowseLoopTests(unittest.IsolatedAsyncioTestCase):
+    """② 的回归面：申请 → 执行 → 结果进下一回合 `webContext`，失败要可见。"""
+
+    def setUp(self) -> None:
+        self.sink = _Sink()
+        interlude_logging.set_log_sink(self.sink)
+        self.addCleanup(interlude_logging.set_log_sink, interlude_logging._default_sink)
+        self.db = Database(':memory:')
+        self.addCleanup(self.db.close)
+        self.db.register_tables()
+        self.ctx = InterludeContext(logger=None, database=self.db, clock=lambda: NOW)
+        self.service = InterludeService(self.ctx, browser_service_config(), self.db, NullTransport())
+        self.db.insert('interlude_story', {
+            'id': STORY_ID, 'platform': 'test', 'selfId': '1', 'userId': '1',
+            'channelId': 'private:1', 'status': 'active',
+            'setting': make_setting(), 'state': encode_story_state(empty_story_state()),
+            'cursorAt': FROM, 'createdAt': FROM, 'updatedAt': FROM,
+        })
+        self.db.insert('interlude_participant', {
+            'id': PARTICIPANT_ID, 'storyId': STORY_ID, 'platform': 'test', 'selfId': '1',
+            'userId': '2', 'channelId': 'private:2', 'personId': 'person:2',
+            'displayName': 'Kela', 'profile': '', 'relationship': '',
+            'state': {'openThreads': [], 'relationshipNotes': []}, 'status': 'active',
+            'createdAt': FROM, 'updatedAt': FROM,
+        })
+
+    async def run_turn(self, decision: dict[str, Any]) -> dict[str, Any]:
+        self.service.narrator = _FakeNarrator(decision)
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+        )
+        await self.service.persist_decision(
+            story, participant, result['decision'], FROM, NOW, True, 'user-message', [], False,
+            result.get('timelinePlan'),
+        )
+        return result
+
+    def decision(self, **overrides: Any) -> dict[str, Any]:
+        return {
+            'script': '她翻了翻手机，指尖停在搜索框上。',
+            'interaction': dict(_REAL_INTERACTION),
+            **overrides,
+        }
+
+    def browse(self) -> _BrowseTransport:
+        transport = _BrowseTransport()
+        self.service.transport = transport
+        return transport
+
+    async def drain_browser_intents(self, at: Any) -> None:
+        """推进到 `at` 时刻的后台扫描（真机上就是到期唤醒 / 常规 sweep 那一跳）。"""
+        self.ctx.clock = lambda: at
+        story = await self.service.get_story(STORY_ID)
+        await self.service.advance_unlocked(story, at, False)
+
+    async def next_turn_web_context(self, at: Any) -> list[Any]:
+        self.service.narrator = _FakeNarrator(self.decision())
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        await self.service.try_decide(
+            story, participant, 'user-message', at, at + timedelta(minutes=1), '在吗', [],
+        )
+        return self.service.narrator.requests[-1].get('webContext') or []
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_the_array_spelling_reaches_the_next_turn_context(self) -> None:
+        transport = self.browse()
+        await self.run_turn(self.decision(browserIntents=[dict(_DEFERRED_SEARCH)]))
+        intents = [dict(row) for row in self.db.all('interlude_intent', {'storyId': STORY_ID})]
+        self.assertEqual([row['type'] for row in intents], ['browser-research'])
+        # 到期唤醒必须排在意图到期那一刻：否则她这一回合说的"正在搜"要等下一次
+        # 常规 sweep（默认 5 分钟）才会真的跑，用户看到的就是"还在转"。
+        self.assertIn(STORY_ID, self.service.due_intent_wake_timers)
+        await self.drain_browser_intents(NOW + timedelta(seconds=30))
+        self.assertIn(('visit', 'https://cn.bing.com/search?q=%E5%A6%B9%E5%A6%B9'), transport.calls)
+        observations = [dict(row) for row in self.db.all('interlude_web_observation', {'storyId': STORY_ID})]
+        self.assertEqual([row['status'] for row in observations], ['success'])
+        self.assertIn(_PAGE_EXCERPT, observations[0]['excerpt'])
+        web_context = await self.next_turn_web_context(NOW + timedelta(minutes=1))
+        self.assertEqual(len(web_context), 1)
+        self.assertIn(_PAGE_EXCERPT, web_context[0]['excerpt'], '取回的内容必须真的进她下一回合的上下文')
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_the_singular_spelling_is_read_too(self) -> None:
+        """提示词曾经教单数 `browserIntent`：历史草稿 / 别的提示词版本照旧要能读。"""
+        transport = self.browse()
+        await self.run_turn(self.decision(browserIntent=dict(_DEFERRED_SEARCH)))
+        intents = [dict(row) for row in self.db.all('interlude_intent', {'storyId': STORY_ID})]
+        self.assertEqual([row['type'] for row in intents], ['browser-research'])
+        await self.drain_browser_intents(NOW + timedelta(seconds=30))
+        web_context = await self.next_turn_web_context(NOW + timedelta(minutes=1))
+        self.assertEqual(len(web_context), 1)
+        self.assertIn(_PAGE_EXCERPT, web_context[0]['excerpt'])
+        self.assertIn(('search', '妹妹'), transport.calls)
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_a_failed_browse_is_visible_and_leaves_a_trace(self) -> None:
+        """搜不到必须**可见**（可行动 warn）并留痕，不许永远"还在转"。"""
+        self.browse().page = False
+        await self.run_turn(self.decision(browserIntents=[dict(_DEFERRED_SEARCH)]))
+        await self.drain_browser_intents(NOW + timedelta(seconds=30))
+        observations = [dict(row) for row in self.db.all('interlude_web_observation', {'storyId': STORY_ID})]
+        self.assertEqual([row['status'] for row in observations], ['failed'])
+        warns = [text for level, text in self.sink.records if level == 'warn']
+        self.assertTrue(any('网页读取失败' in text for text in warns), warns)
+        # 失败也写一条 web-observation 剧本条目：她下一回合在 recentScript 里看得到
+        # 「这一页没打开」，于是不会一直说"还在转"。
+        entries = [dict(row) for row in self.db.all('interlude_script_entry', {'storyId': STORY_ID})]
+        failed_entries = [row for row in entries if row['kind'] == 'web-observation']
+        self.assertEqual(len(failed_entries), 1)
+        self.assertIn('did not complete', failed_entries[0]['content'])
+        self.assertIn('搜索通道不可用', failed_entries[0]['content'])
+        self.assertEqual(await self.next_turn_web_context(NOW + timedelta(minutes=1)), [])
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_a_dropped_request_is_a_visible_warn_not_silence(self) -> None:
+        """模型申请了浏览、配置却没开 → 必须说一句（否则她永远"还在转"）。
+
+        v1.9.7 用户逐字定稿：断言**原始 format 串 + 实参**（分层渲染会把正文里的
+        `key=value` 拆成字段行，所以这里钉的是我们交出去的那一句本身）。
+        """
+        self.service.config = {**self.service.config, 'browser': {'enabled': False}}
+        self.service.__dict__.pop('cached_browser_config', None)
+        with mock.patch.object(self.service, 'report_standalone') as reported:
+            await self.run_turn(self.decision(browserIntents=[dict(_DEFERRED_SEARCH)]))
+        self.assertEqual(self.db.all('interlude_intent', {'storyId': STORY_ID}), [])
+        self.assertIn(
+            (
+                'warn',
+                '网页浏览请求被忽略：网页观察未启用（模式=%s）。打开「网页观察」后她才会真的去查。',
+                'search',
+            ),
+            [call.args for call in reported.call_args_list],
+        )
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_an_incomplete_draft_is_a_visible_warn_that_says_what_is_missing(self) -> None:
+        """模型申请了浏览、草稿形状却不可用 → 同样必须说出来（v1.9.7 定稿文案）。"""
+        with mock.patch.object(self.service, 'report_standalone') as reported:
+            await self.service.append_browser_intent(
+                STORY_ID, {'mode': 'search'}, NOW, PARTICIPANT_ID,
+            )
+        self.assertEqual(self.db.all('interlude_intent', {'storyId': STORY_ID}), [])
+        self.assertIn(
+            (
+                'warn',
+                '网页浏览请求被忽略：草稿不完整（模式=%s）。需要 mode=search|visit 与 purpose；'
+                'search 还需 query，visit 还需公开 url。',
+                'search',
+            ),
+            [call.args for call in reported.call_args_list],
+        )
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_without_a_browse_request_the_next_turn_has_no_web_context(self) -> None:
+        """反向：没申请过浏览就一定没有 webContext——证明上面那条断言不是恒真。"""
+        self.browse()
+        await self.run_turn(self.decision())
+        await self.drain_browser_intents(NOW + timedelta(seconds=30))
+        self.assertEqual(self.db.all('interlude_intent', {'storyId': STORY_ID}), [])
+        self.assertEqual(self.db.all('interlude_web_observation', {'storyId': STORY_ID}), [])
+        self.assertEqual(await self.next_turn_web_context(NOW + timedelta(minutes=1)), [])
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_a_bogus_field_name_yields_nothing(self) -> None:
+        """反向：读的只有两种拼写，别的名字不许被当成意图（否则"恒真"式假绿）。"""
+        self.browse()
+        await self.run_turn(self.decision(browserIntentDraft=dict(_DEFERRED_SEARCH)))
+        self.assertEqual(self.db.all('interlude_intent', {'storyId': STORY_ID}), [])
 
 
 # =========================================================================== #

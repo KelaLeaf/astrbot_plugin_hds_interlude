@@ -565,6 +565,8 @@ class GroupChatRule(TypedDict, total=False):
     context_limit: int
     debounce_seconds: int
     cooldown_seconds: int
+    #: 1.0.1-rc31：一次群聊主叙事最多回流几张**历史**群图片；0 = 关闭回流。
+    historical_image_limit: int
     #: 上游 `Partial<GroupWillingnessConfig>`；本移植版 `GroupWillingnessConfig`
     #: 的键是 snake_case，读取方 `resolve_group_willingness()` 两种拼写都认。
     willingness: Any
@@ -699,6 +701,8 @@ class RuntimeConfig(TypedDict, total=False):
     #: 按配置的分隔符把模型回复拆成多条消息。
     split_reply_messages: bool
     message_separator: str
+    #: 1.0.1-rc36：模型用**换行**分条时也把换行当气泡边界（仅显式真值才开）。
+    convert_newline_to_separator: bool
     typing_base_delay_seconds: float
     typing_characters_per_second: float
     typing_max_delay_seconds: float
@@ -1891,6 +1895,8 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     'runtime': {
         'split_reply_messages': True,
         'message_separator': '<sep/>',
+        # 1.0.1-rc36：小模型换行分句开关。默认 **关**：关着时行为与 rc36 之前逐字一致。
+        'convert_newline_to_separator': False,
         'typing_base_delay_seconds': 1,
         'typing_characters_per_second': 8,
         'typing_max_delay_seconds': 12,

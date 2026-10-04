@@ -584,6 +584,82 @@ class JsonExtractionTests(unittest.TestCase):
         self.assertEqual(balanced_json_values('{"mismatch":[}'), [])
         self.assertEqual(balanced_json_values('nope'), [])
 
+    def test_a_trailing_comma_no_longer_hands_back_an_inner_fragment(self):
+        """尾随逗号是非致命笔误：必须整份还原，**不能**只把 `interaction` 片段当输出。
+
+        2026-10-04 真机：模型写了完整的
+        `{"script":…,"interaction":{"seen":true,"reply":{…}},"browserIntents":[…]}`，
+        只有对象末尾多一个逗号。上游的候选顺序是「全文 → 围栏正文 → 平衡括号值（外→内）」，
+        全文 `json.loads` 失败之后，**内层的 interaction 对象**（它自己是平衡且合法的）
+        被当成模型的整份输出 → 日志打 `interaction: undefined` → 整篇剧本被判成
+        「结构化可见回复缺失」白重写一次（双倍输入 token + 近两分钟）。
+        见 `docs/PORTING_NOTES.md` §79。
+        """
+        text = (
+            '{\n'
+            '  "script": "她翻了翻手机，指尖停在搜索框上。",\n'
+            '  "interaction": {"seen": true, "reply": {"mode": "immediate", "content": "唔，你还有个妹妹啊，搜着呢"}},\n'
+            '  "browserIntents": [{"mode": "search", "query": "妹妹", "purpose": "想看看", "timing": "deferred"}],\n'
+            '}'
+        )
+        parsed = narrator.parse_json_response(text, 'T')
+        self.assertEqual(
+            parsed,
+            {
+                'script': '她翻了翻手机，指尖停在搜索框上。',
+                'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'content': '唔，你还有个妹妹啊，搜着呢'}},
+                'browserIntents': [{'mode': 'search', 'query': '妹妹', 'purpose': '想看看', 'timing': 'deferred'}],
+            },
+            '尾随逗号只该让整份对象被修好，不该让内层片段冒名顶替',
+        )
+        # 反向（变异）：把「去尾随逗号」换回恒等函数 → 整份对象和它的内层片段都不再可解析，
+        # 真机上那次白重写的形态就此复现（`interaction: undefined`）。
+        with mock.patch.object(narrator, '_drop_trailing_commas', lambda value: value):
+            with self.assertRaises(RuntimeError) as ctx:
+                narrator.parse_json_response(text, 'T')
+        self.assertIn('invalid JSON', str(ctx.exception))
+
+    def test_a_truncated_response_is_never_replaced_by_a_nested_fragment(self):
+        """外层不完整时**不许**把内层 `{"seen":…,"reply":{…}}` 当成整份输出。
+
+        片段不是合法输出：拿它去判「结构化可见回复缺失」，会得到一条指向错误原因的
+        日志（`interaction: undefined`）和一次白重写。这里改成诚实的解析失败——上层
+        会打「模型调用失败 … invalid JSON」，运维一眼看到真原因。
+        """
+        text = (
+            '{"script": "她翻了翻手机。", '
+            '"interaction": {"seen": true, "reply": {"mode": "immediate", "content": "搜着呢"}}, '
+            '"browserIntents": [{"mode": "search"'
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            narrator.parse_json_response(text, 'T')
+        self.assertIn('T returned invalid JSON', str(ctx.exception))
+        # 反向（变异）：把「只取最外层」换回上游的「所有平衡值」→ 片段立刻被交出去，
+        # 也就是这次真机事故的成因。
+        with mock.patch.object(narrator, '_top_level_json_values', narrator.balanced_json_values):
+            fragment = narrator.parse_json_response(text, 'T')
+        self.assertEqual(fragment, {'seen': True, 'reply': {'mode': 'immediate', 'content': '搜着呢'}})
+
+    def test_json_candidates_keeps_only_top_level_values_and_adds_repaired_views(self):
+        self.assertEqual(narrator._top_level_json_values('a {"x":{"y":1}} b'), ['{"x":{"y":1}}'])
+        self.assertEqual(narrator._top_level_json_values('前言 {"script":"z"} 后记'), ['{"script":"z"}'])
+        self.assertEqual(narrator._top_level_json_values('{"unclosed":1'), [])
+        self.assertEqual(narrator._drop_trailing_commas('{"a":1,}'), '{"a":1}')
+        self.assertEqual(narrator._drop_trailing_commas('[1,2, ]'), '[1,2 ]')
+        # 字符串里的逗号与 `}` 一个都不许动。
+        self.assertEqual(narrator._drop_trailing_commas('{"a":",}"}'), '{"a":",}"}')
+        candidates = json_candidates('{"a":1,}')
+        self.assertEqual(candidates[0], '{"a":1,}', '原样的候选必须排在修好的前面')
+        self.assertIn('{"a":1}', candidates)
+
+    def test_narrative_decision_root_unwraps_a_single_object_array(self):
+        """模型把决策对象包在单元素数组里时归位（JSON mode 偶发）；别的形状不许猜。"""
+        decision = {'script': '嗯。', 'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'content': '在。'}}}
+        self.assertEqual(narrator.narrative_decision_root([decision]), decision)
+        for untouched in (decision, [], [1, 2], [decision, decision], 'x', None, [None]):
+            with self.subTest(value=untouched):
+                self.assertEqual(narrator.narrative_decision_root(untouched), untouched)
+
     def test_parse_json_response_accepts_fences_prose_bom_and_zero_width_characters(self):
         parse = narrator.parse_json_response
         self.assertEqual(parse('```json\n{"script":"x"}\n```', 'T'), {'script': 'x'})
@@ -824,6 +900,44 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
             'input_tokens': 10, 'output_tokens': 2,
         }])
 
+    async def test_decide_with_a_near_miss_json_still_carries_the_visible_reply(self):
+        """真机回归（2026-10-04）：只多一个尾随逗号的合法草稿必须原样落地。
+
+        这条从**真实传输层**走一遍（假 HttpClient 回一段带尾随逗号的文本），断言
+        `interaction` 与 `script` 都在——上层 `requires_visible_reply_recovery` 读到的
+        就是这份 decision，它决定要不要把整篇剧本扔掉重写（见 §79）。
+        """
+        text = (
+            '{\n'
+            '  "script": "她翻了翻手机，指尖停在搜索框上。",\n'
+            '  "interaction": {"seen": true, "reply": {"mode": "immediate", "content": "唔，你还有个妹妹啊，搜着呢"}},\n'
+            '  "browserIntents": [{"mode": "search", "query": "妹妹", "purpose": "想看看", "timing": "deferred"}],\n'
+            '}'
+        )
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': text}}]}])
+        client = self.make_narrator(http)
+        payload_patch, prompt_patch = stub_prompts()
+        with payload_patch, prompt_patch:
+            decision = await client.decide(make_request())
+        self.assertEqual(decision['script'], '她翻了翻手机，指尖停在搜索框上。')
+        self.assertEqual(
+            decision['interaction'],
+            {'seen': True, 'reply': {'mode': 'immediate', 'content': '唔，你还有个妹妹啊，搜着呢'}},
+        )
+        self.assertEqual(len(decision['browserIntents']), 1)
+
+    async def test_decide_unwraps_a_decision_wrapped_in_a_single_object_array(self):
+        http = FakeHttpClient(responses=[{
+            'choices': [{'message': {'content':
+                '[{"script":"嗯。","interaction":{"seen":true,"reply":{"mode":"immediate","content":"在。"}}}]'}}],
+        }])
+        client = self.make_narrator(http)
+        payload_patch, prompt_patch = stub_prompts()
+        with payload_patch, prompt_patch:
+            decision = await client.decide(make_request())
+        self.assertEqual(decision['script'], '嗯。')
+        self.assertEqual(decision['interaction']['reply']['content'], '在。')
+
     async def test_decide_passes_the_transport_flags_to_the_fixed_contract(self):
         http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '{"script":"x"}'}}]}])
         client = self.make_narrator(http)
@@ -1036,6 +1150,56 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(content[2], {'type': 'input_audio', 'input_audio': {'data': 'QUJD', 'format': 'mp3'}})
 
+    async def test_historical_group_images_are_low_detail_and_come_after_the_current_ones(self):
+        """**wire 级**守卫（rc31 补的 6 行没有守门人）：真发出去的那份 body。
+
+        现有用例只断言"请求字段里有 `historicalGroupImages`"，管不住 multipart 的组装：
+        当前回合图 `detail='auto'`、群聊历史图 `detail='low'`、历史图排在当前图**之后**。
+        （进入模型的那条 user 消息是 `messages[1]`，`messages[0]` 恒为 system。）
+
+        反向：删掉历史图那一段 → 少两个 part；把 `low` 改回 `auto` → detail 断言红；
+        把两段顺序对调 → 顺序断言红。
+        """
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '{"script":"x"}'}}]}])
+        client = self.make_narrator(http)
+        payload_patch, prompt_patch = stub_prompts()
+        with payload_patch, prompt_patch:
+            await client.decide(make_request(
+                phase='user-message',
+                images=[{'id': 'i1', 'mime_type': 'image/png', 'data_uri': 'data:image/png;base64,CURRENT'}],
+                historicalGroupImages=[
+                    {'id': 'h1', 'data_uri': 'data:image/png;base64,GROUP-1'},
+                    {'id': 'h2', 'data_uri': 'data:image/png;base64,GROUP-2'},
+                ],
+            ))
+
+        # 最终发出的 HTTP body（假 HttpClient 收到的就是 `HttpxHttpClient` 要 json 序列化的那份）。
+        body = http.posts[0]['body']
+        self.assertEqual(body['messages'][0]['role'], 'system')
+        self.assertEqual(body['messages'][1]['role'], 'user')
+        content = body['messages'][1]['content']
+        self.assertIsInstance(content, list, '带图的回合 = 一个 multipart user 消息')
+        self.assertEqual(content[0]['type'], 'text')
+        parts = content[1:]
+        self.assertEqual(
+            [part['image_url']['url'] for part in parts],
+            [
+                'data:image/png;base64,CURRENT',
+                'data:image/png;base64,GROUP-1',
+                'data:image/png;base64,GROUP-2',
+            ],
+            '当前回合图在前、群聊历史图在后（顺序反了或少了历史图都在这里红）',
+        )
+        self.assertEqual(
+            [part['image_url']['detail'] for part in parts],
+            ['auto', 'low', 'low'],
+            '当前图 auto、群历史图 low（历史图是旧证据，别花高价重复看）',
+        )
+        # 序列化之后的 wire 形状（不是内部对象）：detail 必须真的被写进 JSON。
+        sent = json.dumps(content, ensure_ascii=False)
+        self.assertEqual(sent.count('"detail": "auto"'), 1)
+        self.assertEqual(sent.count('"detail": "low"'), 2)
+
     async def test_compaction_retries_without_max_tokens_when_the_first_output_is_unparsable(self):
         http = FakeHttpClient(responses=[
             {'choices': [{'message': {'content': '思考被截断的残句'}}]},
@@ -1131,6 +1295,10 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
                 {'enabled': True, 'max_tokens': 300, 'timeout': 20_000, 'temperature': 0.3, 'top_p': 1, 'prompt': 'P'},
             )
         self.assertEqual(decision, {'description': '变化了'})
+        # `alter_system.max_tokens` **真的到得了请求体**：首轮带 300，降级重试那一趟放开
+        # （与压缩 / 时间导演同一条形状；v1.9.7 起这一条是 Alter 家族的"到得了调用"证据）。
+        self.assertEqual(http.posts[0]['body']['max_tokens'], 300)
+        self.assertNotIn('max_tokens', http.posts[1]['body'])
         # Alter 的用户消息必须是上游 camelCase 键名（内部结构是 snake_case）。
         self.assertEqual(
             http.posts[1]['body']['messages'][1]['content'],
@@ -1346,6 +1514,292 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(silent, SilentVisionDescriber)
         self.assertFalse(silent.available())
         self.assertIsNone(await silent.describe_images(images))
+
+
+class MainTaskParameterTests(unittest.IsolatedAsyncioTestCase):
+    """「主叙事」那一组参数必须**真的到得了请求体**（v1.9.7）。
+
+    现场：`narrator.ts:369` 的 `hasMainRoute` 门（显式 main 线路才认任务参数，
+    否则整组回落连接行）在本移植版多出来的那条模型来源上恒为假——用户只填了
+    一条连接、没勾「用于主叙事」时，连接行成了 `legacy-fallback` 候选，
+    于是「主叙事最大输出 token / 温度 / top-p / 超时」四项**改了配置一点反应都没有**：
+    实测 `main_max_tokens=1234` 发出去的是连接行的 2048。
+
+    这里的断言不是"配置被读出来了"，而是**实际发出的 HTTP body / timeout**
+    （`FakeHttpClient.posts[0]`）。反向：把 `has_main_route` 那道门加回去 →
+    本类第一条立刻红（连接行的 2048 / 0.8 / 1 / 60000 会盖住 1234 / 0.42 / 0.33 / 7777）。
+    """
+
+    async def _posted(self, config, request=None):
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '{"script":"x"}'}}]}])
+        client = OpenAICompatibleNarrator(
+            http, config, silent_logs=True, routing=narrator.resolve_model_routing(config),
+        )
+        payload_patch, prompt_patch = stub_prompts()
+        with payload_patch, prompt_patch:
+            await client.decide(request or make_request())
+        return http.posts[0]
+
+    def _config(self, **overrides):
+        connection = make_provider(
+            use_for_main=False,      # 没勾「用于主叙事」→ 路由是 legacy-fallback
+            max_tokens=2048, temperature=0.8, top_p=1, timeout=60_000,
+        )
+        config = make_config(
+            providers=[connection],
+            main_max_tokens=1234, main_temperature=0.42, main_top_p=0.33, main_timeout=7777,
+        )
+        config.update(overrides)
+        return config
+
+    async def test_the_four_main_parameters_reach_the_request_on_a_fallback_route(self):
+        post = await self._posted(self._config())
+        self.assertEqual(post['body']['max_tokens'], 1234, '不是连接行的 2048')
+        self.assertEqual(post['body']['temperature'], 0.42, '不是连接行的 0.8')
+        self.assertEqual(post['body']['top_p'], 0.33, '不是连接行的 1')
+        self.assertEqual(post['timeout'], 7777, '不是连接行的 60000')
+
+    async def test_the_main_parameters_also_win_on_an_assigned_route(self):
+        config = self._config()
+        config['providers'][0]['use_for_main'] = True
+        post = await self._posted(config)
+        self.assertEqual(post['body']['max_tokens'], 1234)
+        self.assertEqual(post['body']['temperature'], 0.42)
+        self.assertEqual(post['timeout'], 7777)
+
+    async def test_zero_max_tokens_means_no_limit_not_the_connection_row_value(self):
+        """`0` = 不限制：请求体里**没有** `max_tokens`，而不是连接行的 2048。"""
+        post = await self._posted(self._config(main_max_tokens=0))
+        self.assertNotIn('max_tokens', post['body'])
+
+    async def test_zero_timeout_keeps_the_connection_row_timeout(self):
+        """`main_timeout = 0` 保持"用连接行的"（超时写成 0 在 httpx 侧是立刻超时）。"""
+        post = await self._posted(self._config(main_timeout=0))
+        self.assertEqual(post['timeout'], 60_000)
+
+    async def test_a_missing_main_key_still_falls_back_to_the_connection_row(self):
+        """缺键（None）= 没配过 → 连接行兜底，老配置零回归。"""
+        config = self._config()
+        del config['main_max_tokens']
+        del config['main_temperature']
+        post = await self._posted(config)
+        self.assertEqual(post['body']['max_tokens'], 2048)
+        self.assertEqual(post['body']['temperature'], 0.8)
+
+    async def test_a_dirty_main_value_falls_back_to_the_connection_row(self):
+        post = await self._posted(self._config(main_max_tokens='abc', main_temperature='abc'))
+        self.assertEqual(post['body']['max_tokens'], 2048)
+        self.assertEqual(post['body']['temperature'], 0.8)
+
+    async def test_an_anthropic_route_says_the_number_it_injected(self):
+        """Anthropic 的 `max_tokens` 是**必填**：替用户补的那个数必须可见（v1.9.7）。
+
+        用户在「主叙事最大输出 token」填 0（= 不限制）时，Anthropic 这条连接上做不到
+        "不限制"——协议层会补一个 4096。那是一个用户没配过的数，不许悄悄发出去。
+        """
+        config = self._config(main_max_tokens=0)
+        config['providers'][0].update({
+            'protocol': 'anthropic-messages',
+            'endpoint': 'https://example.test/v1/messages',
+        })
+        http = FakeHttpClient(responses=[{
+            'id': 'msg_1', 'type': 'message', 'role': 'assistant',
+            'content': [{'type': 'text', 'text': '{"script":"x"}'}],
+            'stop_reason': 'end_turn',
+        }])
+        logger = RecordingLogger()
+        client = OpenAICompatibleNarrator(
+            http, config, silent_logs=False, routing=narrator.resolve_model_routing(config),
+            logger=logger,
+        )
+        payload_patch, prompt_patch = stub_prompts()
+        with payload_patch, prompt_patch:
+            await client.decide(make_request())
+        said = [item for item in logger.warns if 'max_tokens 必填' in str(item[0])]
+        self.assertEqual(len(said), 1, '同一条连接只说一次')
+        self.assertIn('%d', said[0][0])
+        self.assertEqual(said[0][1], (narrator.ANTHROPIC_FALLBACK_MAX_TOKENS,))
+        self.assertIn('主叙事最大输出 token', said[0][0], '要说清去哪儿调')
+        # 反向：用户给了数就不许再喊（这一趟真的按他给的数发）。
+        config2 = self._config(main_max_tokens=1234)
+        config2['providers'][0].update({
+            'protocol': 'anthropic-messages',
+            'endpoint': 'https://example.test/v1/messages',
+        })
+        http2 = FakeHttpClient(responses=[{
+            'id': 'msg_1', 'type': 'message', 'role': 'assistant',
+            'content': [{'type': 'text', 'text': '{"script":"x"}'}],
+            'stop_reason': 'end_turn',
+        }])
+        logger2 = RecordingLogger()
+        client2 = OpenAICompatibleNarrator(
+            http2, config2, silent_logs=False, routing=narrator.resolve_model_routing(config2),
+            logger=logger2,
+        )
+        with payload_patch, prompt_patch:
+            await client2.decide(make_request())
+        self.assertEqual(http2.posts[0]['body']['max_tokens'], 1234)
+        self.assertFalse([item for item in logger2.warns if 'max_tokens 必填' in str(item[0])])
+
+
+class OutputTruncationVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    """被输出上限截断时**必须说出来**，并点名哪道闸、去哪儿调（v1.9.7）。
+
+    现场：截断与"模型胡说"在日志里长得一样（JSON 断在预算处报 `Unterminated string`，
+    主叙事再抛成「叙事模型返回了无效 JSON」）。用户把「主叙事最大输出 token」调小之后
+    只会以为模型不行。这里断言的是**日志里真的出现那句点名的 warn**，不是"有个函数在"。
+
+    反向：把 `narrator._TRUNCATION_REASONS` 清空（或删掉 `_request_provider` 里那次
+    调用）→ 本类前两条红。
+    """
+
+    def _client(self, responses, logger):
+        http = FakeHttpClient(responses=responses)
+        config = make_config()
+        client = OpenAICompatibleNarrator(
+            http, config, silent_logs=False, routing=narrator.resolve_model_routing(config),
+            logger=logger,
+        )
+        return http, client
+
+    @staticmethod
+    def _truncated_stop(content: str = '{"script":"x"}') -> dict:
+        return {'choices': [{'message': {'content': content}, 'finish_reason': 'length'}]}
+
+    async def test_a_length_stop_is_reported_once_with_the_way_out(self) -> None:
+        logger = RecordingLogger()
+        _, client = self._client([self._truncated_stop(), self._truncated_stop()], logger)
+        payload_patch, prompt_patch = stub_prompts()
+        with payload_patch, prompt_patch:
+            await client.decide(make_request())
+            await client.decide(make_request())
+        said = [item for item in logger.warns if '被上限截断' in str(item[0])]
+        self.assertEqual(len(said), 1, '同一条连接同一类任务只说一次，别每轮刷屏')
+        text = said[0][0]
+        self.assertIn('length', said[0][1], '要把模型报的那个原因带出来')
+        self.assertIn('主叙事最大输出 token', text, '要说出是哪道闸')
+        self.assertIn('0 = 不限制', text, '要说出怎么放开')
+
+    async def test_a_normal_stop_says_nothing(self) -> None:
+        logger = RecordingLogger()
+        _, client = self._client(
+            [{'choices': [{'message': {'content': '{"script":"x"}'}, 'finish_reason': 'stop'}]}], logger,
+        )
+        payload_patch, prompt_patch = stub_prompts()
+        with payload_patch, prompt_patch:
+            await client.decide(make_request())
+        self.assertFalse([item for item in logger.warns if '被上限截断' in str(item[0])])
+        # 取不到 `finish_reason`（老网关 / 自造响应）同样不许乱说。
+        self.assertEqual(narrator._finish_reason({'choices': [{'message': {}}]}), '')
+
+    async def test_a_side_task_truncation_is_named_too(self) -> None:
+        """旁路 JSON 任务同一把尺子：解析宽容的任务（例如外挂视频观察）否则完全看不见。"""
+        logger = RecordingLogger()
+        http, client = self._client([self._truncated_stop('{}')], logger)
+        provider = make_provider()
+        await client._side_task_json(  # noqa: SLF001 - 断言的就是这条旁路
+            provider, 'm1', '压缩', 1_000,
+            lambda capped: {'model': 'm1', 'messages': []},
+            lambda text: {'ok': True},
+        )
+        said = [item for item in logger.warns if '被上限截断' in str(item[0])]
+        self.assertEqual(len(said), 1)
+        self.assertEqual(said[0][1][0], '压缩', '点名是哪一类任务')
+        self.assertEqual(http.posts[0]['body'], {'model': 'm1', 'messages': []})
+
+    def test_the_reason_parser_reads_both_shapes(self) -> None:
+        self.assertEqual(narrator._finish_reason({'choices': [{'finish_reason': 'length'}]}), 'length')
+        self.assertEqual(narrator._finish_reason({'candidates': [{'finishReason': 'MAX_TOKENS'}]}), 'MAX_TOKENS')
+        self.assertEqual(narrator._finish_reason({'choices': []}), '')
+        self.assertEqual(narrator._finish_reason(None), '')
+        self.assertIn('MAX_TOKENS', narrator._TRUNCATION_REASONS)
+
+
+class WorldSeedingBudgetTests(unittest.IsolatedAsyncioTestCase):
+    """`world_seeder.max_tokens` / `timeout` 必须**真的到得了请求体**（v1.9.7 补）。
+
+    这一段此前只在 `test_world_seeder.py` 里对账过"配置解析出来的值"——那只能证明
+    "读出来了"。这里断言的是 `FakeHttpClient.posts[0]` 的 body / timeout：
+    `core/video_understanding.py` 那句"只断言被读出来不算"同样适用于播种器。
+    反向：把 `build_body` 里的 max_tokens / timeout 写死 → 本条红。
+    """
+
+    def _client(self, responses):
+        http = FakeHttpClient(responses=responses)
+        config = make_config(providers=[make_provider(use_for_main=False, use_for_world_seeding=True)])
+        client = OpenAICompatibleNarrator(
+            http, config, silent_logs=True, routing=narrator.resolve_model_routing(config),
+        )
+        return http, client
+
+    async def test_the_configured_budget_and_timeout_reach_the_request(self) -> None:
+        http, client = self._client([{'choices': [{'message': {'content': '{"events":[]}'}}]}])
+        result = await client.generate_world_seeds(
+            'SYS', 'USER', {'max_tokens': 1234, 'timeout': 4_321, 'temperature': 0.5},
+        )
+        self.assertEqual(result, {'events': []})
+        self.assertEqual(http.posts[0]['body']['max_tokens'], 1_234)
+        self.assertEqual(http.posts[0]['timeout'], 4_321)
+        self.assertEqual(http.posts[0]['body']['temperature'], 0.5)
+
+    async def test_a_missing_budget_keeps_the_historical_default(self) -> None:
+        http, client = self._client([{'choices': [{'message': {'content': '{"events":[]}'}}]}])
+        await client.generate_world_seeds('SYS', 'USER', {})
+        self.assertEqual(http.posts[0]['body']['max_tokens'], 1_000, '缺键 = 老默认')
+        self.assertEqual(http.posts[0]['timeout'], 60_000, '缺键 = 连接行的超时')
+
+
+class SideTaskProtocolConformanceTests(unittest.IsolatedAsyncioTestCase):
+    """工厂交出来的那个对象**必须真的有**这两支侧任务方法（v1.9.7 修，真 bug）。
+
+    现场：`generate_world_seeds` / `maintain_memory` 两支**错装在 `SilentCompactor` 上**，
+    而生产里 `create_narrator` 与 `create_compactor` 返回的都是 `OpenAICompatibleNarrator`
+    （`SilentCompactor` 只在紧凑化路由不可用时才出场，且它没有 `_assigned_providers` /
+    `_side_task_json`，真跑起来也是 AttributeError）。后果：
+
+    * `chunk10.world_seeder_sweep` 每次扫描 `self.narrator.generate_world_seeds(...)`
+      → AttributeError：**世界播种器从来没成功生成过一次**，它那一组数值键
+      （cadence / max_tokens / temperature / timeout / horizon）全部"读了但到不了调用"；
+    * `chunk8.maintain_memory` 用 `getattr(compactor, 'maintain_memory', None)` 兜底
+      → 拿不到就当"没有模型"，**静默跳过**：事实去重 / 矛盾合并的模型裁决一次都没跑过。
+
+    既有夹具（`host.narrator = mock.Mock()`）永远暴露不了它——这正是"夹具不许造生产
+    不存在的东西"那条纪律的反面教材。所以这里直接钉**工厂产物**。
+    """
+
+    def _config(self):
+        return make_config(providers=[make_provider(
+            use_for_main=True, use_for_compaction=True, use_for_world_seeding=True,
+        )])
+
+    def test_the_real_clients_carry_the_side_task_calls(self):
+        http = FakeHttpClient()
+        narrator_client = create_narrator(http, self._config())
+        compactor = create_compactor(http, self._config())
+        for client in (narrator_client, compactor):
+            self.assertTrue(callable(getattr(client, 'generate_world_seeds', None)),
+                            '%s 缺 generate_world_seeds' % type(client).__name__)
+            self.assertTrue(callable(getattr(client, 'maintain_memory', None)),
+                            '%s 缺 maintain_memory' % type(client).__name__)
+
+    async def test_the_silent_compactor_stays_silent(self):
+        """空实现仍然是空实现：返回 None，不炸（调用方按"本轮跳过"处理）。"""
+        silent = create_compactor(FakeHttpClient(), make_config(compaction={'enabled': False}))
+        self.assertIsInstance(silent, SilentCompactor)
+        self.assertIsNone(await silent.generate_world_seeds('SYS', 'USER', {}))
+        self.assertIsNone(await silent.maintain_memory({'groups': []}))
+
+    async def test_the_maintenance_budget_reaches_the_request_body(self):
+        """`compaction.max_tokens` 也要**真的到得了**记忆维护那次调用。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '{"groups":[]}'}}]}])
+        config = make_config(
+            providers=[make_provider(use_for_main=False, use_for_compaction=True)],
+            compaction={'enabled': True, 'max_tokens': 777, 'timeout': 30_000},
+        )
+        client = create_compactor(http, config)
+        self.assertEqual(await client.maintain_memory({'groups': []}), {'groups': []})
+        self.assertEqual(http.posts[0]['body']['max_tokens'], 777)
+        self.assertEqual(http.posts[0]['timeout'], 30_000)
 
 
 class SideTaskRouteTests(unittest.IsolatedAsyncioTestCase):

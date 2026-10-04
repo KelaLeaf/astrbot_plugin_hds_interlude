@@ -113,7 +113,8 @@ UPSTREAM_FIELDS = {
         "maxCrossConversationActions", "participantContextLimit", "managerAccounts",
     ],
     "runtime": [
-        "splitReplyMessages", "messageSeparator", "typingBaseDelaySeconds",
+        "splitReplyMessages", "messageSeparator", "convertNewlineToSeparator",
+        "typingBaseDelaySeconds",
         "typingCharactersPerSecond", "typingMaxDelaySeconds", "typingJitterRatio",
         "userMessageDebounceSeconds", "narrativeRetryDelaySeconds", "narrativeRetryMaxAttempts",
         "captureDirectMessages", "autoCreate", "ignoreCommandMessages",
@@ -414,6 +415,8 @@ CAMEL_TO_SNAKE = {
     "characterRole": "character_role", "responseMode": "response_mode",
     "contextLimit": "context_limit", "debounceSeconds": "debounce_seconds",
     "cooldownSeconds": "cooldown_seconds", "maxScore": "max_score",
+    # 1.0.1-rc31：群规则里的历史图片回流张数（0 = 关闭）。
+    "historicalImageLimit": "historical_image_limit",
     "probabilityAmplifier": "probability_amplifier",
     "decayHalfLifeSeconds": "decay_half_life_seconds", "replyCost": "reply_cost",
     "baseGain": "base_gain", "quoteGain": "quote_gain", "keywordGain": "keyword_gain",
@@ -424,6 +427,7 @@ CAMEL_TO_SNAKE = {
     "participantContextLimit": "participant_context_limit",
     "managerAccounts": "manager_accounts", "splitReplyMessages": "split_reply_messages",
     "messageSeparator": "message_separator",
+    "convertNewlineToSeparator": "convert_newline_to_separator",
     "typingBaseDelaySeconds": "typing_base_delay_seconds",
     "typingCharactersPerSecond": "typing_characters_per_second",
     "typingMaxDelaySeconds": "typing_max_delay_seconds",
@@ -945,6 +949,25 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertIn("叠加", window["description"])
         self.assertIn("只按条数上限", window["hint"], "窗口填 0 的语义必须写出来")
 
+    # -- 上游 1.0.1-rc36：小模型换行分句开关 ------------------------------------
+
+    def test_the_newline_bubble_switch_is_off_by_default_and_says_what_it_does(self):
+        """`runtime.convert_newline_to_separator`：上游 rc36 新增，**默认关**。
+
+        上游语义（`upstream/src/index.ts:209` + `service.ts:6582` /
+        `splitVisibleReplyBubbles`）：模型没按合约给 `<sep/>`、而是用换行分条时，
+        把换行运行当气泡边界再发送；**内容已含显式分隔符时不转换**；按 `=== true`
+        读取（只有显式真值才开）。行为断言在 `test_bubble_split_newline.py`。
+
+        反向（变异）：把 default 改成 true（或文案里删掉"已含…不转换"）→ 这条红。
+        """
+        entry = self.section("runtime")["convert_newline_to_separator"]
+        self.assertEqual(entry["type"], "bool")
+        self.assertIs(entry["default"], False, "上游默认关闭：旧配置行为必须逐字不变")
+        self.assertIn("换行", entry["description"])
+        self.assertIn("不转换", entry["hint"], "已含显式分隔符时不转换是上游守卫，必须写出来")
+        self.assertIn("换行", entry["hint"])
+
     # -- 上游第 16 条：separate optional perspective layer ----------------------
 
     def test_console_exposes_a_separate_optional_perspective_layer(self):
@@ -982,6 +1005,33 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertEqual(groups["response_mode"]["default"], "mention-only")
         self.assertEqual(groups["context_limit"]["default"], 20)
         self.assertEqual(groups["cooldown_seconds"]["default"], 60)
+
+    def test_historical_group_image_backflow_defaults_to_three_and_zero_means_off(self):
+        """上游 1.0.1-rc31：群规则 `historicalImageLimit` 默认 **3**、**0 = 关闭**。
+
+        三处必须一致：schema `default`、core 的 `DEFAULT_HISTORICAL_IMAGE_LIMIT`
+        （缺键时的 fallback）、`docs/CONFIG_MAP.md` 那一行。
+
+        **上界不在这边拍**（v1.9.7 新规矩）：上游 schema 写 `max(6)`、选择器里还有
+        `Math.min(6, …)`，本项目一律撤掉 —— 配多少读多少。所以这里同时**反向钉住**
+        "没有一个我们自己写的数字区间"：description / hint 里不许出现 `0~6` / `0-6`
+        这种区间（那种区间一旦写进文案就会被当成"上界"）。
+
+        反向（变异）：① default 改成 0 或 6 → 红；② hint 里补一句"（0~6）" → 红；
+        ③ core 常量与 schema 漂了 → 红（下面三方对账）。
+        """
+        from plugin.core.service.helpers import DEFAULT_HISTORICAL_IMAGE_LIMIT
+
+        entry = self.section("qq_access")["group_chats"]["items"]["historical_image_limit"]
+        self.assertEqual(entry["type"], "int")
+        self.assertEqual(entry["default"], 3, "上游默认 3（省成本那侧，但配了要生效）")
+        self.assertEqual(entry["default"], DEFAULT_HISTORICAL_IMAGE_LIMIT)
+        self.assertIn("0", entry["hint"], "0 = 关闭必须写出来")
+        self.assertIn("关闭", entry["hint"])
+        for text in (entry["description"], entry["hint"]):
+            self.assertNotIn("~", text, "不写数字区间：上界不由本插件拍")
+            self.assertNotIn("－", text)
+        self.assertNotIn("max", entry, "schema 不设上界（v1.9.7：配多少读多少）")
 
     # -- 上游第 19 条：Urge ----------------------------------------------------
 
@@ -1290,8 +1340,9 @@ class ConfigurationSchemaTest(unittest.TestCase):
         `VISION_IMAGE_BUDGET_DEFAULT` 那套做法）——两边各写各的，用户就会看见
         "界面上是 1、实际按 3 跑"（用户那次真机报告的正中间）。
 
-        顺带把**区间**也对上：schema 的 slider 就是 `QZONE_CONFIG_BOUNDS`，
-        改了 core 的边界而忘了 schema，配置页会允许填一个马上被夹掉的值。
+        **v1.9.7 起这两项没有上界**（原来那个 9 / 3 是我们自己拍的）：schema 不再声明
+        `slider`（声明了就等于替用户决定最大能填多少），core 的边界上界是 `None`，
+        用户填 20 就按 20 跑——所以要断言的是"没有任何一处再夹它"。
         """
         from plugin.core.qzone import (  # noqa: PLC0415
             DEFAULT_QZONE_CONFIG,
@@ -1305,10 +1356,16 @@ class ConfigurationSchemaTest(unittest.TestCase):
                 node = self.schema["qzone"]["items"][key]
                 self.assertEqual(node["default"], DEFAULT_QZONE_CONFIG[key])
                 self.assertEqual(resolved[key], DEFAULT_QZONE_CONFIG[key])
-                self.assertEqual(
-                    (node["slider"]["min"], node["slider"]["max"]), QZONE_CONFIG_BOUNDS[key],
-                    "schema 的 slider 与 core 的边界必须是同一段（单边漂移就红）",
+                self.assertNotIn(
+                    "slider", node,
+                    "v1.9.7 起本项没有上界：schema 不许再声明一个替用户拍的最大值",
                 )
+                self.assertEqual(
+                    QZONE_CONFIG_BOUNDS[key][1], None,
+                    "core 侧的边界必须同样没有上界（单边漂移就红）",
+                )
+                # 反向：core 真的按用户填的数走（20 = 曾经会被夹到 9 / 3 的那个值）。
+                self.assertEqual(resolve_qzone_config({key: 20})[key], 20)
         # 默认取**省成本**那侧：一次动态读取只识别 1 张图 / 取 1 段视频
         # （与既有「单条转发最多读取的视频数」的默认 1 同量级）。
         self.assertEqual(DEFAULT_QZONE_CONFIG["feed_image_cap"], 1)
@@ -1317,6 +1374,36 @@ class ConfigurationSchemaTest(unittest.TestCase):
         # 再开一个"关掉"的入口就是同一把闸的第二处判据。
         self.assertEqual(QZONE_CONFIG_BOUNDS["feed_image_cap"][0], 1)
         self.assertEqual(QZONE_CONFIG_BOUNDS["feed_video_cap"][0], 1)
+
+    def test_input_status_has_no_invented_ceiling(self):
+        """`input_status.min_visible_ms`（v1.9.7）：schema 不许再替用户拍一个最大值。
+
+        v1.7.8 引入时 slider 是 `0..10000`——那是我们自己拍的（宿主/平台没有这条限制），
+        用户要 30 秒就只能被 UI 挡在门口，而 core 侧**根本没有夹取**，两边不一致。
+        现在 slider 撤掉（填多少就是多少）；`beat_chance` 是概率，`0..1` 是它的定义域，
+        不是猜的上界，保留。
+
+        `runtime.input_status` 是唯一生效的那一份，顶层 `input_status` 只是只读兼容位
+        （`LEGACY_SECTION_MERGES`），两处形状要一致——只改一处就是"两个真相"。
+        """
+        nested = self.schema["runtime"]["items"]["input_status"]["items"]
+        legacy = self.schema["input_status"]["items"]
+        for name, node in (("runtime.input_status", nested), ("input_status", legacy)):
+            with self.subTest(group=name):
+                self.assertNotIn("slider", node["min_visible_ms"], "本项没有上界")
+                self.assertEqual(node["min_visible_ms"]["default"], 600)
+        self.assertEqual(nested["beat_chance"]["slider"]["max"], 1, "概率的定义域不是猜的上界")
+        # 反向：core 照配置发（40000 = 曾经被 UI 挡在门口的那个量级）。
+        from plugin.core.service.chunk12 import (  # noqa: PLC0415
+            ServiceChunk12 as _Chunk12,
+        )
+
+        host = _Chunk12.__new__(_Chunk12)
+        host.config = {"runtime": {"input_status": {"enabled": True, "min_visible_ms": 40000}}}
+        host.action_group_values = lambda path: (  # noqa: ARG005
+            (host.config.get("runtime") or {}).get("input_status") or {}
+        )
+        self.assertEqual(host.input_status_config()["min_visible_ms"], 40000)
 
     def test_deep_sections_are_complete(self):
         model = self.section("model_center")
@@ -1838,6 +1925,47 @@ class ConfigurationSchemaTest(unittest.TestCase):
             self.assertIsInstance(spec, dict, f"{key} 的值必须是对象")
             self.assertIn("type", spec, f"{key} 缺少 type")
 
+    # -- v1.9.7 用户逐字定稿：主叙事四个任务级参数的 hint + docs 对账 -----------
+
+    def test_main_task_parameter_hints_are_verbatim(self):
+        """用户逐字定稿（v1.9.7）：四个 `main_*` 的 hint 一个字都不许漂。
+
+        前两条说的都是「直连连接行时本项优先；用 AstrBot 里的模型时不生效」——
+        走宿主 Provider 时这四个参数由宿主决定、插件传不进去（日志会说明）；
+        `main_temperature` / `main_top_p` 原本没有 hint，这次按同一口径补上。
+        """
+        items = self.section("model_center")
+        self.assertEqual(
+            items["main_max_tokens"]["hint"],
+            "0 表示不限制（由模型与服务端决定）。直连连接行时本项优先；"
+            "用 AstrBot 里的模型时不生效（日志会说明）。",
+        )
+        self.assertEqual(
+            items["main_timeout"]["hint"],
+            "0 表示用连接行的超时。直连连接行时本项优先；用 AstrBot 里的模型时不生效。",
+        )
+        for key in ("main_temperature", "main_top_p"):
+            with self.subTest(field=key):
+                self.assertEqual(
+                    items[key]["hint"], "用 AstrBot 里的模型时不生效（日志会说明）。",
+                )
+
+    def test_config_map_quotes_the_same_main_task_hints(self):
+        """三处同改：`_conf_schema.json` / 本文件 / `docs/CONFIG_MAP.md` 逐字一致。"""
+        path = os.path.join(REPO_ROOT, "docs", "CONFIG_MAP.md")
+        if not os.path.exists(path):
+            self.skipTest("发布仓布局没有 docs/CONFIG_MAP.md")
+        with open(path, encoding="utf-8") as handle:
+            config_map = handle.read()
+        for sentence in (
+            "0 表示不限制（由模型与服务端决定）。直连连接行时本项优先；"
+            "用 AstrBot 里的模型时不生效（日志会说明）。",
+            "0 表示用连接行的超时。直连连接行时本项优先；用 AstrBot 里的模型时不生效。",
+            "用 AstrBot 里的模型时不生效（日志会说明）。",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertIn(sentence, config_map, "CONFIG_MAP.md 缺那句逐字 hint")
+
 
 class ImageBudgetConfigTests(unittest.TestCase):
     """v1.9.4：每回合图片预算的**解析**（双拼写 / 脏值 / 夹取），判据只住在 core 一处。"""
@@ -1845,14 +1973,12 @@ class ImageBudgetConfigTests(unittest.TestCase):
     def test_defaults_and_clamping(self):
         from plugin.core.vision_budget import (  # noqa: PLC0415
             VISION_IMAGE_BUDGET_DEFAULT,
-            VISION_IMAGE_BUDGET_MAX,
             VISION_IMAGE_BUDGET_MIN,
             resolve_image_budget,
         )
 
         self.assertEqual(VISION_IMAGE_BUDGET_DEFAULT, 3)
         self.assertEqual(VISION_IMAGE_BUDGET_MIN, 1)
-        self.assertEqual(VISION_IMAGE_BUDGET_MAX, 20)
         cases = (
             ({}, 3, '缺键 = 默认'),
             (None, 3, '整段缺失'),
@@ -1861,7 +1987,7 @@ class ImageBudgetConfigTests(unittest.TestCase):
             ({'max_per_turn': '7'}, 7, '字符串数字'),
             ({'max_per_turn': 0}, 1, '下限 1：关掉图片走 `vision.enabled`，不在这里再开一个入口'),
             ({'max_per_turn': -5}, 1, '下限'),
-            ({'max_per_turn': 99}, 20, '上限'),
+            ({'max_per_turn': 99}, 99, 'v1.9.7 起没有上界：读得出多少就是多少'),
             ({'max_per_turn': 'abc'}, 3, '脏值回默认'),
             ({'max_per_turn': True}, 3, 'bool 不是数字'),
             ({'max_per_turn': None}, 3, '显式 null = 没写'),
@@ -1878,7 +2004,6 @@ class ImageBudgetConfigTests(unittest.TestCase):
         """
         from plugin.core.vision_budget import (  # noqa: PLC0415
             VISION_IMAGE_BUDGET_DEFAULT,
-            VISION_IMAGE_BUDGET_MAX,
             resolve_image_budget,
         )
 
@@ -1893,8 +2018,8 @@ class ImageBudgetConfigTests(unittest.TestCase):
         # **只向上跟随**：把单卡上限调小（1 / 0）不该连累直发图与视频帧的额度。
         self.assertEqual(resolve_image_budget({}, 1), VISION_IMAGE_BUDGET_DEFAULT)
         self.assertEqual(resolve_image_budget({}, 0), VISION_IMAGE_BUDGET_DEFAULT)
-        # 上限照旧夹在本项自己的区间里（单卡上限 0~10 不可能超过它，这一条只是不变量）。
-        self.assertLessEqual(resolve_image_budget({}, 10), VISION_IMAGE_BUDGET_MAX)
+        # 单卡上限本身没有上界（v1.9.7）→ 跟随出来的值也不许被谁夹回去。
+        self.assertEqual(resolve_image_budget({}, 30), 30, '跟随值原样透出，不许再有第二道上限')
         # 不传 / 脏值 = 老行为：只有本项说了算（老调用方零回归）。
         self.assertEqual(resolve_image_budget({}), VISION_IMAGE_BUDGET_DEFAULT)
         self.assertEqual(resolve_image_budget({'max_per_turn': 7}), 7)

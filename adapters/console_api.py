@@ -28,6 +28,13 @@ from typing import Any, Optional
 from ..core import platform_actions
 from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
+#: FFmpeg 状态：**判据只有一处**（`core/video_understanding.ffmpeg_status_label`），
+#: 控制台这一层不自己算、也不看宿主的 schema（宿主内存里那次注入永远不会出现在
+#: 我们读的仓库文件里——这正是用户"报告了却看不见"的现场之一）。
+from ..core.video_understanding import (
+    apply_ffmpeg_status_hint_or_problem,
+    ffmpeg_status_group,
+)
 #: N:1 旧分组归并（配置页显示的当前值必须与运行期读到的一致，见 `config_schema`）。
 from ..core.service.config import (
     LEGACY_MERGE_TARGETS,
@@ -1594,8 +1601,31 @@ class ConsoleApi:
         每个字段带三样东西：**当前值**（密钥类字段会抹掉）、**schema 声明**
         （类型/说明/hint/默认值/候选项），以及**兼容性提示** `note`
         ——宿主配置页编不了的字段在这里会被点名（见 `host_editor_note`）。
+
+        ## FFmpeg 状态（本轮）
+
+        我们读的是**仓库里的** `_conf_schema.json`（`load_config_schema()`，按 mtime
+        缓存），宿主动态写进内存 schema 的那句状态**永远不会**出现在这里——用户"报告了
+        却看不见"的现场之一。所以控制台自己算一遍：判据仍旧只有
+        `core/video_understanding.ffmpeg_status_label()` **一处**，贴的节点与宿主配置页
+        是**同一张表**（`FFMPEG_HINT_TARGETS`：识别模式 + 启用视频理解），文本逐字相同。
+
+        写在一份**深拷贝**上：`load_config_schema()` 返回的是缓存对象本身，就地改它会把
+        状态漏给同一进程里所有读 schema 的地方（`set_config_value` 的门禁也读它）。
         """
-        schema = load_config_schema()
+        schema = copy.deepcopy(load_config_schema())
+        #: 状态词（`✅ FFmpeg 已识别` / `⚠️ 未发现 FFmpeg`）；这里**不**重探 ffmpeg
+        #: （重探发生在插件加载与宿主配置页那两个刷新点），只读进程里那一份探好的结果，
+        #: 免得每次打开配置页都扫一遍 PATH。
+        #: 缺节点时**也**要留痕（状态词本身照样下发到分组标题上，用户仍然看得见），
+        #: 但"仓库里这份 schema 的形状不对"是维护者必须知道的事，不许静默。
+        ffmpeg_status, ffmpeg_problem = apply_ffmpeg_status_hint_or_problem(schema)
+        if ffmpeg_problem:  # pragma: no cover - 仓库里那份 schema 的形状由我们自己保证
+            log_fallback(
+                'warn',
+                '控制台：FFmpeg 状态没能贴到提示上（%s）；状态词仍显示在「模型中心」分组标题上。'
+                % ffmpeg_problem,
+            )
         raw = self.bridge.raw_config()
         groups: list[dict[str, Any]] = []
         for group_key, group_spec in schema.items():
@@ -1672,6 +1702,10 @@ class ConsoleApi:
                 #: `description` 是一句话说明，留在卡片里当副标题。
                 'title': _text(group_spec.get('title')),
                 'description': _text(group_spec.get('description')),
+                #: 分组级状态词：目前只有「模型中心」有（视频理解的 FFmpeg 状态）。
+                #: 挂在分组标题上，是为了让用户**一眼**看见，而不是在某个子项旁边
+                #: 找一行 11px 的灰字——用户报"看不见"的直接原因就是这个。
+                'status': ffmpeg_status if group_key == ffmpeg_status_group() else '',
                 'invisible': bool(group_spec.get('invisible')),
                 'fields': fields,
             })

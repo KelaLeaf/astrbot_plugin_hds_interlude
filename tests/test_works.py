@@ -976,6 +976,44 @@ class WorksWiringTests(unittest.IsolatedAsyncioTestCase):
         self.db = Database(':memory:')
         self.db.register_tables()
         self.addCleanup(self.db.close)
+        # ⚠️ 关库前必须把在飞的写手任务推完：`start_work_generation` 里的推理是
+        # `ensure_future` 出去的（`works.py:653`），`stop_works()` 只作废结果、**不等它**，
+        # 而那一跳会在 `asyncio.to_thread` 里读/写库。收尾 LIFO 决定它排在 `db.close`
+        # 之前、所有 `service.stop_works` 之后。少这一步 = 全量 discover 间歇段错误
+        # （sqlite 在 C 层 use-after-close，见 `docs/PORTING_NOTES.md` §83）。
+        self.addCleanup(self._drain_work_generators)
+
+    @staticmethod
+    def _generation_tasks() -> list[Any]:
+        """还挂着的写手任务（`ensure_future` 出去、调用方不 await 的那些）。"""
+        current = asyncio.current_task()
+        found: list[Any] = []
+        for task in asyncio.all_tasks():
+            if task is current or task.done():
+                continue
+            coro = task.get_coro() if hasattr(task, 'get_coro') else None
+            if 'run_generation' in str(getattr(coro, '__qualname__', '')):
+                found.append(task)
+        return found
+
+    async def _drain_work_generators(self) -> None:
+        """等写手任务跑完再关库（真实让出时间：线程池里那一跳要真的跑完）。"""
+        pending: list[Any] = []
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            pending = self._generation_tasks()
+            if not pending:
+                return
+            await asyncio.sleep(0.01)
+        # 兜底：故意用 `_BlockingNarrator` 卡住的写手（等一个永不到来的 await），取消即可。
+        for task in pending:
+            task.cancel()
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while asyncio.get_running_loop().time() < deadline:
+            if not self._generation_tasks():
+                return
+            await asyncio.sleep(0.01)
+        self.fail('后台写手任务没有在预期时间内结束：%r' % (pending,))
 
     def make_service(self, config: Any = None) -> Any:
         ctx = InterludeContext(logger=None, database=self.db)

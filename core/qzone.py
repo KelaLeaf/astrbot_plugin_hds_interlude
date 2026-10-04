@@ -127,17 +127,22 @@ DEFAULT_QZONE_CONFIG: dict[str, Any] = {
     'feed_video_cap': 1,
 }
 
-#: 配置夹取边界（上游 `CONFIG_BOUNDS`，键名转 snake_case）。
-#: 动态媒体那两个键的上限取"一条说说装得下的量"：图片 9（`_qzone_msg_image_refs`
-#: 自己的去重上限就是 9）、视频 3（QZone 说说视频的实际量级，再多也只是重复抽帧）。
-QZONE_CONFIG_BOUNDS: dict[str, tuple[int, int]] = {
+#: 配置夹取边界（上游 `CONFIG_BOUNDS`，键名转 snake_case）。`maximum=None` = **没有上界**。
+#:
+#: 前五个是**上游口径**（`upstream/src/index.ts:555-559` 的 `Schema.natural().min().max()`），
+#: 照抄不动；后两个（`feed_image_cap` / `feed_video_cap`）是本移植版新增的键，早先由我们
+#: 拍了个"一条说说装得下的量"（图片 9 / 视频 3）——**v1.9.7 起放开上界**：用户填 20 就
+#: 真的按 20 去读，界面 / 日志里不许再出现一个他没配过的数。下限仍是 1，因为它不是
+#: "省成本"，而是语义：0 = 一张都不识，那件事由图片/视频理解的**总开关**表达，
+#: 再开一个"关掉"的入口就是同一把闸两处判。
+QZONE_CONFIG_BOUNDS: dict[str, tuple[int, Optional[int]]] = {
     'daily_post_cap': (0, 20),
     'daily_comment_cap': (0, 60),
     'daily_like_cap': (0, 120),
     'min_interval_minutes': (10, 1440),
     'feed_window_minutes': (15, 720),
-    'feed_image_cap': (1, 9),
-    'feed_video_cap': (1, 3),
+    'feed_image_cap': (1, None),
+    'feed_video_cap': (1, None),
 }
 
 #: 配置键的两种拼写（camelCase 优先，snake_case 兜底）。
@@ -331,7 +336,8 @@ def resolve_qzone_config(config: Any = None) -> dict[str, Any]:
     for snake, (minimum, maximum) in QZONE_CONFIG_BOUNDS.items():
         raw = _raw_number(config, snake, _CONFIG_KEY_SPELLINGS[snake])
         if _finite(raw):
-            resolved[snake] = min(maximum, max(minimum, math.floor(raw)))
+            floored = max(minimum, math.floor(raw))
+            resolved[snake] = floored if maximum is None else min(maximum, floored)
     enabled = _pick(config, 'enabled') if isinstance(config, Mapping) else None
     resolved['enabled'] = enabled is True
     # 上游没有 auto_feed（`qzoneFeedSweep` 恒开）：本移植版用它表达「允许她浏览

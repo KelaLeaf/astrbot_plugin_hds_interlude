@@ -20,7 +20,7 @@
 | --- | --- | --- | --- |
 | `frame_mode` | `sequence` | `VIDEO_DEFAULT_FRAME_MODE` | `sequence` 连续抽帧（每 N 秒 1 帧）/ `average` 平均抽帧（整段均分 N 帧） |
 | `frame_interval_seconds` | `4` | `VIDEO_FRAME_INTERVAL_SECONDS` | 连续抽帧：每几秒抽 1 帧 |
-| `frame_average_count` | `3` | `VIDEO_AVERAGE_FRAMES` | 平均抽帧：整段平均抽几帧（上限 = 视觉预算 `VIDEO_MAX_FRAMES`） |
+| `frame_average_count` | `3` | `VIDEO_AVERAGE_FRAMES` | 平均抽帧：整段平均抽几帧（无上界；超出每回合图片预算的帧进不了模型，会留可数线索） |
 | `out_format` | `mp3` | `VIDEO_DEFAULT_AUDIO_FORMAT` | 音轨转码输出格式（与「语音 / 音频理解」那组的**同名同义键**） |
 | `audio_duration` | `custom` | `VIDEO_DEFAULT_AUDIO_DURATION` | `custom` 按下面的秒数截；`unlimited` 整段都要（只受体积预算与超时兜底） |
 | `audio_duration_seconds` | `60` | `VIDEO_AUDIO_CLIP_SECONDS` | `custom` 时取前几秒音轨 |
@@ -127,10 +127,13 @@ __all__ = [
     'EXTERNAL_MISSING_MODEL_REASON', 'EXTERNAL_NO_URL_REASON', 'VIDEO_TRUNCATED_REASON',
     'VIDEO_TOO_LARGE_REASON', 'VIDEO_BUSY_REASON', 'VIDEO_FRAME_TIMEOUT_PREFIX',
     'VIDEO_FRAME_PARTIAL_PREFIX', 'GROUP_NO_VISION_REASON',
-    'FFMPEG_FOUND_LABEL', 'FFMPEG_MISSING_LABEL',
+    'FFMPEG_FOUND_LABEL', 'FFMPEG_MISSING_LABEL', 'FFMPEG_STATUS_LABELS',
+    'FFMPEG_HINT_TARGETS', 'ffmpeg_hint_field_path', 'ffmpeg_status_hint_targets',
+    'ffmpeg_status_group',
     'clip', 'VideoExtraction', 'VideoMedia', 'resolve_video_config', 'video_config',
     'audio_clip_seconds', 'frame_timeout_reason', 'frame_partial_reason', 'ffmpeg_path', 'ffmpeg_available', 'reset_ffmpeg_probe',
-    'ffmpeg_status_label', 'apply_ffmpeg_status_hint', 'extract_session_video_sources',
+    'ffmpeg_status_label', 'apply_ffmpeg_status_hint',
+    'apply_ffmpeg_status_hint_or_problem', 'extract_session_video_sources',
     'video_input_target', 'extract_video', 'video_fact_note', 'degradation_message',
     'collect_video_sources', 'collect_group_video_media', 'reset_video_runtime_state',
     'video_read_budget', 'video_turn_budget_note', 'video_turn_budget_warning',
@@ -249,8 +252,11 @@ def _text(value: Any) -> str:
     return value if isinstance(value, str) else str(value)
 
 
-def _int_in(value: Any, fallback: int, low: int, high: int) -> int:
-    """读一个整数并夹到 `[low, high]`（读不出来 / 是 bool 之外的非数 → `fallback`）。
+def _int_at_least(value: Any, fallback: int, low: int) -> int:
+    """读一个整数并夹到 `>= low`（**没有上界**）；读不出来 / bool / 非数 → `fallback`。
+
+    v1.9.7：`model_center.video` 是本移植版新增的一组键，早先四个数值项各有一个
+    我们自己拍的上界。上界撤掉之后，值就是用户在配置页看到的那个值。
 
     "手改坏了配置"与"从没写过"都回到默认值，绝不因为一个脏值把超时变成 0 秒
     （那会把每一条视频都判成超时）。
@@ -261,7 +267,7 @@ def _int_in(value: Any, fallback: int, low: int, high: int) -> int:
         number = int(float(value))
     except (TypeError, ValueError):
         return fallback
-    return max(low, min(high, number))
+    return max(low, number)
 
 
 def resolve_video_config(raw: Any) -> dict[str, Any]:
@@ -289,23 +295,27 @@ def resolve_video_config(raw: Any) -> dict[str, Any]:
         'mode': mode,
         'model_id': _text(_pick(section, 'modelId', 'model_id')).strip(),
         'frame_mode': frame_mode,
-        'frame_interval_seconds': _int_in(
+        # v1.9.7：这四项**只有下限、没有上界**。它们各自的"上界"（60 秒间隔 /
+        # 3 帧 / 1 小时音轨 / 600 秒超时）都是我们自己拍的：用户填 10 帧会静默变 3，
+        # 界面与日志里一个字都没有。现在读得出多少就是多少——帧多了会在
+        # **可见**的那道闸上被削（帧与直发图片共用每回合图片预算，附可数线索）。
+        'frame_interval_seconds': _int_at_least(
             _pick(section, 'frameIntervalSeconds', 'frame_interval_seconds'),
-            VIDEO_FRAME_INTERVAL_SECONDS, 1, 60,
+            VIDEO_FRAME_INTERVAL_SECONDS, 1,
         ),
-        'frame_average_count': _int_in(
+        'frame_average_count': _int_at_least(
             _pick(section, 'frameAverageCount', 'frame_average_count'),
-            VIDEO_AVERAGE_FRAMES, 1, VIDEO_MAX_FRAMES,
+            VIDEO_AVERAGE_FRAMES, 1,
         ),
         'out_format': out_format,
         'audio_duration': audio_duration,
-        'audio_duration_seconds': _int_in(
+        'audio_duration_seconds': _int_at_least(
             _pick(section, 'audioDurationSeconds', 'audio_duration_seconds'),
-            VIDEO_AUDIO_CLIP_SECONDS, 1, 3600,
+            VIDEO_AUDIO_CLIP_SECONDS, 1,
         ),
-        'timeout_seconds': _int_in(
+        'timeout_seconds': _int_at_least(
             _pick(section, 'timeoutSeconds', 'timeout_seconds'),
-            VIDEO_FFMPEG_TIMEOUT_SECONDS, 1, 600,
+            VIDEO_FFMPEG_TIMEOUT_SECONDS, 1,
         ),
         'group_enabled': _pick(section, 'groupEnabled', 'group_enabled') is True,
     }
@@ -419,15 +429,24 @@ def ffmpeg_available() -> bool:
     return bool(ffmpeg_path())
 
 
-#: 识别模式那一项最前面的状态提示（用户口径的两个取值；宿主配置页**不支持着色**，
-#: 所以用文本标记，见 `apply_ffmpeg_status_hint` 的宿主依据）。
+#: 状态提示（用户口径的两个取值；宿主配置页**不支持着色**，所以用文本标记，
+#: 见 `apply_ffmpeg_status_hint` 的宿主依据）。
+#: **判据只有一处**：`ffmpeg_status_label()` —— 配置页、控制台、日志全都读它。
 FFMPEG_FOUND_LABEL = '✅ FFmpeg 已识别'
 FFMPEG_MISSING_LABEL = '⚠️ 未发现 FFmpeg'
 
+#: 那两个取值本身。只用于写提示前把**上一次**贴上去的状态剥掉（写第二次不叠罗汉）。
+FFMPEG_STATUS_LABELS = (FFMPEG_FOUND_LABEL, FFMPEG_MISSING_LABEL)
 
-def ffmpeg_status_label() -> str:
-    """配置项旁边那句状态（用户原话的两个取值 + 文本标记）。"""
-    return FFMPEG_FOUND_LABEL if ffmpeg_available() else FFMPEG_MISSING_LABEL
+
+def ffmpeg_status_label(*, refresh: bool = False) -> str:
+    """配置项旁边那句状态（用户原话的两个取值 + 文本标记）。
+
+    `refresh=True` 重探一次外部二进制——"动态"得真的动态：用户装完 ffmpeg 不重启，
+    打开配置页也该看见它翻成 `✅`。重探只发生在**显式刷新点**（插件加载、控制台配置页
+    打开），不在每条视频消息都会走的那条读路径上。
+    """
+    return FFMPEG_FOUND_LABEL if ffmpeg_path(refresh=refresh) else FFMPEG_MISSING_LABEL
 
 
 #: 识别模式的**静态** hint（用户逐字口径）：状态提示由 `apply_ffmpeg_status_hint`
@@ -435,22 +454,77 @@ def ffmpeg_status_label() -> str:
 #: 配置项，写死在文案里就是第二个真相（过时即误导）。
 VIDEO_MODE_HINT = '需要启用语音原生理解与启用图片理解后抽帧模式才会生效。'
 
+#: 状态提示要贴的 schema 节点 —— **同一份状态文本、同一处判据**，贴两处：
+#: 「识别模式」说的是这条状态管什么，「启用视频理解」（总开关）是用户找"视频理解到底
+#: 开没开"的第一眼位置。只贴一处是用户报"看不见"的直接原因之一。
+#:
+#: 每组 = `(schema 节点路径, 接续文本)`；接续文本为 `None` 时接着该节点**自己已有的**
+#: hint 写——静态文案的真相在 `_conf_schema.json` 里，这里不复制第二份（否则改一处漏一处）。
+FFMPEG_HINT_TARGETS: tuple[tuple[tuple[str, ...], Optional[str]], ...] = (
+    (('model_center', 'items', 'video', 'items', 'mode'), VIDEO_MODE_HINT),
+    (('model_center', 'items', 'video', 'items', 'enabled'), None),
+)
 
-def apply_ffmpeg_status_hint(schema: Any) -> str:
+
+def ffmpeg_hint_field_path(path: Any) -> str:
+    """schema 节点路径 → 配置页里的点分字段路径（`items` 只是结构层，不出现）。"""
+    if not isinstance(path, (list, tuple)):
+        return ''
+    return '.'.join(part for part in path if part != 'items')
+
+
+def _status_free_hint(text: Any) -> str:
+    """剥掉开头那句**上一次**贴上去的状态（让写入幂等）。
+
+    不剥的话每打开一次配置页就叠一层「⚠️ 未发现 FFmpeg。⚠️ 未发现 FFmpeg。…」。
+    """
+    value = text if isinstance(text, str) else ''
+    for known in FFMPEG_STATUS_LABELS:
+        if value.startswith(known):
+            rest = value[len(known):]
+            return rest[1:] if rest.startswith('。') else rest
+    return value
+
+
+def _schema_node(root: Any, path: Any) -> Optional[dict]:
+    """沿路径取 schema 节点；中途不是 dict / 取不到就回 `None`（绝不抛）。"""
+    node = root
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node if isinstance(node, dict) else None
+
+
+def ffmpeg_status_hint_targets() -> tuple[str, ...]:
+    """状态提示落在哪几个字段上（控制台按这份表找那两项）。"""
+    return tuple(ffmpeg_hint_field_path(path) for path, _ in FFMPEG_HINT_TARGETS)
+
+
+def ffmpeg_status_group() -> str:
+    """状态提示所在的分组（schema 顶层键）——控制台按它把状态词挂在分组标题上。"""
+    return FFMPEG_HINT_TARGETS[0][0][0]
+
+
+def apply_ffmpeg_status_hint(schema: Any, *, refresh: bool = False) -> str:
     """把「✅ FFmpeg 已识别 / ⚠️ 未发现 FFmpeg」写进**内存里的** schema（返回状态文本）。
+
+    签名与返回值与 v1.9.0 一致（给日志 / 自检读）；要看"写没写进去、为什么没写进去"
+    用 `apply_ffmpeg_status_hint_or_problem()`。
 
     ## 为什么能动态（宿主源码依据，AstrBot 4.28）
 
     * schema 是宿主在插件加载时从 `_conf_schema.json` 读一次得到的 **Python 对象**，
-      挂在 `AstrbotConfig.schema` 上（`astrbot/core/star/star_manager.py:603-616`
+      挂在 `AstrBotConfig.schema` 上（`astrbot/core/star/star_manager.py:603-616`
       读取、`:1157-1165` 构造、`:1208` `metadata.config = plugin_config`、
-      `:1223-1226` 把**同一个对象**传给插件实例的 `config=`）；
+      `:1222-1225` 把**同一个对象**传给插件实例的 `config=`）；
     * 配置页每次打开都现取：`astrbot/dashboard/services/config_service.py:853-872`
       的 `get_plugin_config()` 里是 `"items": plugin_md.config.schema`（**活对象**），
-      端点 `astrbot/dashboard/api/plugins.py:753` / `:1020`；
+      端点 `astrbot/dashboard/api/plugins.py:721` / `:754`（`ConfigDisplayService.get_configs`
+      → 同一个 `get_plugin_config`）；
     * 前端就是把这个字符串塞进 DOM：`astrbot/dashboard/dist/assets/ProviderSelectMenu-*.js`
       的 `G.hint ? ... U(A.__template_key, ie, "hint", G.hint)`（并认 `invisible`）。
-    * 而 `AstrbotConfig.save_config()` 只写 `dict(self)`（配置值），
+    * 而 `AstrBotConfig.save_config()` 只写 `dict(self)`（配置值），
       **schema 从不落盘**（`astrbot/core/config/astrbot_config.py:262-272 / :308 / :339`）。
 
     ## 为什么**不能**着色（宿主源码依据，AstrBot 4.28；别改成 HTML）
@@ -467,20 +541,46 @@ def apply_ffmpeg_status_hint(schema: Any) -> str:
     所以「绿色 / 黄色状态提示」只能退化成文本标记（用户给的替代口径：
     `✅ FFmpeg 已识别` / `⚠️ 未发现 FFmpeg`）。
 
-    拿不到那个节点（宿主换了形状 / 手搓 schema）时**原样返回**，只把状态文本交给调用方
-    去写日志：绝不为了让提示好看而抛异常。
+    ## 写到哪几处
+
+    `FFMPEG_HINT_TARGETS` 那张表：**识别模式**（这条状态管什么）与**启用视频理解**
+    （总开关，用户找"视频理解开没开"的第一眼位置）。两处贴的是**同一份文本**，
+    判据只有 `ffmpeg_status_label()` 一处，不各算一次。写入是**幂等**的（写之前把
+    上一次贴的那句剥掉），所以每个刷新点都可以放心重写。
+
+    拿不到节点（宿主换了形状 / 手搓 schema）时**原样返回状态文本**，把原因交给
+    `apply_ffmpeg_status_hint_or_problem()` 的第二个返回值——调用方负责喊出来，
+    绝不为了让提示好看而抛异常，也**不再静默吞掉**（v1.9.0 那版是 `except … : pass`）。
     """
-    label = ffmpeg_status_label()
-    if not isinstance(schema, dict):
-        return label
-    hint = '%s。%s' % (label, VIDEO_MODE_HINT)
-    try:
-        node = schema['model_center']['items']['video']['items']['mode']
-        if isinstance(node, dict):
-            node['hint'] = hint
-    except (KeyError, TypeError):  # pragma: no cover - schema 形状由仓库自己保证
-        pass
+    label, _problem = apply_ffmpeg_status_hint_or_problem(schema, refresh=refresh)
     return label
+
+
+def apply_ffmpeg_status_hint_or_problem(
+    schema: Any, *, refresh: bool = False,
+) -> tuple[str, str]:
+    """同 `apply_ffmpeg_status_hint`，但把"**没写进去**"的原因也带出来。
+
+    返回 `(状态文本, 问题)`：写成功时问题为空串；拿不到 schema 对象 / 缺节点时是一句
+    给日志读的话（由调用方打一条 **warn** —— v1.9.0 那版是 `except (KeyError, TypeError):
+    pass`，**静默**，于是"用户看不见状态"这件事在日志里毫无痕迹，这正是本轮要修的）。
+    """
+    label = ffmpeg_status_label(refresh=refresh)
+    if not isinstance(schema, dict):
+        return label, '拿不到配置 schema（拿到的是 %s）' % type(schema).__name__
+    missed: list[str] = []
+    for path, static in FFMPEG_HINT_TARGETS:
+        node = _schema_node(schema, path)
+        if node is None:
+            missed.append(ffmpeg_hint_field_path(path))
+            continue
+        #: 接续文本：`mode` 用模块常量（与 `_conf_schema.json` 里那句同源）；
+        #: `enabled` 用它**自己**已有的 hint（静态文案不复制第二份）。
+        tail = static if isinstance(static, str) else _status_free_hint(node.get('hint'))
+        node['hint'] = ('%s。%s' % (label, tail)) if tail else label
+    if missed:
+        return label, '配置 schema 里没有这些节点：%s' % '、'.join(missed)
+    return label, ''
 
 
 # =========================================================================== #
@@ -709,11 +809,12 @@ def _frame_filter(
     """抽帧模式 → `(-vf 的值, 帧数上限)`。
 
     * `sequence`：`fps=1/每几秒`，上限 = 视觉预算 `VIDEO_MAX_FRAMES`（与直发图共用）；
-    * `average`：整段均分 N 帧 → `fps=N/时长`，上限 = N。时长**探不到**时退回连续
-      抽帧那条 fps（不猜时长），上限仍然是 N。
+    * `average`：整段均分 N 帧 → `fps=N/时长`，上限 = N（N 就是 `frame_average_count`，
+      v1.9.7 起**没有上界**；时长探不到时退回连续抽帧那条 fps，不猜时长）。
 
     两个模式都受同一件事实约束：**多抽的帧到不了模型**（帧和图片抢同一个每回合预算，
-    见 `core/vision_budget.py`），所以平均抽帧的 N 上限就是 `VIDEO_MAX_FRAMES`。
+    见 `core/vision_budget.py`）——所以平均抽帧抽得再多，真正交给模型的仍由那道
+    **可见**的每回合图片预算裁（附可数线索），而不是在这里被一个看不见的常量削掉。
     """
     frames_cap = max(1, int(average_frames)) if frame_mode == 'average' else VIDEO_MAX_FRAMES
     if frame_mode == 'average':
@@ -1319,7 +1420,14 @@ async def _collect_external(
                 {'role': 'user', 'content': prompt},
             ],
         }
-        if not capped:
+        # 首轮带 1200 的输出预算（省成本那侧：这段观察最终只留 800 字符，见函数末尾），
+        # `_side_task_json` 在**首轮输出不可解析**时去掉它重试一次。
+        #
+        # v1.9.7 修：这一支原来是反的（`if not capped`）——首轮**不带**预算，只有
+        # "模型返回空"的重试才带，既与同族所有 `build_body` 相反，又让这个数只在一条
+        # 几乎走不到的分支上生效。现在与同族一致：**首轮带 cap、重试放开**；真被截断时
+        # `narrator._warn_output_truncated()` 会点名说出来（本轮新加的可见截断）。
+        if capped:
             body['max_tokens'] = 1_200
         return body
 

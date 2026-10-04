@@ -1208,20 +1208,13 @@ class ServiceBase:
 
         `category` 是可选扩展：知道真实会话类型的调用方直接给标签（见
         `report_standalone` 的说明），不传时照旧按文案推断。
+
+        ⚠️ **这里只渲染 / 投递日志**。早先世界播种器的**启动代码**（注册定时器 +
+        报一条启动结论）混进了这一支：`report_standalone` → `write_standalone` →
+        又 `report_standalone` = **无限递归**，任何只挂 base（没有 chunk9 的同名方法
+        盖住这一支）却有 `world_seeder_runtime` 的宿主一调就开始爆栈。那段已收敛到
+        它该在的地方——`start_background_tasks()`（见 `docs/PORTING_NOTES.md` §84）。
         """
-        # 上游 1.0.1-rc23：世界播种器。启用条件是**总开关 + 至少一条勾选「用于世界播种」
-        # 的连接**（AND）。不满足时连定时器都不注册（零成本）；但启动时要说清原因——
-        # 上游在这条路径上完全静默，用户会以为坏了（见 PORTING_NOTES §31）。
-        if hasattr(self, 'world_seeder_runtime'):
-            seeder_runtime = self.world_seeder_runtime()
-            if seeder_runtime.get('enabled'):
-                self._world_seeder_timer = self.ctx.set_interval(
-                    lambda: self._spawn(self.world_seeder_sweep()),
-                    max(5, int(seeder_runtime['cadence_minutes'])) * 60_000,
-                )
-                self.report_standalone('info', self.explain_world_seeder_state())
-            else:
-                self.report_standalone('warn', self.explain_world_seeder_state())
         if self.blind_mode_config.get('enabled'):
             if level in ('error', 'warn'):
                 self.blind_mode_health_issue = True
@@ -1651,6 +1644,25 @@ class ServiceChunk0(ServiceBase):
             self._compaction_timer = self.ctx.set_interval(
                 lambda: self._spawn(self._compact_stories_guarded()), max(1, memory_interval) * 60_000,
             )
+        # 上游 1.0.1-rc23：世界播种器定时器（`src/service.ts:926`，排在记忆扫描之后）。
+        # 启用条件是**总开关 + 至少一条勾选「用于世界播种」的连接**（AND）；不满足时连
+        # 定时器都不注册（零成本），但**启动时要说清原因**——上游这条路径完全静默，
+        # 用户会以为坏了（受控偏离，见 `docs/PORTING_NOTES.md` §31 #14）。
+        #
+        # 判据只有一处：`world_seeder_runtime()`（chunk10；只挂 base 的宿主没有它，
+        # `hasattr` 即整段跳过）。**这段必须住在这里**：它是"注册定时器 + 说一句启动
+        # 结论"，不是日志渲染；早先错放在 `write_standalone` 里会让任何只挂 base 的
+        # 宿主在 `report_standalone` 上无限递归（§84）。
+        if hasattr(self, 'world_seeder_runtime'):
+            seeder_runtime = self.world_seeder_runtime()
+            if seeder_runtime.get('enabled'):
+                self._world_seeder_timer = self.ctx.set_interval(
+                    lambda: self._spawn(self.world_seeder_sweep()),
+                    max(5, int(seeder_runtime['cadence_minutes'])) * 60_000,
+                )
+                self.report_standalone('info', self.explain_world_seeder_state())
+            else:
+                self.report_standalone('warn', self.explain_world_seeder_state())
         if self.blind_mode_config.get('enabled'):
             health_minutes = int(
                 pick(self.blind_mode_config, 'healthReportMinutes', 'health_report_minutes') or 1

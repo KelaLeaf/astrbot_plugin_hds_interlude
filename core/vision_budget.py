@@ -31,7 +31,6 @@ from typing import Any, Optional
 
 __all__ = [
     'VISION_IMAGE_BUDGET_DEFAULT',
-    'VISION_IMAGE_BUDGET_MAX',
     'VISION_IMAGE_BUDGET_MIN',
     'VISION_IMAGE_BUDGET_WARN_INTERVAL_MS',
     'image_budget_note',
@@ -53,9 +52,12 @@ VISION_IMAGE_BUDGET_DEFAULT = 3
 #: （总开关）的语义；再开一个"关掉"的入口就是第二个真相（同一把闸两处判）。
 VISION_IMAGE_BUDGET_MIN = 1
 
-#: 上限。20 张原生图已经是一个很贵的回合；再往上配也只是把成本交给运气，
-#: 所以读出来的值一律夹在这一段（手改坏了配置也不会变成"全都给"）。
-VISION_IMAGE_BUDGET_MAX = 20
+#: **本项没有上界**（v1.9.7）。早先这里有一个我们自己拍的 `20`，读出来的值一律夹进去：
+#: 用户填 30 会静默变成 20，界面 / 日志里都没有一个字说明——正是"改了配置不生效"那一类。
+#: 现在读得出多少就是多少：真撞上结构性极限（模型的图片数 / 上下文窗口、网关的限制）
+#: 会由**对方**报错，那是一句看得见的话；插件的责任只是**照配置发**、并在真的截断时
+#: 留下可数线索（`image_budget_note`）与节流 warn（`note_image_budget_skip`）。
+#: 代价仍要写清：每多一张 = 一次下载 + 一份原生视觉 token，token / 延迟 / 费用同步上升。
 
 #: 截断告警的节流间隔（毫秒）。与 `MEDIA_OBSERVABILITY_WARN_INTERVAL_MS` 同档：
 #: 丢内容这件事必须让人看见，但同一条原因不能刷屏。
@@ -97,7 +99,7 @@ def normalize_image_budget(value: Any) -> int:
         number = int(float(value))
     except (TypeError, ValueError):
         return VISION_IMAGE_BUDGET_DEFAULT
-    return max(VISION_IMAGE_BUDGET_MIN, min(VISION_IMAGE_BUDGET_MAX, number))
+    return max(VISION_IMAGE_BUDGET_MIN, number)
 
 
 def _forward_limit(forward_limit: Any) -> Optional[int]:
@@ -115,11 +117,11 @@ def resolve_image_budget(section: Any, forward_limit: Any = None) -> int:
 
     读不出来（脏值 / bool / 非数）一律回 `VISION_IMAGE_BUDGET_DEFAULT`：用户手改坏了
     配置不该悄悄变成"不限制"或者"一张都不给"。读得出来的值夹到
-    `[VISION_IMAGE_BUDGET_MIN, VISION_IMAGE_BUDGET_MAX]`。
+    `>= VISION_IMAGE_BUDGET_MIN`（**没有上界**）。
 
     **两张卡不再打架（v1.9.4）**：`forward_limit` 是
     `forward_message.forward_read_limits(段).max_images`（单条转发最多读取的图片数，
-    0~10，已经由**那一处**夹好；不传 = 老行为，只有本项说了算）。
+    由**那一处**解析好；不传 = 老行为，只有本项说了算）。
 
     规则只有一条 —— **本项没被改过**（读出来等于 `VISION_IMAGE_BUDGET_DEFAULT`）时，
     有效值向上跟随单卡上限：用户只把「单条转发最多读取的图片数」调到 10，这一回合就
@@ -136,7 +138,7 @@ def resolve_image_budget(section: Any, forward_limit: Any = None) -> int:
     limit = _forward_limit(forward_limit)
     if limit is None:
         return value
-    return max(value, min(VISION_IMAGE_BUDGET_MAX, limit))
+    return max(value, limit)
 
 
 # --------------------------------------------------------------------------- #

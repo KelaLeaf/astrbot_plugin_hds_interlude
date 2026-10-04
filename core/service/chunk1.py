@@ -79,6 +79,8 @@ from .base import (
     pick,
 )
 from .helpers import (
+    DEFAULT_HISTORICAL_IMAGE_LIMIT,
+    _turn_get,
     clip,
     describe_group_attachments,
     describe_quoted_message,
@@ -86,6 +88,7 @@ from .helpers import (
     extract_session_file_facts,
     extract_session_voice_count,
     format_group_speaker,
+    group_image_refs_for_storage,
     narrative_cursor,
     normalize_group_chat_actions,
     normalize_group_visible_reply,
@@ -95,8 +98,11 @@ from .helpers import (
 # `load_native_audio`。chunk3 **不** import chunk1，所以这条模块级依赖不成环。
 # `_extract_session_media` 同源：群聊入站的自动收藏要**与私聊同一份**结构化媒体表
 # （`SessionView.media` → `[{source, kind, summary, label}]`），不能另外推一份（见 §45.6/§46）。
+# `_extract_session_image_sources` 同源：群聊图片来源与私聊视觉走**同一处判据**（§46.7），
+# 不另造一套"群聊专用图片解析"（1.0.1-rc31 的历史图片证据靠它）。
 from .chunk3 import (
-    _extract_session_media, _load_group_batch_audio,
+    _extract_session_image_sources, _extract_session_media, _load_group_batch_audio,
+    _member, _unique, _vision_config,
     audio_turn_budget_note, audio_turn_slice, note_audio_budget_skip,
 )
 # 视频理解（v1.9.1）：群回合**只有音轨有通道**的那条接线（判据在
@@ -1139,9 +1145,12 @@ class ServiceChunk1(ServiceBase):
         # `mention-only` 下它也算"叫了她"——这条与私聊那条 `session.content?.trim()`
         # 的例外同源。没开语音理解时它仍然只留一条占位事实（见 `load_group_batch_audio`）。
         audio_sources = extract_session_audio_sources(session)
+        # 1.0.1-rc31：群聊图片是**可被后续叙事读取的视觉证据**，不是隐式指令。
+        # 有了它，`mention-only` 下"发给别人看的图"也能落库，供下一次真实回合回流。
+        image_sources = _extract_session_image_sources(session)
         if (
             pick(rule, 'responseMode', 'response_mode') == 'mention-only'
-            and not mentioned_bot and not audio_sources
+            and not mentioned_bot and not audio_sources and not image_sources
         ):
             self.note_group_skip(
                 session,
@@ -1188,12 +1197,32 @@ class ServiceChunk1(ServiceBase):
             }
             if quote:
                 metadata['quote'] = quote
+            if image_sources:
+                # 1.0.1-rc31：图片证据**落库**（不再只有正文里的 `[图片]` 占位符）。
+                # 只存可重新获取的引用（URL / OneBot file），data URI 永不入库。
+                # 形状逐字 = 上游 `{imageCount, groupImageRefs:[{source,ordinal,sourceType}]}`。
+                metadata['imageCount'] = len(image_sources)
+                metadata['groupImageRefs'] = group_image_refs_for_storage(image_sources)
             return await self.append_entry(story_id, {
                 'kind': 'group-message', 'actor': 'user', 'content': message_content,
                 'occurredAt': iso(now), 'metadata': metadata,
             }, now)
 
         accepted = await self.serial(story_id, task)
+        # `mention-only` 下没 @ 机器人的图片：它现在已经**落库**（上面那条 entry），
+        # 但绝不能自己触发主叙事 —— 不进 debounce 队列、不消耗意愿、不查冷却、
+        # 不调模型（上游 `receiveGroup` 的那句 `return true`）。真正的回流发生在
+        # 下一次真实进入群聊主叙事的回合（`load_historical_group_images`）。
+        if (
+            pick(rule, 'responseMode', 'response_mode') == 'mention-only'
+            and not mentioned_bot and not audio_sources
+        ):
+            self.report_operation(
+                'diagnostic', 'debug', story, 'user-message',
+                '群图片已作为历史证据落库（未 @ 机器人，不触发主叙事）群=%s 张数=%d',
+                group_id, len(image_sources),
+            )
+            return True
         message_id = _targetable_message_id(_session_read(session, 'messageId', 'message_id'))
         message: dict[str, Any] = {
             'senderId': sender_id, 'senderName': sender_name,
@@ -1209,6 +1238,7 @@ class ServiceChunk1(ServiceBase):
         message['direction'] = 'user'
         self.buffer_group_message(
             story, rule, session, message, mentioned_bot, quoted_bot, audio_sources,
+            image_sources,
         )
         # 群聊收藏钩子挂在**真正的入站处理点**（所有闸门之后）：白名单外的群、
         # 关掉的群、`mention-only` 下没 @ 的消息、找不到 / 非 active 的剧本，
@@ -1470,6 +1500,7 @@ class ServiceChunk1(ServiceBase):
         mentioned_bot: bool,
         quoted_bot: bool,
         audio_sources: Any = None,
+        image_sources: Any = None,
     ) -> None:
         """上游 `bufferGroupMessage(story, rule, session, message, mentionedBot, quotedBot)`
         （`src/service.ts:1750`）。
@@ -1479,6 +1510,11 @@ class ServiceChunk1(ServiceBase):
 
         v1.7.6：带上这条消息的语音来源（上游 2099 的 `audioSources` + `audioSession`）
         ——群音频的**批次预算**靠它逐条算（见 `load_group_batch_audio`）。
+
+        1.0.1-rc31：同时带上这条消息的图片来源（上游 `imageSources` + `imageSession`）。
+        它只活在这个**内存批次**里（"Transport sources belong only to this fresh batch,
+        never to durable history"）：当前回合的图是 `images`，落库的历史证据是
+        `metadata.groupImageRefs`，两者不是同一份东西。
         """
         story_id = pick(story, 'id')
         group_id = normalize_group_id(pick(rule, 'groupId', 'group_id'))
@@ -1497,6 +1533,10 @@ class ServiceChunk1(ServiceBase):
         if sources:
             # 上游同一形状：有语音才写这两个键，没有就**不出现**（别留空数组）。
             message = {**message, 'audioSources': sources, 'audioSession': session}
+        images = [str(item) for item in (image_sources or []) if str(item or '').strip()]
+        if images:
+            # 上游同一形状：有图才写这两个键。
+            message = {**message, 'imageSources': images, 'imageSession': session}
         turn.setdefault('messages', []).append(message)
         turn['mentioned_bot'] = bool(turn.get('mentioned_bot')) or bool(mentioned_bot)
         turn['quoted_bot'] = bool(turn.get('quoted_bot')) or bool(quoted_bot)
@@ -1508,6 +1548,84 @@ class ServiceChunk1(ServiceBase):
             lambda: _spawn(self.flush_group_turn(key, revision)), delay,
         )
         self.buffered_group_turns[key] = turn
+
+    async def load_historical_group_images(
+        self,
+        story: Any,
+        refs: Any,
+        limit: Any,
+        session: Any = None,
+        current_sources: Any = None,
+    ) -> list[dict[str, Any]]:
+        """上游 `loadHistoricalGroupImages(story, refs, limit, session?, currentSources)`
+        （`src/service.ts:2498`）。
+
+        从**同一群**的历史条目里按新到旧取最近 `limit` 张图，作为视觉证据附在**下一次**
+        真实进入群聊主叙事的回合里：
+
+        * 原生视觉（`model.vision.enabled`）关着 / `limit <= 0` / 没有引用 → 一张都不取
+          （`historicalImageLimit = 0` 就是"关闭回流"，不是"取 0 张再往下走"）；
+        * 与**当前回合**的图片按来源去重（`current_sources`）——同一张图不会既算当前图
+          又算历史图；重复引用也只取一份；
+        * 返回**由旧到新**（上游 `selected.reverse()`）：模型从较早的图读到较新的；
+        * 单张取不回（端点不可用 / 图过期 / `getImage` 失败）只记一条**可行动**的 warn
+          并跳过，**绝不阻塞文字主叙事**；
+        * `id` 前缀 `group-history-image-N`，与当前回合的 `turn-image-N` 不重名。
+
+        受控偏离（见 `docs/PORTING_NOTES.md` §78）：上游这里是
+        `Math.min(6, Math.max(0, Math.floor(limit)))` —— 本项目 v1.9.7 起不再替用户拍上界，
+        配多少读多少；默认 3 仍是最省成本那一侧，"0 = 关闭"逐字照上游。
+        """
+        if not bool(_config_value(_vision_config(self), 'enabled', False)):
+            return []
+        try:
+            bound = int(float(limit))
+        except (TypeError, ValueError):
+            bound = DEFAULT_HISTORICAL_IMAGE_LIMIT
+        if bound <= 0 or not isinstance(refs, list) or not refs:
+            return []
+        selected: list[dict[str, Any]] = []
+        seen = {str(source) for source in (current_sources or [])}
+        for ref in refs:
+            if len(selected) >= bound:
+                break
+            source = str(pick(ref, 'source') or '').strip()
+            if not source or source in seen:
+                continue
+            seen.add(source)
+            try:
+                image = await self.fetch_native_image(source, _member(session, 'bot'))
+            except Exception as error:  # noqa: BLE001 - 附加证据取不回，不许带崩回合
+                self.report(
+                    'warn', story, 'user-message',
+                    '历史群聊图片读取失败，已跳过这张图（本回合照常写作）来源=%s 错误=%s',
+                    source, error,
+                )
+                continue
+            if not image:
+                self.report(
+                    'warn', story, 'user-message',
+                    '历史群聊图片读取失败，已跳过这张图（本回合照常写作）来源=%s 错误=%s',
+                    source, '取回结果为空（端点不可用 / 图已过期 / 坐标不可信）',
+                )
+                continue
+            entry: dict[str, Any] = {
+                'id': 'group-history-image-%d' % (len(selected) + 1),
+                **image,
+                'sourceEntryId': pick(ref, 'source_entry_id', 'source_entry_id'),
+                'senderId': pick(ref, 'sender_id', 'sender_id'),
+                'senderName': pick(ref, 'sender_name', 'sender_name'),
+                'occurredAt': pick(ref, 'occurred_at', 'occurred_at'),
+                # 历史图片是**旧证据**，不是当前指令：低细节发送（上游在 multipart 那一跳
+                # 硬编码 `detail:'low'`）。随条目带上是这个意图的唯一落点。
+                'detail': 'low',
+            }
+            message_id = pick(ref, 'message_id', 'message_id')
+            if message_id:
+                entry['messageId'] = message_id
+            selected.append(entry)
+        selected.reverse()
+        return selected
 
     async def flush_group_turn(self, key: str, revision: int) -> None:
         """上游 `flushGroupTurn(key, revision)`（`src/service.ts:1769`）。
@@ -1619,7 +1737,10 @@ class ServiceChunk1(ServiceBase):
                 current = await self.get_story(pick(story, 'id'))
                 if not current:
                     raise RuntimeError('剧本不存在，无法刷出群回合。')
-                context_messages = await self.group_messages(
+                # 1.0.1-rc31：一次 `groupMessages` 同时给出**可见上下文**与**历史图片引用**
+                # （上游 `GroupMessagesSnapshot = {messages, imageRefs}`）——上下文里看得见的
+                # 消息和能回流的图必须来自同一批行，否则两份判据会漂。
+                group_snapshot = await self.group_messages_snapshot(
                     pick(current, 'id'), group_id, _config_limit(rule, 'contextLimit', 'context_limit', 20),
                 )
                 current_now = self.now()
@@ -1627,7 +1748,8 @@ class ServiceChunk1(ServiceBase):
                     'story': current,
                     'from': narrative_cursor(current, current_now),
                     'now': current_now,
-                    'contextMessages': context_messages,
+                    'contextMessages': group_snapshot['messages'],
+                    'imageRefs': group_snapshot['imageRefs'],
                 }
 
             snapshot = await self.serial(pick(story, 'id'), snapshot_task)
@@ -1670,8 +1792,9 @@ class ServiceChunk1(ServiceBase):
             group_audio = await _load_group_batch_audio(
                 self, snapshot['story'], batch, turn.get('latest_session'),
             )
-            # 视频理解（v1.9.1）：群聊**没有视觉通道**（下面 `try_decide` 的图片位恒为
-            # `[]`，群消息也不带 `imageSources`），但**音频通道是通的**——`group_audio`
+            # 视频理解（v1.9.1）：群聊的**视频帧**没有去处（抽帧结果不进下面的图片通道：
+            # rc31 接的是"群消息里真正发过的图片"，不是视频帧；帧要与直发图抢同一个每回合
+            # 预算，那是 v1.9.1 §53 的既有口径），但**音频通道是通的**——`group_audio`
             # 就是它。所以复用同一个判据 `collect_group_video_media`：抽出的帧没有去处
             # 时**节流明说一次**，音轨并进这批音频，**至少让声音进去**。
             # 这是"群聊开关打开后到底发生什么"的答案——不许开着却静默什么都不做（坑 25）。
@@ -1683,10 +1806,42 @@ class ServiceChunk1(ServiceBase):
             if video_note:
                 # 视频事实进**当前事件**（与私聊 `chunk3.flush_buffered_narrative` 同一处）。
                 user_message = '%s\n%s' % (user_message, video_note)
+            # 群聊视觉通道（1.0.1-rc31）：本批消息带过的图片是**当前回合的图**，
+            # 历史条目落的 `groupImageRefs` 是**可回流的旧证据**。两者都只在本回合存在，
+            # 按上游口径：当前图 `images`、历史图 `historicalGroupImages`，去重后一起交给
+            # 主叙事；历史图由选择器按"同群、新到旧、最近 N 张"取（`historicalImageLimit`，
+            # 0 = 关闭）。视觉关着时 `load_native_images` 与选择器各自早退，一个字节都不取。
+            image_session = next(
+                (item.get('imageSession') for item in batch
+                 if isinstance(item, dict) and item.get('imageSession') is not None),
+                turn.get('latest_session'),
+            )
+            current_image_sources = _unique([
+                str(source) for item in batch
+                for source in (_turn_get(item, 'imageSources', 'image_sources') or [])
+                if str(source or '').strip()
+            ])
+            current_images = await self.load_native_images(
+                snapshot['story'], current_image_sources, image_session,
+            )
+            historical_group_images = await self.load_historical_group_images(
+                snapshot['story'],
+                snapshot['imageRefs'],
+                _config_limit(
+                    rule, 'historicalImageLimit', 'historical_image_limit',
+                    DEFAULT_HISTORICAL_IMAGE_LIMIT,
+                ),
+                image_session,
+                current_image_sources,
+            )
+            vision_mode = _config_value(_vision_config(self), 'mode', 'native') or 'native'
+            images = current_images if vision_mode == 'native' else []
+            historical_images = historical_group_images if vision_mode == 'native' else []
             decision_result = await self.try_decide(
                 snapshot['story'], None, 'user-message', snapshot['from'], snapshot['now'],
-                user_message, [], [], group_context, [], group_audio, chat_capabilities, [],
+                user_message, [], [], group_context, images, group_audio, chat_capabilities, [],
                 sticker_catalog, turn_query_embedding, None, None, None, sticker_groups,
+                historical_images,
             )
             decision = pick(decision_result, 'decision') or {}
             succeeded = bool(pick(decision_result, 'succeeded'))

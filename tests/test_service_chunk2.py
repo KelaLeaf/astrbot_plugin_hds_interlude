@@ -35,6 +35,7 @@ host 对象**上跑。本移植版用 `ServiceChunk2.__new__(ServiceChunk2)` + �
 from __future__ import annotations
 
 import asyncio
+import ast
 import atexit
 import hashlib
 import os
@@ -46,6 +47,7 @@ import zlib
 from typing import Any, Optional
 
 from plugin.core.bubbles import VOICE_MARKER
+from plugin.core import logging as core_logging
 from plugin.core.database import Database
 from plugin.core.narrator import SilentStickerDescriber
 from plugin.core.script.episode_index import episode_excerpt
@@ -1151,6 +1153,103 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         ), 0)
         self.assertEqual(cancelled, [('cancelled', 'reaction-api-unavailable')])
 
+    async def test_a_failed_action_log_gives_every_placeholder_its_own_argument(self) -> None:
+        """**渲染守卫**：`report()` 的实参必须拆开 —— 元组会被第一个 `%s` 整个吃下。
+
+        `core/logging.py::_format_message` 是 Node `util.format` 语义：**占位符多于
+        参数时原样保留**。早先 8 处把 `(a, b, error)` 当**单个**实参传下来，真机日志里
+        就是 `错误: %s` 那一行原样残留（`docs/PORTING_NOTES.md` §81.5 / §84）。
+
+        反向：把任意一处改回元组写法 → 这条立刻红（渲染结果里出现裸 `%s`）。
+        """
+        host = _host(transport=_MemoryRecorderTransport())  # 没有 `send_sticker` = 投递失败
+        host.record_platform_delivery_outcome = _noop_async
+        sent = await host.send_sticker(
+            {'id': 's'}, {'platform': 'onebot'}, 'chan',
+            {'assetId': 'sticker-c5ad6fc27d316504', 'filePath': 'a.png'},
+            None,
+            {'commit_id': 'c', 'event_id': 'e', 'script_entry_id': 1, 'segment_index': 0},
+        )
+        self.assertFalse(sent)
+
+        entry = [
+            item for item in host.reports
+            if len(item) >= 4 and item[0] == 'warn' and '本地表情包' in str(item[3])
+        ][-1]
+        _level, _story, _phase, message, *args = entry
+        self.assertEqual(len(args), 2, '两个占位符 = 两个实参（不是一个元组）')
+        rendered = core_logging.render_log_message(message, args)
+        self.assertNotIn('%s', rendered, '占位符没被填完：元组被当成单个实参了')
+        self.assertIn('sticker-c5ad6fc27d316504', rendered, '素材 id 要看得见')
+        self.assertIn('transport-unavailable', rendered, '失败原因要看得见')
+        self.assertNotIn('RuntimeError', rendered,
+                         'BaseException 会被渲染层归一成 str()，不许带壳')
+
+    async def test_a_long_action_error_is_clipped_to_one_short_line(self) -> None:
+        """失败原因进日志前 `clip(str(error), 200)`：一行、有限长（真机那种超长异常）。"""
+
+        class _Exploding(_MemoryRecorderTransport):
+            async def send_sticker(self, channel_id: str, file_path: str, is_group: bool = False) -> Any:
+                raise RuntimeError('E' * 600)
+
+        host = _host(transport=_Exploding())
+        host.record_platform_delivery_outcome = _noop_async
+        await host.send_sticker(
+            {'id': 's'}, {'platform': 'onebot'}, 'chan',
+            {'assetId': 'sticker-x', 'filePath': 'a.png'},
+            None,
+            {'commit_id': 'c', 'event_id': 'e', 'script_entry_id': 1, 'segment_index': 0},
+        )
+        entry = [
+            item for item in host.reports
+            if len(item) >= 4 and item[0] == 'warn' and '本地表情包' in str(item[3])
+        ][-1]
+        _level, _story, _phase, message, *args = entry
+        rendered = core_logging.render_log_message(message, args)
+        self.assertEqual(rendered.count('E'), 200, '错误信息截到 200 字符')
+        self.assertNotIn('E' * 201, rendered)
+        self.assertNotIn('\n', rendered, '一条日志就是一行')
+        self.assertNotIn('%s', rendered)
+
+
+class LogCallArgumentShapeTests(unittest.TestCase):
+    """**全 core 扫描**：日志调用不许把元组当单个实参（§81.5 / §84 那一类）。
+
+    `report()` / `report_operation()` / `report_standalone*()` / `log()` 的格式串走
+    Node `util.format` 语义，占位符多于参数时原样残留 —— 少给实参不会报错，只会在
+    真机日志里留下裸 `%s`。8 处已修（`chunk2`），这条用 AST 把口子焊死：任何新写的
+    `report(..., (a, b, c))` 都会在这里红。
+    """
+
+    def test_no_log_call_passes_a_tuple_as_a_single_argument(self) -> None:
+        core_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'core')
+        offenders: list[str] = []
+        for base, _dirs, names in os.walk(core_root):
+            for name in sorted(names):
+                if not name.endswith('.py'):
+                    continue
+                path = os.path.join(base, name)
+                with open(path, encoding='utf-8') as handle:
+                    tree = ast.parse(handle.read(), filename=path)
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    func = node.func
+                    attr = func.attr if isinstance(func, ast.Attribute) else (
+                        func.id if isinstance(func, ast.Name) else ''
+                    )
+                    if attr not in (
+                        'report', 'report_operation', 'report_standalone',
+                        'report_standalone_operation', 'log',
+                    ):
+                        continue
+                    for arg in node.args:
+                        if isinstance(arg, ast.Tuple):
+                            offenders.append('%s:%d %s(...)' % (
+                                os.path.relpath(path, core_root), node.lineno, attr,
+                            ))
+        self.assertEqual(offenders, [], '把元组当单个实参传给日志：%s' % offenders)
+
 
 class BufferTurnTests(unittest.IsolatedAsyncioTestCase):
     async def test_buffer_user_narrative_merges_messages_and_schedules_one_flush(self):
@@ -1636,6 +1735,48 @@ class AutomaticStickerCollectionTests(unittest.IsolatedAsyncioTestCase):
                 sorted(os.listdir(os.path.join(tmp, 'stickers', 'collected'))),
                 sorted(os.path.basename(row['filePath']) for row in rows),
             )
+
+    async def test_collected_asset_id_carries_the_namespace_exactly_once(self):
+        """库里存的 `assetId` 恰好一个 `sticker-` 前缀（真机 `sticker-sticker-…` 的守卫）。
+
+        真机现场：库那行就是 `sticker-sticker-c5ad6fc27d316504`，模型把它原样抄回来
+        （`localMedia={"assetId":"sticker-sticker-…"}`）。这里钉的是**库里到底存了什么**：
+        最常见的种类 `sticker` 恰好等于命名空间词，最容易在这里拼出第二次。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            source = 'https://cdn.example.com/sticker.png'
+            host.transport.payloads[source] = _png(b'one')
+            collected = await host.collect_incoming_stickers(
+                [{'source': source, 'kind': 'sticker'}], [source],
+            )
+            self.assertEqual(len(collected), 1)
+            rows = await host.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 1)
+            asset_id = rows[0]['assetId']
+            self.assertEqual(asset_id, 'sticker-%s' % rows[0]['hash'][:16])
+            self.assertEqual(asset_id.count('sticker'), 1, asset_id)
+            self.assertNotIn('sticker-sticker', asset_id)
+
+    async def test_collected_asset_id_shapes_per_kind_are_distinct(self):
+        """三种入站种类各生成一个 id：只有 `sticker` 那种省掉重复的种类段，且互不相撞。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._collect_host(tmp)
+            sources = ['https://cdn.example.com/%s.png' % name for name in ('sticker', 'animated', 'market')]
+            for index, source in enumerate(sources):
+                host.transport.payloads[source] = _png(bytes([90 + index]))
+            collected = await host.collect_incoming_stickers(
+                [{'source': sources[0], 'kind': 'sticker'},
+                 {'source': sources[1], 'kind': 'animated'},
+                 {'source': sources[2], 'kind': 'market'}],
+                sources,
+            )
+            self.assertEqual(len(collected), 3)
+            ids = sorted(row['assetId'] for row in await host.db_get('interlude_sticker', {}))
+            self.assertEqual(len(set(ids)), 3, ids)
+            self.assertEqual(len([item for item in ids if item.startswith('sticker-animated-')]), 1, ids)
+            self.assertEqual(len([item for item in ids if item.startswith('sticker-market-')]), 1, ids)
+            self.assertEqual(len([item for item in ids if item.startswith('sticker-') and not item.startswith('sticker-animated-') and not item.startswith('sticker-market-')]), 1, ids)
 
     async def test_plain_photos_and_unknown_kinds_never_enter_the_library(self):
         """单独钉死红线：`image` / 缺种类 / 未知种类 → 零入库、零网络请求。"""

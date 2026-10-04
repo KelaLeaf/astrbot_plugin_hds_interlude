@@ -34,6 +34,7 @@ from plugin.tests.test_astrbot_bridge import (
 from plugin.adapters import console_api as console_module
 from plugin.adapters.console_api import ConsoleApi, ConsoleError, CONSOLE_TASKS, mask_endpoint
 from plugin.core import platform_actions
+from plugin.core import video_understanding as video_module
 from plugin.core.database import Database
 from plugin.core.narrator import parse_token_usage
 from plugin.core.logging import set_log_sink
@@ -51,6 +52,14 @@ def _run(coro):
 
 #: 仓库根（`plugin/tests/x.py` → `tests` → `plugin` → 仓库根）。发布仓布局里没有 `docs/`。
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+#: 插件自带的配置 schema（控制台配置页读的就是这一份；宿主内存 schema 是另一份）。
+# 按**插件包**定位，不按仓库根：开发仓是 plugin/_conf_schema.json，CNB / 发布仓布局里
+# 插件根就是仓库根（astrbot_plugin_hds_interlude/ 或 .），REPO_ROOT/plugin 在那边不存在
+# （曾因此在两个发布布局各红 3 条）。
+SCHEMA_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '_conf_schema.json',
+)
 
 #: 「对象行列表」在宿主配置页的那句提示：**三处逐字一致**（`_conf_schema.json` 的 5 处
 #: hint / `console_api.HOST_LIST_DEGRADED_NOTE` / 两份 docs）。初版写的是「⚠️此配置项不
@@ -1428,6 +1437,72 @@ class ConfigEditorTests(unittest.TestCase):
         payload = _run(self.api.config_schema())
         blob = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn('sk-real', blob)
+
+    # ---- FFmpeg 状态（本轮：用户报"配置页上看不到"）----
+
+    def test_the_payload_carries_the_ffmpeg_status_for_both_states(self):
+        """有 / 无 ffmpeg 两种状态各自渲染出的**字面量**（控制台这一层**不看宿主 schema**）。
+
+        为什么必须在这里再算一遍：控制台读的是**仓库里的** `_conf_schema.json`
+        （`load_config_schema()`），宿主动态写进内存 schema 的那句状态永远不会出现在
+        这里——这就是用户"报告了却看不见"的现场之一。
+        反向：把 `config_schema()` 里那次 `apply_ffmpeg_status_hint` 去掉 → 本条红。
+        """
+        for probe, expected in (('/usr/bin/ffmpeg', '✅ FFmpeg 已识别'),
+                                ('', '⚠️ 未发现 FFmpeg')):
+            with self.subTest(expected=expected):
+                with mock.patch.object(video_module, '_FFMPEG_PATH', probe):
+                    payload = _run(self.api.config_schema())
+                group = next(item for item in payload['groups'] if item['key'] == 'model_center')
+                self.assertEqual(group['status'], expected)
+                video = next(field for field in group['fields'] if field['key'] == 'video')
+                items = video['node']['items']
+                self.assertTrue(items['mode']['hint'].startswith(expected + '。'))
+                self.assertTrue(items['enabled']['hint'].startswith(expected + '。'))
+                # 状态词本身极短：只有状态词，不附解释。
+                self.assertEqual(len(expected), len(expected.strip()))
+
+    def test_only_the_model_center_group_carries_a_status(self):
+        with mock.patch.object(video_module, '_FFMPEG_PATH', ''):
+            payload = _run(self.api.config_schema())
+        for group in payload['groups']:
+            with self.subTest(group=group['key']):
+                if group['key'] == 'model_center':
+                    self.assertEqual(group['status'], '⚠️ 未发现 FFmpeg')
+                else:
+                    self.assertFalse(group.get('status'), '状态只挂在它真正所属的分组上')
+
+    def test_the_console_status_is_the_same_judgement_as_the_host_page(self):
+        """两处文本**逐字相同**、判据只有一处：`video_understanding.ffmpeg_status_label()`。
+
+        反向：控制台自己另算一次可用性（例如直接 `shutil.which`）→ 这条对账就散了。
+        """
+        with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            host_schema = json.load(handle)
+        with mock.patch.object(video_module, '_FFMPEG_PATH', ''):
+            host_label = video_module.apply_ffmpeg_status_hint(host_schema)
+            payload = _run(self.api.config_schema())
+        group = next(item for item in payload['groups'] if item['key'] == 'model_center')
+        self.assertEqual(group['status'], host_label)
+        video = next(field for field in group['fields'] if field['key'] == 'video')
+        self.assertEqual(
+            video['node']['items']['mode']['hint'],
+            host_schema['model_center']['items']['video']['items']['mode']['hint'],
+        )
+        self.assertEqual(
+            video['node']['items']['enabled']['hint'],
+            host_schema['model_center']['items']['video']['items']['enabled']['hint'],
+        )
+
+    def test_the_status_write_does_not_poison_the_cached_schema(self):
+        """写在一份深拷贝上：`load_config_schema()` 是 mtime 缓存，就地改会漏给全进程。"""
+        before = console_module.load_config_schema()['model_center']['items']['video']['items']['mode']['hint']
+        with mock.patch.object(video_module, '_FFMPEG_PATH', ''):
+            _run(self.api.config_schema())
+        after = console_module.load_config_schema()['model_center']['items']['video']['items']['mode']['hint']
+        self.assertEqual(before, after)
+        self.assertNotIn('已识别', after)
+        self.assertNotIn('未发现 FFmpeg', after)
 
     # ---- 写 ----
 
@@ -4802,6 +4877,94 @@ class ModelCenterRoutingSourceTests(unittest.TestCase):
         payload = _run(ConsoleApi(bridge).models())
         self.assertEqual(payload['task_models']['works']['astrbot_provider'], '')
         self.assertEqual(bridge.task_model_id('works'), 'writer-conn', '值本身不动')
+
+
+class FfmpegStatusFallbackTests(unittest.TestCase):
+    """宿主那条路断了（拿不到 schema）时：**一条可见 warn** + 控制台照样有状态。
+
+    为什么归在控制台这个文件里：这是同一条契约的两半——"宿主配置页写不进去要说出来，
+    但用户无论如何得在控制台里看得见"。用例是真的构造一个插件实例（不是读源码），
+    所以它管得住"warn 到底有没有打出来"。
+    """
+
+    def setUp(self):
+        self.stub_logger = sys.modules['astrbot'].logger
+        self.before = len(self.stub_logger.messages)
+        self.addCleanup(video_module.reset_ffmpeg_probe)
+
+    def _warnings(self):
+        return [
+            text for level, text in self.stub_logger.messages[self.before:]
+            if level == 'warning'
+        ]
+
+    def test_a_missing_schema_says_so_once_and_still_reports_the_label(self):
+        with mock.patch.object(video_module, '_FFMPEG_PATH', ''):
+            plugin = _make_plugin({})  # 光秃秃的 dict：`getattr(config, 'schema')` 拿不到
+            self.assertEqual(plugin.video_ffmpeg_status, '⚠️ 未发现 FFmpeg')
+            first = [text for text in self._warnings() if '未能把 FFmpeg 状态写进宿主配置页提示' in text]
+            self.assertTrue(first, '写不进去必须有一条可见 warn：%r' % (self._warnings(),))
+            self.assertTrue(any('拿不到配置 schema' in text and 'NoneType' in text for text in first),
+                            '原因要说清"拿到的是什么"：%r' % (first,))
+            # 节流：同一条原因再刷一次不重复喊。
+            plugin._refresh_ffmpeg_status_hint()
+            again = [
+                text for text in self._warnings()
+                if '未能把 FFmpeg 状态写进宿主配置页提示' in text
+            ]
+            self.assertEqual(len(again), len(first), '同一条原因只许喊一次')
+
+    def test_a_real_schema_receives_the_status_and_no_warning(self):
+        class _Cfg(dict):
+            schema = None
+
+        cfg = _Cfg({'model_center': {'video': {'enabled': False, 'mode': 'frames'}}})
+        with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            cfg.schema = json.load(handle)
+        with mock.patch.object(video_module, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
+            plugin = _make_plugin(cfg)
+        self.assertEqual(plugin.video_ffmpeg_status, '✅ FFmpeg 已识别')
+        video = cfg.schema['model_center']['items']['video']['items']
+        self.assertEqual(video['mode']['hint'], '✅ FFmpeg 已识别。' + video_module.VIDEO_MODE_HINT)
+        self.assertTrue(video['enabled']['hint'].startswith('✅ FFmpeg 已识别。视频理解的总开关'))
+        self.assertFalse(
+            [text for text in self._warnings() if 'FFmpeg 状态' in text],
+            '写得进去就不该有这句 warn',
+        )
+
+    def test_opening_the_console_config_page_rewrites_a_rebuilt_schema(self):
+        """宿主**真按 `_conf_schema.json` 重建**时的现场：打开一次配置页，新对象上也要有状态。
+
+        这是"退回初始化时写一次就完"的**行为级**反向用例（不是扫源码）：把插件手上那份
+        `config.schema` 换成一份刚造出来的新对象（宿主重建的样子，与旧对象无关联），
+        走一遍真的 `page_console_config()` —— 新对象必须拿到状态。
+        反向：删掉 `page_console_config` 里那句 `_refresh_ffmpeg_status_hint(refresh=True)`
+        → 本条红（旧的一次性写法在这一步就断了）。
+        """
+        class _Cfg(dict):
+            schema = None
+
+        cfg = _Cfg({'model_center': {'video': {'enabled': False, 'mode': 'frames'}}})
+        with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            cfg.schema = json.load(handle)
+        with mock.patch.object(video_module, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
+            plugin = _make_plugin(cfg)
+        self.addCleanup(_install_web_request())
+
+        # 宿主重建：一份全新的 schema 对象，上面**没有**状态。
+        with open(SCHEMA_PATH, encoding='utf-8-sig') as handle:
+            rebuilt = json.load(handle)
+        cfg.schema = rebuilt
+        node = rebuilt['model_center']['items']['video']['items']['mode']
+        self.assertNotIn('FFmpeg', node['hint'])
+
+        # 打开配置页 → 顺带把状态补写到"新的"那份 schema 上（并重探 ffmpeg）。
+        with mock.patch.object(video_module.shutil, 'which', lambda _name: ''):
+            _run(plugin.page_console_config())
+        items = rebuilt['model_center']['items']['video']['items']
+        self.assertTrue(items['mode']['hint'].startswith('⚠️ 未发现 FFmpeg。'), items['mode']['hint'])
+        self.assertTrue(items['enabled']['hint'].startswith('⚠️ 未发现 FFmpeg。'), items['enabled']['hint'])
+        self.assertEqual(plugin.video_ffmpeg_status, '⚠️ 未发现 FFmpeg')
 
 
 class TokenStatsAvailabilityTests(unittest.TestCase):

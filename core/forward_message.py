@@ -108,8 +108,8 @@
 
 | 预算 | 位置 | 默认 | 区间 | 理由 |
 | --- | --- | --- | --- | --- |
-| `maxImages`（单条转发最多取几张图） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_images` | **3** | 0~10 | 转发里的图**先过这一道**。它管的是"从这张卡里取出几个坐标"：取 3 而不是 15，省的是原生图 token 与下载时间；取 0 就等于关掉"转发也看图"，是个**合法**配置（用例钉着）。取出多少张由卡上那句 `[图片×15，仅取前 3 张]` 说清。**v1.9.4 起每回合图片预算没改过时跟随本项**（见 `core/vision_budget.py`：只调这一个键，模型就真的多看到几张） |
-| `maxVideos`（单条转发最多读取几段视频） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_videos` | **1** | 0~10 | 视频比图贵一个量级：每读一段就是一次 ffmpeg（抽帧 + 抽音轨）加一次视觉预算占用。"一段" = 一条视频消息段（去重后的坐标）。**同一个数也是一回合真正读取几段的上限**（v1.9.4，`video_understanding.video_read_budget()`）——一句判据管两处，不许第二处再算一份。**例外只有 QQ 空间动态那条路**（v1.9.6）：它的段数由 `qzone.feed_video_cap` × 每回合视觉预算决定，**不读本键**（`chunk13._qzone_feed_video_lines` 把上限经 `collect_video_sources(limit=…)` 交给链；转发键与动态无关，早先取小过一次，用户"只调本组的键"照样只取 1 段）。显式配成 **0** 才是 v1.8.7 的老行为"转发里的视频一段都不读"（转发这一侧连坐标都不收；私聊直发的视频不受这个键管）。取到的坐标交给 `model_center.video` 那条链：私聊只看它的总开关，群聊另看群聊开关 |
+| `maxImages`（单条转发最多取几张图） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_images` | **3** | 0 起，**无上界**（v1.9.7） | 转发里的图**先过这一道**。它管的是"从这张卡里取出几个坐标"：取 3 而不是 15，省的是原生图 token 与下载时间；取 0 就等于关掉"转发也看图"，是个**合法**配置（用例钉着）。取出多少张由卡上那句 `[图片×15，仅取前 3 张]` 说清。**v1.9.4 起每回合图片预算没改过时跟随本项**（见 `core/vision_budget.py`：只调这一个键，模型就真的多看到几张） |
+| `maxVideos`（单条转发最多读取几段视频） | 本模块 `ForwardReadLimits` / 配置 `forward_message.max_videos` | **1** | 0 起，**无上界**（v1.9.7） | 视频比图贵一个量级：每读一段就是一次 ffmpeg（抽帧 + 抽音轨）加一次视觉预算占用。"一段" = 一条视频消息段（去重后的坐标）。**同一个数也是一回合真正读取几段的上限**（v1.9.4，`video_understanding.video_read_budget()`）——一句判据管两处，不许第二处再算一份。**例外只有 QQ 空间动态那条路**（v1.9.6）：它的段数由 `qzone.feed_video_cap` × 每回合视觉预算决定，**不读本键**（`chunk13._qzone_feed_video_lines` 把上限经 `collect_video_sources(limit=…)` 交给链；转发键与动态无关，早先取小过一次，用户"只调本组的键"照样只取 1 段）。显式配成 **0** 才是 v1.8.7 的老行为"转发里的视频一段都不读"（转发这一侧连坐标都不收；私聊直发的视频不受这个键管）。取到的坐标交给 `model_center.video` 那条链：私聊只看它的总开关，群聊另看群聊开关 |
 | `forward_media_turn_cap()`（整条消息的转发媒体表上限） | 本模块函数（**不暴露配置**；v1.9.4 起**跟随**每回合图片预算） | `max(6, 每回合图片预算, 单卡 max_images)` | — | 它**不是**第三道视觉预算，只是媒体条目表的安全上限：削在这里，下游就再也说不出"一共几张"。所以取值必须 ≥ 用户配得出来的任何一份（`chunk3` 的每回合预算 / 单卡 `max_images`）。真正的视觉上限由 `chunk3` 那一刀执行，并在当前事件里留 `[图片×14，本回合仅取前 3 张]` |
 | 单张体积上限 | **不加新键**：复用 `stickers.max_file_size_mb`（默认 10MB） | 视觉路径 `chunk3.MAX_NATIVE_IMAGE_BYTES`（4MB）、收藏路径 `store_collected_sticker` 的 `max_file_size_mb` | — | "一张图多大算大"在这个仓库里已经有答案，再写一份就是第二个真相 |
 | 只取前面的 | 节点顺序（含嵌套展开顺序） | — | — | 与三重预算同一条纪律：**排在前面的先拿**，后面的只留线索 |
@@ -192,12 +192,12 @@ class ForwardReadLimits:
     别当成 1。
 
     `max_images`（v1.8.7）是**第四道预算**：单条合并转发最多取几张图的坐标。
-    默认 3（与直发消息的视觉预算同量级）、区间 0~10，理由见模块 docstring。
+    默认 3（与直发消息的视觉预算同量级）、下限 0、**没有上界**（v1.9.7），理由见模块 docstring。
     v1.9.4 起，「每回合图片数上限」没被改过时**跟随本项**（`core/vision_budget.py`
     的 `resolve_image_budget()` 一处判）。
 
     `max_videos`（v1.9.1）是**第五道预算**：单条合并转发最多读取几段视频（"一段" =
-    一条视频消息段）。默认 **1**，把单卡与单回合的额外成本都封在一次以内；区间 0~10，
+    一条视频消息段）。默认 **1**，把单卡与单回合的额外成本都封在一次以内；下限 0、没有上界，
     显式配 0 才是 v1.8.7 之前的"转发里的视频一段都不读"。取到的视频坐标随
     `SessionView.media`（`kind='video'`）流给 `core/video_understanding.py`，由那里的
     抽帧识别真正"看"（私聊只看总开关，群聊另看群聊开关）；**同一个数也是那里
@@ -240,9 +240,12 @@ FORWARD_VIDEO_MAX_PER_FORWARD = DEFAULT_LIMITS.max_videos
 #: 由 `chunk3` 那一刀（带可数线索）执行，这里只保证"读到的全都在表里"。
 FORWARD_MEDIA_MAX_PER_TURN = 6
 
-#: `forward_media_turn_cap()` 里预算那一份的夹取上限（**不是**每回合图片预算的上限；
-#: 预算自己的区间在 `core/vision_budget.py`）。这里只防一个荒谬值把表撑爆。
-FORWARD_MEDIA_TURN_CAP_MAX = 64
+#: `forward_media_turn_cap()` 的上界**已经不存在**（v1.9.7）：早先这里有个 64，
+#: 它是"我们自己拍的"第二道上限 —— 用户把「每回合图片数上限」调到 100，媒体表只给
+#: 64 个位置，而**没有任何一处会说这件事**（债落在一张静默变短的表上）。
+#: 现在预算读得出多少就是多少，脏值按 0 算；真到结构性极限时，说话的是下游那道
+#: **可见**的闸（`image_budget_note` 的可数线索 + `note_image_budget_skip` 的节流 warn）。
+FORWARD_MEDIA_TURN_CAP_MAX: Optional[int] = None
 
 #: **取字节时**的单张体积上限：**不加新键**，复用表情库的 `stickers.max_file_size_mb`
 #: （默认 10MB）。这里只写一个给读者看的说明性默认值，**不参与判据** —— 真正的体积闸
@@ -310,19 +313,26 @@ def forward_read_limits(value: Any = None) -> ForwardReadLimits:
         max_depth=_limit_value(source, 'maxDepth', 'max_depth', 0, 8, DEFAULT_LIMITS.max_depth),
         # 下限是 **0**：0 = "转发里的图一张都不取"（合法配置，只留可数线索），
         # 与 `maxDepth` 的下限是 0 同一种语义。写成 1 就把"关掉"这件事说死了。
+        #
+        # **上界放开**（v1.9.7）：`max_images` / `max_videos` 是本移植版新增的键
+        # （上游没有），早先由我们拍了个 `0~10`，用户填 30 会静默变成 10、界面上
+        # 一个字都没有。现在读得出多少就是多少——真撞上平台/模型的硬顶时由对方报错，
+        # 插件只负责照配置发 + 真的截断时留可数线索。
         max_images=_limit_value(
-            source, 'maxImages', 'max_images', 0, 10, DEFAULT_LIMITS.max_images,
+            source, 'maxImages', 'max_images', 0, None, DEFAULT_LIMITS.max_images,
         ),
         # 视频同理：**默认就是 1** —— 单卡与单回合的额外成本都封在一次以内；
         # 显式配 0 才是"转发里的视频一段都不读"。
         max_videos=_limit_value(
-            source, 'maxVideos', 'max_videos', 0, 10, DEFAULT_LIMITS.max_videos,
+            source, 'maxVideos', 'max_videos', 0, None, DEFAULT_LIMITS.max_videos,
         ),
     )
 
 
-def _limit_value(source: dict[str, Any], camel: str, snake: str, low: int, high: int, fallback: int) -> int:
-    """双拼写读一个预算字段（优先 camelCase）。
+def _limit_value(
+    source: dict[str, Any], camel: str, snake: str, low: int, high: Optional[int], fallback: int,
+) -> int:
+    """双拼写读一个预算字段（优先 camelCase）。`high=None` = 没有上界。
 
     **"没写"与"写了但不可用"是两回事**（上游只有 `value?.x === undefined` 那一种）：
 
@@ -363,8 +373,11 @@ def _js_number(text: str) -> Optional[float]:
         return None
 
 
-def clamp_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
+def clamp_int(value: Any, minimum: int, maximum: Optional[int], fallback: int) -> int:
     """上游 `clampInt`：`Math.floor(Number(value))` 后夹取，非有限数回 `fallback`。
+
+    `maximum=None` = **没有上界**（v1.9.7：本移植版新增的那几个媒体键不再由我们拍上限，
+    见 `forward_read_limits`）。上限只留在上游原本就声明了的那几项上。
 
     JS 的 `Number()` 语义逐条对齐（不照抄会变成异常，而不是夹取）：
 
@@ -399,6 +412,8 @@ def clamp_int(value: Any, minimum: int, maximum: int, fallback: int) -> int:
         return fallback
     # `Math.floor`：正数截断、负数向下取整。`int()` 是朝零截断，负数要用 `//`。
     floored = int(number // 1) if number < 0 else int(number)
+    if maximum is None:
+        return max(minimum, floored)
     return max(minimum, min(maximum, floored))
 
 
@@ -498,7 +513,7 @@ def forward_media_turn_cap(image_budget: Any = None, limits: Any = None) -> int:
        （`model_center.vision.max_per_turn`，解析与默认值在 `core/vision_budget.py`）：
        用户要 10 张就该有 10 个位置，别让媒体表先把它削掉 —— **削在这里，下游就再也
        说不出"一共几张"**。`None` / 脏值按 0 算（老调用方不传预算时行为与 v1.8.7 一致）；
-    3. 单卡 `max_images` —— 它本身就是用户配的（0~10），读到的坐标必须都进表。
+    3. 单卡 `max_images` —— 它本身就是用户配的（下限 0、无上界），读到的坐标必须都进表。
 
     这样任何一次截断都只剩两处可解释的闸：**单卡预算**（卡上那句
     `[图片×15，仅取前 3 张]`）与**每回合预算**（当前事件里那句

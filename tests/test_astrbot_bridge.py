@@ -1141,6 +1141,136 @@ class DeliveryCoordinateTests(unittest.TestCase):
                          'default:FriendMessage:1000008890')
 
 
+class MediaDeliveryConversationTypeTests(unittest.TestCase):
+    """媒体 / 动作投递的 UMO 必须按**真实会话类型**拼（真机：私聊表情包落到 GroupMessage）。
+
+    真机现场（私聊回合）：`localMedia` 选中一张本地表情包，日志里
+    `AstrBot 消息投递失败 会话=NapCat:GroupMessage:1000008890`、
+    `retcode 1200 rich media transfer failed` —— 用户号被拼成了群号，**表情包实际没发出去**。
+    根因是 `channel_umo()` 的"先群后私"：`group_umo()` 在没登记群端点时会拿唯一平台实例
+    凭空造一个群 UMO，于是私聊的用户号必然落进群分支。
+
+    这里的夹具刻意**只有私聊端点、没有群端点**（真机就是这么回事）：谁把判据改回
+    "先群后私"，`test_private_turn_media_lands_on_friend_message` 立刻红。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.logs: list[str] = []
+
+        def sink(level, text):  # noqa: ARG001
+            self.logs.append(text)
+
+        self._sink = sink
+        interlude_logging.set_log_sink(sink)
+        self.addCleanup(interlude_logging.set_log_sink, interlude_logging._default_sink)
+
+    def _bridge(self, instances=None):
+        context = FakeContext()
+        if instances is not None:
+            context.platform_manager = FakePlatformManager(instances)
+        fake_db = FakeDatabase(':memory:')
+        with mock.patch.object(bridge_module, 'Database', lambda path: fake_db), \
+                mock.patch.object(bridge_module, 'plugin_data_dir', lambda *a, **k: self._tmp.name):
+            bridge = AstrbotBridge(
+                context=context, config={}, logger=sys.modules['astrbot'].logger,
+            )
+        bridge.db = fake_db
+        interlude_logging.set_log_sink(self._sink)
+        return bridge
+
+    @staticmethod
+    def _endpoint(**overrides):
+        base = dict(
+            platform='onebot', platform_id='default', platform_name='aiocqhttp',
+            self_id='100001357', user_id='', group_id='', is_group=False,
+            umo='', message_id='', session_id='',
+        )
+        base.update(overrides)
+        return bridge_module.AstrbotEndpoint(**base)
+
+    def _private_bridge(self, instances=None):
+        """只登记**私聊**坐标的桥（这台机器上只有 `default` 一个平台实例）。"""
+        bridge = self._bridge(instances if instances is not None else [_FakePlatform('aiocqhttp', 'default')])
+        bridge.remember_event(object(), object(), self._endpoint(
+            user_id='1000008890', is_group=False,
+            umo='default:FriendMessage:1000008890', session_id='1000008890',
+        ))
+        return bridge
+
+    def _group_bridge(self, instances=None):
+        bridge = self._bridge(instances if instances is not None else [_FakePlatform('aiocqhttp', 'default')])
+        bridge.remember_event(object(), object(), self._endpoint(
+            group_id='100004964', is_group=True,
+            umo='default:GroupMessage:100004964', session_id='100004964',
+        ))
+        return bridge
+
+    def test_private_turn_media_lands_on_friend_message(self):
+        """私聊回合：表情包 / 图片 / 原生表情三段投递都必须是 `FriendMessage`。"""
+        bridge = self._private_bridge()
+        # 夹具证伪力：同一条记录走老口径（先群后私）会拼出群号——真机就是这么被拒收的。
+        self.assertEqual(bridge.group_umo('1000008890'), 'default:GroupMessage:1000008890')
+
+        sticker = asyncio.run(bridge.transport.send_sticker('1000008890', '/tmp/x.png', is_group=False))
+        image = asyncio.run(bridge.transport.send_image('1000008890', '/tmp/x.png', is_group=False))
+        face = asyncio.run(bridge.transport.send_native_face('1000008890', '14', is_group=False))
+        self.assertTrue(sticker.get('ok'), sticker)
+        self.assertTrue(image.get('ok'), image)
+        self.assertTrue(face.get('ok'), face)
+
+        umos = [umo for umo, _chain in bridge.context.sent]
+        self.assertEqual(umos, ['default:FriendMessage:1000008890'] * 3)
+        for umo in umos:
+            self.assertNotIn('GroupMessage', umo, '私聊回合不许把用户号当群号发出去')
+
+    def test_group_turn_media_still_lands_on_group_message(self):
+        """群聊回合不受影响：登记过的群端点照旧 `GroupMessage`。"""
+        bridge = self._group_bridge()
+        result = asyncio.run(bridge.transport.send_sticker('100004964', '/tmp/x.png', is_group=True))
+        self.assertTrue(result.get('ok'), result)
+        self.assertEqual([umo for umo, _chain in bridge.context.sent],
+                         ['default:GroupMessage:100004964'])
+
+    def test_registered_conversation_type_beats_the_old_guess(self):
+        """私聊登记过的群号不同：`channel_umo` 不给类型时也只在登记过的会话里找。
+
+        真机那次用户号与群号不同，所以两个都试也救不了；这里钉的是"判据"本身：
+        私聊坐标在册 → 私聊；群坐标在册 → 群；**不凭空造**。
+        """
+        bridge = self._bridge([_FakePlatform('aiocqhttp', 'default')])
+        bridge.remember_event(object(), object(), self._endpoint(
+            user_id='1000008890', is_group=False,
+            umo='default:FriendMessage:1000008890', session_id='1000008890',
+        ))
+        self.assertEqual(bridge.channel_umo('1000008890'), 'default:FriendMessage:1000008890')
+        # 没登记过的会话 id：回空串（调用方按"没有投递目标"降级），不猜成群。
+        self.assertEqual(bridge.channel_umo('999999999'), '')
+
+    def test_unregistered_private_media_uses_friend_message_from_the_sole_platform(self):
+        """重启后没有登记表（但宿主只有一个平台实例）：私聊兜底也必须是 `FriendMessage`。"""
+        bridge = self._bridge([_FakePlatform('aiocqhttp', 'default')])
+        self.assertEqual(bridge.channel_umo('1000008890', False),
+                         'default:FriendMessage:1000008890')
+        result = asyncio.run(bridge.transport.send_image('1000008890', '/tmp/x.png', is_group=False))
+        self.assertTrue(result.get('ok'), result)
+        self.assertEqual([umo for umo, _chain in bridge.context.sent],
+                         ['default:FriendMessage:1000008890'])
+
+    def test_ambiguous_platform_is_not_guessed_for_private_media(self):
+        """反向：两个平台实例时**不猜**——私聊图片宁可报"没有投递目标"，也不乱发。"""
+        bridge = self._bridge([
+            _FakePlatform('aiocqhttp', 'default'),
+            _FakePlatform('aiocqhttp', 'second'),
+        ])
+        result = asyncio.run(bridge.transport.send_image('1000008890', '/tmp/x.png', is_group=False))
+        self.assertFalse(result.get('ok'), result)
+        self.assertEqual(result.get('error'), 'no-session-target')
+        self.assertEqual(bridge.context.sent, [])
+        self.assertTrue(any('私聊投递无法确定用哪一个' in item for item in self.logs), self.logs)
+
+
 def _make_bridge(config=None, context=None):
     """构造一个不落盘的 `AstrbotBridge`。"""
     fake_db = FakeDatabase(':memory:')
@@ -3443,11 +3573,13 @@ class _FakeProvider:
 class _RecordingContext:
     """记下 `llm_generate` 收到了什么；`error` 非空时逐次抛出。"""
 
-    def __init__(self, provider_id='prov-1', modalities=None, errors=None):
+    def __init__(self, provider_id='prov-1', modalities=None, errors=None, finish_reason=None):
         self.provider_id = provider_id
         self.provider = _FakeProvider(provider_id, modalities)
         self.errors = list(errors or [])
         self.calls: list[dict] = []
+        #: 宿主 `LLMResponse.raw_completion` 里报的停止原因（None = 拿不到）。
+        self.finish_reason = finish_reason
 
     async def get_current_chat_provider_id(self, umo):  # noqa: ARG002
         return self.provider_id
@@ -3459,10 +3591,15 @@ class _RecordingContext:
         self.calls.append(kwargs)
         if self.errors:
             raise self.errors.pop(0)
+        reason = self.finish_reason
 
         class _Response:
             completion_text = '模型回复'
             usage = {'prompt_tokens': 3, 'completion_tokens': 5}
+            raw_completion = (
+                types.SimpleNamespace(choices=[types.SimpleNamespace(finish_reason=reason)])
+                if reason else None
+            )
 
         return _Response()
 
@@ -3601,7 +3738,10 @@ class AstrBotProviderRoutingTests(unittest.TestCase):
         call = context.calls[0]
         self.assertNotIn('image_urls', call)
         self.assertNotIn('audio_urls', call)
-        warnings = [item for item in logged.call_args_list if item.args and item.args[0] == 'warn']
+        warnings = [
+            item for item in logged.call_args_list
+            if item.args and item.args[0] == 'warn' and '图片会被忽略' in str(item.args[1])
+        ]
         self.assertEqual(len(warnings), 1, '丢内容必须留下一条警告')
         self.assertIn('图片会被忽略', warnings[0].args[1])
 
@@ -3619,7 +3759,10 @@ class AstrBotProviderRoutingTests(unittest.TestCase):
             self._run(client, _multimodal_payload())
             self._run(client, _multimodal_payload())
         self.assertEqual(
-            len([item for item in logged.call_args_list if item.args and item.args[0] == 'warn']), 1,
+            len([
+                item for item in logged.call_args_list
+                if item.args and item.args[0] == 'warn' and '图片会被忽略' in str(item.args[1])
+            ]), 1,
         )
 
     def test_sidecar_mode_never_sends_images_to_the_main_model(self):
@@ -3628,6 +3771,78 @@ class AstrBotProviderRoutingTests(unittest.TestCase):
         client = _make_client(context, vision_mode='sidecar')
         self._run(client, _multimodal_payload())
         self.assertNotIn('image_urls', context.calls[0])
+
+    def test_sampling_parameters_the_host_drops_are_reported_once(self):
+        """走 AstrBot 模型时 `temperature` / `max_tokens` **到不了请求**——必须说出来。
+
+        AstrBot 的 `llm_generate(**kwargs)` 只把额外参数转给 Provider 的
+        `text_chat(**kwargs)`，内置实现把它们丢掉（`_prepare_chat_payload` 造出的
+        payloads 里只有 `messages` / `model`）。插件改不了宿主的这条边界，但"用户改了
+        「主叙事最大输出 token」却什么都没发生"必须能在日志里看见（坑 25）。
+        同一条原因只说一次：连跑两轮只留一条 warn。
+        文案要说**当前请求里的值**（v1.9.7）：用户拿它跟自己填的数对得上账。
+        """
+        context = _RecordingContext(modalities=['text', 'image'])
+        client = _make_client(context)
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            self._run(client, _multimodal_payload())
+            self._run(client, _multimodal_payload())
+        said = [
+            item for item in logged.call_args_list
+            if item.args and item.args[0] == 'warn' and '不吃这些参数' in str(item.args)
+        ]
+        self.assertEqual(len(said), 1, '同一条原因只说一次，别每轮刷屏')
+        text = str(said[0].args)
+        self.assertIn('temperature', text)
+        self.assertIn('max_tokens', text)
+        self.assertIn('max_tokens=%s' % _multimodal_payload()['max_tokens'], text,
+                      '要带出实际值，别只说"不生效"')
+        self.assertIn('「模型连接」', text, '要说清去哪儿改')
+        self.assertIn('直连 endpoint', text, '要说清怎么改')
+
+    def test_the_host_finish_reason_is_carried_through(self):
+        """宿主报"输出到顶了"时，插件不许把它改写成 `stop`（v1.9.7）。
+
+        截断与"模型胡说"在日志里长得一模一样；`finish_reason` 是 core 唯一拿得到的
+        那条线索（`narrator._warn_output_truncated()`）。这里恒写 `'stop'` 就等于
+        把宿主唯一一句真话吞掉。反向：改回恒 `'stop'` → 本条红。
+        """
+        context = _RecordingContext(modalities=['text'], finish_reason='length')
+        result = self._run(_make_client(context), {
+            'model': 'x', 'messages': [{'role': 'user', 'content': '你好'}],
+        })
+        self.assertEqual(result['choices'][0]['finish_reason'], 'length')
+        # 拿不到（老宿主 / 自造响应）就照旧 `'stop'`，不猜。
+        self.assertEqual(bridge_module._host_finish_reason(types.SimpleNamespace()), 'stop')
+        self.assertEqual(bridge_module._host_finish_reason(None), 'stop')
+
+    def test_a_payload_without_sampling_parameters_says_nothing(self):
+        """没设采样参数就无话可说——不许对每一轮都念一遍。"""
+        context = _RecordingContext(modalities=['text'])
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            self._run(_make_client(context), {'model': 'x', 'messages': [{'role': 'user', 'content': '你好'}]})
+        self.assertFalse([
+            item for item in logged.call_args_list
+            if item.args and item.args[0] == 'warn' and '不吃这些参数' in str(item.args)
+        ])
+
+    def test_the_typeerror_retry_names_the_parameters_it_dropped(self):
+        """宿主不吃这些参数时的重发**不是无痕降级**：丢掉了什么，日志里要有名字。
+
+        重试那一趟连 `image_urls` / `audio_urls` 一起丢——"看起来发了、模型根本没
+        看到图"是静默失明，比报错难查得多。
+        """
+        context = _RecordingContext(modalities=['text', 'image', 'audio'], errors=[TypeError('boom')])
+        with mock.patch.object(bridge_module, 'log_fallback') as logged:
+            self._run(_make_client(context), _multimodal_payload())
+        said = [
+            item for item in logged.call_args_list
+            if item.args and item.args[0] == 'warn' and '已去掉它们重发一次' in str(item.args)
+        ]
+        self.assertEqual(len(said), 1)
+        text = str(said[0].args)
+        self.assertIn('image_urls', text)
+        self.assertIn('max_tokens', text)
 
     # ---- 按任务指名 AstrBot Provider ----
 

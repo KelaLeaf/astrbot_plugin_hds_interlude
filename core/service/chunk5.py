@@ -1320,12 +1320,35 @@ class ServiceChunk5(ServiceBase):
         模型永远不直接写页面内容：它只提出未来的浏览动作，由独立的浏览任务稍后
         产出观察。`fallbackParticipantId` 是"活跃参与者拥有本次实时浏览；无人值守的
         生活浏览是世界级的"这条隐私边界。
+
+        v1.9.7（受控偏离，见 `docs/PORTING_NOTES.md` §79）：意图建好之后**顺手把唤醒
+        排到它到期的那一刻**。上游只等下一次常规 sweep（默认 `sweepIntervalMinutes`
+        分钟），而模型在剧本里许下的是"我现在搜一下"——结果要等好几分钟才回来，用户
+        那边看到的正是"连续几版都停在还在转"。同时把两类**静默丢弃**改成可见 warn：
+        模型申请了浏览、我们却没建意图（功能没开 / 草稿形状不可用），必须说出来。
         """
         config = self.browser_config
+        mode = (_row(draft, 'mode') if isinstance(draft, dict) else None) or '(未给)'
+        # 丢掉一次"她申请去查"必须留痕（可行动 warn）：`diagnostic` 频道在默认 verbosity
+        # 下一个字都不打（AGENTS.md 坑 25），而"她说了在搜、结果永远不来"正是运维最需要
+        # 看见的事。用 standalone 通道（`[系统]` 标签），这里拿不到本回合的 phase。
+        def warn(message: str, *args: Any) -> None:
+            report_standalone = getattr(self, 'report_standalone', None)
+            if callable(report_standalone):
+                report_standalone('warn', message, *args)
+
         if not _cfg(config, 'enabled', False):
+            # 提示词只在启用时教它申请浏览；走到这里说明模型照旧草稿吐了意图。
+            warn(
+                '网页浏览请求被忽略：网页观察未启用（模式=%s）。打开「网页观察」后她才会真的去查。', mode,
+            )
             return
         normalized = normalize_browser_intent_draft(draft, config)
         if not normalized:
+            warn(
+                '网页浏览请求被忽略：草稿不完整（模式=%s）。需要 mode=search|visit 与 purpose；'
+                'search 还需 query，visit 还需公开 url。', mode,
+            )
             return
         participant_id = fallback_participant_id
         if participant_id:
@@ -1344,6 +1367,9 @@ class ServiceChunk5(ServiceBase):
                 'purpose': _row(normalized, 'purpose'),
             },
         }, now, participant_id)
+        # 到点就唤醒（与拆分气泡 / 其它到期意图同一条通道）：她这一回合说出口的
+        # "正在搜"必须在她下一个回合之前真的跑完，否则下一回合还是"还在转"。
+        self.schedule_due_intent_wake(story_id, not_before)
         self.report_standalone_operation(
             'diagnostic', 'debug', '已创建网页浏览意图：故事=%s 模式=%s',
             story_id, _row(normalized, 'mode'),

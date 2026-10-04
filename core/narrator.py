@@ -75,6 +75,7 @@ from typing import (
 )
 
 from .anthropic import (
+    ANTHROPIC_FALLBACK_MAX_TOKENS,
     anthropic_body,
     anthropic_headers,
     anthropic_response,
@@ -804,44 +805,8 @@ class SilentCompactor:
         return {'summary': ''}
 
     async def generate_world_seeds(self, system: str, user: str, runtime: dict[str, Any]) -> Any:
-        """上游 `worldSeeder.generate(payload)`：世界播种器的一次生成调用。
-
-        走侧任务链（`customSideTask(provider, '世界播种', timeout, temperature, maxTokens,
-        system, user)` → `sideTaskJson`）：`response_format=json_object`，思考型网关截断时
-        去掉 `max_tokens` 重试一次（`_side_task_json` 已内建）。返回解析后的对象；
-        没有勾选「用于世界播种」的连接时返回 None（播种器整体关闭）。
-        """
-        assigned = self._assigned_providers('world_seeding')
-        if not assigned:
-            return None
-        provider = assigned[0]
-        model = _trim(_get(provider, 'model'))
-        if not model:
-            return None
-        timeout = _coalesce(_get(runtime, 'timeout'), provider.get('timeout'))
-
-        def build_body(capped: bool) -> dict[str, Any]:
-            body: dict[str, Any] = {
-                **parse_object(provider.get('extra_body'), 'extraBody', self.logger),
-                'model': model,
-                'temperature': _coalesce(_get(runtime, 'temperature'), provider.get('temperature'), 0.9),
-                'top_p': _coalesce(provider.get('top_p'), 1),
-            }
-            if capped:
-                body['max_tokens'] = _coalesce(_get(runtime, 'max_tokens'), 1_000)
-            body['response_format'] = {'type': 'json_object'}
-            body['messages'] = [
-                {'role': 'system', 'content': system},
-                {'role': 'user', 'content': user},
-            ]
-            return body
-
-        def parse(text: str) -> Any:
-            if not text:
-                raise RuntimeError('World seeder returned an empty response.')
-            return parse_json_response(text, 'World seeder')
-
-        return await self._side_task_json(provider, model, '世界播种', timeout, build_body, parse)
+        """不产出世界种子（没有可用连接 → 播种器整体关闭）。"""
+        return None
 
     async def plan_schedule_preplan(
         self, request: SchedulePreplanReviewRequest,
@@ -850,57 +815,8 @@ class SilentCompactor:
         return None
 
     async def maintain_memory(self, request: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """后台记忆维护的裁决调用（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.1）。
-
-        复用 `compaction` 的连接与参数：这一步和压缩同属"后台低成本加工"，
-        单独开一条路由只会让用户在配置页多填一遍同样的东西。
-        拿不到可用模型时返回 `None`，调用方按"本轮跳过"处理。
-        """
-        compact_config = self.config.get('compaction')
-        if _is_false(_get(compact_config, 'enabled')):
-            return None
-        route = self.routing['compaction'].get('target') or {}
-        assigned = self._assigned_providers('compaction')
-        providers = assigned if assigned else self._select_route_providers(self.routing['compaction'], False)
-        if not providers:
-            return None
-        selected = [provider for provider in providers if provider.get('id') == route.get('provider_id')] \
-            if _truthy(route.get('provider_id')) else providers
-        provider = _first(selected) or providers[0]
-        model = provider.get('model') if assigned else _or(route.get('model'), provider.get('model'))
-        if not model:
-            return None
-        max_tokens = _coalesce(_get(compact_config, 'max_tokens'), _coalesce(route.get('max_tokens'), provider.get('max_tokens')))
-
-        def build_body(capped: bool) -> dict[str, Any]:
-            body: dict[str, Any] = {
-                **parse_object(provider.get('extra_body'), 'extraBody', self.logger),
-                'model': model,
-                'temperature': _js_min(_coalesce(_get(compact_config, 'temperature'), provider.get('temperature')), 0.2),
-                'top_p': _coalesce(_get(compact_config, 'top_p'), 1),
-            }
-            if capped and _is_number(max_tokens) and max_tokens > 0:
-                body['max_tokens'] = max_tokens
-            body['response_format'] = {'type': 'json_object'}
-            body['messages'] = [
-                {'role': 'system', 'content': memory_maintenance_prompt()},
-                {'role': 'user', 'content': _stringify_json(to_memory_maintenance_payload(request))},
-            ]
-            return body
-
-        def parse(text: str) -> Any:
-            if not text:
-                raise RuntimeError('Memory maintenance provider returned an empty response.')
-            try:
-                return parse_json_response(text, 'Memory maintenance provider')
-            except Exception as error:  # noqa: BLE001 - 与压缩同一套降级语义
-                raise RuntimeError('Memory maintenance provider returned invalid JSON.') from error
-
-        return await self._side_task_json(
-            provider, model, '记忆维护',
-            _or(_or(_get(compact_config, 'timeout'), route.get('timeout')), provider.get('timeout')),
-            build_body, parse,
-        )
+        """不产出记忆维护裁决（调用方按"本轮跳过"处理）。"""
+        return None
 
     async def plan_timeline(self, request: TimelinePlanRequest) -> Optional[TimelinePlan]:
         """不产出时间线计划。"""
@@ -1084,6 +1000,52 @@ class OpenAICompatibleNarrator:
         if self.logger is not None:
             self.logger.warn(message, *args)
 
+    def _warn_max_tokens_injected(self, provider: ProviderConfig) -> None:
+        """Anthropic 连接上"没给输出上限"时，协议层会补一个数——说一次就够。
+
+        同一条连接只提醒一次（`provider_key`），免得每个回合刷屏。
+        """
+        warned = getattr(self, '_max_tokens_injected_warned', None)
+        if warned is None:
+            warned = set()
+            self._max_tokens_injected_warned = warned
+        marker = provider_key(provider)
+        if marker in warned:
+            return
+        warned.add(marker)
+        self._warn(
+            'Anthropic 协议要求 max_tokens 必填：本回合没有可用的输出上限（未配置或配成 0），'
+            '已按 %d 发送。要自己定这个数，请在「模型中心 → 主叙事最大输出 token」里填值。',
+            ANTHROPIC_FALLBACK_MAX_TOKENS,
+        )
+
+    def _warn_output_truncated(self, provider: ProviderConfig, task: str, response: Any) -> None:
+        """模型被**输出上限**截断 → 明说，并点名是哪道闸、去哪儿调（v1.9.7）。
+
+        为什么必须说：截断与"模型胡说"在日志里长得一模一样——JSON 在预算处断掉，
+        报的是 `Unterminated string at position N`，主叙事那边再往上抛成
+        「叙事模型返回了无效 JSON」。用户只会以为模型不行，永远猜不到是自己把
+        「主叙事最大输出 token」调小了（或服务端/网关有自己的硬顶）。
+        同一条连接、同一类任务只说一次（`task + provider_key` 节流）。
+        """
+        reason = _finish_reason(response)
+        if reason not in _TRUNCATION_REASONS:
+            return
+        warned = getattr(self, '_output_truncated_warned', None)
+        if warned is None:
+            warned = set()
+            self._output_truncated_warned = warned
+        marker = (task, provider_key(provider))
+        if marker in warned:
+            return
+        warned.add(marker)
+        self._warn(
+            '%s 的输出被上限截断（%s）：正文 / JSON 在预算处断掉。'
+            '调大「模型中心 → 主叙事最大输出 token」（填 0 = 不限制）或该连接行的「最大输出 token」；'
+            '旁路任务看它自己分组里的那一项。',
+            task, reason,
+        )
+
     # ---------- 模型特化 ----------
 
     def resolve_specialty(self, provider: Optional[ProviderConfig] = None) -> dict[str, Any]:
@@ -1180,9 +1142,7 @@ class OpenAICompatibleNarrator:
         """主叙事调用：允许逐服务商重试与故障切换。"""
         # 一次失败不能让故事卡死在某个 endpoint。
         assigned = self._assigned_providers('main')
-        main_model_id = effective_main_model_id(self.config)
         route = self.routing['main'].get('target') or {}
-        has_main_route = bool(main_model_id) or bool(len(assigned))
         providers = assigned if assigned else self._select_route_providers(self.routing['main'], not _truthy(route.get('model')))
         # Anthropic Messages 没有原生 input_audio 块：这一回合带了语音的连接先被
         # **确定性能力筛选**排除，而不是进故障切换、白烧一次请求再进冷却桶。
@@ -1223,22 +1183,39 @@ class OpenAICompatibleNarrator:
                     try:
                         decision = await self._request_provider(provider, request_with_early_reply, {
                             'model': _get(provider, 'model') if assigned else _or(route.get('model'), provider.get('model')),
-                            'temperature': _coalesce(self.config.get('main_temperature'), provider.get('temperature'))
-                            if has_main_route else provider.get('temperature'),
-                            'top_p': _coalesce(self.config.get('main_top_p'), provider.get('top_p'))
-                            if has_main_route else provider.get('top_p'),
-                            'max_tokens': self.config.get('main_max_tokens')
-                            if has_main_route and _is_number(self.config.get('main_max_tokens'))
-                            and self.config['main_max_tokens'] > 0
-                            else _coalesce(route.get('max_tokens'), provider.get('max_tokens')),
-                            'timeout': self.config.get('main_timeout')
-                            if has_main_route and _is_number(self.config.get('main_timeout'))
-                            and self.config['main_timeout'] > 0
-                            else _coalesce(route.get('timeout'), provider.get('timeout')),
+                            # v1.9.7：任务级参数（「主叙事」那一组）**一律优先**。
+                            #
+                            # 上游把它挂在 `hasMainRoute` 门后面（`narrator.ts:369/401-405`）：
+                            # 只有"显式 main 线路"（模型档案 / 勾了 `useForMain` 的连接）
+                            # 才认任务参数，否则整组回落连接行。本移植版多了一条上游没有的
+                            # 模型来源（AstrBot Provider / 会话默认模型），那条路上
+                            # `assigned` 为空、`main_model_id` 也恒空，于是
+                            # **`main_max_tokens` / `main_temperature` / `main_top_p` /
+                            # `main_timeout` 四项全部静默失效**，用户改配置界面没有任何反应
+                            # （实测：连接行 `use_for_main` 未勾时 `max_tokens=1234`
+                            # 发出去的是连接行的 2048）。
+                            #
+                            # 现在按"用户填的那个键说了算"：任务键读得出就用它，读不出
+                            # （缺键 / 脏值）才回落到连接行 / 路由。`0` 是**显式**的第三种
+                            # 意思（见 `_task_override`），不再被连接行默认值顶掉。
+                            'temperature': _task_number_override(
+                                self.config.get('main_temperature'), provider.get('temperature'),
+                            ),
+                            'top_p': _task_number_override(
+                                self.config.get('main_top_p'), provider.get('top_p'),
+                            ),
+                            'max_tokens': _task_override(
+                                self.config.get('main_max_tokens'),
+                                _coalesce(route.get('max_tokens'), provider.get('max_tokens')),
+                            ),
+                            'timeout': _task_timeout_override(
+                                self.config.get('main_timeout'),
+                                _coalesce(route.get('timeout'), provider.get('timeout')),
+                            ),
                             'response_format': _coalesce(
                                 self.config.get('main_response_format'),
                                 _coalesce(route.get('response_format'), provider.get('response_format')),
-                            ) if has_main_route else provider.get('response_format'),
+                            ),
                         }, usages, '主叙事')
                         # A provider that recovers should be eligible immediately; do not
                         # retain an earlier failure's cooldown after a successful response.
@@ -1291,7 +1268,10 @@ class OpenAICompatibleNarrator:
         # uses one multipart user message, so text, images and audio remain one event.
         images = request.get('images') or []
         audio = request.get('audio') or []
-        if request.get('phase') == 'user-message' and (images or audio):
+        # Group historical evidence (rc31): same image channel, low detail, after
+        # the current-turn images so the new ones stay first in the message.
+        historical_images = request.get('historicalGroupImages') or []
+        if request.get('phase') == 'user-message' and (images or audio or historical_images):
             user_content: Any = [
                 {'type': 'text', 'text': payload},
                 *[
@@ -1301,6 +1281,14 @@ class OpenAICompatibleNarrator:
                         else {'url': image.get('data_uri'), 'detail': 'auto'},
                     }
                     for image in images
+                ],
+                *[
+                    {
+                        'type': 'image_url',
+                        'image_url': {'url': image.get('data_uri')} if _truthy(provider.get('zhipu_official'))
+                        else {'url': image.get('data_uri'), 'detail': 'low'},
+                    }
+                    for image in historical_images
                 ],
                 # OpenAI-compatible audio input: Gemini and other multimodal main
                 # models accept transcoded voice directly; no text transcript exists.
@@ -1321,6 +1309,12 @@ class OpenAICompatibleNarrator:
         max_tokens = _coalesce(overrides.get('max_tokens'), provider.get('max_tokens'))
         if _is_number(max_tokens) and max_tokens > 0:
             request_body['max_tokens'] = max_tokens
+        elif _provider_protocol(provider) == 'anthropic-messages':
+            # **结构性极限必须可见**（v1.9.7）：Anthropic Messages 把 `max_tokens`
+            # 列为必填，缺了服务端直接 400。所以"本回合没给输出上限"（缺键，或用户
+            # 明确写 0 = 不限制）在这条连接上会**由协议层补一个 4096** —— 那是一个
+            # 用户没配过、界面上也看不到的数，必须说出来，并点名去哪儿调。
+            self._warn_max_tokens_injected(provider)
         if _or(overrides.get('response_format'), provider.get('response_format')) == 'json-object':
             request_body['response_format'] = {'type': 'json_object'}
         story = request.get('story') or {}
@@ -1419,13 +1413,18 @@ class OpenAICompatibleNarrator:
                 cache_first_payload, task='main',
             )
             collect(_get(response, 'usage'))
+            # **截断必须可见**（v1.9.7）：撞上模型 / 服务端 / 网关的输出硬顶时，
+            # 这里留下一句点名了闸与去处的话（否则只剩"返回了无效 JSON"）。
+            self._warn_output_truncated(provider, task, response)
             text = extract_chat_text(response)
 
         if not text:
             raise RuntimeError('Narrative provider returned an empty response.')
 
         try:
-            decision: NarrativeDecision = parse_json_response(text, 'Narrative provider')
+            decision: NarrativeDecision = narrative_decision_root(
+                parse_json_response(text, 'Narrative provider'),
+            )
         except Exception as error:  # noqa: BLE001 - 与上游 catch 等价
             # 上游在拒绝时保留原始输出的前若干字符于**调试日志**（不改进异常文案，
             # 异常文案是上游逐字契约，改编会被逐字断言的上游用例抓到）。
@@ -1496,6 +1495,10 @@ class OpenAICompatibleNarrator:
                 provider, body, headers, timeout, task=SIDE_TASK_ROUTES.get(task, 'compaction'),
             )
             collect(_get(response, 'usage'))
+            # 旁路 JSON 任务同一把尺子：截断要说出来（下面那条"疑似思考预算截断"
+            # 只在**解析失败**时才说，解析宽容的旁路任务——例如外挂视频观察——
+            # 少了这句就完全看不见）。
+            self._warn_output_truncated(provider, task, response)
             last_error: Exception = RuntimeError('No textual response field found.')
             saw_text = False
             for text in chat_text_candidates(response):
@@ -1523,6 +1526,112 @@ class OpenAICompatibleNarrator:
         finally:
             if usage_sink is None:
                 self._emit_usage(task, usages)
+
+    # ---------- 世界播种 / 记忆维护（侧任务） ----------
+    #
+    # v1.9.7 修：这两支原先错挂在 `SilentCompactor` 上——而生产里 `create_narrator`
+    # 与 `create_compactor` 返回的都是本类，于是
+    # `chunk10` 的 `self.narrator.generate_world_seeds(...)` 每次扫描都 AttributeError、
+    # `chunk8` 的 `self.compactor.maintain_memory(...)` 静默跳过（getattr 拿不到就当没有）。
+    # 世界播种器与记忆维护的全部数值键因此都"读了但到不了调用"。
+
+    async def generate_world_seeds(self, system: str, user: str, runtime: dict[str, Any]) -> Any:
+        """上游 `worldSeeder.generate(payload)`：世界播种器的一次生成调用。
+
+        走侧任务链（`customSideTask(provider, '世界播种', timeout, temperature, maxTokens,
+        system, user)` → `sideTaskJson`）：`response_format=json_object`，思考型网关截断时
+        去掉 `max_tokens` 重试一次（`_side_task_json` 已内建）。返回解析后的对象；
+        没有勾选「用于世界播种」的连接时返回 None（播种器整体关闭）。
+        """
+        assigned = self._assigned_providers('world_seeding')
+        if not assigned:
+            return None
+        provider = assigned[0]
+        model = _trim(_get(provider, 'model'))
+        if not model:
+            return None
+        timeout = _coalesce(_get(runtime, 'timeout'), provider.get('timeout'))
+
+        def build_body(capped: bool) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                **parse_object(provider.get('extra_body'), 'extraBody', self.logger),
+                'model': model,
+                # 三级回落：播种器配置 → 连接行 → 0.9（`_coalesce` 只吃两个参数，
+                # v1.9.7 修：这里原来写成三个参数的 `_coalesce(a, b, 0.9)`——因为整支方法
+                # 挂在没人用的 `SilentCompactor` 上，这个 TypeError 从来没被跑出来过）。
+                'temperature': _coalesce(
+                    _coalesce(_get(runtime, 'temperature'), provider.get('temperature')), 0.9,
+                ),
+                'top_p': _coalesce(provider.get('top_p'), 1),
+            }
+            if capped:
+                body['max_tokens'] = _coalesce(_get(runtime, 'max_tokens'), 1_000)
+            body['response_format'] = {'type': 'json_object'}
+            body['messages'] = [
+                {'role': 'system', 'content': system},
+                {'role': 'user', 'content': user},
+            ]
+            return body
+
+        def parse(text: str) -> Any:
+            if not text:
+                raise RuntimeError('World seeder returned an empty response.')
+            return parse_json_response(text, 'World seeder')
+
+        return await self._side_task_json(provider, model, '世界播种', timeout, build_body, parse)
+
+    async def maintain_memory(self, request: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """后台记忆维护的裁决调用（v1.4.0，`docs/MEMORY_MAINTENANCE.md` §5.1）。
+
+        复用 `compaction` 的连接与参数：这一步和压缩同属"后台低成本加工"，
+        单独开一条路由只会让用户在配置页多填一遍同样的东西。
+        拿不到可用模型时返回 `None`，调用方按"本轮跳过"处理。
+        """
+        compact_config = self.config.get('compaction')
+        if _is_false(_get(compact_config, 'enabled')):
+            return None
+        route = self.routing['compaction'].get('target') or {}
+        assigned = self._assigned_providers('compaction')
+        providers = assigned if assigned else self._select_route_providers(self.routing['compaction'], False)
+        if not providers:
+            return None
+        selected = [provider for provider in providers if provider.get('id') == route.get('provider_id')] \
+            if _truthy(route.get('provider_id')) else providers
+        provider = _first(selected) or providers[0]
+        model = provider.get('model') if assigned else _or(route.get('model'), provider.get('model'))
+        if not model:
+            return None
+        max_tokens = _coalesce(_get(compact_config, 'max_tokens'), _coalesce(route.get('max_tokens'), provider.get('max_tokens')))
+
+        def build_body(capped: bool) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                **parse_object(provider.get('extra_body'), 'extraBody', self.logger),
+                'model': model,
+                'temperature': _js_min(_coalesce(_get(compact_config, 'temperature'), provider.get('temperature')), 0.2),
+                'top_p': _coalesce(_get(compact_config, 'top_p'), 1),
+            }
+            if capped and _is_number(max_tokens) and max_tokens > 0:
+                body['max_tokens'] = max_tokens
+            body['response_format'] = {'type': 'json_object'}
+            body['messages'] = [
+                {'role': 'system', 'content': memory_maintenance_prompt()},
+                {'role': 'user', 'content': _stringify_json(to_memory_maintenance_payload(request))},
+            ]
+            return body
+
+        def parse(text: str) -> Any:
+            if not text:
+                raise RuntimeError('Memory maintenance provider returned an empty response.')
+            try:
+                return parse_json_response(text, 'Memory maintenance provider')
+            except Exception as error:  # noqa: BLE001 - 与压缩同一套降级语义
+                raise RuntimeError('Memory maintenance provider returned invalid JSON.') from error
+
+        return await self._side_task_json(
+            provider, model, '记忆维护',
+            _or(_or(_get(compact_config, 'timeout'), route.get('timeout')), provider.get('timeout')),
+            build_body, parse,
+        )
 
     async def compact(self, request: CompactionRequest) -> CompactionDecision:
         """压缩场景与长期事实（上游 `compact`）。"""
@@ -2728,16 +2837,46 @@ def parse_json_response(text: Any, source: str) -> Any:
     raise RuntimeError(f'{source} returned invalid JSON ({detail}).')
 
 
+def narrative_decision_root(value: Any) -> Any:
+    """把主叙事的解析结果归位到「模型写的那一个决策对象」上（受控偏离，§79）。
+
+    只有一种形状需要归位：模型把整个决策对象包在**单元素数组**里（JSON mode 下偶发）。
+    数组根在上游是合法返回（`typeof value === 'object'`，`parse_json_response` 的用例
+    钉着 `[1,2]`），主叙事契约却是对象——包一层之后 `decision.interaction` 与
+    `decision.script` 全是 undefined，症状同样是「结构化可见回复缺失」白重写一次。
+    这里只拆**恰好一个 dict 元素**的数组，别的形状原样返回（不猜、不合并）。
+    """
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+        return value[0]
+    return value
+
+
 def json_candidates(text: str) -> list[str]:
-    """上游 `jsonCandidates()`：原文、代码围栏正文、以及其中平衡的 JSON 值。"""
+    """上游 `jsonCandidates()`：原文、代码围栏正文、以及其中平衡的 JSON 值。
+
+    本移植版在这条链上补两个**只丢弃、不编造**的容错（受控偏离，见
+    `docs/PORTING_NOTES.md` §79；2026-10-04 真机的一次白重写）：
+
+    1. 每个候选后面紧跟它的「去掉尾随逗号」版本。`{"a":1,}` 是模型最常见的非致命
+       笔误，上游把它当成"这整份 JSON 不合法"，于是**唯一**还能 `json.loads` 的候选
+       变成内层的 `{"seen":true,"reply":{…}}`——整篇已经写好的剧本被判成"结构化
+       可见回复缺失"、白重写一次（双倍输入 token + 近两分钟）。
+    2. 括号平衡扫描只取**最外层**的值（`_top_level_json_values`）。内层值只在外层
+       解析失败时才会被用到，而那一刻它必然只是一个片段（`interaction` / `reply`），
+       不可能是模型的整份输出；把片段当输出正是上面那场白重写的直接原因。
+    """
     if not text:
         return []
     candidates: dict[str, None] = {}
 
     def add(value: str) -> None:
         trimmed = _LEADING_BOM.sub('', value).strip()
-        if trimmed:
-            candidates[trimmed] = None
+        if not trimmed:
+            return
+        candidates[trimmed] = None
+        repaired = _drop_trailing_commas(trimmed)
+        if repaired != trimmed:
+            candidates[repaired] = None
 
     add(text)
     for match in _FENCE_PATTERN.finditer(text):
@@ -2745,9 +2884,90 @@ def json_candidates(text: str) -> list[str]:
         closing_fence = text.find('```', body_start)
         add(text[body_start:] if closing_fence < 0 else text[body_start:closing_fence])
     for candidate in list(candidates):
-        for value in balanced_json_values(candidate):
+        for value in _top_level_json_values(candidate):
             add(value)
     return list(candidates)
+
+
+def _drop_trailing_commas(text: str) -> str:
+    """删掉对象 / 数组结尾多出来的逗号（`{"a":1,}` / `[1,2,]`）。
+
+    只看**字符串之外**的逗号，并且只删「后面跳过空白就紧跟 `}` / `]`」的那一个字符。
+    不补任何内容、不改任何值：尾随逗号本来就是 JS / 多数网关容忍、而 Python 的
+    `json.loads` 不容忍的写法。找不到可删的逗号时原样返回。
+    """
+    if ',' not in text:
+        return text
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for index, character in enumerate(text):
+        if in_string:
+            out.append(character)
+            if escaped:
+                escaped = False
+            elif character == '\\':
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            out.append(character)
+            continue
+        if character == ',':
+            following = index + 1
+            while following < len(text) and text[following] in ' \t\r\n':
+                following += 1
+            if following < len(text) and (text[following] == '}' or text[following] == ']'):
+                continue  # 尾随逗号：丢掉这一个字符
+        out.append(character)
+    return ''.join(out)
+
+
+def _top_level_json_values(text: str) -> list[str]:
+    """`balanced_json_values` 的**最外层子集**：只返回括号深度 0 的值。
+
+    单趟扫描、带字符串/转义状态与括号栈（括号不匹配时整段作废，与
+    `balanced_json_values` 的 `break` 等价）。上游从每一个 `{` / `[` 起扫，因此
+    `a {"x":{"y":1}} b` 会同时交出 `{"x":{"y":1}}` 与 `{"y":1}`；后者是前者的
+    内层片段，只在**外层解析失败**时才会被 `parse_json_response` 选中——
+    而那时它只可能是模型的半截输出。片段永远不是合法输出，所以不再给它们候选资格。
+    """
+    values: list[str] = []
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    start = -1
+    for index, character in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == '\\':
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            continue
+        if character == '{' or character == '[':
+            if not stack:
+                start = index
+            stack.append('}' if character == '{' else ']')
+            continue
+        if character == '}' or character == ']':
+            if not stack:
+                continue  # 文本里孤立的右括号：不是值的一部分
+            if stack[-1] != character:
+                stack.clear()  # 括号不匹配：这一段作废
+                start = -1
+                continue
+            stack.pop()
+            if not stack and start >= 0:
+                values.append(text[start:index + 1])
+                start = -1
+    return values
 
 
 def balanced_json_values(text: str) -> list[str]:
@@ -3075,6 +3295,66 @@ def _or(left: Any, right: Any) -> Any:
 def _coalesce(value: Any, default: Any) -> Any:
     """JS `??`：只有 None（undefined/null）才回落，`0` / `''` 保留。"""
     return default if value is None else value
+
+
+#: 各家协议里"输出被上限截断"的 `finish_reason` 拼写（OpenAI `length`、
+#: Anthropic `max_tokens`、Gemini `MAX_TOKENS`、部分网关 `max_output_tokens`）。
+#: 只在**取到**这些值时说话；取不到 = 没有线索，不当成截断（不猜）。
+_TRUNCATION_REASONS = ('length', 'max_tokens', 'MAX_TOKENS', 'max_output_tokens')
+
+
+def _finish_reason(response: Any) -> str:
+    """OpenAI / Gemini 兼容响应里的 `finish_reason`（取不到返回空串）。
+
+    两种形状都认：OpenAI 在 `choices[0]`，Gemini 原生在 `candidates[0]`。值是字符串
+    才有意义，别的一律当"没有线索"——这条判据只用来决定**说不说**，不参与任何解析。
+    """
+    for key in ('choices', 'candidates'):
+        items = _get(response, key)
+        first = items[0] if isinstance(items, list) and items else None
+        reason = _trim(_or(_get(first, 'finish_reason'), _get(first, 'finishReason')))
+        if reason:
+            return reason
+    return ''
+
+
+def _task_override(configured: Any, fallback: Any) -> Any:
+    """任务级数值参数（`main_max_tokens`）→ 真正发出去的值。
+
+    * 缺键 / 脏值 / 负数 → 回落到连接行（路由 / `providers[].max_tokens`）那一档；
+    * **`0` → 原样返回 `0`**：调用方看到 0 就**不带这个参数**（= 不限制，交给服务端
+      按模型自己的输出上限来），这是 `0` 在本键上新立的第三种意思（v1.9.7），
+      不再被连接行的默认值顶掉；
+    * 正数 → 原样，**没有隐形上界**：真撞上模型 / 服务端的硬顶时由对方报错，
+      不在这里悄悄改小（要改就改配置页上那个数）。
+    """
+    if isinstance(configured, bool) or not _is_number(configured) or configured < 0:
+        return fallback
+    return configured
+
+
+def _task_number_override(configured: Any, fallback: Any) -> Any:
+    """任务级采样参数（`main_temperature` / `main_top_p`）→ 发出去的值。
+
+    与 `_task_override` 同一套口径，只差 `0` 的含义：采样参数里 **`0` 本身是合法值**
+    （`temperature = 0` 就是确定性输出），所以照原样发；`'abc'` / 对象这类脏值回落到
+    连接行，而不是把 `"temperature": "abc"` 塞进请求体让服务端 400。
+    """
+    if isinstance(configured, bool) or not _is_number(configured):
+        return fallback
+    return configured
+
+
+def _task_timeout_override(configured: Any, fallback: Any) -> Any:
+    """`main_timeout` → 毫秒；与 `_task_override` 刻意不同：**只有正数才认**。
+
+    超时写成 `0` 在 `httpx` 侧是"立刻超时"（`Timeout(max(0.001, 0))`），不是"不限制"；
+    把它解释成"不限制"等于给一个能无限挂住的回合开后门（后台扫描会被这一个请求拖死，
+    而且不报错）。所以本键的 `0` / 缺键 / 脏值一律回落到连接行的超时。
+    """
+    if isinstance(configured, bool) or not _is_number(configured) or configured <= 0:
+        return fallback
+    return configured
 
 
 def _is_false(value: Any) -> bool:

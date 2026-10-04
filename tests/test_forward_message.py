@@ -34,6 +34,7 @@ from plugin.core.forward_message import (
     FORWARD_FETCH_TIMEOUT_MS,
     FORWARD_MEDIA_MAX_PER_FORWARD,
     FORWARD_MEDIA_MAX_PER_TURN,
+    FORWARD_MEDIA_TURN_CAP_MAX,
     FORWARD_VIDEO_MAX_PER_FORWARD,
     ForwardMediaBudget,
     ForwardReadLimits,
@@ -640,7 +641,7 @@ class ForwardMediaBudgetTests(unittest.TestCase):
         self.assertEqual(forward_read_limits({'maxImages': 0}).max_images, 0, '0 是合法值')
         self.assertEqual(forward_read_limits({'max_images': 0}).max_images, 0, '两种拼写都认')
         self.assertEqual(forward_read_limits({'maxImages': -5}).max_images, 0, '夹到下限 0')
-        self.assertEqual(forward_read_limits({'maxImages': 99}).max_images, 10, '夹到上限 10')
+        self.assertEqual(forward_read_limits({'maxImages': 99}).max_images, 99, 'v1.9.7 起没有上界：读得出多少就是多少')
         # "没写"与"写了不可用"仍是两回事（与三重预算同一条语义）。
         self.assertEqual(forward_read_limits({'maxImages': 'abc'}).max_images, 3)
         self.assertEqual(forward_read_limits({'maxImages': None}).max_images, 0, 'Number(null)=0')
@@ -782,7 +783,7 @@ class ForwardMediaBudgetTests(unittest.TestCase):
         self.assertEqual(forward_read_limits({'maxVideos': 2}).max_videos, 2)
         self.assertEqual(forward_read_limits({'max_videos': 2}).max_videos, 2, '两种拼写都认')
         self.assertEqual(forward_read_limits({'maxVideos': -5}).max_videos, 0, '夹到下限 0')
-        self.assertEqual(forward_read_limits({'maxVideos': 99}).max_videos, 10, '夹到上限 10')
+        self.assertEqual(forward_read_limits({'maxVideos': 99}).max_videos, 99, 'v1.9.7 起没有上界')
         # "没写"回默认 1（一张卡最多读一段）；`null` 是 Number(null)=0 → 夹成 0（两种都合法，语义不同）。
         self.assertEqual(forward_read_limits({}).max_videos, 1)
         self.assertEqual(forward_read_limits({'maxVideos': None}).max_videos, 0)
@@ -1061,6 +1062,19 @@ class ForwardMediaReadTests(unittest.TestCase):
         self.assertEqual(forward_media_turn_cap(3, {'maxImages': 10}), 10)
         self.assertEqual(forward_media_turn_cap(10, {'maxImages': 2}), 10)
         self.assertEqual(forward_media_turn_cap(3, {'max_images': 0}), FORWARD_MEDIA_MAX_PER_TURN)
+
+    def test_a_budget_beyond_the_old_invisible_ceiling_is_honored(self):
+        """v1.9.7：媒体表没有第二道隐形上限（原来那个 64 是我们自己拍的）。
+
+        现场读法：用户把「每回合图片数上限」调到 100，媒体表却只给 64 个位置，
+        **没有任何一处会说这件事**——债落在一张静默变短的表上。反向：把
+        `FORWARD_MEDIA_TURN_CAP_MAX` 改回 64 → 本条红。
+        """
+        self.assertIsNone(FORWARD_MEDIA_TURN_CAP_MAX, '本项的上界已经撤掉')
+        self.assertEqual(forward_media_turn_cap(100), 100)
+        self.assertEqual(forward_media_turn_cap(100, {'maxImages': 100}), 100)
+        # 下限照旧：0 / 脏值不会把表压到 6 以下（下面那道闸自己在算）。
+        self.assertEqual(forward_media_turn_cap(0), FORWARD_MEDIA_MAX_PER_TURN)
 
     def test_a_raised_card_cap_is_not_shadowed_by_the_turn_cap(self):
         """反向：单卡读到多少张，就该有多少条进媒体表（一道闸不许遮蔽另一道）。"""

@@ -2426,7 +2426,9 @@ class AstrbotTransport:
 
     async def send_image(self, channel_id: str, file_path: str, is_group: bool = False) -> dict[str, Any]:
         """发送本地图片。上游 `:2076`。"""
-        umo = self.bridge.group_umo(channel_id) if is_group else self.bridge.channel_umo(channel_id)
+        # 会话类型由调用方给（`chunk2.send_sticker` 传的是 `bool(group_id)`），
+        # UMO 的拼法只在 `channel_umo()` 一处判（私聊回合落 `GroupMessage` 会被平台拒收）。
+        umo = self.bridge.channel_umo(channel_id, is_group)
         if not umo:
             log_fallback('debug', '图片发送跳过：无法解析会话 频道=%s', channel_id)
             return {'ok': False, 'error': 'no-session-target'}
@@ -2447,7 +2449,7 @@ class AstrbotTransport:
         平台不是 OneBot 家族时按移植约定 降级：返回
         `{'ok': False}`，调用方走既有的"投递失败"分支。
         """
-        umo = self.bridge.group_umo(channel_id) if is_group else self.bridge.channel_umo(channel_id)
+        umo = self.bridge.channel_umo(channel_id, is_group)
         if not umo:
             return {'ok': False, 'error': 'no-session-target'}
         if not self.bridge.is_onebot_umo(umo):
@@ -3774,7 +3776,20 @@ class AstrbotHttpClient:
     没有可用的 AstrBot Provider 时（或不是 chat/embedding 请求）回落到
     `HttpxHttpClient`：这样在 `model_center.providers` 里直接填 endpoint/key
     的旧配置也仍然可用。流式（`iterate_sse`）本版本不接管，一律回落。
+
+    **宿主的硬边界：采样参数到不了请求**（v1.9.7）。AstrBot 的
+    `llm_generate(**kwargs)` 把额外参数一路转给 Provider 的 `text_chat(**kwargs)`，
+    而**内置 Provider 实现把它们丢掉**——4.28 与本机新版都只看
+    `openai_source._prepare_chat_payload`：payloads 里只有 `messages` / `model`，
+    `temperature` / `top_p` / `max_tokens` 连请求体都进不去（`_query` 只遍历
+    payloads 的键，kwargs 从来没进过 payloads）。也就是说：**走 AstrBot 模型这条路时，
+    「主叙事最大输出 token」之类的插件参数一律不生效**，模型按自己在 AstrBot 里的
+    配置生成。这是宿主边界，插件改不了，所以必须**说出来**（坑 25：丢内容要可见），
+    不能默默按别的值发。
     """
+
+    #: 「插件采样参数被宿主丢掉」这件事的告警节流键（task + provider，避免每轮刷屏）。
+    _SAMPLING_PARAM_KEYS: tuple[str, ...] = ('temperature', 'top_p', 'max_tokens')
 
     #: 任务名 → AstrBot Provider 的解析策略都相同；保留参数是为了日志可读。
     def __init__(self, bridge: 'AstrbotBridge', fallback: Any = None) -> None:
@@ -3782,10 +3797,42 @@ class AstrbotHttpClient:
         self._fallback = fallback if fallback is not None else HttpxHttpClient()
         #: 已经警告过的「模态不匹配」(provider_id, 需要的模态)，避免每轮刷屏
         self._modality_warned: set[tuple[str, tuple[str, ...]]] = set()
+        #: 已经警告过的「宿主不吃采样参数」(task, provider_id)，同原因只说一次。
+        self._sampling_param_warned: set[tuple[str, str]] = set()
 
     @property
     def context(self) -> Context:
         return self.bridge.context
+
+    def note_sampling_params_ignored(self, task: Optional[str], provider_id: str, params: Any) -> None:
+        """插件设了采样参数、但这一趟走 AstrBot 模型 → 明说它们不生效（节流）。
+
+        只在**真的设了**这几项时说话（`payload` 里没有就是没设，无话可说）。
+        带上**实际值**：这句要能对上"我在界面上填的是 1234"，而不是一句空口。
+        """
+        if not isinstance(params, dict):
+            return
+        present = [key for key in self._SAMPLING_PARAM_KEYS if params.get(key) is not None]
+        if not present:
+            return
+        # 惰性建表：本类有绕过 `__init__` 直接装配的调用方（测试夹具 / 老装配路径），
+        # 不能假设 `__init__` 一定跑过。
+        warned = getattr(self, '_sampling_param_warned', None)
+        if warned is None:
+            warned = set()
+            self._sampling_param_warned = warned
+        marker = (task or '', provider_id or '')
+        if marker in warned:
+            return
+        warned.add(marker)
+        log_fallback(
+            'warn',
+            'AstrBot 模型（%s）这一趟不带插件里的 %s：宿主发请求时不吃这些参数（当前请求里是 %s），'
+            '由服务端按默认值生成。要按这些数值发，请在「模型连接」里给它填直连 endpoint。',
+            provider_id or '(未解析)',
+            ' / '.join(present),
+            ' / '.join('%s=%s' % (key, params[key]) for key in present),
+        )
 
     async def post_json(
         self,
@@ -3993,6 +4040,8 @@ class AstrbotHttpClient:
             params['image_urls'] = image_urls
         if audio_urls:
             params['audio_urls'] = audio_urls
+        # 采样参数这一趟到不了请求（见类注释）——**明说**，别让用户以为改了没反应。
+        self.note_sampling_params_ignored(task, provider_id, params)
         try:
             response = await self.context.llm_generate(
                 chat_provider_id=provider_id,
@@ -4002,6 +4051,14 @@ class AstrbotHttpClient:
             )
         except TypeError:
             # 某些 Provider 不接受采样参数 / 多模态参数：去掉后重试一次。
+            # **降级必须可见**（坑 25）：这一趟丢掉的不只是采样参数，还有图片 / 语音，
+            # 悄悄重试等于"看起来发了、模型根本没看到图"。
+            dropped = sorted(params)
+            log_fallback(
+                'warn',
+                'AstrBot 模型不接受这些参数：%s；已去掉它们重发一次（本条回合的图片 / 语音若在列表里，模型看不到）。',
+                ' / '.join(dropped) or '(空)',
+            )
             try:
                 response = await self.context.llm_generate(
                     chat_provider_id=provider_id,
@@ -4020,7 +4077,14 @@ class AstrbotHttpClient:
             'id': 'astrbot-%s' % provider_id,
             'object': 'chat.completion',
             'model': provider_id,
-            'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': text}, 'finish_reason': 'stop'}],
+            'choices': [{
+                'index': 0,
+                'message': {'role': 'assistant', 'content': text},
+                # 宿主给的停止原因**原样带出来**（v1.9.7）：这里原先恒写 `'stop'`，
+                # 于是模型被输出上限截断时 core 一点线索都没有，只能看见"无效 JSON"。
+                # 拿不到就照旧 `'stop'`（不猜）。
+                'finish_reason': _host_finish_reason(response),
+            }],
             'usage': _openai_usage(usage),
         }
 
@@ -4232,6 +4296,28 @@ def routing_row_provider_id(row: Any) -> str:
         return ''
     return target[len(ROUTING_TARGET_PREFIX):].strip()
 
+
+
+def _host_finish_reason(response: Any) -> str:
+    """宿主 `LLMResponse` 的停止原因 → OpenAI 形状的 `finish_reason`（拿不到回 `'stop'`）。
+
+    三处形状都认：OpenAI 兼容在 `raw_completion.choices[0].finish_reason`，Gemini 在
+    `raw_completion.candidates[0].finish_reason`，对象也可能是普通 dict。**只在取到
+    字符串时**用它——`'stop'` 是"没有线索"的旧口径，保持老行为。
+    """
+    raw = getattr(response, 'raw_completion', None)
+    for key in ('choices', 'candidates'):
+        items = getattr(raw, key, None)
+        if items is None and isinstance(raw, dict):
+            items = raw.get(key)
+        first = items[0] if isinstance(items, (list, tuple)) and items else None
+        for field in ('finish_reason', 'finishReason'):
+            value = getattr(first, field, None)
+            if value is None and isinstance(first, dict):
+                value = first.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return 'stop'
 
 
 def _audio_data_uri(audio: dict[str, Any]) -> str:
@@ -5639,8 +5725,12 @@ class AstrbotBridge:
                 ids.append(instance_id)
         return ids
 
-    def _sole_platform_id(self) -> str:
-        """群聊用：只有唯一平台时给出它的实例 id，多个候选一律不猜。"""
+    def _sole_platform_id(self, kind: str = '群聊', scope_word: str = '这个群') -> str:
+        """只有一个平台时给出它的实例 id，多个候选一律不猜。
+
+        `kind` / `scope_word` 只影响那条 warn 的措辞（私聊兜底传「私聊 / 这个会话」），
+        默认值与历史文案逐字一致。
+        """
         known = [value for value in self._platform_ids.values() if value]
         known += [value for value in self._saved_platform_ids.values() if value]
         unique = list(dict.fromkeys(known))
@@ -5654,9 +5744,9 @@ class AstrbotBridge:
         if len(host_ids) > 1:
             log_fallback(
                 'warn',
-                '宿主机上有多个平台实例（%s），群聊投递无法确定用哪一个；'
-                '等这个群收到一条消息后会自动登记',
-                '、'.join(host_ids),
+                '宿主机上有多个平台实例（%s），%s投递无法确定用哪一个；'
+                '等%s收到一条消息后会自动登记',
+                '、'.join(host_ids), kind, scope_word,
             )
         return ''
 
@@ -5687,15 +5777,46 @@ class AstrbotBridge:
             return ''
         return '%s:GroupMessage:%s' % (platform_id, channel)
 
-    def channel_umo(self, channel_id: str) -> str:
-        """按会话 id 猜 UMO（私聊与群聊都试一遍）。"""
-        return self.group_umo(channel_id) or self.private_umo_for_scope(channel_id)
+    def channel_umo(self, channel_id: str, is_group: Optional[bool] = None) -> str:
+        """按**真实会话类型**拼某个会话 id 的 UMO。
+
+        判据只有这一处（`is_group`），别再"先群后私"地猜：私聊回合的 `channelId` 就是
+        用户号，`group_umo()` 会在没登记群端点时拿唯一平台实例把它拼成 `GroupMessage`，
+        平台直接拒收（真机 `retcode 1200 rich media transfer failed`）——表情包/图片
+        一条都没发出去，剧本却写着"发出去"。
+
+        * `is_group=True` → 群 UMO；
+        * `is_group=False` → 私聊 UMO（登记过的坐标优先，其次按唯一平台实例补齐）；
+        * 不给（`None`）→ 只在**登记过**的会话里找（群 → 私）；两处都没有就回空串，
+          调用方按"没有投递目标"降级，绝不凭空造一个类型不对的会话。
+        """
+        channel = _text(channel_id)
+        if is_group is True:
+            return self.group_umo(channel)
+        if is_group is False:
+            return self.private_umo_for_scope(channel) or self.private_umo_from_host(channel)
+        # 类型未知（只为兼容不传 `is_group` 的老调用）：只在登记过的会话里找。
+        known_group = channel in self._group_endpoints or channel in self._saved_group_umos
+        return self.group_umo(channel) if known_group else self.private_umo_for_scope(channel)
 
     def private_umo_for_scope(self, scope: str) -> str:
+        """按用户号找**登记过**的私聊 UMO（运行期坐标），找不到回空串。"""
         for endpoint in self._private_endpoints.values():
-            if endpoint.user_id == scope:
+            if endpoint.user_id == _text(scope):
                 return endpoint.build_umo()
         return ''
+
+    def private_umo_from_host(self, user_id: str) -> str:
+        """只知道用户号时的私聊兜底：`<唯一平台实例>:FriendMessage:<用户号>`。
+
+        与 `group_umo()` 的兜底同一纪律：**拿不到唯一平台实例就回空串**，绝不猜第二段
+        （平台实例 id 猜错的后果是整条消息静默失败，见 `DeliveryCoordinateTests`）。
+        """
+        user = _text(user_id)
+        platform_id = self._sole_platform_id('私聊', '这个会话')
+        if not platform_id or not user:
+            return ''
+        return '%s:FriendMessage:%s' % (platform_id, user)
 
     def session_umo(self, session: Any) -> str:
         """从一个 `SessionView` / dict / 原始事件解析 UMO。"""

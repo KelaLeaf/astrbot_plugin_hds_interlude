@@ -383,6 +383,9 @@ export interface ConfigGroup {
   /** 短标题（schema 的 `title`）：下拉与卡片标题。 */
   title: string
   description: string
+  /** 分组级状态词（目前只有「模型中心」：视频理解的 FFmpeg 状态，如 `✅ FFmpeg 已识别`）。
+   *  空串＝这个分组没有状态可报。**只显示状态词，不附解释**。 */
+  status?: string
   invisible: boolean
   fields: ConfigField[]
 }

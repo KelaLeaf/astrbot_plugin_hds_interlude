@@ -1708,7 +1708,14 @@ class GroupStickerCollectionTests(ServiceHarness):
 
     @needs('receive_group', 'collect_incoming_stickers')
     async def test_rejected_groups_never_collect(self) -> None:
-        """白名单外的群 / 关掉的群 / `mention-only` 里没 @ 的消息：零任务、零入库、零下载。"""
+        """白名单外的群 / 关掉的群 / `mention-only` 里没 @ 的**纯文本**消息：
+        零任务、零入库、零下载。
+
+        ⚠️ 1.0.1-rc31 起这一条只对**纯文本**成立：没 @ 机器人、但**带了图片**的群消息
+        现在是"历史视觉证据"——它会落库（`metadata.groupImageRefs`）却不触发主叙事。
+        那条新语义由 `test_group_historical_images.py` 单独钉住；这里把第三种情况收窄成
+        纯文本，免得"A 消息没被拒绝"和"B 消息不该收藏"两件事混在一条断言里。
+        """
         sticker_content = STICKER_TAG
         cases: list[tuple[str, dict[str, Any], Any]] = [
             (
@@ -1727,9 +1734,9 @@ class GroupStickerCollectionTests(ServiceHarness):
                 group_session(content=sticker_content, media=[STICKER_MEDIA]),
             ),
             (
-                'mention-only 且这条没 @ 机器人',
+                'mention-only 且这条纯文本没 @ 机器人',
                 onebot_config(onebot={'groupChats': [group_rule_stub(responseMode='mention-only')]}),
-                group_session(content=sticker_content, media=[STICKER_MEDIA]),
+                group_session(content='群里随便聊一句'),
             ),
         ]
         self.make_story()
@@ -1995,6 +2002,10 @@ class ReceiveTests(ServiceHarness):
         metadata = self.rows('interlude_script_entry')[0]['metadata']
         self.assertEqual(metadata['imageCount'], 1)
         self.assertEqual(metadata['audioCount'], 1)
+        # 反向（1.0.1-rc31）：私聊图片**永远**不进群聊那本历史账 —— 不写引用表、
+        # 不写群图计数，也不带群聊的当前图来源（`imageSources` 只活在群回合的内存批次里）。
+        self.assertNotIn('groupImageRefs', metadata)
+        self.assertNotIn('imageSources', metadata)
         self.assertIn('当前事件包含图片附件', self.sink.text())
         self.assertIn('当前事件包含语音附件', self.sink.text())
 
@@ -3587,12 +3598,14 @@ class UpstreamBehaviourPortTests(ServiceHarness):
         }
         captured: dict[str, Any] = {}
 
-        async def messages(story_id: str, group_id: str, limit: int) -> list[dict[str, Any]]:
-            return [{
+        async def messages(story_id: str, group_id: str, limit: int) -> dict[str, Any]:
+            # 1.0.1-rc31：`flush_group_turn` 走的是上游那个**完整快照**
+            # （`{messages, imageRefs}`），可见上下文与历史图片引用来自同一次读取。
+            return {'messages': [{
                 'sender_id': '200', 'sender_name': '成员', 'speaker': '群成员「成员」（QQ：200）',
                 'message_ref': 'msg-7', 'message_id': '-12345', 'content': '这条消息可以被操作',
                 'occurred_at': STORY_TIME, 'direction': 'user',
-            }]
+            }], 'imageRefs': []}
 
         def capabilities(_session: Any, seen_messages: Any) -> dict[str, Any]:
             captured['messages'] = seen_messages
@@ -3629,7 +3642,7 @@ class UpstreamBehaviourPortTests(ServiceHarness):
             sent['args'] = args
             return {'deliveredSegments': [], 'complete': False, 'segmentOutcomes': []}
 
-        service.group_messages = messages
+        service.group_messages_snapshot = messages
         service.group_chat_capabilities = capabilities
         service.try_decide = decide
         service.persist_decision = persist

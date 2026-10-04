@@ -138,6 +138,7 @@ from .helpers import (
     normalize_allowed_reactions,
     normalize_expression_threshold,
     normalize_quoted_message_context,
+    normalize_stored_group_image_ref,
     parse_sticker_auto_group,
     parse_sticker_group_choice,
     parse_sticker_selection_receipt,
@@ -502,6 +503,16 @@ def _now_ms(owner: Any) -> int:
     return dt_ms(utc_now())
 
 
+def _coerce_int(value: Any) -> int:
+    """落库的 `ordinal` / 条目 id → int（脏值算 0，与上游 `Number(raw.ordinal) || 0` 同）。"""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _message_characters(runtime: Any) -> int:
     """上游 `normalizeVisibleMessageContent(text, this.config.runtime.maxMessageCharacters, ...)`。
 
@@ -549,10 +560,31 @@ class ServiceChunk2(ServiceBase):
     # ------------------------------------------------------------------ #
 
     async def group_messages(self, story_id: str, group_id: str, limit: int) -> list[dict[str, Any]]:
-        """上游 `groupMessages(storyId, groupId, limit)`（`src/service.ts:1929`）。
+        """上游 `groupMessages(storyId, groupId, limit)`（`src/service.ts:1929`）的消息那一半。
 
         从最近 8×limit 条剧本条目里筛出该群的消息，取最新 `limit` 条后**反转**
         成时间正序（`GroupMessageContext` 的内部 snake_case 形状）。
+        图片引用那一半（1.0.1-rc31）在 `group_messages_snapshot`，这里只是它的投影。
+        """
+        snapshot = await self.group_messages_snapshot(story_id, group_id, limit)
+        return snapshot['messages']
+
+    async def group_messages_snapshot(self, story_id: str, group_id: str, limit: int) -> dict[str, Any]:
+        """上游 `groupMessages(storyId, groupId, limit)` 的完整产物（`src/service.ts:1929`）。
+
+        返回 `{'messages': [...], 'imageRefs': [...]}` —— 上游 `GroupMessagesSnapshot`
+        的逐字形状（本移植版内部键 snake_case，wire 折叠发生在调用点，见
+        `chunk1._group_context_messages`）。
+
+        `imageRefs` 是 1.0.1-rc31 的群聊历史图片证据：从**同一群**的
+        `group-message` / `character-group-message` 条目里，逐条读
+        `metadata.groupImageRefs`（只认 `actor='user'` 的真实群消息，避免把主角自己
+        发的图或别的群的图当成历史证据）。逐条仍按上游口径再校验一遍（非空、
+        不是 `data:image/…`、不超 8 MiB、`sourceType` 只能是 `file` / `url`），
+        然后按**新到旧**排序：`occurredAt` → 条目 id → `ordinal`。
+
+        扫描用的是**与可见上下文同一批行**（同一次 `db_get`、同一个群过滤），
+        所以"上下文里看得见的图"和"能回流的图"不会来自两份互相漂移的判据。
         """
         bounded = max(1, int(limit))
         rows = await self.db_get(
@@ -560,7 +592,7 @@ class ServiceChunk2(ServiceBase):
             {'limit': max(20, min(200, bounded * 8)), 'sort': {'occurredAt': 'desc'}},
         )
         wanted_group = normalize_group_id(group_id)
-        selected: list[dict[str, Any]] = []
+        group_rows: list[dict[str, Any]] = []
         for entry in rows:
             if not isinstance(entry, dict):
                 continue
@@ -570,8 +602,8 @@ class ServiceChunk2(ServiceBase):
             raw_group = pick(metadata, 'groupId', 'group_id')
             if normalize_group_id(str(raw_group if raw_group is not None else '')) != wanted_group:
                 continue
-            selected.append(entry)
-        selected = selected[:bounded]
+            group_rows.append(entry)
+        selected = group_rows[:bounded]
         selected.reverse()
 
         messages: list[dict[str, Any]] = []
@@ -604,7 +636,46 @@ class ServiceChunk2(ServiceBase):
             message['occurred_at'] = entry.get('occurredAt')
             message['direction'] = 'character' if actor == 'character' else 'user'
             messages.append(message)
-        return messages
+
+        # 历史图片引用（1.0.1-rc31）：按**新到旧**排序交给选择器，由它决定取最后 N 张。
+        # 校验复用**写库那一套**（`helpers.normalize_stored_group_image_ref`）：
+        # 判据只有一处，老库 / 手改过的 metadata 在这里被同一套规则收一遍。
+        image_refs: list[dict[str, Any]] = []
+        for entry in group_rows:
+            if entry.get('actor') != 'user':
+                continue
+            metadata = entry.get('metadata') if isinstance(entry.get('metadata'), dict) else {}
+            raw_refs = pick(metadata, 'groupImageRefs', 'group_image_refs')
+            if not isinstance(raw_refs, list):
+                continue
+            sender_id = str(pick(metadata, 'senderId', 'sender_id') or 'unknown')
+            sender_name = str(pick(metadata, 'senderName', 'sender_name') or sender_id)
+            message_id = targetable_message_id(pick(metadata, 'messageId', 'message_id'))
+            for raw in raw_refs:
+                ref_value = normalize_stored_group_image_ref(raw)
+                if ref_value is None:
+                    continue
+                ref: dict[str, Any] = {
+                    'source': ref_value['source'],
+                    'ordinal': _coerce_int(ref_value['ordinal']),
+                    'source_type': ref_value['sourceType'],
+                    'source_entry_id': entry.get('id'),
+                    'sender_id': sender_id,
+                    'sender_name': sender_name,
+                    'occurred_at': entry.get('occurredAt'),
+                }
+                if message_id:
+                    ref['message_id'] = message_id
+                image_refs.append(ref)
+        image_refs.sort(
+            key=lambda ref: (
+                dt_ms(pick(ref, 'occurred_at')),
+                _coerce_int(pick(ref, 'source_entry_id')),
+                _coerce_int(pick(ref, 'ordinal')),
+            ),
+            reverse=True,
+        )
+        return {'messages': messages, 'imageRefs': image_refs}
 
     async def group_cooldown_active(self, story_id: str, group_id: str, cooldown_seconds: float) -> bool:
         """上游 `groupCooldownActive(...)`（`src/service.ts:1953`）。
@@ -794,14 +865,18 @@ class ServiceChunk2(ServiceBase):
                     completed += 1
                     self.report(
                         'warn', story, 'user-message',
+                        # **拆成多个实参**（不许把元组当单个实参）：`report()` 的格式串
+                        # 走 Node `util.format` 语义，占位符多于参数时原样残留——早先这里
+                        # 只发出一个元组，第一个 `%s` 吃下整个元组、后面的 `%s` 就留在
+                        # 日志里（见 `docs/PORTING_NOTES.md` §81.5 / §84）。
                         '聊天动作已完成但结果记录不完整 类型=消息表情 群=%s 目标=%s 错误=%s',
-                        (group_id, pick(reaction, 'messageRef', 'message_ref'), error),
+                        group_id, pick(reaction, 'messageRef', 'message_ref'), clip(str(error), 200),
                     )
                 else:
                     self.report(
                         'warn', story, 'user-message',
                         '聊天动作失败 类型=消息表情 群=%s 目标=%s 错误=%s',
-                        (group_id, pick(reaction, 'messageRef', 'message_ref'), error),
+                        group_id, pick(reaction, 'messageRef', 'message_ref'), clip(str(error), 200),
                     )
         return completed
 
@@ -959,13 +1034,13 @@ class ServiceChunk2(ServiceBase):
                 self.report(
                     'warn', story, 'user-message',
                     '聊天动作已完成但结果记录不完整 类型=本地表情包 素材=%s 错误=%s',
-                    (pick(asset, 'assetId', 'asset_id'), error),
+                    pick(asset, 'assetId', 'asset_id'), clip(str(error), 200),
                 )
                 return True
             self.report(
                 'warn', story, 'user-message',
                 '聊天动作失败 类型=本地表情包 素材=%s 错误=%s',
-                (pick(asset, 'assetId', 'asset_id'), error),
+                pick(asset, 'assetId', 'asset_id'), clip(str(error), 200),
             )
             return False
 
@@ -1034,12 +1109,12 @@ class ServiceChunk2(ServiceBase):
                 self.report(
                     'warn', story, 'user-message',
                     '聊天动作已完成但结果记录不完整 类型=原生表情 语义=%s 错误=%s',
-                    (semantic, error),
+                    semantic, clip(str(error), 200),
                 )
                 return True
             self.report(
                 'warn', story, 'user-message',
-                '聊天动作失败 类型=原生表情 语义=%s 错误=%s', (semantic, error),
+                '聊天动作失败 类型=原生表情 语义=%s 错误=%s', semantic, clip(str(error), 200),
             )
             return False
 
@@ -1065,7 +1140,7 @@ class ServiceChunk2(ServiceBase):
             self.report(
                 'warn', story, 'user-message',
                 '没有可用机器人账号投递群消息 群频道=%s 故事平台=%s 故事账号=%s',
-                (channel_id, pick(story, 'platform'), pick(story, 'selfId', 'self_id')),
+                channel_id, pick(story, 'platform'), pick(story, 'selfId', 'self_id'),
             )
             return {
                 'delivered_segments': [],
@@ -1102,7 +1177,7 @@ class ServiceChunk2(ServiceBase):
                 })
                 self.report(
                     'warn', story, 'user-message', '群消息投递失败 群频道=%s 错误=%s',
-                    (channel_id, error),
+                    channel_id, clip(str(error), 200),
                 )
         return {'delivered_segments': delivered_segments, 'complete': all_delivered, 'segment_outcomes': segment_outcomes}
 

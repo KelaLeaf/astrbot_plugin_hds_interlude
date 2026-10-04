@@ -33,7 +33,10 @@ from .adapters.astrbot_bridge import (
 )
 from .adapters.console_api import ConsoleApi
 from .core.health import format_health_lines
-from .core.video_understanding import apply_ffmpeg_status_hint, resolve_video_config
+from .core.video_understanding import (
+    apply_ffmpeg_status_hint_or_problem,
+    resolve_video_config,
+)
 
 __all__ = ['COMMANDS', 'COMMAND_HANDLERS', 'HDSInterludePlugin', 'MANAGEMENT_COMMANDS']
 
@@ -461,18 +464,25 @@ class HDSInterludePlugin(Star):
         #: 控制台（WebUI 插件页面）的取数入口；逻辑在 `adapters/console_api.py`。
         self._console = ConsoleApi(self.bridge)
         self._register_config_page_apis(context)
-        #: 视频抽帧识别的 FFmpeg 状态（v1.9.0）：同时写进**内存里的** schema，
-        #: 让配置页「识别模式」旁边显示「✅ FFmpeg 已识别 / ⚠️ 未发现 FFmpeg」
+        #: 视频抽帧识别的 FFmpeg 状态（v1.9.0）：写进**内存里的** schema，
+        #: 让配置页「识别模式」与「启用视频理解」旁边显示
+        #: 「✅ FFmpeg 已识别 / ⚠️ 未发现 FFmpeg」
         #: （文本标记：宿主的 hint 是纯文本渲染，着不了色，依据见那个模块的注释）。
         #: 宿主每打开一次配置页都现取 `config.schema` 这个活对象
-        #: （`astrbot/dashboard/services/config_service.py:866`），而
-        #: `AstrbotConfig.save_config()` 只写配置值、**schema 从不落盘**
+        #: （`astrbot/dashboard/services/config_service.py:853-872` 的
+        #: `"items": plugin_md.config.schema`），而 `AstrBotConfig.save_config()`
+        #: 只写配置值、**schema 从不落盘**
         #: （`astrbot/core/config/astrbot_config.py:262-272`）——所以仓库里的
         #: `_conf_schema.json` 一个字都不改。详见 `core/video_understanding.py`。
+        #: 「加载时写一次」在 AstrBot 4.28 上够用（已按宿主代码路径实测），但那是宿主的
+        #: **行为不是承诺**，所以凡是我们能拿到 schema 的时机都补一次
+        #: （`_refresh_ffmpeg_status_hint`）；写不进去会有一条可见的 warn。
         #: 拿不到 schema（测试 / 极旧宿主）时它只回一个状态串，不抛异常。
-        self.video_ffmpeg_status: str = apply_ffmpeg_status_hint(
-            getattr(self.config, 'schema', None),
-        )
+        self.video_ffmpeg_status: str
+        #: 上一次「写不进配置页提示」的原因：同一条只 warn 一次（节流，见下）。
+        self._ffmpeg_hint_problem: str = ''
+        #: 立刻写一次并记下状态串；后面凡能拿到 schema 的时机都会再补一次。
+        self.video_ffmpeg_status = self._refresh_ffmpeg_status_hint()
         #: 盲区模式（上游 `blindMode.enabled`，兼容旧键 `blackBox.enabled`）。
         self.blind_mode: bool = self.bridge.blind_mode_enabled
         #: 被摘除的管理命令方法名（盲区模式下非空）。
@@ -495,6 +505,39 @@ class HDSInterludePlugin(Star):
             )
         else:
             logger.info('hds-interlude：插件加载开始')
+
+    def _refresh_ffmpeg_status_hint(self, *, refresh: bool = False) -> str:
+        """把 FFmpeg 状态（重）写进宿主配置页那两处提示，并更新 `self.video_ffmpeg_status`。
+
+        ## 为什么不是"初始化时写一次就完"
+
+        那次写的是宿主**内存里**的 schema 对象。今天（AstrBot 4.28）它确实是配置页每次
+        打开现取的那个活对象——本地按宿主代码路径实测过：`ConfigDisplayService
+        .get_plugin_config()` 返回的 payload 里就是带状态的 hint（依据见
+        `docs/PORTING_NOTES.md` §53.5 / §82）——但这条链路是**宿主的行为，不是承诺**：
+        宿主哪次改成按 `_conf_schema.json` 重建 schema，一次性的内存改动就白做，
+        而用户那边看到的现象恰恰是"说好有状态提示，结果什么也没有"。
+        所以每个能拿到 schema 的时机（插件加载、控制台配置页每次打开）都补一次；
+        写的是同一份文本，重复写不叠罗汉（`core` 那边是幂等的）。
+
+        `refresh=True` 顺带重探一次 ffmpeg：用户装完不重启也该翻成 `✅`（"动态"得真动态）。
+
+        写不进去**必须可见**（坑 25：用户一定看得见的才算报告）：同一条原因只 warn 一次
+        （节流）——既不刷屏，也不再像 v1.9.0 那样静默。
+        """
+        label, problem = apply_ffmpeg_status_hint_or_problem(
+            getattr(self.config, 'schema', None), refresh=refresh,
+        )
+        self.video_ffmpeg_status = label
+        if not problem:
+            self._ffmpeg_hint_problem = ''
+        elif problem != self._ffmpeg_hint_problem:
+            self._ffmpeg_hint_problem = problem
+            logger.warning(
+                'hds-interlude：未能把 FFmpeg 状态写进宿主配置页提示：%s；'
+                '控制台「配置 → 模型中心 → 视频理解」里仍能看到同一个状态。' % problem
+            )
+        return label
 
     async def initialize(self) -> None:
         """AstrBot 的异步初始化钩子：起一个**延后的模型能力自检**。
@@ -741,6 +784,11 @@ class HDSInterludePlugin(Star):
     # ---- 控制台的配置页（schema 驱动） ---- #
 
     async def page_console_config(self):
+        # 每次打开控制台配置页都补一次状态（`_refresh_ffmpeg_status_hint`）：宿主那边
+        # 一次性的内存改动不是承诺，而且用户可能刚装上 ffmpeg（`refresh=True` 重探）。
+        # 控制台自己那份 payload 也会带同一个状态（见 `adapters/console_api.py`），
+        # 所以就算宿主这条路断了，用户在控制台里照样看得见。
+        self._refresh_ffmpeg_status_hint(refresh=True)
         return await self._console_json(lambda api, q: api.config_schema())
 
     async def page_console_config_set(self):

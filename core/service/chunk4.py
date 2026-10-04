@@ -596,6 +596,31 @@ def _route_background_reply(
     return updated, route
 
 
+def _browser_intent_drafts(raw: Any) -> list[Any]:
+    """读模型给的浏览意图草稿：`browserIntents`（数组）与 `browserIntent`（单个对象）都认。
+
+    **契约真相**（受控偏离，见 `docs/PORTING_NOTES.md` §79）：wire 上唯一被解析、落库、
+    注入下一回合 `webContext` 的名字是 **`browserIntents`（数组，最多一项）**。
+    提示词从上游 `narrator.ts:1750` 起一直写的是单数 `browserIntent`，模型照提示词吐
+    单个对象时 `_raw_decision(raw, 'browserIntents')` 读不到 → 意图被**静默丢弃** →
+    她永远"还在转"、结果永远回不到她手上。
+
+    两种拼写、两种形状都收（数组 / 单对象），统一成列表交给调用方；其余形状返回空列表
+    （不猜、不把脏值当意图）。调用方是本文件的三处：`_normalize_decision`、
+    `try_decide` 的即时浏览分支、`persist_decision` 的落库分支。
+    """
+    if not is_record(raw):
+        return []
+    value = pick(raw, 'browserIntents', 'browser_intents')
+    if value is None:
+        value = pick(raw, 'browserIntent', 'browser_intent')
+    if isinstance(value, list):
+        return value
+    if is_record(value):
+        return [value]
+    return []
+
+
 def _normalize_browser_intent_draft_loose(value: Any) -> Optional[dict[str, Any]]:
     """上游 `normalizeBrowserIntentDraftLoose`（`:7881`）。"""
     if not is_record(value) or value.get('mode') not in ('search', 'visit'):
@@ -756,11 +781,10 @@ def _normalize_decision(
             )})
     intents = intents[:8]
     intent_updates = _normalize_intent_updates(_raw_decision(raw, 'intentUpdates'))
-    browser_raw = _raw_decision(raw, 'browserIntents')
-    browser_intents = (
-        [item for item in (_normalize_browser_intent_draft_loose(value) for value in browser_raw) if item][:1]
-        if isinstance(browser_raw, list) else []
-    )
+    browser_raw = _browser_intent_drafts(raw)
+    browser_intents = [
+        item for item in (_normalize_browser_intent_draft_loose(value) for value in browser_raw) if item
+    ][:1]
     proactive = phase == 'advance'
     agency_gated_proactive = proactive and not is_record(_raw_decision(raw, 'proactiveContact'))
     cross_raw = _raw_decision(raw, 'crossConversationActions')
@@ -1175,6 +1199,7 @@ class ServiceChunk4(ServiceBase):
         on_early_reply: Any = None,
         attachments: Optional[list[dict[str, Any]]] = None,
         sticker_groups: Optional[list[dict[str, Any]]] = None,
+        historical_group_images: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """上游 `decide(story, participant, phase, from, now, ...)`（`:3437`）。
 
@@ -1187,6 +1212,11 @@ class ServiceChunk4(ServiceBase):
         （`[{groupId, name, description, count}]`，不列条目）——两级选择的第一段。
         与 `sticker_catalog` 互斥：给了分组目录就不平铺条目（那正是省 token 的地方）。
 
+        `historical_group_images` 同样追加在末尾（上游 1.0.1-rc31 的末位参数
+        `historicalGroupImages`，`service.ts:4217`）：群聊历史图片**证据**，与
+        `images`（当前回合的图）分开走 —— multipart 里它是低细节块，`currentEvent`
+        里单独计数（`historicalImageCount`）并带上来源元数据。
+
         主模型上下文的**唯一入口**。返回的 `NarrativeRequest` 是**发给模型的 wire
         format**：顶层与嵌套键全部保持上游 camelCase（见模块 docstring 第 3 条）。
         """
@@ -1198,6 +1228,7 @@ class ServiceChunk4(ServiceBase):
         quoted_messages = quoted_messages or []
         sticker_catalog = sticker_catalog or []
         sticker_groups = sticker_groups or []
+        historical_group_images = historical_group_images or []
         visual_observations = visual_observations or []
         # 上游 1.0.1-rc23/rc26：到点世界事件在**本回合开始前**排水注入，于是它们本回合
         # 就出现在 recentScript 里（先进账、后写作）。`low` 只在非 user-message 相位
@@ -1440,6 +1471,9 @@ class ServiceChunk4(ServiceBase):
             'userReportedTimes': user_reported_times,
             'images': images,
             'audio': audio,
+            # 1.0.1-rc31：群聊历史图片证据（短生命周期，只活在本回合的请求里；
+            # `dataUri` 只在发往视觉模型的 multipart 里出现，不进数据库 / 日志 / JSON payload）。
+            'historicalGroupImages': historical_group_images,
             'visualObservations': visual_observations,
             'attachments': attachments or [],
             'timelinePlan': timeline_plan,
@@ -1797,6 +1831,7 @@ class ServiceChunk4(ServiceBase):
         on_early_reply: Any = None,
         attachments: Optional[list[dict[str, Any]]] = None,
         sticker_groups: Optional[list[dict[str, Any]]] = None,
+        historical_group_images: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """上游 `tryDecide(...)`（`:3720`）。
 
@@ -1806,6 +1841,10 @@ class ServiceChunk4(ServiceBase):
 
         `sticker_groups`（末位追加，受控偏离 §48 甲）是两级选择第一段的分组目录，
         原样透传给 `decide()`（三次重写调用都要带上，否则重写那一遍会退回平铺目录）。
+
+        `historical_group_images`（1.0.1-rc31，上游末位参数）是群聊历史图片证据，
+        同样**三次重写调用都要带上**：重写那一遍丢了它，模型就会在第一遍看见旧图、
+        重写时突然看不见 —— 那是同一回合里的两份现实。
         """
         superseded_intents = superseded_intents or []
         images = images or []
@@ -1813,6 +1852,7 @@ class ServiceChunk4(ServiceBase):
         quoted_messages = quoted_messages or []
         sticker_catalog = sticker_catalog or []
         sticker_groups = sticker_groups or []
+        historical_group_images = historical_group_images or []
         visual_observations = visual_observations or []
         immediate_observations: list[dict[str, Any]] = []
         effective_now = now
@@ -1873,14 +1913,14 @@ class ServiceChunk4(ServiceBase):
                 superseded_intents, group_context, images, audio, [], False, chat_capabilities,
                 quoted_messages, sticker_catalog, turn_query_embedding, visual_observations,
                 timeline_plan, early_reply if can_early_reply else None, attachments,
-                sticker_groups,
+                sticker_groups, historical_group_images,
             )
             immediate = None
             if (
                 phase == 'user-message' and participant and not group_context
                 and _cfg(browser, 'enabled', False) and _cfg(browser, 'mode') == 'allow-immediate'
             ):
-                for raw_intent in (_raw_decision(decision, 'browserIntents') or []):
+                for raw_intent in _browser_intent_drafts(decision):
                     normalized = _normalize_browser_intent_draft(raw_intent, browser)
                     if normalized and normalized.get('timing') == 'immediate':
                         immediate = normalized
@@ -1899,7 +1939,7 @@ class ServiceChunk4(ServiceBase):
                     superseded_intents, group_context, images, audio, immediate_observations, False,
                     chat_capabilities, quoted_messages, sticker_catalog, turn_query_embedding,
                     visual_observations, timeline_plan, early_reply if can_early_reply else None,
-                    attachments, sticker_groups,
+                    attachments, sticker_groups, historical_group_images,
                 )
             # 用户自报的钟点（「八点赶到」）对守卫背书：模型复述它们不是时间越界。
             # 提取是 O(消息长度) 的本地正则，只在实况用户回合发生一次。
@@ -1956,7 +1996,7 @@ class ServiceChunk4(ServiceBase):
                     superseded_intents, group_context, images, audio, immediate_observations, True,
                     chat_capabilities, quoted_messages, sticker_catalog, turn_query_embedding,
                     visual_observations, timeline_plan, early_reply if can_early_reply else None,
-                    attachments, sticker_groups,
+                    attachments, sticker_groups, historical_group_images,
                 )
                 recovered_time_overflow = detect_live_script_time_overflow(
                     _raw_decision(decision, 'script'), phase, from_, effective_now, timezone, endorsed_clocks,
@@ -2232,7 +2272,7 @@ class ServiceChunk4(ServiceBase):
                 ),
             }, now, intent.get('participantId') or participant_id or '')
         resolved_follow_ups: set[int] = set()  # 只有确认投递才能结清。
-        for browser_intent in decision.get('browserIntents') or []:
+        for browser_intent in _browser_intent_drafts(decision):
             # 即时意图在启用时已由最终叙事回合之前处理。若它走到这里（模式被关、群回合、
             # 或连续第二次请求），安全地降级为延迟任务。
             if participant or phase != 'user-message' or _cfg(self.browser_config, 'allowGroupTriggeredResearch', False):

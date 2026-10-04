@@ -158,6 +158,12 @@ __all__ = [
     'format_group_speaker',
     'normalize_group_visible_reply',
     'visible_reply_mode',
+    # ---- 群聊历史图片证据（1.0.1-rc31）----
+    'DEFAULT_HISTORICAL_IMAGE_LIMIT',
+    'GROUP_IMAGE_REF_MAX_BYTES',
+    'GROUP_IMAGE_FILE_PREFIX',
+    'group_image_refs_for_storage',
+    'normalize_stored_group_image_ref',
     # ---- 决策结构判定 ----
     'has_required_narrative_script',
     'resolve_blind_mode_config',
@@ -1544,6 +1550,10 @@ def apply_sticker_follow_up_content(decision: Any, content: Any) -> bool:
     return False
 
 
+#: 自动收藏资产的命名空间词（`assetId` 里**恰好出现一次**，判据见 `collected_sticker_asset_id`）。
+STICKER_ASSET_NAMESPACE = 'sticker'
+
+
 def uploaded_sticker_asset_id(content_hash: Any) -> str:
     """上传素材的 `assetId`：`upload-<哈希前 16 位>`。
 
@@ -1581,15 +1591,26 @@ def verify_sticker_image_bytes(data: Any) -> str:
 
 
 def collected_sticker_asset_id(name: Any, content_hash: Any) -> str:
-    """自动收藏资产的 `assetId`：`sticker-<名字>--<哈希片段>`。
+    """自动收藏资产的 `assetId`：`sticker-<名字>-<哈希片段>`（名字为空时省掉那一段）。
 
     带 `sticker-` 前缀是为了让 id **自述来源**（控制台的 `source` 字段据此派生，
     不必给表加一列），也让自动资产与磁盘扫描出来的资产在日志里一眼可分。
     哈希片段让同内容永远得到同一个 id —— `assetId` 有唯一索引，撞了就是写失败。
+
+    **命名空间只出现一次**（这条判据只有这一处）：调用方传进来的"名字"往往就是
+    入站种类（`sticker` / `animated` / `market`），也可能本身就是一份旧 id。早先
+    直接把名字接在前缀后面，于是最常见的 `kind='sticker'` 落库成
+    `sticker-sticker-<hash>` —— 真机上模型把它原样抄回来，id 自述来源的用途反而成了噪音。
     """
     digest = re.sub(r'[^a-fA-F0-9]', '', _str(content_hash)).lower()[:16] or 'unhashed'
     stem = re.sub(r'[^a-zA-Z0-9_-]+', '-', _str(name).strip())[:80].strip('-') or 'inbound'
-    return ('sticker-%s-%s' % (stem, digest))[:255]
+    # 把名字里打头的命名空间词剥干净（`sticker` / `sticker-…` / 旧的双前缀 id 都算），
+    # 免得拼出 `sticker-sticker-…`。
+    while stem == STICKER_ASSET_NAMESPACE or stem.startswith(STICKER_ASSET_NAMESPACE + '-'):
+        stem = stem[len(STICKER_ASSET_NAMESPACE):].lstrip('-')
+    if not stem:
+        return ('%s-%s' % (STICKER_ASSET_NAMESPACE, digest))[:255]
+    return ('%s-%s-%s' % (STICKER_ASSET_NAMESPACE, stem, digest))[:255]
 
 
 # =========================================================================== #
@@ -2316,6 +2337,68 @@ def _normalize_group_interaction_reply(raw: Any, max_characters: int,
     return _normalize_visible_message_content(raw['reply'].get('content'), max_characters, separator)
 
 
+# =========================================================================== #
+# 群聊历史图片证据（上游 1.0.1-rc31）
+# =========================================================================== #
+
+#: 一次群聊主叙事默认回流几张历史图片（上游 `index.ts:444`
+#: `historicalImageLimit: Schema.natural().min(0).max(6).default(3)`）。**0 = 关闭**。
+#: ⚠️ 上界不在这边拍：上游那个 `max(6)` 与 `Math.min(6, …)` 按本项目 v1.9.7 的新规矩
+#: 撤掉，配多少读多少（见 `docs/PORTING_NOTES.md` §78）。
+DEFAULT_HISTORICAL_IMAGE_LIMIT = 3
+
+#: 单条历史图片引用的大小上限（逐字 = 上游 `groupImageRefsForStorage` 的 8 MiB）。
+GROUP_IMAGE_REF_MAX_BYTES = 8 * 1024 * 1024
+
+#: `onebot-file:` 前缀 = "这个坐标要去当前端点的 `getImage(file)` 回源"。
+#: 其余引用一律按 URL 处理（`sourceType: 'url'`），与上游同一判据。
+GROUP_IMAGE_FILE_PREFIX = 'onebot-file:'
+
+#: 内联图片**永不落库**：持久化层只存可重新获取的引用（URL / OneBot file），
+#: 不存 `data:image/…;base64,…` 这种回合级长度的二进制串。
+GROUP_IMAGE_DATA_URI_RE = re.compile(r'^data:image/', re.IGNORECASE)
+
+
+def group_image_refs_for_storage(sources: Any) -> list[dict[str, Any]]:
+    """上游 `groupImageRefsForStorage(sources)`（`src/service.ts:9780`）。
+
+    `[来源字符串]` → `[{'source', 'ordinal', 'sourceType'}]`（**camelCase**：这是写进
+    `interlude_script_entry.metadata` 的持久化形状，与既有群元数据同一拼写）。
+
+    跳过空值、`data:image/…` 与超过 8 MiB 的串；`sourceType` 只有两种 ——
+    `onebot-file:` 前缀算 `file`（回源时走当前端点的 `getImage(file)`），
+    其余算 `url`。
+    """
+    refs: list[dict[str, Any]] = []
+    for ordinal, source in enumerate(sources if isinstance(sources, (list, tuple)) else []):
+        value = _str(source).strip()
+        if not value or GROUP_IMAGE_DATA_URI_RE.match(value) or len(value) > GROUP_IMAGE_REF_MAX_BYTES:
+            continue
+        source_type = 'file' if value.startswith(GROUP_IMAGE_FILE_PREFIX) else 'url'
+        if source_type == 'file' and not value[len(GROUP_IMAGE_FILE_PREFIX):].strip():
+            continue
+        refs.append({'source': value, 'ordinal': ordinal, 'sourceType': source_type})
+    return refs
+
+
+def normalize_stored_group_image_ref(raw: Any) -> Optional[dict[str, Any]]:
+    """读一条落库的 `groupImageRefs` 项（上游 `groupMessages` 里的那段校验）。
+
+    与 `group_image_refs_for_storage` 是**同一条判据的两端**：写的时候按这一套过滤，
+    读的时候再按同一套收一遍（老库、手改过的 metadata、别的版本写下的行都可能不干净）。
+    不合规返回 `None`，由调用方跳过。键名双读（`sourceType` / `source_type`）。
+    """
+    if not isinstance(raw, dict):
+        return None
+    source = _str(raw.get('source')).strip()
+    if not source or GROUP_IMAGE_DATA_URI_RE.match(source) or len(source) > GROUP_IMAGE_REF_MAX_BYTES:
+        return None
+    source_type = raw.get('sourceType', raw.get('source_type'))
+    if source_type not in ('file', 'url'):
+        return None
+    return {'source': source, 'ordinal': raw.get('ordinal'), 'sourceType': source_type}
+
+
 #: 上游 `normalizeVisibleMessageContent` 的可见回复污染清除。
 _VISIBLE_SEP_RE = re.compile(r'[<＜]\s*sep\s*/?\s*[>＞]', re.IGNORECASE | re.UNICODE)
 _VISIBLE_TAG_RE = re.compile(
@@ -2395,17 +2478,45 @@ def _has_structured_group_reply_field(value: Any) -> bool:
     )
 
 
+#: `reply.mode` 的别名容错集（上游 1.0.1-rc15）：弱模型把 mode 写成这几个词。
+_REPLY_MODE_ALIASES = (None, 'text', 'send', 'reply', 'message')
+
+
+def coerce_reply_mode(mode: Any, has_content: bool) -> Optional[str]:
+    """把模型写的 `reply.mode` 归一到 `none|immediate|delayed`；认不出时返回 `None`。
+
+    **判据一处**（v1.2.9 的 `seen` 就是在这上面踩过一次）：`normalize_interaction`
+    （真正决定发不发）与 `_has_structured_interaction`（决定要不要抛弃草稿重写）
+    必须共用同一套宽容——两边各写一份，就会出现"归一化之后完全合法的回复被判定成
+    结构化可见回复缺失、白重写一次"。见 `docs/PORTING_NOTES.md` §79。
+    """
+    if not isinstance(mode, str):
+        mode = None
+    if mode in ('none', 'immediate', 'delayed'):
+        return mode
+    # 带了内容 + 别名（含缺键）→ 按 immediate 处理；缺键且无内容才是真的沉默。
+    if has_content and mode in _REPLY_MODE_ALIASES:
+        return 'immediate'
+    if mode is None:
+        return 'none'
+    return None
+
+
 def _has_structured_interaction(value: Any) -> bool:
-    # `seen` 与 `normalize_interaction` 保持一致地宽容：这是恢复检查（读的是**归一化
-    # 之前**的 decision），漏 seen 的 DeepSeek V4.1 回复如果在这里被否掉，就会白烧一次
-    # 重写。见 `PORTING_NOTES.md` 的 rc28 条目。
+    # 这是恢复判定，读的是**归一化之前**的 decision：只要 `normalize_interaction`
+    # 之后会产出一条可见回复，这里就必须判 True，否则一个合法回复会被白扔、整篇重写
+    # （`seen` 的宽容见 PORTING_NOTES 的 rc28 条目；`mode` 的宽容见 §79）。
     if not is_record(value) or not is_record(value.get('reply')):
         return False
-    if value.get('seen') is not None and not isinstance(value.get('seen'), bool):
-        return False
     reply = value['reply']
-    mode = reply.get('mode')
-    if mode not in ('none', 'immediate', 'delayed'):
+    content = reply.get('content')
+    # `seen` 只是"读没读到这条消息"的信息性字段，`normalize_interaction` 对它的类型
+    # 一律宽恕（缺省/字符串/数字都按已读处理），判定也必须一样。
+    # `mode` 走 `coerce_reply_mode`（与 `normalize_interaction` 同一份容错）：
+    # 模型把 immediate 写成 text/send/reply/message 时，归一化会照常发出这条回复，
+    # 判定却在这里把它当成"缺失"→ 整篇白重写。
+    mode = coerce_reply_mode(reply.get('mode'), isinstance(content, str) and bool(content.strip()))
+    if mode is None:
         return False
     if mode == 'none':
         # `mode:'none'` 有两种来源：模型真的决定不回（正常），以及**声明了 immediate 但
@@ -2416,7 +2527,7 @@ def _has_structured_interaction(value: Any) -> bool:
         return not reply.get('unresolved_action_id')
     if reply.get('unresolved_action_id'):
         return False
-    if not isinstance(reply.get('content'), str) or not reply['content'].strip():
+    if not isinstance(content, str) or not content.strip():
         return False
     if mode == 'immediate':
         return True
@@ -2756,22 +2867,17 @@ def normalize_interaction(value: Any, now: datetime, runtime: dict[str, Any]) ->
     if not is_record(value) or not is_record(value.get('reply')):
         return None
     reply = value['reply']
-    mode = reply.get('mode')
-    if not isinstance(mode, str):
-        mode = None
     raw_content = reply.get('content')
     # 上游 1.0.1-rc15：`mode` 的宽容归一。弱模型（Gemini Flash 等）常把 mode 写成
     # text/send/reply/message；只要带了 content 就按 immediate 处理，整条丢掉等于
     # 白扔一条有效回复。缺失 mode 且没有 content 才算 none；其它任何词、或者
     # 缺 mode 却带 content 之外的情形，才丢整条。
-    if mode not in ('none', 'immediate', 'delayed'):
-        has_content = isinstance(raw_content, str) and bool(raw_content.strip())
-        if has_content and mode in (None, 'text', 'send', 'reply', 'message'):
-            mode = 'immediate'
-        elif mode is None and not has_content:
-            mode = 'none'
-        else:
-            return None
+    # 容错本身抽到 `coerce_reply_mode`：恢复判定 `_has_structured_interaction` 读的是
+    # **归一化之前**的 decision，两边必须是同一套（判据一处，见 §79）。
+    has_content = isinstance(raw_content, str) and bool(raw_content.strip())
+    mode = coerce_reply_mode(reply.get('mode'), has_content)
+    if mode is None:
+        return None
     content = (
         _normalize_visible_message_content(
             reply.get('content'),

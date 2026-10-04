@@ -544,6 +544,47 @@ class StickerVisionHelperTests(unittest.TestCase):
         self.assertRegex(h.stable_sticker_asset_id('bq (6).png', hash_a), r'aaaaaaaaaaaaaaaa$')
 
 
+class CollectedStickerAssetIdTests(unittest.TestCase):
+    """自动收藏的 `assetId`：命名空间**恰好出现一次**（真机 `sticker-sticker-<hash>`）。
+
+    现场：模型把表情库里那条 id 原样抄回来
+    （`localMedia={"assetId":"sticker-sticker-c5ad6fc27d316504"}`），于是库里那行
+    自述来源的前缀成了噪音，模型照着抄也更容易自己"顺手修一下"拼写而对不上候选表。
+
+    生成点只有 `helpers.collected_sticker_asset_id()` 一处，而调用方（`chunk2`）传进来的
+    "名字"是入站**种类** `sticker` / `animated` / `market` —— 种类恰好等于命名空间词的那种
+    情况下，旧写法把 `sticker-` 拼了两次。
+    """
+
+    HASH = 'c5ad6fc27d316504aabbccddeeff00112233445566778899aabbccddeeff0011'
+
+    def test_the_namespace_appears_exactly_once(self):
+        self.assertEqual(h.collected_sticker_asset_id('sticker', self.HASH),
+                         'sticker-c5ad6fc27d316504')
+        self.assertEqual(h.collected_sticker_asset_id('animated', self.HASH),
+                         'sticker-animated-c5ad6fc27d316504')
+        self.assertEqual(h.collected_sticker_asset_id('market', self.HASH),
+                         'sticker-market-c5ad6fc27d316504')
+        # 反向：任何一个入参都不许拼出第二个命名空间词（改回"直接接前缀"这条立刻红）。
+        for name in ('sticker', 'animated', 'market', 'sticker-sticker', 'sticker-collected', '', None):
+            asset_id = h.collected_sticker_asset_id(name, self.HASH)
+            with self.subTest(name=name):
+                self.assertTrue(asset_id.startswith(h.STICKER_ASSET_NAMESPACE + '-'), asset_id)
+                self.assertEqual(asset_id.count(h.STICKER_ASSET_NAMESPACE), 1, asset_id)
+                self.assertNotIn('sticker-sticker', asset_id)
+
+    def test_hash_tail_and_sanitizing_are_unchanged(self):
+        """老口径里与命名空间无关的部分逐字不变（哈希尾巴、非法字符、去重稳定性）。"""
+        self.assertTrue(h.collected_sticker_asset_id('sticker', self.HASH).endswith('c5ad6fc27d316504'))
+        # 拿不到哈希时照旧有 `unhashed` 兜底；名字为空照旧有 `inbound` 兜底。
+        self.assertEqual(h.collected_sticker_asset_id('sticker', ''), 'sticker-unhashed')
+        self.assertEqual(h.collected_sticker_asset_id('', self.HASH), 'sticker-inbound-c5ad6fc27d316504')
+        self.assertEqual(h.collected_sticker_asset_id('a b/c', self.HASH),
+                         'sticker-a-b-c-c5ad6fc27d316504')
+        self.assertEqual(h.collected_sticker_asset_id('sticker', self.HASH),
+                         h.collected_sticker_asset_id('sticker', self.HASH))
+
+
 class StickerGuessHelperTests(unittest.TestCase):
     """第二层判据的纯函数（本移植版新增，受控偏离 `§45.7`）。
 

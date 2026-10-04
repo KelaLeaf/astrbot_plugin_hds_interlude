@@ -13,7 +13,9 @@
 4. sqlite3 类型映射（`unsigned`→INTEGER / `double`→REAL / `timestamp`/`json`→TEXT）；
 5. 自增主键、JSON 列往返、时间列往返（datetime → 库内 ISO 字符串 → 读回 aware datetime）；
 6. 通用读写（`get` / `all` / `count` / `insert` / `update` / `remove` / `upsert`）；
-7. 全局写队列：并发 20 个异步写任务串行化，最终 count 正确且无 `database is locked`。
+7. 全局写队列：并发 20 个异步写任务串行化，最终 count 正确且无 `database is locked`；
+8. `close` 与其它连接操作共用同一把实例锁（反向用例：线程里握着连接时 `close()` 必须排队，
+   插队 = sqlite 在 C 层 use-after-close → 整个进程段错误，见 `docs/PORTING_NOTES.md` §83）。
 
 数据库文件建在本测试目录下（**不放 /tmp**），每个 TestCase 用临时目录，
 `tearDown` 里整体删除。
@@ -32,6 +34,8 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -1069,6 +1073,45 @@ class WriteQueueTests(_DatabaseTestCase):
         stored = asyncio.run(main())
         self.assertEqual(stored['content'], 'ok')
         self.assertEqual(self.db.count('interlude_memory'), 1)
+
+    def test_close_does_not_race_an_in_flight_connection_operation(self):
+        """反向用例：线程里握着连接（`asyncio.to_thread` 里的那种）时，`close()` 必须排队。
+
+        真现场：`IsolatedAsyncioTestCase` 的收尾顺序是「`doCleanups()`（关库）→
+        `Runner.close()`（**这时才** join 线程池）」，所以漏网的后台任务还在工作线程里
+        读库时关库 = sqlite 在 C 层 use-after-close → 整个 discover 段错误（EXIT=139，
+        实测 `test_sticker_delivery_reality`）。这条钉的是"close 与其它连接操作共用同一把锁"。
+        """
+        entered = threading.Event()
+        release = threading.Event()
+        order: list[str] = []
+
+        def in_flight() -> None:
+            with self.db._lock:  # 等价：工作线程正在 `sqlite3_step`
+                entered.set()
+                release.wait(5)
+                order.append('worker-done')
+
+        def closer() -> None:
+            self.db.close()
+            order.append('closed')
+
+        worker = threading.Thread(target=in_flight)
+        worker.start()
+        self.assertTrue(entered.wait(5), '工作线程没握住连接锁')
+        closing = threading.Thread(target=closer)
+        closing.start()
+        # 放行 worker **之前**先给 closer 一个真的跑到 `close()` 的机会：它要么卡在
+        # 连接锁上（正确），要么已经把连接关了（错误——worker 还握着它）。
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline and not order:
+            time.sleep(0.005)
+        self.assertEqual(order, [], 'close 插队了：worker 还握着连接（真机上这是段错误）')
+        release.set()
+        worker.join(5)
+        closing.join(5)
+        self.assertEqual(order, ['worker-done', 'closed'])
+        self.assertIsNone(self.db.conn)
 
     def test_context_manager_registers_tables_and_closes(self):
         other_dir = tempfile.mkdtemp(prefix='hdsi_db_', dir=_HERE)

@@ -892,7 +892,18 @@ class Database:
         self.close()
 
     def close(self) -> None:
-        """关闭连接（幂等）。"""
+        """关闭连接（幂等）。
+
+        ⚠️ 这是**唯一**必须与其它连接操作串行化、却不在 `_serialized` 名单里的成员写错了
+        一次就会赔上整个进程：`Database.write` / `service.db_get` 会把连接操作丢进
+        `asyncio.to_thread` 的工作线程，而 `loop.close()` 之前没人 join 那些线程
+        （`IsolatedAsyncioTestCase` 的收尾顺序是 doCleanups → `Runner.close()`）。
+        没有互斥时，"关库"会撞上"线程里正在 `sqlite3_step`"，sqlite 在 C 层
+        use-after-close **直接段错误**（不是异常，测不到、也抓不到）——实测
+        `plugin/tests/test_sticker_delivery_reality.py` 让全量 discover 约 1/5 概率
+        EXIT=139。放到 `_serialized` 名单里（见文件末尾）后，close 会等这次操作
+        跑完再关，任何"漏网的后台任务"都不再能杀掉进程。
+        """
         conn = getattr(self, 'conn', None)
         if conn is None:
             return
@@ -1259,6 +1270,9 @@ for _name in (
     'list_tables', 'columns', 'table_exists', 'indexes', 'index_columns',
     'register_tables', 'get', 'all', 'count', 'count_by', 'insert', 'update', 'remove',
     'upsert', 'commit',
+    # `close` 也在这张名单里：它同样是"一次连接操作"，漏掉它 = 关库可以与线程池里
+    # 正在跑的 `sqlite3_step` 并发（C 层 use-after-close → 段错误）。见 `close()` 的注释。
+    'close',
 ):
     setattr(Database, _name, _serialized(getattr(Database, _name)))
 del _name

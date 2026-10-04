@@ -927,5 +927,58 @@ class DeliveryDisciplinePromptTests(unittest.TestCase):
         self.assertIn('keep an unconfirmed one unconfirmed', prompt)
 
 
+class BrowserContractPromptTests(unittest.TestCase):
+    """浏览契约的**字段名**：提示词教的必须就是解析器读的（`docs/PORTING_NOTES.md` §79）。
+
+    上游一直教单数 `browserIntent`（`narrator.ts:1750` 起），而解析器读的是复数数组
+    `browserIntents`（`service.ts:10678`）——模型照提示词吐的那个对象永远读不到，
+    她只能一直"还在转"。这里把两边钉在一起：提示词里出现的**每一个**浏览器字段名，
+    解析器都必须能读（两种拼写都行，但都不许读不到）。
+    """
+
+    #: 一份合法草稿（search 需要 query，visit 需要公开 url）。
+    DRAFT = {'mode': 'search', 'query': '妹妹', 'purpose': '想看看他妹妹是谁', 'timing': 'deferred'}
+
+    def prompt_field_names(self, text: str) -> set[str]:
+        """提示词里出现的字段名（`browserIntent` / `browserIntents`）。"""
+        return set(re.findall(r'browserIntents?\b', text))
+
+    def test_every_browser_field_name_the_prompt_teaches_is_readable(self) -> None:
+        from plugin.core.service.chunk4 import _browser_intent_drafts
+
+        texts = [
+            writing_affordances({'browserMode': mode})
+            for mode in ('disabled', 'deferred-only', 'allow-immediate')
+        ]
+        # 常设块里那句 `An entry in browserIntents …` 也点名了字段。
+        texts.append(system_prompt_6('user-message'))
+        seen: set[str] = set()
+        for text in texts:
+            names = self.prompt_field_names(text)
+            self.assertTrue(names, text)
+            for name in names:
+                seen.add(name)
+                with self.subTest(name=name):
+                    self.assertEqual(
+                        _browser_intent_drafts({name: [dict(self.DRAFT)]}), [self.DRAFT],
+                        '提示词点名的字段，解析器必须读得到（数组形态）',
+                    )
+                    self.assertEqual(
+                        _browser_intent_drafts({name: dict(self.DRAFT)}), [self.DRAFT],
+                        '提示词点名的字段，解析器必须读得到（单对象形态）',
+                    )
+        self.assertIn('browserIntents', seen)
+
+    def test_the_taught_contract_is_the_plural_list_the_parser_reads(self) -> None:
+        for mode in ('deferred-only', 'allow-immediate'):
+            with self.subTest(mode=mode):
+                text = writing_affordances({'browserMode': mode})
+                self.assertIn('browserIntents as a list with at most one item', text)
+                # 上游那句"return at most one browserIntent"（单数对象）必须不再出现。
+                self.assertNotIn('at most one browserIntent.', text)
+        # disabled 那一段本来就是复数（"leave browserIntents empty"）。
+        self.assertIn('leave browserIntents empty', writing_affordances({'browserMode': 'disabled'}))
+
+
 if __name__ == '__main__':
     unittest.main()
