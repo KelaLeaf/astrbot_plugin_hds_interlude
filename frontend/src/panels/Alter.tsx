@@ -34,9 +34,15 @@ function Sparkline({
   )
 }
 
+// 方向语义以**判据源头**为准（`plugin/core/narrator_prompts.py` 给她的定义 +
+// `core/alter.py:542` 的映射）：**正 = 更严肃/克制/沉重（serious），负 = 更放松/开放/活跃（relaxed）**。
+// 这里原先**正好写反**（正方向标成 relaxed、负方向标成 serious，图例也把两侧对调），
+// 与提示词完全相反——用户 2026-10-05 在控制台上看出不对。
+// （守卫用例：`plugin/tests/test_alter_trigger_wiring.py::AlterCopyMatchesTheJudgementSourceTests`，
+//   它按源码断言方向标签与图例，旧的错误串一律不许再出现——所以这里不逐字复述旧文案。）
 const DIRECTION: Record<number, { label: string; tone: 'ok' | 'warn' | 'neutral' }> = {
-  1: { label: '偏 relaxed', tone: 'ok' },
-  [-1]: { label: '偏 serious', tone: 'warn' },
+  1: { label: '偏严肃 / 沉重', tone: 'warn' },
+  [-1]: { label: '偏放松 / 活跃', tone: 'ok' },
   0: { label: '无位移', tone: 'neutral' },
 }
 
@@ -109,7 +115,7 @@ export function Alter({ storyId, refreshKey }: PanelProps) {
           <div>
             <div class="mb-1 flex items-center justify-between text-[11px] text-muted">
               <span>单轮增量（alter）</span>
-              <span>正=放松，负=紧绷</span>
+              <span>正=严肃/沉重，负=放松/活跃</span>
             </div>
             <Sparkline values={deltas} tone="var(--app-warn)" />
           </div>

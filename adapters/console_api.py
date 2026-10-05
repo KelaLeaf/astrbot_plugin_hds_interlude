@@ -25,6 +25,7 @@ import os
 from datetime import datetime
 from typing import Any, Optional
 
+from ..core.alter import DEFAULT_COOLDOWN_MS
 from ..core import platform_actions
 from ..core.database import TABLES
 from ..core.meta import HDS_INTERLUDE_VERSION
@@ -320,6 +321,10 @@ def mark_token_availability(summary: Any) -> Any:
             flag(row)
     return summary
 
+
+#: 侧端氛围分析的重试冷却（**代码常量**，不可配）：面板要显示它的**有效值**，
+#: 而不是上游那个早已不存在的配置键。
+_ALTER_COOLDOWN_MINUTES = max(1, int(DEFAULT_COOLDOWN_MS // 60_000))
 
 class StickerFileMissing(FileNotFoundError):
     """取不到图：`FileNotFoundError` + **它找过哪儿**的结构化诊断。
@@ -3514,11 +3519,27 @@ class ConsoleApi:
         section = self.bridge.section('alter_system')
         return {
             'enabled': section.get('enabled') is not False,
-            'threshold': section.get('threshold'),
+            # 面板这几个键名要比对**真实 schema**（`alter_system` 组）：实际是
+            # `base_threshold` / `opposite_decay` / `same_direction_boost`，冷却更是**代码常量**
+            # （`DEFAULT_COOLDOWN_MS`，不可配）——原先按上游旧名读，于是面板上「触发阈值/衰减/
+            # 冷却/权重步长」四栏全是「—」（只有恰好同名的 `max_intensity` 显示了值）。
+            'threshold': section.get(
+                'base_threshold', section.get('baseThreshold', section.get('threshold')),
+            ),
             'max_intensity': section.get('max_intensity', section.get('maxIntensity')),
-            'decay': section.get('decay'),
-            'cooldown_minutes': section.get('cooldown_minutes', section.get('cooldownMinutes')),
-            'weight_step': section.get('weight_step', section.get('weightStep')),
+            'decay': section.get(
+                'opposite_decay', section.get('oppositeDecay', section.get('decay')),
+            ),
+            'cooldown_minutes': section.get(
+                'cooldown_minutes', section.get('cooldownMinutes', _ALTER_COOLDOWN_MINUTES),
+            ),
+            'weight_step': section.get(
+                'same_direction_boost',
+                section.get('sameDirectionBoost', section.get('weight_step', section.get('weightStep'))),
+            ),
+            # 面板还没画、但配置里真实存在的两项（前端补列时直接用）
+            'density_factor': section.get('density_factor', section.get('densityFactor')),
+            'min_weight': section.get('min_weight', section.get('minWeight')),
         }
 
     def _agency_config(self) -> dict[str, Any]:

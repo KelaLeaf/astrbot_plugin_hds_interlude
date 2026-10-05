@@ -962,6 +962,25 @@ _normalize_browser_intent_draft_loose = _prefer_helper(
 # =========================================================================== #
 
 class ServiceChunk4(ServiceBase):
+
+    def _maybe_schedule_alter_analysis(
+        self, alter_turn: Any, story_id: str, phase: str,
+    ) -> bool:
+        """**触发判定**：`advance_alter_system()` 说到了阈值就排一次侧端氛围分析。
+
+        ⚠️ 双拼写读取（坑 41/46/53/65）：`advance_alter_system()` 返回的是 **snake_case**
+        （`threshold_reached` / `source_participant_id` / `offset_expired`）。这里原先只读
+        camelCase → 恒为 `None` → **触发后的侧端氛围分析从来没被排过**：真机现场是桶值攒到
+        -43、阈值只有 ~9.7，页面却写「上次分析：从未」、内心天气永远空着（2026-10-05 由用户
+        贴出的控制台数据暴露）。返回是否排了一次（给用例断言，不用 mock 内部状态）。
+        """
+        if not pick(alter_turn, 'threshold_reached', 'thresholdReached'):
+            return False
+        self.schedule_alter_analysis(
+            story_id, phase,
+            pick(alter_turn, 'source_participant_id', 'sourceParticipantId') or '',
+        )
+        return True
     """对应 `upstream/src/service.ts` 第 3217–4185 行的成员。"""
 
     # ------------------------------------------------------------------ #
@@ -2714,10 +2733,7 @@ class ServiceChunk4(ServiceBase):
                 'interlude_story', {'id': story['id']},
                 {'state': encode_story_state(next_state), 'updatedAt': now},
             )
-            if _record(alter_turn).get('thresholdReached'):
-                self.schedule_alter_analysis(
-                    story['id'], phase, _record(alter_turn).get('sourceParticipantId') or '',
-                )
+            self._maybe_schedule_alter_analysis(alter_turn, story['id'], phase)
 
         if agency_recheck:
             await self.append_proactive_check(

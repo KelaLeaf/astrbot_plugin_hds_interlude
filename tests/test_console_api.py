@@ -14,7 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -181,15 +181,22 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(payload['totals']['inputTokens'], 0)
         self.assertEqual(len(payload['series']), 1, '按天视图至少给今天这一格')
 
+        # ⚠️ 夹具**不许依赖墙上时钟**（2026-10-06 踩到）：这里原先硬编码 2026-09-29/30，
+        # 而 `week` 是**滚动 7 天窗口**——跨过 10-06 零点后 09-29T00:00 被挤出窗口，
+        # 断言就从 1600 掉成 1200（每天凌晨必红，与实现无关）。改成相对"今天"。
+        today = datetime.now(timezone.utc).date()
+        yesterday = today - timedelta(days=1)
         self.bridge.db.insert('interlude_token_usage', {
-            'day': '2026-09-30', 'storyId': 's1', 'task': '主叙事', 'model': 'deepseek-chat',
+            'day': today.isoformat(), 'storyId': 's1', 'task': '主叙事', 'model': 'deepseek-chat',
             'provider': '连接A', 'inputTokens': 1200, 'outputTokens': 300, 'cachedTokens': 600,
-            'calls': 3, 'createdAt': '2026-09-30T00:00:00Z', 'updatedAt': '2026-09-30T00:00:00Z',
+            'calls': 3, 'createdAt': today.isoformat() + 'T00:00:00Z',
+            'updatedAt': today.isoformat() + 'T00:00:00Z',
         })
         self.bridge.db.insert('interlude_token_usage', {
-            'day': '2026-09-29', 'storyId': 's1', 'task': '压缩', 'model': 'flash',
+            'day': yesterday.isoformat(), 'storyId': 's1', 'task': '压缩', 'model': 'flash',
             'provider': '连接B', 'inputTokens': 400, 'outputTokens': 100, 'cachedTokens': 0,
-            'calls': 1, 'createdAt': '2026-09-29T00:00:00Z', 'updatedAt': '2026-09-29T00:00:00Z',
+            'calls': 1, 'createdAt': yesterday.isoformat() + 'T00:00:00Z',
+            'updatedAt': yesterday.isoformat() + 'T00:00:00Z',
         })
         week = _run(self.api.token_stats('week', '', ''))
         self.assertEqual(week['range'], 'week')
@@ -200,9 +207,9 @@ class ConsoleApiTests(unittest.TestCase):
         self.assertEqual(len(week['series']), 7)
 
         # 自选范围能精确圈住一天（8 月那类老数据不进本周视图这件事由纯函数测试覆盖）。
-        custom = _run(self.api.token_stats('custom', '2026-09-30', '2026-09-30'))
+        custom = _run(self.api.token_stats('custom', today.isoformat(), today.isoformat()))
         self.assertEqual(custom['totals']['inputTokens'], 1200)
-        self.assertEqual(custom['from'], '2026-09-30')
+        self.assertEqual(custom['from'], today.isoformat())
 
     # ---- 平台动作目录与权限（面板「动作」） ----
 
