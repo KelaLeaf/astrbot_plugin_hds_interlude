@@ -43,7 +43,6 @@ from plugin.core.script.commit_builder import (  # noqa: E402
     find_outgoing_script_event,
 )
 from plugin.core.service import InterludeContext, NullTransport  # noqa: E402
-from plugin.core.service import chunk6 as chunk6_module  # noqa: E402
 from plugin.core.service.base import ServiceBase, ServiceChunk0  # noqa: E402
 from plugin.core.service.chunk2 import ServiceChunk2  # noqa: E402
 from plugin.core.service.chunk11 import ServiceChunk11  # noqa: E402
@@ -750,23 +749,6 @@ class GroupExplicitEndpointTests(_GateTestCase):
 # 3c. U17：跨群出站（上游 `service.ts:6162`，rc28 `:5790`）
 # =========================================================================== #
 
-def _group_dispatch_wired() -> bool:
-    """`chunk6.send_outgoing_messages` 的**群目标分支**是否已落地。
-
-    U17 的第二跳（上游 `:6223`）必须插在私聊参与者查表**之前**，而 `chunk6.py` 是
-    M3/M4 已收口的文件（只读；改动以逐字补丁交给 Lead）。补丁落地前这里如实 skip，
-    落地后同一批用例立刻转成真跑——两个方向都不会假装通过。
-    """
-    try:
-        source = inspect.getsource(chunk6_module)
-    except OSError:  # pragma: no cover - 源码不可读时不假装通过
-        return False
-    return 'send_cross_group_message' in source
-
-
-_GROUP_DISPATCH_WIRED = _group_dispatch_wired()
-
-
 class _FailingGroupTransport(_RecordingTransport):
     """群路出站**试过但失败**的 transport（用来钉住失败也要记回端点状态）。"""
 
@@ -1129,12 +1111,12 @@ class CrossGroupMessageTests(_GateTestCase):
         )
 
 
-@unittest.skipUnless(
-    _GROUP_DISPATCH_WIRED,
-    'chunk6 的群目标分发分支待应用 U17 逐字补丁（chunk6 属 M3/M4 冻结文件）',
-)
 class CrossGroupDispatchTests(_GateTestCase):
-    """上游 `:6223`：`sendOutgoingMessages` 的群目标分支（生产调用方）。"""
+    """上游 `:6223`：`sendOutgoingMessages` 的群目标分支（生产调用方）。
+
+    这一支（`chunk6` 的 P1 逐字补丁）曾在工作区里缺失，本用例那时只能 skip。现在补丁
+    已落地，**不留 skip**：谁把那一支删掉，这里立刻红——"没接"不许再藏在绿里。
+    """
 
     GROUP_CHANNEL = 'group:123'
 
