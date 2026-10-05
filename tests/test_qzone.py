@@ -559,6 +559,113 @@ class FeedFilterTests(unittest.TestCase):
         }
 
 
+class ReactionDeltaTests(unittest.TestCase):
+    """被评论 / 被点赞感知的纯函数层。
+
+    上游对端：`upstream/src/qzone.ts:203`（`qzoneReactionDeltas`）+
+    `upstream/test/qzone.test.ts:256`（五态：首次立基线 / 增量>0 / 回落下修 / 缺席不动 /
+    空 tid）。上游只算评论（注释逐字写着「赞数上游尚未暴露字段」）；本移植版按 rc33
+    「被赞也要知道」把**回执里本来就有**的赞数一并比对——多出来的用例在下面标了 `[本移植版]`。
+    键名按本仓库 Python 内部约定用 snake_case（上游 `contentExcerpt` → `content_excerpt`），
+    `previous` / `current` 与上游逐字同名，方便逐条对账。
+    """
+
+    ENTRIES = [
+        {'tid': 'a', 'content': '今天的晚霞', 'comment_num': 3},
+        {'tid': 'b', 'content': '考试结束啦', 'comment_num': 1},
+    ]
+
+    def test_upstream_five_states(self):
+        entries = self.ENTRIES
+        # ① 首次观测：只立基线，零感知（新帖自带评论是常态）
+        first = q.qzone_reaction_deltas(
+            [record(tid='a')], entries,
+        )
+        self.assertEqual(len(first['deltas']), 0)
+        self.assertEqual(first['baselines'], [
+            {'tid': 'a', 'comment_num': 3, 'like_num': None},
+        ])
+        # ② 增量：a 3→5 报 2 条；b 首次立基线不报
+        second = q.qzone_reaction_deltas(
+            [record(tid='a', commentNum=3), record(tid='b')],
+            [dict(entries[0], comment_num=5), entries[1]],
+        )
+        self.assertEqual(len(second['deltas']), 1)
+        self.assertEqual(second['deltas'][0]['previous'], 3)
+        self.assertEqual(second['deltas'][0]['current'], 5)
+        self.assertEqual(second['deltas'][0]['content_excerpt'], '今天的晚霞')
+        self.assertEqual([item['tid'] for item in second['baselines']], ['a', 'b'])
+        # ③ 回落（删评）：5→4 静默下修基线，不产出
+        third = q.qzone_reaction_deltas([record(tid='a', commentNum=5)], [dict(entries[0], comment_num=4)])
+        self.assertEqual(len(third['deltas']), 0)
+        self.assertEqual(third['baselines'], [{'tid': 'a', 'comment_num': 4, 'like_num': None}])
+        # ④ 帖子不在拉取列表：基线保持、不产出、不写 baselines
+        absent = q.qzone_reaction_deltas([record(tid='zzz', commentNum=2)], entries)
+        self.assertEqual(len(absent['deltas']), 0)
+        self.assertEqual(len(absent['baselines']), 0)
+        # ⑤ 空 tid 不参与
+        empty = q.qzone_reaction_deltas([record(tid=' ')], entries)
+        self.assertEqual(len(empty['baselines']), 0)
+
+    def test_like_increment_is_reported_alongside_comments(self):
+        """[本移植版] 赞数增量：评论 3→5、赞 2→6 → 一条 delta 两件事都在。"""
+        result = q.qzone_reaction_deltas(
+            [record(tid='a', commentNum=3, likeNum=2)],
+            [dict(self.ENTRIES[0], comment_num=5, like_num=6)],
+        )
+        delta = result['deltas'][0]
+        self.assertEqual((delta['previous'], delta['current']), (3, 5))
+        self.assertEqual((delta['like_previous'], delta['like_current']), (2, 6))
+        self.assertEqual(result['baselines'][0]['like_num'], 6)
+
+    def test_a_missing_like_count_never_becomes_a_ghost_increment(self):
+        """[本移植版] **反向**：回执里没有赞数（`like_num` 缺失）时不许按 0 比。
+
+        若把 `None` 当 0，一条"基线 2 个赞、这轮回执没说"的说说会永远算出 `2 > 0`
+        的幽灵增量——每轮都报一次"收到了 2 个新赞"。
+        """
+        result = q.qzone_reaction_deltas(
+            [record(tid='a', commentNum=3, likeNum=2)],
+            [dict(self.ENTRIES[0], comment_num=3, like_num=None)],
+        )
+        self.assertEqual(result['deltas'], [], '没有可比的赞数就不产出')
+        self.assertIsNone(result['baselines'][0]['like_num'])
+
+    def test_like_only_post_still_produces_a_delta(self):
+        """[本移植版] 只涨赞不涨评论也要产出（评论部分留 `None`）。"""
+        result = q.qzone_reaction_deltas(
+            [record(tid='a', commentNum=3, likeNum=1)],
+            [dict(self.ENTRIES[0], comment_num=3, like_num=4)],
+        )
+        delta = result['deltas'][0]
+        self.assertIsNone(delta['previous'])
+        self.assertIsNone(delta['current'])
+        self.assertEqual((delta['like_previous'], delta['like_current']), (1, 4))
+
+
+class OnebotTargetIdTests(unittest.TestCase):
+    """OneBot 多通道账号标识校验（rc33，上游 `src/service.ts:9719`）。"""
+
+    def test_digits_become_numbers_and_other_accounts_stay_strings(self):
+        from plugin.core.service.chunk13 import onebot_target_id
+        self.assertEqual(onebot_target_id('10002'), 10002)
+        self.assertEqual(onebot_target_id('10002'), 10002)
+        self.assertEqual(onebot_target_id(10002), 10002)
+        self.assertEqual(onebot_target_id('wxid_abc123'), 'wxid_abc123')
+        self.assertEqual(onebot_target_id('12345@chatroom'), '12345@chatroom')
+        # 上游 `/^(?:private:|group:)/` 前缀先剥掉再判类型
+        self.assertEqual(onebot_target_id('private:10002'), 10002)
+        self.assertEqual(onebot_target_id('group:10002'), 10002)
+
+    def test_qzone_read_channel_refuses_non_qq_accounts(self):
+        """**反向**：认不出数字 QQ 号时返回 `None` + 原因，绝不"省掉键去查自己"。"""
+        from plugin.core.service.chunk13 import _qzone_target_uin
+        self.assertEqual(_qzone_target_uin('10002'), (10002, ''))
+        self.assertEqual(_qzone_target_uin('wxid_abc'), (None, 'non-qq'))
+        self.assertEqual(_qzone_target_uin(''), (None, 'missing'))
+        self.assertEqual(_qzone_target_uin(None), (None, 'missing'))
+
+
 # --------------------------------------------------------------------------- #
 # 动作调用（传输层按契约 stub）
 # --------------------------------------------------------------------------- #
@@ -946,6 +1053,10 @@ class _Host(ServiceChunk13):
 
     def report_operation(self, verbosity: str, level: str, story: Any, phase: str, message: str, *args: Any) -> None:
         self.reports.append((verbosity, level, phase, message % args if args else message))
+
+    def report(self, level: str, story: Any, phase: str, message: str, *args: Any) -> None:
+        """`chunk9.report`（生产 MRO 上一定有它）的最小替身：只记录、不格式化。"""
+        self.reports.append((level, phase, message % args if args else message))
 
     def report_standalone(self, level: str, message: str, *args: Any, **_kwargs: Any) -> None:
         self.standalone.append((level, message % args if args else message))
@@ -1726,6 +1837,199 @@ class ServiceFeedSweepTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(host.qzone_feed_poll_minutes(), minutes)
 
 
+class ServiceReactionSweepTests(unittest.IsolatedAsyncioTestCase):
+    """被评论 / 被点赞感知的**服务层**：上游 `src/service.ts:7432`（`qzoneReactionSweep`）。
+
+    上游对端的行为判据（逐条）：
+    * 只读拉取失败 → 基线不动、下轮重试，但必须可见（`src/service.ts:7450`）；
+    * 无增量的帖子也推进基线（含首次初始化，`:7456`）；
+    * 单轮预算 3、逐条提交、先写基线再写条目、基线失败本轮中止（`:7465-7496`）。
+    上游没有服务层测试（只有 `qzone.test.ts:256` 的纯函数层），所以这里是**我们自建**的
+    端到端用例，每条都配了反向。
+    """
+
+    def _transport(self, msgs: list[dict[str, Any]]) -> _StubTransport:
+        return _StubTransport(_sweep_handler(), http=_sweep_http('', _cgi_moods_text(msgs)))
+
+    @staticmethod
+    def _post(index: int = 1, **overrides: Any) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            'id': index, 'storyId': STORY_ID, 'kind': 'post', 'tid': 't%d' % index,
+            'status': 'confirmed', 'createdAt': NOW,
+        }
+        row.update(overrides)
+        return row
+
+    async def test_new_comments_become_a_script_entry_even_with_auto_feed_off(self):
+        """评论 3→5：入账一条 `[空间动态]`，基线推进到 5。
+
+        `auto_feed=False` 是刻意的：被评论感知读的是**她自己**的说说，
+        与"浏览别人动态"那个开关无关——关掉自动浏览她也该知道有人评论了她。
+        """
+        host = _Host(
+            rows=[self._post(commentNum=3)],
+            transport=self._transport([_raw_msg('t1', '今天的晚霞', cmtnum=5)]),
+            config=dict(BASE_CONFIG, auto_feed=False),
+        )
+        await host.qzone_feed_sweep()
+        entries = [item for item in host.entries if item['kind'] == 'friend-feed']
+        self.assertEqual(len(entries), 1, '被评论感知必须入账（与 auto_feed 无关）')
+        content = entries[0]['content']
+        self.assertIn('[空间动态]', content)
+        self.assertIn('今天的晚霞', content)
+        self.assertIn('收到了 2 条新评论（累计 5 条）', content)
+        self.assertEqual(entries[0]['actor'], 'system')
+        self.assertEqual(entries[0]['metadata']['qzone_tid'], 't1')
+        self.assertEqual(entries[0]['metadata']['qzone_reactions'],
+                         {'previous': 3, 'current': 5, 'like_previous': None, 'like_current': None})
+        self.assertEqual(host.rows[0]['commentNum'], 5, '基线要推进（先写基线再写条目）')
+        self.assertIs(host._qzone_feed_sweep_running, False)
+
+    async def test_the_first_observation_only_sets_the_baseline(self):
+        """**反向**：首次观测（没有 `commentNum`）只立基线、零条目。"""
+        host = _Host(
+            rows=[self._post()],
+            transport=self._transport([_raw_msg('t1', '今天的晚霞', cmtnum=3)]),
+        )
+        await host.qzone_feed_sweep()
+        self.assertEqual([item for item in host.entries if item['kind'] == 'friend-feed'], [])
+        self.assertEqual(host.rows[0]['commentNum'], 3, '首次观测必须立基线，否则该帖永久失聪')
+
+    async def test_a_removed_comment_only_lowers_the_baseline(self):
+        """**反向**：删评（5→4）静默下修基线，不产出幽灵增量。"""
+        host = _Host(
+            rows=[self._post(commentNum=5)],
+            transport=self._transport([_raw_msg('t1', 'x', cmtnum=4)]),
+        )
+        await host.qzone_feed_sweep()
+        self.assertEqual([item for item in host.entries if item['kind'] == 'friend-feed'], [])
+        self.assertEqual(host.rows[0]['commentNum'], 4)
+
+    async def test_the_per_round_budget_leaves_the_fourth_post_unaccounted(self):
+        """单轮预算 3：第 4 条**不推进基线**（下轮重新发现），绝不永久丢失。"""
+        rows = [self._post(index, commentNum=1) for index in range(1, 5)]
+        msgs = [_raw_msg('t%d' % index, '第 %d 条' % index, cmtnum=5) for index in range(1, 5)]
+        host = _Host(rows=rows, transport=self._transport(msgs))
+        await host.qzone_feed_sweep()
+        entries = [item for item in host.entries if item['kind'] == 'friend-feed']
+        self.assertEqual(len(entries), 3, '预算 3')
+        self.assertEqual([row['commentNum'] for row in host.rows], [5, 5, 5, 1],
+                         '第 4 条基线不动 = 下轮还能发现它')
+
+    async def test_a_failing_baseline_write_aborts_the_round(self):
+        """**反向**：基线回写失败 → 本轮中止（不写条目），避免"旧基线重算同一增量"重复入账。"""
+        host = _Host(
+            rows=[self._post(commentNum=3)],
+            transport=self._transport([_raw_msg('t1', 'x', cmtnum=5)]),
+        )
+
+        async def failing_set(table: str, where: Any, patch: Any) -> dict[str, Any]:
+            raise RuntimeError('database is locked')
+
+        host.db_set = failing_set  # type: ignore[assignment]
+        await host.qzone_feed_sweep()
+        self.assertEqual([item for item in host.entries if item['kind'] == 'friend-feed'], [],
+                         '基线没写进去就不许写条目')
+        self.assertEqual(host.rows[0]['commentNum'], 3)
+        self.assertTrue(any('基线回写失败' in item[-1] for item in host.reports))
+
+    async def test_a_failing_reaction_fetch_is_visible_and_leaves_the_baseline_alone(self):
+        """**反向**：被评论列表拉取失败 → 可见 warn、基线不动、下轮重试。"""
+
+        def http(method: str, url: str, headers: object, data: object) -> Any:
+            if 'emotion_cgi_msglist_v6' in url:
+                return None  # 这一轮说说列表没回执
+            return ''
+
+        host = _Host(
+            rows=[self._post(commentNum=3)],
+            transport=_StubTransport(_sweep_handler(), http=http),
+            config=dict(BASE_CONFIG, auto_feed=False),
+        )
+        await host.qzone_feed_sweep()
+        self.assertEqual(host.rows[0]['commentNum'], 3)
+        self.assertEqual([item for item in host.entries if item['kind'] == 'friend-feed'], [])
+        self.assertTrue(any('被评论列表拉取失败' in item[-1] for item in host.reports),
+                        '拉取失败必须可见（此前零日志）')
+
+    async def test_a_like_increment_is_reported_and_baselined(self):
+        """被点赞：赞 2→6 与评论 3→5 一条条目里都说清，`likeNum` 一起推进。"""
+        host = _Host(
+            rows=[self._post(commentNum=3, likeNum=2)],
+            transport=self._transport([_raw_msg('t1', '晚霞', cmtnum=5, likecount=6)]),
+        )
+        await host.qzone_feed_sweep()
+        entries = [item for item in host.entries if item['kind'] == 'friend-feed']
+        self.assertEqual(len(entries), 1)
+        self.assertIn('收到了 2 条新评论（累计 5 条）', entries[0]['content'])
+        self.assertIn('收到了 4 个新赞（累计 6 个）', entries[0]['content'])
+        self.assertEqual(host.rows[0]['likeNum'], 6)
+
+    async def test_a_channel_without_like_counts_degrades_visibly(self):
+        """**反向**：回执没有赞数 → 可见 warn，且**不许**把 `likeNum` 写成 0。
+
+        把"不可知"写成 0 会让下一轮凭空报出"收到了 N 个新赞"（幽灵增量）。
+        """
+        host = _Host(
+            rows=[self._post(commentNum=3, likeNum=2)],
+            transport=self._transport([_raw_msg('t1', '晚霞', cmtnum=3)]),
+        )
+        await host.qzone_feed_sweep()
+        self.assertEqual(host.rows[0]['likeNum'], 2, '不可知 ≠ 0：旧基线原样留着，不许被写坏')
+        warned = [text for _level, text in host.standalone]
+        self.assertTrue(any('点赞' in text and '不可知' in text for text in warned),
+                        '能力缺失要留可见说明：%s' % warned)
+        self.assertTrue(any('下一步' in text for text in warned), '还要给可行动的下一步')
+        # 从没立过基线的那一条：连键都不该出现（不是 0）
+        fresh = _Host(
+            rows=[self._post(commentNum=3)],
+            transport=self._transport([_raw_msg('t1', '晚霞', cmtnum=3)]),
+        )
+        await fresh.qzone_feed_sweep()
+        self.assertNotIn('likeNum', fresh.rows[0])
+
+    async def test_a_non_qq_sweep_account_is_refused_visibly_without_any_read(self):
+        """**反向**（rc33 多通道账号标识校验）：轮询账号不是数字 QQ 号 → 不查、可见 warn。
+
+        "省掉 `targetUin`"会让 CGI 返回**我自己**的说说列表——那就是认错账号
+        （拿她的帖子去比对别人的评论）。
+        """
+        host = _Host(
+            rows=[self._post(commentNum=3)],
+            transport=self._transport([_raw_msg('t1', 'x', cmtnum=5)]),
+            config=dict(BASE_CONFIG, auto_feed=False),
+        )
+        host.canonical_story = dict(STORY, selfId='wxid_abc123')
+        await host.qzone_feed_sweep()
+        self.assertEqual(host.transport.http_calls, [], '认不出账号就不许发读请求')
+        self.assertEqual(host.rows[0]['commentNum'], 3)
+        warned = [text for _level, text in host.standalone]
+        self.assertTrue(any('不是数字 QQ 号' in text for text in warned), warned)
+        self.assertTrue(any('端点注册表' in text for text in warned), '要说清下一步该配什么')
+
+    async def test_a_feed_from_a_non_qq_account_never_queries_our_own_mood_list(self):
+        """**反向**（同上，好友动态这条链）：动态的 `uin` 不是数字 QQ 号 → 只留"刷到过"。"""
+        # 动态文本里的 `uin` 平时是裸数字；字符串账号要带引号才表达得出来。
+        feed_text = (
+            "{ver:1,key:'k1',appid:311,uin:'wxid_abc',nickname:'好友',abstime:%d,"
+            "html:'<div>正文</div>',}" % int(NOW.timestamp() - 600)
+        )
+        host = _Host(
+            rows=[],
+            transport=_StubTransport(
+                _sweep_handler(), http=_sweep_http(feed_text, _cgi_moods_text([])),
+            ),
+        )
+        await host.qzone_feed_sweep()
+        entries = [item for item in host.entries if item['kind'] == 'friend-feed']
+        self.assertEqual(len(entries), 1, '动态本身照常入账（她确实刷到了）')
+        self.assertIn('但正文没取到', entries[0]['content'], '认不出账号就不许声称看到了内容')
+        moods_calls = [call for call in host.transport.http_calls
+                       if 'emotion_cgi_msglist_v6' in call['url']]
+        self.assertEqual(moods_calls, [], '认不出账号就不许查列表（查了就是认错账号）')
+        self.assertTrue(any('数字 QQ 号' in text for _level, text in host.standalone))
+
+
 def _feed_text_at(now: datetime, key: str, uin: str, *, nickname: str = '',
                   seconds_ago: int = 600) -> str:
     """相对**给定时刻**的一页好友动态（`_cgi_feed_text` 绑的是模块级 `NOW`）。"""
@@ -2277,7 +2581,7 @@ class ServiceFeedMediaRecognitionTests(unittest.IsolatedAsyncioTestCase):
     async def test_video_frames_without_a_vision_channel_are_reported(self):
         """视频开着、图片理解关着 → 帧**没有通道可去**：丢掉，但要留事实 + 一条可行动 warn。
 
-        依据与群回合那条 `GROUP_NO_VISION_REASON` 同一条尺子：抽帧花了钱却没人看，
+        依据与群回合那条 `GROUP_FRAMES_NO_CHANNEL_REASON` 同一条尺子：抽帧花了钱却没人看，
         不许静默（否则模型会以为她看见了画面）。
         """
         from unittest import mock  # noqa: PLC0415

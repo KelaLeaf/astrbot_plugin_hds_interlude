@@ -37,6 +37,7 @@ from plugin.core.script.commit_builder import (
 from plugin.core.script.delivery_ledger import (
     aggregate_delivery_status,
     create_script_delivery_actions,
+    delivery_intent_key,
     delivery_reference,
     platform_action_reference,
     update_script_delivery_actions,
@@ -185,6 +186,31 @@ class _ServiceStub:
 
 
 class DeliveryLedgerTest(unittest.TestCase):
+    def test_intent_key_is_event_id_colon_bubble_index(self) -> None:
+        """P1-1 业务幂等键（上游 `src/service.ts:6356` 的 ``eventId:bubbleIndex``）。
+
+        上游把这段契约交给宿主 outbox（`desktop-bridge.ts:93`）；AstrBot 没有那一层，
+        所以本移植版自己按这个键记账（`service/desktop.py::_background_delivery`），
+        但**键的形状逐字一致**——将来宿主补上 outbox 可以直接接。
+        """
+        # 内部写法（`core/delivery.py::message_event_reference` 的产出）
+        self.assertEqual(delivery_intent_key({'event_id': 'e1', 'bubble_index': 0}), 'e1:0')
+        self.assertEqual(delivery_intent_key({'event_id': 'e1', 'bubble_index': 2}), 'e1:2')
+        # 上游/模型写法（camelCase）双读
+        self.assertEqual(delivery_intent_key({'eventId': 'e1', 'bubbleIndex': 3}), 'e1:3')
+        # 只有投递账本的 `segment_index` 时也认
+        self.assertEqual(delivery_intent_key({'event_id': 'e1', 'segment_index': 1}), 'e1:1')
+        # 缺 bubbleIndex → 0（上游 `?? 0`）
+        self.assertEqual(delivery_intent_key({'event_id': 'e1'}), 'e1:0')
+
+    def test_an_invalid_reference_gets_no_intent_key(self) -> None:
+        """**反向**：拿不到合法 `eventId` 就不给键——不许编一个键把两条话算成同一条。"""
+        for value in (None, {}, {'event_id': ''}, {'event_id': 1}, 'e1', {'bubble_index': 0}):
+            with self.subTest(value=value):
+                self.assertEqual(delivery_intent_key(value), '')
+        # 坏 bubbleIndex（非安全整数）塌成 0，而不是丢掉整个键
+        self.assertEqual(delivery_intent_key({'event_id': 'e1', 'bubble_index': 'x'}), 'e1:0')
+
     def test_partial_requires_actual_delivery_while_unfinished_attempts_remain_pending(self) -> None:
         def status(*values: str) -> str:
             return aggregate_delivery_status([

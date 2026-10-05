@@ -5069,5 +5069,133 @@ class HostProviderUsageTests(unittest.TestCase):
         self.assertIs(records[0]['ok'], False)
 
 
+# =========================================================================== #
+# 3.5 管理员名单（同步）——§86.4
+# =========================================================================== #
+
+class AdminRosterTests(unittest.TestCase):
+    """`AstrbotTransport.known_super_admin_ids()`：动作权限表 `admin` 档的**同步**取值口。
+
+    生产现场（`docs/PORTING_NOTES.md` §86.3/§86.4）：核心侧的权限判定是同步的
+    （`chunk12.resolve_action_session_role()` 是 `def`，`chunk4` 的提示词组装也同步调它），
+    而这份名单原来**没人喂** —— 生产上 `admin` 档恒假。这里钉住四件事：
+    读得到 / 归一化从严 / 读不到**可见** / 空名单是"答过的没有"（不报警），
+    并把"名单真的影响能调什么"接到 `chunk12` 的可用集上（不是只测方法返回值）。
+    """
+
+    ADMIN = '1000008890'
+    OTHER = '10001'
+
+    def setUp(self):
+        self.context = FakeContext()
+        self.bridge = _make_bridge(context=self.context)
+        self.transport = AstrbotTransport(self.bridge)
+        self.logs: list[tuple[str, str]] = []
+
+        def sink(level, text):  # noqa: ARG001
+            self.logs.append((level, text))
+
+        # `_make_bridge` 的构造期会把 sink 换成桥自己的转发器 → 造完再装测试的。
+        interlude_logging.set_log_sink(sink)
+        self.addCleanup(interlude_logging.set_log_sink, interlude_logging._default_sink)
+
+    def _host_config(self, value):
+        self.context.get_config = lambda: value  # type: ignore[method-assign]
+
+    def _warns(self) -> list[str]:
+        return [text for level, text in self.logs if level == 'warn']
+
+    # ---- 读得到 / 归一化 ----
+
+    def test_the_roster_is_read_and_normalized(self):
+        self._host_config({'admins_id': [self.ADMIN, 10001, None, '']})
+        self.assertEqual(self.transport.known_super_admin_ids(), (self.ADMIN, '10001'))
+        self.assertEqual(self._warns(), [], '读得到名单时不该有任何 warn')
+
+    def test_a_string_roster_is_refused_not_split_into_single_characters(self):
+        """`'12345'` 绝不能被当成五个单字符 id（否则可能碰巧放行一个单字符用户号）。"""
+        self._host_config({'admins_id': self.ADMIN})
+        self.assertEqual(self.transport.known_super_admin_ids(), ())
+        self.assertTrue(any('admins_id' in text for text in self._warns()))
+
+    def test_an_explicit_empty_roster_is_an_answer_and_stays_silent(self):
+        """`admins_id: []` 是宿主**答过**的"没有超管"，不是"读不到"——不报警。"""
+        self._host_config({'admins_id': []})
+        self.assertEqual(self.transport.known_super_admin_ids(), ())
+        self.assertEqual(self._warns(), [])
+
+    # ---- 读不到：空名单 + 可见 warn（不静默、不猜） ----
+
+    def test_a_missing_roster_gives_an_empty_list_and_one_visible_warning(self):
+        self._host_config({})
+        self.assertEqual(self.transport.known_super_admin_ids(), ())
+        warns = self._warns()
+        self.assertEqual(len(warns), 1)
+        self.assertIn('admins_id', warns[0])
+        self.assertIn('下一步', warns[0], 'warn 必须可行动（点名下一步）')
+        self.assertNotIn('None', warns[0], '缺项不说"详情=None"（说给用户看的句子）')
+
+    def test_an_unreadable_host_config_gives_an_empty_list_and_a_visible_warning(self):
+        def explode():
+            raise RuntimeError('config store is gone')
+
+        self.context.get_config = explode  # type: ignore[method-assign]
+        self.assertEqual(self.transport.known_super_admin_ids(), ())
+        warns = self._warns()
+        self.assertEqual(len(warns), 1)
+        self.assertIn('admins_id', warns[0])
+
+    def test_a_non_dict_host_config_is_refused_with_a_warning(self):
+        self._host_config(['not', 'a', 'dict'])
+        self.assertEqual(self.transport.known_super_admin_ids(), ())
+        self.assertTrue(self._warns())
+
+    def test_the_warning_is_emitted_once_per_reason(self):
+        """这个口每个回合都被提示词组装调到 → 同类原因只报一次（不刷屏）。"""
+        self._host_config({})
+        for _ in range(5):
+            self.assertEqual(self.transport.known_super_admin_ids(), ())
+        self.assertEqual(len(self._warns()), 1)
+
+    # ---- 名单真的影响"能调什么" ----
+
+    def _chunk12_host(self):
+        from plugin.tests.test_platform_dispatch import _Host
+
+        host = _Host(config={}, transport=self.transport)
+        host.action_permission_table = lambda: {'set_group_kick': 'admin'}
+        return host
+
+    def test_the_roster_actually_decides_the_admin_tier(self):
+        """管理员 session → `admin`，且该档动作**真进可用集**；非管理员 → 空档。"""
+        self._host_config({'admins_id': [self.ADMIN]})
+        host = self._chunk12_host()
+        self.assertEqual(host.resolve_action_session_role({'userId': self.ADMIN}), 'admin')
+        self.assertIn('set_group_kick', host.available_platform_actions('admin', ('group',)))
+        self.assertEqual(host.resolve_action_session_role({'userId': self.OTHER}), '')
+        self.assertNotIn('set_group_kick', host.available_platform_actions('', ('group',)))
+
+    def test_reverse_an_empty_roster_keeps_the_admin_tier_out(self):
+        """反向：名单喂空 → `admin` 档断言必须红（这就是生产事故的形状）。"""
+        self._host_config({'admins_id': []})
+        host = self._chunk12_host()
+        self.assertEqual(host.resolve_action_session_role({'userId': self.ADMIN}), '')
+        with self.assertRaises(AssertionError):
+            self.assertIn('set_group_kick', host.available_platform_actions('', ('group',)))
+
+    def test_the_protocol_still_does_not_require_the_roster(self):
+        """`known_super_admin_ids` 是协议**之外**的可选能力（core 侧 `getattr` 探）。
+
+        加进 `Transport` 协议就会让"只实现了协议方法"的替身 / 其它适配器
+        `isinstance(..., Transport)` 当场变假（`@runtime_checkable` 只查 `hasattr`），
+        而它本来就允许缺席（缺席 = 没有超管，安全侧）。`dir()` 是这条的守卫：
+        真加进协议时它会出现，这条用例立刻红。
+        """
+        from plugin.core.service import Transport
+
+        self.assertIsInstance(self.transport, Transport)
+        self.assertNotIn('known_super_admin_ids', dir(Transport))
+
+
 if __name__ == '__main__':
     unittest.main()

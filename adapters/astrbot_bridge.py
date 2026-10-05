@@ -2999,6 +2999,56 @@ class AstrbotTransport:
             return False
         return any(_text(item) == target for item in admins)
 
+    def known_super_admin_ids(self) -> tuple[str, ...]:
+        """宿主管理员名单的**同步**取值口（`admins_id`）——动作权限表 `admin` 档的判据来源。
+
+        `is_super_admin()` 是 `async def`，而核心侧的权限判定是**同步**的
+        （`chunk12.resolve_action_session_role()` 是 `def`，`chunk4` 的提示词组装也同步调它），
+        所以名单必须以同步形状交出去：这里一次读完、归一化成 `tuple[str, ...]`；
+        形状校验仍由核心侧 `chunk12.super_admin_ids_from_host()` **一处**做。
+
+        **读不到就给空名单**（= 没有权限，安全侧），但**不静默**：配置接口不可用 /
+        配置不是字典 / `admins_id` 缺失或不是名单（含字符串——`'12345'` 绝不能被拆成
+        五个单字符 id）各留一条 warn 并点名下一步。这个口每个回合都会被提示词组装调到，
+        所以同类原因**只报一次**（与宿主丢弃采样参数那条告警同一套节流纪律）。
+
+        宿主明确给出空名单（`admins_id: []`）不算"读不到"：那是**答过**的"没有超管"，
+        不报警（否则每个没配管理员的部署都会白得一条 warn）。
+        """
+        try:
+            config = self.context.get_config()
+        except Exception as error:  # noqa: BLE001 - 宿主没这个 API 就当没有管理员名单
+            self._warn_admin_roster_unreadable('宿主配置接口不可用', error)
+            return ()
+        if not isinstance(config, dict):
+            self._warn_admin_roster_unreadable('宿主配置不是字典', type(config).__name__)
+            return ()
+        admins = config.get('admins_id')
+        if admins is None:
+            self._warn_admin_roster_unreadable('宿主配置里没有 admins_id 这一项', None)
+            return ()
+        if not isinstance(admins, (list, tuple, set, frozenset)):
+            self._warn_admin_roster_unreadable('admins_id 不是名单', type(admins).__name__)
+            return ()
+        return tuple(_text(item) for item in admins if _text(item))
+
+    def _warn_admin_roster_unreadable(self, reason: str, detail: Any = None) -> None:
+        """管理员名单读不到时的一条 warn：**同类原因只报一次**，并点名下一步。"""
+        warned = getattr(self, '_admin_roster_warned', None)
+        if warned is None:
+            warned = set()
+            self._admin_roster_warned = warned
+        if reason in warned:
+            return
+        warned.add(reason)
+        suffix = '' if detail in (None, '') else ' 详情=%s' % (detail,)
+        log_fallback(
+            'warn',
+            '读不到宿主管理员名单（admins_id）：%s%s。「仅管理员」档平台动作一律不可用；'
+            '下一步：在 AstrBot 主配置里填好 admins_id（管理员账号列表）后重载插件',
+            reason, suffix,
+        )
+
     async def set_input_status(self, target: dict[str, Any], typing: bool) -> dict[str, Any]:
         """设置「正在输入」状态（NapCat `set_input_status`，`event_type` 1=开始 / 2=结束）。
 

@@ -314,7 +314,7 @@
             "type": "bool",
             "description": "群聊视频理解",
             "default": false,
-            "hint": "群里沿用上面同一套设置；群回合没有视觉通道，画面进不去会说明一次。"
+            "hint": "群里沿用上面同一套设置；群里的视频画面与图片一起走「每回合图片数上限」，没识别会说明一次。"
           }
         }
       },
@@ -2402,10 +2402,58 @@
       }
     }
   },
+  "long_horizon": {
+    "type": "object",
+    "title": "长线叙事催化器",
+    "description": "【扩展 16】长线叙事催化器：证据攒够后给她一个可选、可撤回的长期走向（实验，默认关闭）。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用长线叙事催化器",
+        "default": false,
+        "hint": "攒够叙事证据时后台会多一次模型调用"
+      },
+      "trigger_score": {
+        "type": "int",
+        "description": "首次审视的加权分数门槛",
+        "default": 25,
+        "hint": "私聊条目全额计入、群聊减半；攒够本项才给她一个长期方向"
+      },
+      "review_increment": {
+        "type": "int",
+        "description": "再次审视所需的分数增量",
+        "default": 40,
+        "hint": "上次审视之后再多攒这么多分，复查一次长期方向；每次复查都是一次模型调用"
+      },
+      "private_weight": {
+        "type": "float",
+        "description": "兼容旧配置，固定 1.0",
+        "default": 1.0,
+        "hint": "私聊条目始终全额计入；本项填什么都不改变权重"
+      },
+      "group_weight": {
+        "type": "float",
+        "description": "兼容旧配置，固定 0.5",
+        "default": 0.5,
+        "hint": "群聊条目始终减半计入；本项填什么都不改变权重"
+      },
+      "intensity": {
+        "type": "string",
+        "description": "指导强度",
+        "default": "subtle",
+        "options": [
+          "subtle",
+          "moderate",
+          "strong"
+        ],
+        "hint": "subtle = 只允许最小、可撤回的表达；调高后模型请求的更强档位才生效"
+      }
+    }
+  },
   "qzone": {
     "type": "object",
     "title": "QQ 空间",
-    "description": "【扩展 16】QQ 空间：说说与好友动态的低频维护（上游 rc28 的 qzone 组）。",
+    "description": "【扩展 17】QQ 空间：说说与好友动态的低频维护（上游 rc28 的 qzone 组）。",
     "items": {
       "enabled": {
         "type": "bool",

@@ -98,7 +98,8 @@ from typing import Any, Callable, Optional
 from ..agency import active_agency_window, proactive_candidate_fingerprint
 from ..bubbles import VOICE_MARKER, runtime_bubble_segments
 from ..delivery import delivery_entry_metadata, restore_message_event, script_event_payload
-from ..script.delivery_ledger import update_script_delivery_actions
+from ..script.completion_report import ledger_completion
+from ..script.delivery_ledger import delivery_intent_key, update_script_delivery_actions
 from ..story_state import decode_story_state, encode_story_state
 from ..time import dt_ms, format_log_time, iso, parse_dt, utc_now
 from ..urge import (
@@ -109,6 +110,10 @@ from ..urge import (
     urge_user_event,
 )
 from .base import ServiceBase, is_one_bot_platform, pick
+# 「请求已写出、结果不可知、禁止自动重试」那句判据只有一处（`desktop.py`，
+# 与 `core/qzone.py::_frame_ambiguous` 同源）。这里读它只为把失败理由写实、
+# 并让 30 秒重试在 ambiguous 时不排期——重投就是真重复。
+from .desktop import AMBIGUOUS_DELIVERY_NOTE
 from .transport import voice_kwargs
 from .helpers import (
     active_rest_window,
@@ -431,6 +436,10 @@ class ServiceChunk6(ServiceBase):
                         await self.update_script_delivery_outcome(
                             story_id, reference, 'cancelled', now, 'delivery-target-unavailable',
                         )
+                        # v1.9.9（§87）：到期分段被取消 = 一条"没发出去"的事实，当场回报。
+                        await self._report_split_completion(
+                            story_id, reference, 'cancelled', 'delivery-target-unavailable', now,
+                        )
                 else:
                     message: dict[str, Any] = {
                         'participant_id': pick(participant, 'id'),
@@ -453,6 +462,27 @@ class ServiceChunk6(ServiceBase):
                     if not delivered:
                         if pick(participant, 'id') in self.interrupted_typing_participants:
                             return
+                        if message.get('delivery_ambiguous') is True:
+                            # v1.9.9（§88.1/§88.2 的接线）：结果不可知**绝不排 30 秒重试**
+                            # ——请求已经写出去了，重投就是真重复（上游这条由宿主 outbox
+                            # 去重，我们靠桥侧自记账 + 这里的不重排）。意图结清成终态，
+                            # 投递现实留在 `pending`（三态里的"结果不确定"），由 §87 的
+                            # 完成回报当场告诉她"这条到底发没发出去不确定"。
+                            if message.get('script_event'):
+                                await self.update_script_delivery_outcome(
+                                    story_id, message['script_event'], 'pending', now,
+                                    'delivery-ambiguous-no-retry',
+                                )
+                            await self.db_set(
+                                'interlude_intent', {'id': pick(next_intent, 'id')},
+                                {'status': 'completed', 'updatedAt': now},
+                            )
+                            if message.get('script_event'):
+                                await self._report_split_completion(
+                                    story_id, message['script_event'], 'pending',
+                                    'delivery-ambiguous-no-retry', now,
+                                )
+                            return
                         if message.get('script_event'):
                             await self.update_script_delivery_outcome(
                                 story_id, message['script_event'], 'pending', now,
@@ -464,6 +494,12 @@ class ServiceChunk6(ServiceBase):
                             {'notBefore': retry_at, 'updatedAt': now},
                         )
                         self.schedule_due_intent_wake(story_id, retry_at)
+                        # v1.9.9（§87）：没有回执（重试已排期）也要当场说一声"不确定"。
+                        if message.get('script_event'):
+                            await self._report_split_completion(
+                                story_id, message['script_event'], 'pending',
+                                'delivery-unconfirmed-retry-scheduled', now,
+                            )
                         return
                     await self.append_entry(story_id, {
                         'kind': 'character-message',
@@ -1086,9 +1122,27 @@ class ServiceChunk6(ServiceBase):
                     if outgoing_voice:
                         # 正文 `<tts/>` 意图随投递动作一起交给适配层（有才写这个键）。
                         delivery['voice'] = True
+                    # v1.9.9（§88.1 的接线，上游 `service.ts:6356` 那一行）：
+                    # `intentKey = eventId:bubbleIndex` 是投递意图的**业务幂等键**。
+                    # 没有它，桥侧那份自记账账本在生产上不会被激活（`desktop.py`
+                    # 的 `_intent_delivered` / `_intent_in_flight` 只认这个键），
+                    # 于是"同一次 30 秒重试风暴"里的重投会真的重复发出。
+                    # 拿不到合法 `eventId` 时是空串 = 这条没有幂等身份，
+                    # 此时不许去重（宁可照旧重试，也不能拿编出来的键把两条话当成一条）。
+                    intent_key = delivery_intent_key(message.get('script_event') or {})
+                    if intent_key:
+                        delivery['intentKey'] = intent_key
                     outcome = await desktop_handler(delivery)
                     if not (isinstance(outcome, dict) and outcome.get('ok')):
-                        failure = _record(outcome).get('error') or 'typ-0 宿主投递失败。'
+                        record = _record(outcome)
+                        failure = record.get('error') or 'typ-0 宿主投递失败。'
+                        if record.get('ambiguous') is True:
+                            # 结果不可知（§88.2）：请求**已经写出去了**。把 `ambiguous`
+                            # 与 error 一起带进失败理由，并在消息上留一个标记，让下面
+                            # 的 catch 与调用方（30 秒重试那两处）都能分辨
+                            # "没发出去"（可重试）与"可能已经发出去了"（禁止重试）。
+                            failure = '%s（%s）' % (failure, AMBIGUOUS_DELIVERY_NOTE)
+                            message['delivery_ambiguous'] = True
                         raise RuntimeError(str(failure))
                     delivered.append(message)
                     continue
@@ -1133,9 +1187,21 @@ class ServiceChunk6(ServiceBase):
                     '消息投递失败 参与者=%s 错误=%s', target_id, error,
                 )
                 if record_failures:
-                    await self.record_outgoing_delivery_failure(
-                        story, target_id, message, 'transport-error: %s' % error,
-                    )
+                    if message.get('delivery_ambiguous') is True:
+                        # v1.9.9（§88.2 / §87 三态）：结果不可知**不是**"没发出去"——
+                        # 账本停在 `pending`（→ `not-confirmed` → 三态里的 `unknown`），
+                        # 并且**不写** `outgoing-delivery-failed` 那条"仍未发送"的系统
+                        # 证据（那两处都会把"可能已经收到了"说成"确定没收到"）。
+                        # 调用方看到消息上的标记就不排 30 秒重试（重投就是真重复）。
+                        if message.get('script_event'):
+                            await self.update_script_delivery_outcome(
+                                pick(story, 'id'), message.get('script_event'), 'pending',
+                                _now_of(self), 'delivery-ambiguous: %s' % error,
+                            )
+                    else:
+                        await self.record_outgoing_delivery_failure(
+                            story, target_id, message, 'transport-error: %s' % error,
+                        )
             finally:
                 if typing_window:
                     # 这条气泡发出去了（或明确失败）——**立刻**熄灭，绝不留到下一批 /
@@ -1270,6 +1336,17 @@ class ServiceChunk6(ServiceBase):
                 'occurred_at': iso(now),
                 'metadata': metadata,
             }, now, participant_id)
+            # v1.9.9（§87）：没发出去的主角消息**当场**回报（她正跟这个人说话，不能等到
+            # 下一次有人开口）。三态与事实仍由投递账本派生，不在这里另判一次。
+            if message.get('script_event') and callable(
+                getattr(self, 'report_ledger_completion', None)
+            ):
+                await self.report_ledger_completion(
+                    pick(story, 'id'), message['script_event'], 'failed', clip(reason, 500), now,
+                    kind='message',
+                    participant_id=participant_id,
+                    user_initiated=pick(message, 'userInitiated', 'user_initiated') is True,
+                )
 
         await self.serial(pick(story, 'id'), task)
 
@@ -1406,7 +1483,12 @@ class ServiceChunk6(ServiceBase):
         status: str,
         reason: Optional[str] = None,
     ) -> None:
-        """上游 `recordPlatformDeliveryOutcome(...)`（`:5300`）逐条移植。"""
+        """上游 `recordPlatformDeliveryOutcome(...)`（`:5300`）逐条移植。
+
+        v1.9.9（§87）：账本写完之后，**失败 / 不可知**的结果立刻走统一回报通道
+        （成功不打扰——她自己知道那条图发出去了）。回报是观察性的第二跳：它自己
+        失败也绝不回滚已经记好的平台结果，只多一条 warn。
+        """
         try:
             async def task() -> None:
                 await self.update_script_delivery_outcome(
@@ -1420,6 +1502,100 @@ class ServiceChunk6(ServiceBase):
                 story_id, pick(reference, 'eventId', 'event_id'),
                 pick(reference, 'segmentIndex', 'segment_index'), error,
             )
+            return
+        if status == 'delivered' or not callable(getattr(self, 'report_ledger_completion', None)):
+            return
+        # 回报是观察性的第二跳：它自己炸了也绝不回滚已经记好的平台结果，但一定要留痕。
+        try:
+            await self.report_ledger_completion(
+                story_id, reference, status, reason, _now_of(self), kind='platform-delivery',
+            )
+        except Exception as error:
+            self.report_standalone(
+                'warn', '异步动作完成回报失败 故事=%s 事件=%s 错误=%s',
+                story_id, pick(reference, 'eventId', 'event_id'), error,
+            )
+
+    # ------------------------------------------------------------------ #
+    # reportLedgerCompletion（v1.9.9 受控偏离，见 docs/PORTING_NOTES.md §87）
+    # ------------------------------------------------------------------ #
+
+    async def report_ledger_completion(
+        self,
+        story_id: str,
+        reference: Any,
+        status: str,
+        reason: Any = None,
+        now: Any = None,
+        kind: str = 'delivery',
+        participant_id: str = '',
+        user_initiated: bool = False,
+    ) -> str:
+        """投递类完成（气泡 / 媒体 / 平台片段）→ 从投递账本派生三态 → 统一回报通道。
+
+        **判据一处**：调用方给的 `status` 只用来判断这一跳值不值得查账本；真正的事实与
+        三态由 `script/completion_report.ledger_completion()` 从 `delivery_reality`
+        派生。于是账本自己那条纪律自动成立：迟到的 `failed` 不得降级已 `delivered`
+        的片段——账本说 delivered，这里就派生 delivered，也就是不回报。
+        """
+        reporter = getattr(self, 'report_async_completion', None)
+        if not callable(reporter):
+            return 'unavailable'
+        moment = to_date(now) or _now_of(self)
+        script_entry_id = pick(reference, 'scriptEntryId', 'script_entry_id')
+        if isinstance(script_entry_id, bool) or not isinstance(script_entry_id, int):
+            return 'unavailable'
+        try:
+            rows = await self.db_get('interlude_script_entry', {'id': int(script_entry_id)})
+        except Exception as error:
+            self.report_standalone(
+                'warn', '完成回报读投递账本失败 故事=%s 条目=%s 错误=%s',
+                story_id, script_entry_id, error,
+            )
+            return 'unavailable'
+        entry = rows[0] if rows else None
+        if not isinstance(entry, dict) or pick(entry, 'storyId', 'story_id') != story_id:
+            return 'unavailable'
+        event_id = pick(reference, 'eventId', 'event_id')
+        owner = participant_id or pick(entry, 'participantId', 'participant_id') or ''
+        completion = ledger_completion(
+            entry, pick(reference, 'commitId', 'commit_id'), event_id, owner or None, True,
+        )
+        return await reporter(
+            story_id,
+            kind=kind,
+            state=completion['state'],
+            facts=completion['facts'],
+            now=moment,
+            participant_id=owner,
+            # 同因 = 同一类动作、同一个结局、同一句原因。**刻意不带事件 id**：同一次
+            # 投递的重试循环、以及"她为了回报而回的那句话也发不出去"的连锁，原因都一样，
+            # 必须合成一次回报（失败不许刷爆她的回合）；换一个原因才是新事实。
+            cause='%s|%s|%s' % (kind, completion['state'], reason or ''),
+            reason=str(reason or ''),
+            user_initiated=user_initiated,
+            source_entry_id=script_entry_id,
+        )
+
+    async def _report_split_completion(
+        self, story_id: str, reference: Any, status: str, reason: str, now: Any,
+    ) -> str:
+        """到期分段气泡的结局 → 统一回报通道（§87，`deliver_due_split_segments` 用）。
+
+        回报是观察性的第二跳：它自己失败绝不回滚投递结果或重试排期，只多一条 warn。
+        """
+        if not isinstance(reference, dict):
+            return 'unavailable'
+        try:
+            return await self.report_ledger_completion(
+                story_id, reference, status, reason, now, kind='due-intent',
+            )
+        except Exception as error:
+            self.report_standalone(
+                'warn', '异步动作完成回报失败 故事=%s 事件=%s 错误=%s',
+                story_id, pick(reference, 'eventId', 'event_id'), error,
+            )
+            return 'failed'
 
     # ------------------------------------------------------------------ #
     # resolveLiteralQuoteMessageId（上游 :5313）

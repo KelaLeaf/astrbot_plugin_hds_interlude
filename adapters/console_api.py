@@ -31,7 +31,7 @@ from ..core.meta import HDS_INTERLUDE_VERSION
 #: FFmpeg 状态：**判据只有一处**（`core/video_understanding.ffmpeg_status_label`），
 #: 控制台这一层不自己算、也不看宿主的 schema（宿主内存里那次注入永远不会出现在
 #: 我们读的仓库文件里——这正是用户"报告了却看不见"的现场之一）。
-#: v1.9.8 起状态词**只贴「识别模式」一项的 hint**（用户真机验收：别处不要），
+#: v1.9.9 起状态词**只贴「识别模式」一项的 hint**（用户真机验收：别处不要），
 #: 分组级徽章那条路已整条撤掉。
 from ..core.video_understanding import (
     apply_ffmpeg_status_hint_or_problem,
@@ -1603,7 +1603,7 @@ class ConsoleApi:
         （类型/说明/hint/默认值/候选项），以及**兼容性提示** `note`
         ——宿主配置页编不了的字段在这里会被点名（见 `host_editor_note`）。
 
-        ## FFmpeg 状态（v1.9.8：只贴「识别模式」一项）
+        ## FFmpeg 状态（v1.9.9：只贴「识别模式」一项）
 
         我们读的是**仓库里的** `_conf_schema.json`（`load_config_schema()`，按 mtime
         缓存），宿主动态写进内存 schema 的那句状态**永远不会**出现在这里——用户"报告了
@@ -1707,7 +1707,7 @@ class ConsoleApi:
                 #: `description` 是一句话说明，留在卡片里当副标题。
                 'title': _text(group_spec.get('title')),
                 'description': _text(group_spec.get('description')),
-                #: 分组级状态词**没有**（v1.9.8 撤掉了那条路）：状态词只出现在它真正管的那
+                #: 分组级状态词**没有**（v1.9.9 撤掉了那条路）：状态词只出现在它真正管的那
                 #: 一项旁边（`model_center.video.mode` 的 hint），不在分组标题上再喊一遍。
                 #: 由 `tests/test_console_api.py` 的全量扫描看着：payload 里任何分组都不许
                 #: 再有状态词、任何别的字段 hint / description 也不许有。

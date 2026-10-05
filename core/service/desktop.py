@@ -55,6 +55,17 @@
    没有可用计时器（无运行中的事件循环）时心跳不启动，桥的其余能力不受影响。
 5. **上游 disposer 不重置 event sink**；本移植版的 `stop()` 额外
    `set_desktop_event_sink(None)`，避免停桥后仍向已死的 sink 推送。
+6. **桥接 ambiguous（rc33，`desktop-bridge.ts:191,198,398`）**：超时 / 桥在途关闭 /
+   回执带 `ambiguous: true` 一律按 `AmbiguousDeliveryError` 结算——"请求已写出、
+   结果不可知、**禁止自动重试**"。这条判据与我们已有的
+   `core/qzone.py::_frame_ambiguous` 同源（那边是 QZone CGI）。
+7. **投递幂等（rc33，`service.ts:6356` + `desktop-bridge.ts:93`）**：上游把
+   `intentKey = eventId:bubbleIndex` 交给**宿主 outbox** 跨 `deliveryId` 去重；
+   AstrBot 没有 outbox，所以 `_background_delivery` **自己按这个键记账**
+   （内存表，重启即清空）并在抑制重投时打可见 warn。见方法 docstring。
+8. **多通道账号标识（rc33，`service.ts:9719`）**：后台投递的 `accountKey` 用
+   `onebot:<selfId>`（上游 rc33 把 `desktop:` 改成 `onebot:`）；`chunk13` 侧另有
+   同一条规则的读通道版本（`onebot_target_id`）。
 
 ## 键名约定
 
@@ -82,6 +93,8 @@ from .base import log_fallback, pick
 from .session import SessionView
 
 __all__ = [
+    'AMBIGUOUS_DELIVERY_NOTE',
+    'AmbiguousDeliveryError',
     'DESKTOP_BRIDGE_ENV',
     'DESKTOP_PHASE_ENV',
     'DesktopBridge',
@@ -97,6 +110,32 @@ __all__ = [
     'is_request_id',
     'is_timeline_range_request',
 ]
+
+#: 「请求已写出、结果不可知，禁止自动重试」——`core/qzone.py::_frame_ambiguous`
+#: 的同一条判据（那边是 QZone CGI，这边是桌面桥的投递 / 动作回执）。
+AMBIGUOUS_DELIVERY_NOTE = '结果未知：请求已写出，禁止自动重试'
+
+#: 幂等键（`eventId:bubbleIndex`）已经写出过一次、回执未到时，再次投递会被拒绝。
+DUPLICATE_INTENT_PREFIX = 'duplicate-intent'
+
+
+class AmbiguousDeliveryError(RuntimeError):
+    """桥接**结果不可知**（超时 / 桥在途关闭 / 回执里带 `ambiguous`）。
+
+    上游对端：`upstream/src/desktop-bridge.ts:191`（动作代理超时 → `ambiguous:true`）、
+    `:398`（dispose 窗口内在途请求按 ambiguous 结算）、`upstream/src/service.ts:7224`
+    （qzone 动作代理把 `ambiguous` 映射进 `QzoneActionError`）。
+
+    语义与 `core/qzone.py::QzoneActionError.ambiguous` 完全一致：请求**已经写出去了**，
+    平台可能已经收到，禁止自动重试——重试就是真重复（`AMBIGUOUS_DELIVERY_NOTE`
+    是调用方认的那句话）。
+    """
+
+    ambiguous = True
+
+    def __init__(self, message: str) -> None:
+        super().__init__('%s（%s）' % (message, AMBIGUOUS_DELIVERY_NOTE))
+
 
 #: 上游闸门环境变量：`process.env.HDSI_DESKTOP_BRIDGE !== '1'` 时不安装桥。
 DESKTOP_BRIDGE_ENV = 'HDSI_DESKTOP_BRIDGE'
@@ -368,11 +407,13 @@ def desktop_session(
 class _PendingDelivery:
     """一条等待渠道回执的投递（上游 `PendingDelivery`）。"""
 
-    __slots__ = ('future', 'timer')
+    __slots__ = ('future', 'timer', 'intent_key')
 
-    def __init__(self, future: 'asyncio.Future[list[str]]', timer: Any):
+    def __init__(self, future: 'asyncio.Future[list[str]]', timer: Any, intent_key: str = ''):
         self.future = future
         self.timer = timer
+        #: P1-1 的业务幂等键（`eventId:bubbleIndex`）；空串 = 这条没有幂等身份。
+        self.intent_key = intent_key
 
 
 # =========================================================================== #
@@ -418,6 +459,14 @@ class DesktopBridge:
             self.DELIVERY_TIMEOUT_MS if delivery_timeout_ms is None else int(delivery_timeout_ms)
         )
         self._pending_deliveries: dict[str, _PendingDelivery] = {}
+        #: **投递幂等账本**（P1-1 的显式降级，见 `_background_delivery`）：
+        #: `_intent_delivered` = 已确认投递成功的 `intentKey → messageIds`；
+        #: `_intent_in_flight` = 已写出请求、结果尚未确认的 `intentKey`。
+        #: 上游把这件事交给宿主 outbox（`desktop-bridge.ts:93`）；AstrBot 没有那一层，
+        #: 所以这里**自己记**——只在进程内存里，重启即清空（刻意如此：这把账本只是
+        #: "别在 30 秒重试里重复投递"的护栏，不是持久事实）。
+        self._intent_delivered: dict[str, list[str]] = {}
+        self._intent_in_flight: set[str] = set()
         self._events: deque[dict[str, Any]] = deque(maxlen=self.EVENT_BUFFER_LIMIT)
         self._collector: Optional[list[dict[str, Any]]] = None
         self._heartbeat: Any = None
@@ -481,7 +530,11 @@ class DesktopBridge:
             if callable(timer_cancel):
                 timer_cancel()
             if not pending.future.done():
-                pending.future.set_exception(RuntimeError('typ-0 bridge 已关闭。'))
+                # 上游 `:398`：dispose 窗口里的在途请求按 **ambiguous** 结算
+                # （请求已经写出去了，结果不可知）——不是"失败"，所以不许自动重试。
+                pending.future.set_exception(AmbiguousDeliveryError(
+                    'typ-0 bridge 在投递途中关闭'
+                ))
         self._pending_deliveries.clear()
 
     def __enter__(self) -> 'DesktopBridge':
@@ -526,7 +579,14 @@ class DesktopBridge:
     # ------------------------------------------------------------------ #
 
     async def request_delivery(self, payload: dict[str, Any]) -> list[str]:
-        """上游 `requestDelivery(payload)`（`:131`）：发 `delivery` 事件等 45s 回执。"""
+        """上游 `requestDelivery(payload)`（`:131`）：发 `delivery` 事件等 45s 回执。
+
+        `intentKey`（P1-1 的业务幂等键，`eventId:bubbleIndex`）随请求原样发出去：
+        上游靠宿主 outbox 跨 `deliveryId` 去重，本移植版自己记（见
+        `_background_delivery`），但**仍然把它发出去**——桌面端将来若实现了 outbox，
+        键的形状与上游逐字一致，接得上。
+        """
+        intent_key = str(pick(payload, 'intentKey', 'intent_key') or '')
         delivery_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         future: 'asyncio.Future[list[str]]' = loop.create_future()
@@ -536,7 +596,10 @@ class DesktopBridge:
             delivery_id,
             future,
         )
-        self._pending_deliveries[delivery_id] = _PendingDelivery(future, timer)
+        self._pending_deliveries[delivery_id] = _PendingDelivery(future, timer, intent_key)
+        if intent_key:
+            # 请求**已经写出去了**（下面 emit）：这就是"结果不可知"的起点。
+            self._intent_in_flight.add(intent_key)
         request = dict(payload)
         request['deliveryId'] = delivery_id
         request['occurredAt'] = iso(utc_now())
@@ -544,16 +607,30 @@ class DesktopBridge:
         return await future
 
     def _expire_delivery(self, delivery_id: str, future: 'asyncio.Future[list[str]]') -> None:
-        """上游 `setTimeout` 分支：超时后从挂起表摘掉并拒绝。"""
-        if self._pending_deliveries.pop(delivery_id, None) is None:
+        """上游 `setTimeout` 分支：超时后从挂起表摘掉并拒绝。
+
+        超时 = 回执没回来 = **结果不可知**（不是失败）：请求已经写出去了，平台可能
+        已经收到。按 `AmbiguousDeliveryError` 拒绝，调用方据此**禁止自动重试**。
+        """
+        pending = self._pending_deliveries.pop(delivery_id, None)
+        if pending is None:
             return
         if not future.done():
-            future.set_exception(RuntimeError('等待 typ-0 渠道投递确认超时。'))
+            future.set_exception(AmbiguousDeliveryError('等待 typ-0 渠道投递确认超时'))
+
 
     def settle_delivery(self, value: Any) -> bool:
         """上游 `settleDelivery(value)`（`:136`）：`delivery-result` 回执结算。
 
         返回 `True` 表示确实结算了一条挂起投递（上游同样返回布尔）。
+
+        v1.9.9（rc33 桥接 ambiguous）：回执有三种结局，**必须分开**——
+
+        * `status == 'sent'` → 成功（同时把 `intentKey` 记进"已确认"表）；
+        * 回执显式带 `ambiguous: true`（或 `status == 'unknown'`）→
+          `AmbiguousDeliveryError`：请求已写出、结果不可知，**禁止自动重试**；
+        * 其余（明确失败）→ 普通 `RuntimeError`：这次确实没发出去，可以重试
+          ——`intentKey` 从"在途"表里摘掉，重试才不会被幂等护栏挡住。
         """
         if not isinstance(value, dict):
             return False
@@ -567,26 +644,85 @@ class DesktopBridge:
         if callable(timer_cancel):
             timer_cancel()
         status = value.get('status')
+        ambiguous = pick(value, 'ambiguous') is True or pick(value, 'resultUnknown', 'result_unknown') is True
+        if ambiguous or status == 'unknown':
+            # 结果不可知：请求已经写出去了，**不许**当成"没发出去"去重试。
+            if not pending.future.done():
+                pending.future.set_exception(AmbiguousDeliveryError(
+                    'typ-0 渠道投递结果不可知（status=%s）' % (status if status is not None else 'unknown')
+                ))
+            return True
         if status == 'sent':
             message_ids = value.get('messageIds')
             ids = [item for item in message_ids if isinstance(item, str)] if isinstance(message_ids, list) else []
+            if pending.intent_key:
+                self._intent_delivered[pending.intent_key] = list(ids)
+                self._intent_in_flight.discard(pending.intent_key)
             if not pending.future.done():
                 pending.future.set_result(ids)
         else:
+            # 明确失败 = 这次**没有**发出去：摘掉在途标记，允许调用方重试。
+            if pending.intent_key:
+                self._intent_in_flight.discard(pending.intent_key)
             error = value.get('error') or ('渠道投递失败：%s' % status)
             if not pending.future.done():
                 pending.future.set_exception(RuntimeError(str(error)))
         return True
+
+    def _warn(self, message: str, *args: Any) -> None:
+        """可见 warn（宿主没有日志口时退化成一条 `error` 事件，绝不静默）。"""
+        report = getattr(self.service, 'report_standalone', None)
+        if callable(report):
+            report('warn', message, *args)
+            return
+        self.emit('error', {
+            'command': 'delivery',
+            'message': message % args if args else message,
+        })
 
     async def _background_delivery(self, delivery: Any) -> dict[str, Any]:
         """上游 `setDesktopDeliveryHandler(...).catch(...)`（`:147-171`）。
 
         后台投递（delayed/split/advance）没有实时 Session，走同一条 `delivery`
         事件；失败时把异常包成 `{ok: False, error}`，绝不让宿主回合崩掉。
+
+        **P1-1 投递幂等的显式降级**：上游把这个键交给**宿主 outbox** 跨 `deliveryId`
+        去重（`desktop-bridge.ts:93` 的注释逐字写着这件事）；AstrBot 没有 outbox
+        那一层，而我们自己又有"30 秒未确认则重试 + 重投换新 `deliveryId`"的行为
+        （`chunk6.deliver_due_split_segments`），所以这里**自己按
+        `eventId:bubbleIndex` 记账**：
+
+        * 这条意图已确认送达 → 直接回成功，**不再写请求**（真幂等）；
+        * 已写出、结果未确认 → 拒绝重投（`ambiguous=True` + 可见 warn）：
+          重投会真重复，宁可把"可能少一条"变成"确定不重复"；
+        * 明确失败过 → 放行重试（在途标记已由 `settle_delivery` 摘掉）。
+
+        账本只在进程内存里，**重启即清空**：所以它只防"同一次重试风暴"，不假装
+        能跨重启去重（跨重启的真幂等只能由宿主 outbox 提供——这是降级的一部分）。
         """
+        intent_key = str(pick(delivery, 'intentKey', 'intent_key') or '').strip()
+        if intent_key:
+            confirmed = self._intent_delivered.get(intent_key)
+            if confirmed is not None:
+                return {'ok': True, 'messageIds': list(confirmed), 'idempotent': True}
+            if intent_key in self._intent_in_flight:
+                self._warn(
+                    '投递幂等（本移植版自记账）：意图 %s 上一次已经写出、结果尚不可知，'
+                    '本轮不再重投——重投会真的重复（上游这条由宿主 outbox 保证，'
+                    'AstrBot 没有那一层，所以由我们自己记）。这条消息可能没到；'
+                    '下一步：确认对方是否收到；确实没收到就重启插件（内存账本随重启清空）'
+                    '再让该意图重投。',
+                    intent_key,
+                )
+                return {
+                    'ok': False, 'ambiguous': True,
+                    'error': '%s：%s，已抑制重复投递' % (DUPLICATE_INTENT_PREFIX, intent_key),
+                }
         try:
             message_ids = await self.request_delivery({
-                'accountKey': 'desktop:%s' % (pick(delivery, 'selfId', 'self_id') or ''),
+                # P1-4：多通道账号标识（rc33）——`onebot:<selfId>` 让宿主按 OneBot
+                # 账号注册表路由；旧的 `desktop:` 前缀没有任何实例认它（多实例下会认错账号）。
+                'accountKey': 'onebot:%s' % (pick(delivery, 'selfId', 'self_id') or ''),
                 'transport': 'onebot-external',
                 'platform': pick(delivery, 'platform'),
                 'selfId': pick(delivery, 'selfId', 'self_id'),
@@ -594,7 +730,12 @@ class DesktopBridge:
                 'kind': pick(delivery, 'kind'),
                 'replyTo': pick(delivery, 'quoteMessageId', 'quote_message_id'),
                 'content': pick(delivery, 'content'),
+                **({'intentKey': intent_key} if intent_key else {}),
             })
+        except AmbiguousDeliveryError as error:
+            # 结果不可知：**不上抛成普通失败**——调用方要能分辨"没发出去"（可重试）
+            # 与"可能已经发出去了"（禁止自动重试）。
+            return {'ok': False, 'ambiguous': True, 'error': str(error)}
         except Exception as error:
             return {'ok': False, 'error': str(error)}
         return {'ok': True, 'messageIds': message_ids}

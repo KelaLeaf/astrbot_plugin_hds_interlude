@@ -238,6 +238,13 @@ class Transport(Protocol):
     async def is_super_admin(self, user_id: str) -> bool:
         """宿主管理员判定（用于动作权限表里的 `admin` 档）。
 
+        ⚠️ **core 的权限判定不走这个方法**（v1.9.9 修，§86）：`admin` 档是**同步**判的
+        （`chunk12.resolve_action_session_role()` 是 `def`，`chunk4` 的提示词组装也同步调它），
+        同步上下文里 await 不了协程，历史写法直接 `probe(user_id)` 探它 → 判定恒假 +
+        每次调用一条 `RuntimeWarning: coroutine ... was never awaited`。
+        核心侧现在读同步的 `known_super_admin_ids()`（**可选能力**，见 `NullTransport` 上的
+        那一份），这个方法只为异步调用方留口。
+
         取不到（没实现、读不到管理员名单）一律返回 **False**——这个返回值是多条
         `dangerous` 动作的唯一闸门，"读不到"必须等价于"没有权限"，不能反过来。
         """
@@ -370,3 +377,23 @@ class NullTransport:
     async def is_super_admin(self, user_id: str) -> bool:
         # 没有宿主就谈不上"宿主管理员"：一律 False（权限判定宁可从严）。
         return False
+
+    #: ⚠️ `known_super_admin_ids` 是 `Transport` 协议之外的**可选能力**，刻意**不**写进
+    #: `Transport`（`@runtime_checkable` 的 `isinstance()` 只查方法：往协议里加一个适配层
+    #: 还没实现的方法，会让 `test_astrbot_bridge.TransportDegradationTests
+    #: .test_implements_the_full_transport_protocol` 当场红——那条用例钉的是
+    #: "适配层实现了协议里的每一个方法"）。与 `platform_action` / `set_input_status`
+    #: 同一处境：core 侧用 `getattr` 探，探不到就走安全回退。
+    def known_super_admin_ids(self) -> tuple[str, ...]:
+        """宿主管理员名单（**同步**），`admin` 档的判据来源。
+
+        `admin` 档的判定发生在**同步**上下文里（core 的 role 解析是 `def`，见
+        `chunk12.resolve_action_session_role()`），所以这份名单必须**同步**可取——
+        异步方法在同步上下文里只会留下"协程从未被 await"的警告并恒假。
+
+        宿主适配层实现它时也**必须同步**（名单来自宿主配置 `admins_id`，可以直接同步读）；
+        形状可以是方法，也可以是返回 id 元组的属性（`chunk12.super_admin_ids_from_host()`
+        两种都认）。取不到 / 不是名单 → 空元组 = `admin` 档一律不放行
+        （安全侧，与 `is_super_admin()` 的 False 同一个语义）。
+        """
+        return ()

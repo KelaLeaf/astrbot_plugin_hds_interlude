@@ -112,7 +112,11 @@ from .types import (
     TimelinePlan,
     TimelinePlanRequest,
 )
-from .narrator_prompts import platform_action_instruction, work_instruction
+from .narrator_prompts import (
+    platform_action_instruction,
+    platform_action_params_instruction,
+    work_instruction,
+)
 from .urge import urge_instruction
 
 try:  # 上游 `./script/authored-actions`；由并行的 `core/script/authored_actions.py` 移植任务落地。
@@ -549,6 +553,10 @@ SIDE_TASK_ROUTES: dict[str, str] = {
     '压缩': 'compaction',
     '时间导演': 'compaction',
     '日程预排': 'compaction',
+    # 长线叙事指导（v1.9.9）：上游**复用 compaction 路由**（`narrator.ts:606` 读
+    # `this.routing.compaction`）。这里显式写出来是声明这条路由的归属
+    # （`_side_task_json` 的兜底默认也是 `compaction`，所以改兜底时这一项才是判据）。
+    '长线叙事指导': 'compaction',
     'Overlay 整理': 'compaction',
     'Alter 分析': 'alter',
 }
@@ -790,6 +798,18 @@ class SilentNarrator:
         group_id: str = '',
     ) -> Optional[dict[str, Any]]:
         """两级选择的第二步同样不产出（没有模型连接 → 服务层按"没有候选"兜底）。"""
+        return None
+
+    async def select_platform_action_params(
+        self,
+        action_id: str,
+        label: str = '',
+        summary: str = '',
+        spec: str = '',
+        message_text: str = '',
+        current_params: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """两段式的第二段同样不产出（没有模型连接 → 服务层按"参数没补上"兜底并留 warn）。"""
         return None
 
 
@@ -1354,6 +1374,11 @@ class OpenAICompatibleNarrator:
                     channel_selection_enabled=bool(_get(request, 'channelSelectionEnabled') or request.get('channel_selection_enabled')),
                     # 两级选择的第一段（§48 甲）：分组目录。有它就不平铺条目。
                     sticker_groups=(_get(request, 'stickerGroupCatalog') or request.get('sticker_group_catalog')),
+                    # 长线指导（v1.9.9，上游 `narrator.ts:930`）：软许可，只在她自己
+                    # 觉得自然时用一次（不是剧本、不是硬性指令）。键缺席 = 没注入。
+                    long_horizon_guidance=(
+                        _get(request, 'longHorizonGuidance') or request.get('long_horizon_guidance')
+                    ),
                 ) + urge_instruction(
                     bool(_get(request, 'urgeEnabled')) or request.get('urge_enabled') is True,
                     request.get('phase'),
@@ -1800,6 +1825,73 @@ class OpenAICompatibleNarrator:
             self._debug('Schedule Preplan 不可用：%s', error)
             return None
 
+    async def plan_long_arc_guidance(self, request: LongArcGuidanceRequest) -> Any | None:
+        """长线叙事指导（上游 `planLongArcGuidance`，`narrator.ts:606-632` 逐行）。
+
+        **刻意独立于场景压缩**：一次冗长的摘要响应不该把这条低强度、低温度的长期走向
+        挤掉（上游 `types.ts:1139` 的注释）。连接复用 **compaction 路由**（与
+        `plan_schedule_preplan` 同一套解析：指名优先 → 回落路由 → 没有就 `None`）。
+
+        差异点全部照上游：温度 `min(compaction.temperature, 0.35)`（比预排的 0.2 松一点，
+        但仍属低温创作）、截断重试时 `max_tokens = 2200`、`response_format` 与 compaction
+        同档；系统提示词是 `long_arc_guidance_prompt(side_specialty)`（逐字抄上游
+        `narrator.ts:2343-2364`），user 侧就是**原样的分层输入 JSON**。
+        """
+        compact_config = self.config.get('compaction')
+        if _is_false(_get(compact_config, 'enabled')):
+            return None
+        route = self.routing['compaction'].get('target') or {}
+        assigned = self._assigned_providers('compaction')
+        providers = assigned if assigned else self._select_route_providers(self.routing['compaction'], False)
+        selected = [provider for provider in providers if provider.get('id') == route.get('provider_id')] \
+            if _truthy(route.get('provider_id')) else []
+        provider = (selected[0] if selected else None) or _first(providers)
+        model = (_get(provider, 'model') if assigned else _or(route.get('model'), _get(provider, 'model')))
+        if provider is None or not model:
+            return None
+        response_format = _coalesce(_get(compact_config, 'response_format'), 'json-object')
+        # 上游 `sideSpecialty()`（`narrator.ts:327-329`）：侧任务的档位只看
+        # `config.specialization === 'lite'`（严格等于），家族固定 generic。
+        mode = _coalesce(_get(self.config, 'specialization'), _get(self.config, 'specialization_mode'))
+        side_specialty = {
+            'tier': 'lite' if str(mode or '').strip() == 'lite' else 'full',
+            'family': 'generic', 'source': 'manual', 'probe': 'side-task',
+        }
+
+        def build_body(capped: bool) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                **parse_object(provider.get('extra_body'), 'extraBody', self.logger),
+                'model': model,
+                'temperature': _js_min(
+                    _coalesce(_get(compact_config, 'temperature'), provider.get('temperature')), 0.35,
+                ),
+                'top_p': _coalesce(_get(compact_config, 'top_p'), 1),
+            }
+            if capped:
+                body['max_tokens'] = 2200
+            if response_format == 'json-object':
+                body['response_format'] = {'type': 'json_object'}
+            body['messages'] = [
+                {'role': 'system', 'content': long_arc_guidance_prompt(side_specialty)},
+                {'role': 'user', 'content': _stringify_json(request)},
+            ]
+            return body
+
+        def parse(text: str) -> Any:
+            if not text:
+                raise RuntimeError('Long-horizon guidance provider returned an empty response.')
+            return parse_json_response(text, 'Long-horizon guidance provider')
+
+        try:
+            return await self._side_task_json(
+                provider, model, '长线叙事指导',
+                _or(_or(_get(compact_config, 'timeout'), route.get('timeout')), provider.get('timeout')),
+                build_body, parse,
+            )
+        except Exception as error:  # noqa: BLE001 - 长线指导失败只记日志（sweep 零写入）
+            self._debug('长线叙事指导不可用：%s', error)
+            return None
+
     async def compact_overlay(self, request: OverlayCompactionRequest) -> OverlayCompactionDecision:
         """压缩设定演化 overlay（上游 `compactOverlay`）。"""
         compact_config = self.config.get('compaction')
@@ -2091,6 +2183,88 @@ class OpenAICompatibleNarrator:
             return None
         finally:
             self._emit_usage('表情选择', usages)
+
+    async def select_platform_action_params(
+        self,
+        action_id: str,
+        label: str = '',
+        summary: str = '',
+        spec: str = '',
+        message_text: str = '',
+        current_params: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """动作教学两段式的**第二段**（本移植版新增 §86）：只把选定动作的参数表交给它填。
+
+        与 `select_sticker` 同构（§48 甲的先例），纪律逐条一致：
+
+        * 走**主叙事**连接（`main` 任务）：挑动作的是主角自己，参数也得是她的口吻与判断
+          ——拿识图 / 压缩那类旁路连接去填动作参数是错误的接线；
+        * 返回模型**原样**的 JSON（`{"action": …, "params": {…}}`）；动作 id 是否逐字
+          一致、参数是否齐全合法，仍由 `service.chunk12.parse_platform_action_params()`
+          **一处**收（第一段文本是最终有效的，第二段只填参数槽）；
+        * 任何失败（没有可用连接 / 请求抛错 / 回执不是 JSON）一律回 `None`，绝不抛：
+          调用方按"这一次没补上参数"继续，可见 warn 由服务层打，回合不许卡住。
+
+        参数表由 `narrator_prompts.platform_action_params_instruction()` 渲染
+        （含枚举 / 范围 / 必填标记与可照抄的示例）——与第一段共用同一份目录事实源
+        (`core/platform_actions.py`)。
+        """
+        name = str(action_id or '').strip()
+        form = platform_action_params_instruction(name, summary, spec)
+        if not name or not form:
+            return None
+        assigned = self._assigned_providers('main')
+        route = self.routing['main'].get('target') or {}
+        providers = assigned if assigned else self._select_route_providers(
+            self.routing['main'], not _truthy(route.get('model')),
+        )
+        provider = _first(providers)
+        if provider is None:
+            return None
+        request_body: dict[str, Any] = {
+            **parse_object(provider.get('extra_body'), 'extraBody', self.logger),
+            'model': provider.get('model'),
+            'temperature': 0.2,
+            'top_p': 1,
+            'max_tokens': _sticker_max_tokens(256),
+        }
+        if provider.get('response_format') == 'json-object':
+            request_body['response_format'] = {'type': 'json_object'}
+        request_body['messages'] = [
+            {'role': 'system', 'content': form},
+            {
+                'role': 'user',
+                'content': json.dumps(
+                    {
+                        'action': name,
+                        'label': label,
+                        'message': message_text,
+                        'currentParams': current_params if isinstance(current_params, dict) else {},
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        headers = _json_headers(provider, self.logger)
+        usages: list[TokenUsageRecord] = []
+
+        def collect(raw: Any) -> None:
+            self._collect_usage(usages, '动作参数选择', provider, provider.get('model'), raw)
+
+        try:
+            response = await self._post_chat(
+                provider, request_body, headers, provider.get('timeout'), task='main',
+            )
+            collect(_get(response, 'usage'))
+            text = extract_chat_text(response)
+            if not text:
+                return None
+            parsed = parse_json_response(text, 'Platform action params provider')
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:  # noqa: BLE001 - 追问失败 = 参数没补上（调用方按兜底继续）
+            return None
+        finally:
+            self._emit_usage('动作参数选择', usages)
 
     # ---------- 第二层判据：普通图片 → 是不是表情包（本移植版新增 §45.7） ----------
 
@@ -3595,6 +3769,7 @@ from .narrator_prompts import (  # noqa: E402  (必须在文件末尾，避免�
     compact_prompt_entries,
     compact_script_tag,
     compaction_prompt,
+    long_arc_guidance_prompt,
     memory_maintenance_prompt,
     overlay_compaction_prompt,
     participant_prompt_payload,
@@ -3621,6 +3796,7 @@ __all__ += [
     'compact_prompt_entries',
     'compact_script_tag',
     'compaction_prompt',
+    'long_arc_guidance_prompt',
     'memory_maintenance_prompt',
     'overlay_compaction_prompt',
     'participant_prompt_payload',

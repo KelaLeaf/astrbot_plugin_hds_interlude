@@ -231,6 +231,59 @@ class PayloadOrderTests(unittest.TestCase):
         payload = to_prompt_payload(req, {'cacheFirst': True})
         self.assertEqual(payload['relevantEstablishedEpisodes']['recentExchange'], [])
 
+    def test_the_group_branch_reads_the_same_visual_evidence_fields(self) -> None:
+        """v1.9.9：群分支与私聊分支读**同一套**视觉证据字段。
+
+        侧端识图（`vision.mode = sidecar`）下 `imageCount` 是 0，`visualObservations`
+        就是这一回合的图片证据。群分支此前不读它 → 群里发来的图 / 视频帧的观察结果
+        永远到不了模型（实测：群 `incomingEvent.event` 里根本没有该键）。
+        """
+        group = {'group_id': '111', 'channel_id': '111', 'label': '群',
+                 'purpose': '闲聊', 'character_role': '群友', 'messages': []}
+        observations = ['1. 一只橘猫趴在窗台上。']
+
+        req = request([], None, {'group_context': group, 'visual_observations': observations})
+        event = to_prompt_payload(req, {'cacheFirst': True})['incomingEvent']['event']
+        self.assertEqual(event['type'], 'group-message-batch')
+        self.assertEqual(event['imageCount'], 0)
+        self.assertEqual(event['visualEvidenceMode'], 'sidecar-observations')
+        self.assertEqual(event['visualObservations'], observations, '观察结果必须逐字进群回合')
+
+        # 私聊那条**一个字都不变**（同一个字段、同一套语义）。
+        private = request([], '看图', {'visual_observations': observations})
+        private_event = to_prompt_payload(private, {'cacheFirst': True})['incomingEvent']['event']
+        self.assertEqual(private_event['type'], 'private-message-batch')
+        self.assertEqual(private_event['visualEvidenceMode'], 'sidecar-observations')
+        self.assertEqual(private_event['visualObservations'], observations)
+
+    def test_the_group_visual_mode_is_honest_about_what_is_present(self) -> None:
+        """**反向**：没有画面时说 `none`、有原生图时说 `native-images`，且空观察不进键。"""
+        group = {'group_id': '111', 'channel_id': '111', 'label': '群',
+                 'purpose': '闲聊', 'character_role': '群友', 'messages': []}
+
+        text_only = to_prompt_payload(
+            request([], None, {'group_context': group}), {'cacheFirst': True},
+        )['incomingEvent']['event']
+        self.assertEqual(text_only['visualEvidenceMode'], 'none')
+        self.assertNotIn('visualObservations', text_only)
+
+        empty_observations = to_prompt_payload(
+            request([], None, {'group_context': group, 'visual_observations': []}),
+            {'cacheFirst': True},
+        )['incomingEvent']['event']
+        self.assertEqual(empty_observations['visualEvidenceMode'], 'none')
+        self.assertNotIn('visualObservations', empty_observations)
+
+        native = to_prompt_payload(request([], None, {
+            'group_context': group,
+            'images': [{'id': 'turn-image-1', 'data_uri': 'data:image/png;base64,AA'}],
+            'visual_observations': ['1. 不该出现的观察。'],
+        }), {'cacheFirst': True})['incomingEvent']['event']
+        self.assertEqual(native['visualEvidenceMode'], 'native-images')
+        self.assertEqual(native['imageCount'], 1)
+        self.assertEqual(native['visualObservations'], ['1. 不该出现的观察。'],
+                         '原生图优先只体现在 mode 上：给了观察就照实带上（两条证据并存）')
+
     def test_compact_tags_collapse_kind_actor_triples(self) -> None:
         req = request([
             entry(1, 'character-message', 'a', 50),
@@ -978,6 +1031,42 @@ class BrowserContractPromptTests(unittest.TestCase):
                 self.assertNotIn('at most one browserIntent.', text)
         # disabled 那一段本来就是复数（"leave browserIntents empty"）。
         self.assertIn('leave browserIntents empty', writing_affordances({'browserMode': 'disabled'}))
+
+
+class PlatformActionInstructionTests(unittest.TestCase):
+    """动作教学第一段：`platform_action_instruction(request)`（v1.9.9，§86）。
+
+    这是**注入路径**那个入口（`narrator.ts` 逐字调它）。用户点名的两段式要求它只给
+    "屏幕上有哪些按钮"：**不含参数说明、不含参数枚举**；参数表只有她选定某条动作之后
+    才由 `platform_action_params_instruction()` 给。
+    """
+
+    def test_request_entry_renders_only_ids_and_labels(self) -> None:
+        from plugin.core.narrator_prompts import platform_action_instruction
+
+        text = platform_action_instruction({'platformActions': ['send_poke', 'publish_qzone_post']})
+        self.assertIn('- send_poke 戳一戳', text)
+        self.assertIn('- publish_qzone_post 发说说', text)
+        self.assertNotIn('content', text)
+        self.assertNotIn('ugc_right', text)
+        self.assertNotIn('必填', text)
+        self.assertNotIn('|', text)
+
+    def test_request_entry_ignores_ids_that_are_not_available(self) -> None:
+        from plugin.core.narrator_prompts import platform_action_instruction
+
+        # 可用集里没有的一律不渲染（可用集由 chunk12 一处判完，这里只渲染）。
+        self.assertEqual(platform_action_instruction({'platformActions': ['nosuch_action']}), '')
+
+    def test_request_entry_accepts_both_spellings_and_rejects_junk(self) -> None:
+        from plugin.core.narrator_prompts import platform_action_instruction
+
+        snake = platform_action_instruction({'platform_actions': ['send_poke']})
+        camel = platform_action_instruction({'platformActions': ['send_poke']})
+        self.assertEqual(snake, camel)
+        for junk in ({}, None, 'x', {'platformActions': None}, {'platformActions': 'send_poke'}):
+            with self.subTest(junk=junk):
+                self.assertEqual(platform_action_instruction(junk), '')
 
 
 if __name__ == '__main__':

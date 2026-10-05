@@ -808,6 +808,26 @@ def feed_items_from_text(raw: Any) -> List[Dict[str, Any]]:
     return [parse_feed_item(item) for item in parts[1:] if item.strip()]
 
 
+def _raw_like_count(msg: Mapping[str, Any]) -> Any:
+    """说说回执里的**点赞数**：多种拼写都认，一个都没有 → `None`（不是 0）。
+
+    腾讯在说说列表里到底用哪个键名没有公开保证（参考实现只取 `cmtnum` / `fwdnum`），
+    所以这里按"形状像就收"的宽容口径读；`None` / 布尔 / 非数值一律当"没说"。
+    """
+    for key in ("likecount", "like_num", "likenum", "like"):
+        if key not in msg:
+            continue
+        value = msg.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).strip()
+        if text.lstrip("-").isdigit():
+            return int(text)
+    return None
+
+
 def parse_mood(msg: Any) -> Dict[str, Any]:
     """把说说列表里的一条原始记录整理成结构化字段（照抄 `utils/feed.py::parse_mood`）。
 
@@ -818,6 +838,13 @@ def parse_mood(msg: Any) -> Dict[str, Any]:
     对 `msg.get('video')` 的处理（六个字段：`url3` / `url1` / `video_id` / `video_time` /
     `cover_width` / `cover_height`）。加它的理由是**改可见范围后的回读校验**要能数出视频：
     视频与图片一样不在正文里，只留空富文本字段到底动没动它们，只能靠回读比对。
+
+    `likecount`（v1.9.9 补，rc33 的「被点赞感知」）：参考实现只取 `cmtnum` / `fwdnum`，
+    赞数在原始回执里的键名腾讯没保证，所以这里**多种拼写都认**
+    （`likecount` / `like_num` / `likenum` / `like`），**一个都没有就留 `None`**——
+    `None` = "这条回执没说"，`0` = "确实没人赞"，两者在下游的增量比对里语义相反
+    （见 `core/qzone.py::_qzone_msg_like_count`）。这是本移植版的受控扩展：只多做
+    一件事——把回执里**本来就有**的字段留下来，不新造任何请求、不新造任何通道。
     """
     item: Dict[str, Any] = {
         "tid": "",
@@ -826,6 +853,7 @@ def parse_mood(msg: Any) -> Dict[str, Any]:
         "createTime": "",
         "cmtnum": 0,
         "fwdnum": 0,
+        "likecount": None,
         "name": "",
         "uin": "",
         "lbs": {},
@@ -845,6 +873,7 @@ def parse_mood(msg: Any) -> Dict[str, Any]:
         createTime=msg.get("createTime", ""),
         cmtnum=msg.get("cmtnum", 0),
         fwdnum=msg.get("fwdnum", 0),
+        likecount=_raw_like_count(msg),
         name=msg.get("name", ""),
         uin=msg.get("uin", ""),
         lbs=msg.get("lbs", {}),

@@ -631,6 +631,15 @@ QZONE_POST = TableSpec(
         'error': _spec('text'),
         'createdAt': _spec('timestamp'),
         'postedAt': _spec('timestamp'),
+        # 被评论 / 被点赞感知的**基线**（rc29 + rc33）：
+        # `commentNum` 是上游的列（`upstream/src/database.ts:201`，老库靠
+        # `ctx.model.extend` 补列）；`likeNum` 是本移植版按 rc33「被点赞也要知道」
+        # 补的同型列。**`NULL` = 还没立过基线**（首次观测值 0 与"没有基线"语义不同：
+        # 前者是"确实没人互动"，后者是"下一轮才立基线，本轮不报"）。
+        # 追加在末尾（不是插在中间）：新库与老库 `ALTER TABLE ADD COLUMN` 之后的
+        # 列顺序保持一致，两边对账不会出现"同一张表两种列序"。
+        'commentNum': _spec('unsigned'),
+        'likeNum': _spec('unsigned'),
     },
     primary='id',
     auto_increment=True,
@@ -680,13 +689,68 @@ WORK = TableSpec(
     added_later=True,
 )
 
+#: `interlude_long_arc_guidance` —— 长线叙事指导（上游 rc28 `long-arc.ts` 的版本化行）。
+#: 一行一个版本，**非事实权威**：它只是给主叙事的一次"行动许可"，`status` 走
+#: `draft/active/paused/completed/superseded/expired/rejected`，新方向通过校验后才
+#: supersede 旧 active（版本链）。可变累加器**不在本表**，见下一张 progress 表。
+LONG_ARC_GUIDANCE = TableSpec(
+    name='interlude_long_arc_guidance',
+    fields={
+        'id': _spec('unsigned autoInc'),
+        'storyId': _spec('string(255)'),
+        'version': _spec('unsigned'),
+        'status': _spec('string(16)'),
+        'title': _spec('string(255)'),
+        'premise': _spec('text'),
+        'direction': _spec('text'),
+        'payload': _spec('json'),
+        'currentStage': _spec('string(80)'),
+        'intensity': _spec('string(16)'),
+        'confidence': _spec('double'),
+        'triggerEntryId': _spec('unsigned'),
+        'evidenceEntryIds': _spec('json'),
+        'supersedesId': _spec('unsigned'),
+        'createdAt': _spec('timestamp'),
+        'updatedAt': _spec('timestamp'),
+        'completedAt': _spec('timestamp'),
+        'expiresAt': _spec('timestamp'),
+    },
+    primary='id',
+    auto_increment=True,
+    indexes=('storyId', 'status', 'version'),
+    added_later=True,
+)
+
+#: `interlude_long_arc_progress` —— 长线扫描的**持久游标与分数基线**（每剧本一行）。
+#: 上游注释原文：绝不把可变的累计状态挂到版本化的 guidance 行上——扫描游标写回历史
+#: guidance 会破坏版本链。主键是 `storyId`（非自增），写入必须"查后写"。
+LONG_ARC_PROGRESS = TableSpec(
+    name='interlude_long_arc_progress',
+    fields={
+        'storyId': _spec('string(255)'),
+        'lastCountedEntryId': _spec('unsigned'),
+        'totalScore': _spec('double'),
+        'privateCount': _spec('unsigned'),
+        'privateScore': _spec('double'),
+        'groupCount': _spec('unsigned'),
+        'groupScore': _spec('double'),
+        'unknownCount': _spec('unsigned'),
+        'lastGenerationScore': _spec('double'),
+        'lastGenerationEntryId': _spec('unsigned'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='storyId',
+    indexes=('lastCountedEntryId', 'updatedAt'),
+    added_later=True,
+)
+
 #: 表名 → `TableSpec`。键顺序 = 上游 `registerTables` 的注册顺序。
 TABLES: dict[str, TableSpec] = {
     spec.name: spec for spec in (
         STORY, PARTICIPANT, SCRIPT_ENTRY, MEMORY, INTENT, SCENE, ARC, FACT, STATE_PATCH,
         WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, STICKER_GROUP, SCHEDULE_PREPLAN,
         SEEDED_EVENT, ENDPOINT, STORY_ALIAS, TOKEN_USAGE, QZONE_POST, SCHEDULED_COMMAND,
-        WORK,
+        WORK, LONG_ARC_GUIDANCE, LONG_ARC_PROGRESS,
     )
 }
 

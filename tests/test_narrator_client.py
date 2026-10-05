@@ -1413,6 +1413,63 @@ class NarratorClientTests(unittest.IsolatedAsyncioTestCase):
         silent = SilentNarrator()
         self.assertIsNone(await silent.select_sticker([{'assetId': 'a'}], 'x', 0.7, 'g'))
 
+    async def test_select_platform_action_params_asks_the_main_route_for_the_form(self):
+        """§86 第二段：走**主叙事**连接，把该动作的参数表与已写好的正文一起给它。
+
+        与 `select_sticker` 同构（同一条 `main` 路由、同样的 JSON 原样返回、
+        同样的失败回 `None`）；动作 id 的逐字一致与参数校验由 chunk12 一处收，
+        所以这里只钉"请求长什么样、回执怎么回"。
+        """
+        http = FakeHttpClient(responses=[{
+            'choices': [{'message': {'content': json.dumps({
+                'action': 'send_like', 'params': {'user_id': '10001', 'times': 4},
+            }, ensure_ascii=False)}}],
+            'usage': {'prompt_tokens': 30, 'completion_tokens': 10},
+        }])
+        usages: list = []
+        client = self.make_narrator(http, make_config(), on_usage=usages.append)
+        receipt = await client.select_platform_action_params(
+            'send_like', '点赞', '给某人点赞', 'times :int [1~20]', '在吗', {'user_id': '10001'},
+        )
+        self.assertEqual(receipt, {'action': 'send_like', 'params': {'user_id': '10001', 'times': 4}})
+        body = http.posts[0]['body']
+        system = body['messages'][0]['content']
+        self.assertIn('PLATFORM ACTION PARAMETERS', system)
+        self.assertIn('send_like', system)
+        self.assertIn('times :int [1~20]', system)
+        self.assertIn('必填', system)
+        sent = json.loads(body['messages'][1]['content'])
+        self.assertEqual(sent['action'], 'send_like')
+        self.assertEqual(sent['label'], '点赞')
+        self.assertEqual(sent['message'], '在吗')
+        self.assertEqual(sent['currentParams'], {'user_id': '10001'})
+        self.assertEqual(body['max_tokens'], 256)
+        self.assertEqual(body['response_format'], {'type': 'json_object'})
+        self.assertEqual(usages[0]['task'], '动作参数选择')
+
+    async def test_select_platform_action_params_degrades_to_none(self):
+        """任何不可用都回 `None`、**绝不抛**：调用方按"参数没补上"继续 + 留可见 warn。"""
+        http = FakeHttpClient(responses=[{'choices': [{'message': {'content': '不是 JSON'}}]}])
+        client = self.make_narrator(http, make_config())
+        self.assertIsNone(await client.select_platform_action_params(
+            'send_like', '点赞', '给某人点赞', 'times :int [1~20]', '', {},
+        ))
+        # 没有可用连接 → 一个请求都不发
+        bare_http = FakeHttpClient(responses=[])
+        bare = self.make_narrator(bare_http, make_config(providers=[]))
+        self.assertIsNone(await bare.select_platform_action_params(
+            'send_like', '点赞', '给某人点赞', 'times :int [1~20]', '', {},
+        ))
+        self.assertEqual(bare_http.posts, [])
+        # 缺动作 id / 缺参数表 → 没有可渲染的第二段，同样不发请求
+        self.assertIsNone(await client.select_platform_action_params('', '', '', 'times :int', '', {}))
+        self.assertIsNone(await client.select_platform_action_params('send_like', '点赞', '', '', '', {}))
+        self.assertEqual(len(http.posts), 1, '不可用的调用不该产生请求')
+        # 静默提供者（没有模型连接）同样回 None
+        self.assertIsNone(await SilentNarrator().select_platform_action_params(
+            'send_like', '点赞', '给某人点赞', 'times :int [1~20]', '', {},
+        ))
+
     async def test_describe_sticker_degrades_quietly(self):
         http = FakeHttpClient(responses=[{'choices': [{'message': {'content': ''}}]}])
         config = make_config(providers=[make_provider(use_for_main=False, use_for_stickers=True)])

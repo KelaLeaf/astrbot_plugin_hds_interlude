@@ -1625,7 +1625,7 @@ class AssemblyTests(unittest.TestCase):
         loaded = InterludeService._loaded_chunks
         missing = InterludeService._missing_chunks
         self.assertEqual(loaded[0], 'chunk0')
-        self.assertEqual(sorted(list(loaded) + list(missing)), sorted(['chunk0'] + ['chunk%d' % i for i in range(1, 15)]))
+        self.assertEqual(sorted(list(loaded) + list(missing)), sorted(['chunk0'] + ['chunk%d' % i for i in range(1, 16)]))
 
     def test_public_symbols_importable(self) -> None:
         import plugin.core.service as service_package

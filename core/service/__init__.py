@@ -57,7 +57,7 @@ _MISSING_CHUNKS: list[str] = []
 
 _index = 0
 _module_name = ''
-for _index in range(1, 15):
+for _index in range(1, 16):
     _module_name = 'chunk%d' % _index
     try:
         _module = __import__('%s.%s' % (__name__, _module_name), fromlist=[_module_name])
@@ -75,7 +75,7 @@ for _index in range(1, 15):
 class InterludeService(*_CHUNK_BASES):
     """上游 `InterludeService`（`upstream/src/service.ts:624`）。
 
-    MRO 就是 `ServiceChunk0 → ServiceChunk1 → ... → ServiceChunk14 → ServiceBase`，
+    MRO 就是 `ServiceChunk0 → ServiceChunk1 → ... → ServiceChunk15 → ServiceBase`，
     因此跨 chunk 调用直接 `self.other_method()` 即可（见分解契约 §4）。
 
     `_loaded_chunks` / `_missing_chunks` 供适配层在启动时报告分解完整性。

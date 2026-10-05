@@ -1271,6 +1271,63 @@ class SendOutgoingMessagesTests(unittest.IsolatedAsyncioTestCase):
         await ServiceChunk6.send_outgoing_messages(stub, self.STORY, [self._message()])
         self.assertEqual(stub.failures, [('p1', 'bot-not-found')])
 
+    # -- v1.9.9（§88.1/§88.2 的生产接线）---------------------------------- #
+
+    async def test_the_delivery_intent_carries_the_idempotency_key(self) -> None:
+        """投递意图必须带 `intentKey = eventId:bubbleIndex`（上游 `service.ts:6356`）。
+
+        没有它，桥侧那份自记账账本（`desktop.py` 的 `_intent_delivered` /
+        `_intent_in_flight` 只认这个键）在生产上**不会被激活**——"同一次 30 秒重试
+        风暴"里的重投会真的重复发出。这里断言**具体键值**，不是"有个键"。
+        """
+        stub = _SendStub([dict(self.PARTICIPANT)])
+        seen: list[Any] = []
+
+        async def handler(delivery: Any) -> dict[str, Any]:
+            seen.append(delivery)
+            return {'ok': True}
+
+        stub.desktop_delivery_handler = handler
+        await ServiceChunk6.send_outgoing_messages(stub, self.STORY, [
+            self._message('后台', script_event={'event_id': 'evt-1', 'bubble_index': 2}),
+        ])
+        self.assertEqual(seen[0]['intentKey'], 'evt-1:2')
+
+        # **反向**：没有合法的事件身份（旧调用方 / 没有 `script_event`）→ 这个键
+        # **不出现**，桥侧也就不会去重（宁可让它照旧重试，也不能拿一个编出来的键
+        # 把两条不同的话当成同一条）。
+        seen.clear()
+        await ServiceChunk6.send_outgoing_messages(stub, self.STORY, [self._message('后台')])
+        self.assertNotIn('intentKey', seen[0])
+
+    async def test_an_ambiguous_outcome_is_not_recorded_as_a_failure(self) -> None:
+        """**结果不可知 ≠ 没发出去**：账本留在 `pending`（三态里的"结果不确定"），
+        并且判据那句话（"请求已写出，禁止自动重试"）要跟着失败理由走。"""
+        stub = _SendStub([dict(self.PARTICIPANT)])
+
+        async def ambiguous(_delivery: Any) -> dict[str, Any]:
+            return {'ok': False, 'ambiguous': True, 'error': '桥超时'}
+
+        stub.desktop_delivery_handler = ambiguous
+        delivered = await ServiceChunk6.send_outgoing_messages(
+            stub, self.STORY,
+            [self._message('后台', script_event={'event_id': 'evt-2', 'bubble_index': 0})],
+        )
+        self.assertEqual(delivered, [])
+        self.assertEqual(stub.failures, [], '结果不可知不许走"没发出去"的失败记账')
+        self.assertTrue(
+            any('结果未知' in text and '禁止自动重试' in text for _level, text in stub.reports),
+            stub.reports,
+        )
+
+        # **反向**：明确失败仍然照旧记失败（可重试）。
+        async def failing(_delivery: Any) -> dict[str, Any]:
+            return {'ok': False, 'error': '宿主拒绝'}
+
+        stub.desktop_delivery_handler = failing
+        await ServiceChunk6.send_outgoing_messages(stub, self.STORY, [self._message('后台')])
+        self.assertEqual(stub.failures[-1], ('p1', 'transport-error: 宿主拒绝'))
+
 
 # =========================================================================== #
 # 5. 真实数据库上的 deliverDueSplitSegments
@@ -1402,6 +1459,44 @@ class DeliverDueSplitSegmentsTests(ServiceFixtureMixin, unittest.IsolatedAsyncio
         self.assertEqual(intents[1]['status'], 'pending')
         # 第二段被推到"现在 + 模拟打字时长"，而不是立刻倒出（上游注释的语义）。
         self.assertGreater(parse_dt(intents[1]['notBefore']), NOW)
+
+    # -- v1.9.9（§88.1/§88.2）：30 秒重试不许在"结果不可知"时排期 ------------- #
+
+    async def test_an_ambiguous_delivery_does_not_schedule_the_retry(self) -> None:
+        """**结果未知 → 不排 30 秒重试**：请求已经写出去了，重投就是真重复。
+
+        意图结清成终态（不再被后续 sweep 捞起来重投），`notBefore` **不动**
+        （不推到"现在 +30 秒"），也不排新的唤醒。
+        """
+
+        async def ambiguous(_delivery: Any) -> dict[str, Any]:
+            return {'ok': False, 'ambiguous': True, 'error': '桥超时'}
+
+        self.service.desktop_delivery_handler = ambiguous
+        await self.service.deliver_due_split_segments('story:1')
+
+        intents = self.db.all('interlude_intent', {'storyId': 'story:1'})
+        self.assertEqual([item['status'] for item in intents], ['completed'],
+                         '结果不可知要结清成终态，否则下一次 sweep 会把它当成到期项再投一次')
+        self.assertLess(parse_dt(intents[0]['notBefore']), NOW,
+                        '不许把 notBefore 推到 30 秒后（那就是重投）')
+        self.assertEqual(self.transport.sent, [])
+        self.assertNotIn('story:1', self.service.due_intent_wake_timers,
+                         '不排期就不许留下唤醒')
+
+    async def test_a_plain_failure_still_schedules_the_retry(self) -> None:
+        """**反向**：明确失败（真的没发出去）照常排 30 秒重试——不许一律当成不可知。"""
+
+        async def failing(_delivery: Any) -> dict[str, Any]:
+            return {'ok': False, 'error': '宿主拒绝'}
+
+        self.service.desktop_delivery_handler = failing
+        await self.service.deliver_due_split_segments('story:1')
+
+        intents = self.db.all('interlude_intent', {'storyId': 'story:1'})
+        self.assertEqual([item['status'] for item in intents], ['pending'])
+        self.assertGreater(parse_dt(intents[0]['notBefore']), NOW, '明确失败要排 30 秒重试')
+        self.assertIn('story:1', self.service.due_intent_wake_timers)
 
 
 # =========================================================================== #

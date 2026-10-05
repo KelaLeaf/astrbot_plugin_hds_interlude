@@ -1481,7 +1481,7 @@ class ConfigEditorTests(unittest.TestCase):
         blob = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn('sk-real', blob)
 
-    # ---- FFmpeg 状态（v1.9.8：只贴「视频识别模式」一处）----
+    # ---- FFmpeg 状态（v1.9.9：只贴「视频识别模式」一处）----
 
     def test_the_payload_carries_the_ffmpeg_status_only_on_the_mode_field(self):
         """有 / 无 ffmpeg 两种状态各自渲染出的**字面量**（控制台这一层**不看宿主 schema**）。
@@ -1501,7 +1501,7 @@ class ConfigEditorTests(unittest.TestCase):
                 items = video['node']['items']
                 self.assertTrue(items['mode']['hint'].startswith(expected + '。'))
                 self.assertNotIn('FFmpeg', items['enabled']['hint'],
-                                 '总开关的 hint 回到它自己的静态文案（v1.9.8 那处已撤）')
+                                 '总开关的 hint 回到它自己的静态文案（v1.9.9 那处已撤）')
                 # 状态词本身极短：只有状态词，不附解释。
                 self.assertEqual(len(expected), len(expected.strip()))
 
@@ -1509,14 +1509,14 @@ class ConfigEditorTests(unittest.TestCase):
         """**全量扫描** payload：所有分组、分组标题/描述、所有字段的渲染节点。
 
         只许 `model_center.video.mode.hint` 带状态词；分组级 `status` 一律不许有
-        （v1.9.8 撤掉的那条路）。
+        （v1.9.9 撤掉的那条路）。
         反向：给 `config_schema()` 加回 `'status': …`，或把状态词贴到任何一个别处 → 红。
         """
         with mock.patch.object(video_module, '_FFMPEG_PATH', ''):
             payload = _run(self.api.config_schema())
         for group in payload['groups']:
             with self.subTest(group=group['key']):
-                self.assertFalse(group.get('status'), '分组级状态词那条路已撤（v1.9.8）')
+                self.assertFalse(group.get('status'), '分组级状态词那条路已撤（v1.9.9）')
         self.assertEqual(_console_config_status_paths(payload), ['model_center.video.mode.hint'])
         # 守卫的**反向自检**：把分组徽章加回去 → 全量扫描必须报出来（它不是恒真的口号）。
         center = next(item for item in payload['groups'] if item['key'] == 'model_center')

@@ -24,6 +24,7 @@ from unittest import mock
 from plugin.core.service.desktop import (
     DESKTOP_BRIDGE_ENV,
     DESKTOP_PHASE_ENV,
+    AmbiguousDeliveryError,
     DesktopBridge,
     desktop_session,
     escape_attribute,
@@ -643,13 +644,47 @@ class DeliveryChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.bridge.settle_delivery(receipt))
         self.assertEqual(await pending, [])
 
-    async def test_timeout_rejects_with_the_upstream_message(self) -> None:
+    async def test_timeout_is_ambiguous_not_a_retryable_failure(self) -> None:
+        """rc33 桥接 ambiguous（`desktop-bridge.ts:191`）：超时 = 结果不可知。
+
+        超时**不是**"没发出去"：请求已经写出去了，平台可能已经收到。所以这里必须是
+        `AmbiguousDeliveryError`（`ambiguous is True` + 明确写"禁止自动重试"），
+        而不是一条和普通失败长得一样的 `RuntimeError`——否则调用方会照着"失败"
+        去重试，那正是上游 rc33 要修的重复投递。
+        """
         bridge = DesktopBridge(self.service, None, enabled=True, delivery_timeout_ms=20)
         pending = asyncio.ensure_future(bridge.request_delivery({'content': 'hi'}))
-        with self.assertRaises(RuntimeError) as caught:
+        with self.assertRaises(AmbiguousDeliveryError) as caught:
             await asyncio.wait_for(pending, timeout=2)
-        self.assertEqual(str(caught.exception), '等待 typ-0 渠道投递确认超时。')
+        self.assertIn('等待 typ-0 渠道投递确认超时', str(caught.exception))
+        self.assertIn('禁止自动重试', str(caught.exception))
+        self.assertIs(caught.exception.ambiguous, True)
         self.assertEqual(bridge._pending_deliveries, {})
+
+    async def test_an_ambiguous_receipt_is_not_a_plain_failure(self) -> None:
+        """回执显式带 `ambiguous: true` / `status: 'unknown'` → 同样按不可知结算。"""
+        for receipt in (
+            {'status': 'unknown'},
+            {'status': 'failed', 'ambiguous': True},
+            {'status': 'failed', 'resultUnknown': True},
+        ):
+            with self.subTest(receipt=receipt):
+                pending = asyncio.ensure_future(self.bridge.request_delivery({'content': 'hi'}))
+                await asyncio.sleep(0)
+                delivery_id = self.bridge.drain_events()[0]['payload']['deliveryId']
+                self.assertTrue(self.bridge.settle_delivery({'deliveryId': delivery_id, **receipt}))
+                with self.assertRaises(AmbiguousDeliveryError):
+                    await pending
+
+    async def test_a_real_failure_stays_retryable(self) -> None:
+        """**反向**：回执明确说"没发出去"时仍是普通失败（可重试），不许一律 ambiguous。"""
+        pending = asyncio.ensure_future(self.bridge.request_delivery({'content': 'hi'}))
+        await asyncio.sleep(0)
+        delivery_id = self.bridge.drain_events()[0]['payload']['deliveryId']
+        self.bridge.settle_delivery({'deliveryId': delivery_id, 'status': 'failed', 'error': '没了'})
+        with self.assertRaises(RuntimeError) as caught:
+            await pending
+        self.assertNotIsInstance(caught.exception, AmbiguousDeliveryError)
 
     async def test_background_delivery_wraps_success(self) -> None:
         handler = self.bridge._background_delivery
@@ -659,7 +694,9 @@ class DeliveryChannelTests(unittest.IsolatedAsyncioTestCase):
         }))
         await asyncio.sleep(0)
         sent = self.bridge.drain_events()[0]['payload']
-        self.assertEqual(sent['accountKey'], 'desktop:10001')
+        # rc33：多通道账号标识——`onebot:<selfId>`（上游把 `desktop:` 改成了 `onebot:`，
+        # 否则宿主按账号注册表路由时会认错实例）。
+        self.assertEqual(sent['accountKey'], 'onebot:10001')
         self.assertEqual(sent['transport'], 'onebot-external')
         self.assertEqual(sent['replyTo'], 'q-1')
         self.bridge.settle_delivery({'deliveryId': sent['deliveryId'], 'status': 'sent', 'messageIds': ['m']})
@@ -671,6 +708,108 @@ class DeliveryChannelTests(unittest.IsolatedAsyncioTestCase):
         delivery_id = self.bridge.drain_events()[0]['payload']['deliveryId']
         self.bridge.settle_delivery({'deliveryId': delivery_id, 'status': 'permanent-failed', 'error': '没了'})
         self.assertEqual(await task, {'ok': False, 'error': '没了'})
+
+
+class DeliveryIdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    """rc33 投递幂等的**显式降级**：自己按 `eventId:bubbleIndex` 记账去重。
+
+    上游把这件事交给宿主 outbox（`desktop-bridge.ts:93`：「宿主 outbox 跨 deliveryId
+    去重，防止『上游已收、回执迟到』时重试造成重复投递」）。AstrBot 没有那一层，
+    而我们自己又有 30 秒未确认重试（每次换新 `deliveryId`），所以在桥接侧自己记。
+    上游没有对应测试，这里是**我们自建**的（正向 + 反向各两条）。
+    """
+
+    def setUp(self) -> None:
+        self.service = _FakeService()
+        self.bridge = DesktopBridge(self.service, None, enabled=True)
+
+    async def _start(self, intent_key: str = '') -> Any:
+        """起一次后台投递并**让出一次事件循环**（好让 `delivery` 事件先落地）。"""
+        payload: dict[str, Any] = {'self_id': '10001', 'content': '夜里的一句'}
+        if intent_key:
+            payload['intentKey'] = intent_key
+        task = asyncio.ensure_future(self.bridge._background_delivery(payload))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return task
+
+    async def test_a_confirmed_intent_is_never_delivered_twice(self) -> None:
+        first = await self._start('e1:0')
+        first_delivery = self.bridge.drain_events()[0]['payload']
+        self.bridge.settle_delivery({
+            'deliveryId': first_delivery['deliveryId'], 'status': 'sent', 'messageIds': ['m-1'],
+        })
+        self.assertEqual(await first, {'ok': True, 'messageIds': ['m-1']})
+
+        second = await self._start('e1:0')
+        self.assertEqual(await second, {'ok': True, 'messageIds': ['m-1'], 'idempotent': True})
+        self.assertEqual(self.bridge.drain_events(), [], '已确认的意图不许再写出请求')
+
+    async def test_an_unconfirmed_intent_suppresses_the_retry_with_a_visible_warn(self) -> None:
+        """**正向**：已写出、结果不可知 → 拒绝重投 + 可见 warn（说清上游由谁保证）。"""
+        first = await self._start('e1:1')
+        first_delivery = self.bridge.drain_events()[0]['payload']
+        # 回执迟到 → 超时 → ambiguous（不摘在途标记）
+        self.bridge.settle_delivery({
+            'deliveryId': first_delivery['deliveryId'], 'status': 'unknown',
+        })
+        first_outcome = await first
+        self.assertIs(first_outcome['ambiguous'], True)
+
+        second = await self._start('e1:1')
+        outcome = await second
+        self.assertIs(outcome['ok'], False)
+        self.assertIs(outcome['ambiguous'], True)
+        self.assertIn('duplicate-intent', outcome['error'])
+        events = self.bridge.drain_events()
+        self.assertEqual([item['event'] for item in events], ['error'],
+                         '第二次不许再发 delivery 事件（不许重复投递）')
+        message = events[0]['payload']['message']
+        self.assertIn('投递幂等', message)
+        self.assertIn('宿主 outbox', message, '要说清上游由谁保证、这里由谁记')
+        self.assertIn('下一步', message, '降级必须给可行动的下一步')
+
+    async def test_a_real_failure_still_allows_the_retry(self) -> None:
+        """**反向**：回执明确说"没发出去"→ 在途标记摘掉，重试照常写出请求。"""
+        first = await self._start('e1:2')
+        delivery_id = self.bridge.drain_events()[0]['payload']['deliveryId']
+        self.bridge.settle_delivery({
+            'deliveryId': delivery_id, 'status': 'permanent-failed', 'error': '没了',
+        })
+        self.assertEqual(await first, {'ok': False, 'error': '没了'})
+
+        second = await self._start('e1:2')
+        retry_events = self.bridge.drain_events()
+        self.assertEqual(len(retry_events), 1, '真失败必须允许重试')
+        self.bridge.settle_delivery({
+            'deliveryId': retry_events[0]['payload']['deliveryId'], 'status': 'sent',
+            'messageIds': ['m-2'],
+        })
+        self.assertEqual(await second, {'ok': True, 'messageIds': ['m-2']})
+
+    async def test_without_an_intent_key_nothing_is_deduplicated(self) -> None:
+        """**反向**：没有幂等键（旧调用方 / 无 `script_event`）时行为与历史逐字一致。"""
+        first = await self._start()
+        delivery_id = self.bridge.drain_events()[0]['payload']['deliveryId']
+        self.bridge.settle_delivery({'deliveryId': delivery_id, 'status': 'sent', 'messageIds': []})
+        await first
+        second = await self._start()
+        retry_events = self.bridge.drain_events()
+        self.assertEqual(len(retry_events), 1, '没有键就不许去重')
+        self.bridge.settle_delivery({
+            'deliveryId': retry_events[0]['payload']['deliveryId'], 'status': 'sent', 'messageIds': [],
+        })
+        await second
+
+    async def test_the_intent_key_travels_on_the_wire(self) -> None:
+        """键要**照样发出去**：桌面端将来实现 outbox 时能直接接上（形状与上游一致）。"""
+        task = await self._start('e9:3')
+        request = self.bridge.drain_events()[0]['payload']
+        self.assertEqual(request['intentKey'], 'e9:3')
+        self.bridge.settle_delivery({
+            'deliveryId': request['deliveryId'], 'status': 'sent', 'messageIds': [],
+        })
+        await task
 
 
 # =========================================================================== #
@@ -770,9 +909,11 @@ class BridgeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         pending = asyncio.ensure_future(bridge.request_delivery({'content': 'hi'}))
         await asyncio.sleep(0)
         bridge.stop()
-        with self.assertRaises(RuntimeError) as caught:
+        # 上游 `:398`：dispose 窗口里的在途投递按 **ambiguous** 结算（请求已写出）。
+        with self.assertRaises(AmbiguousDeliveryError) as caught:
             await pending
-        self.assertEqual(str(caught.exception), 'typ-0 bridge 已关闭。')
+        self.assertIn('在投递途中关闭', str(caught.exception))
+        self.assertIn('禁止自动重试', str(caught.exception))
         self.assertIsNone(self.service.event_sink)
         self.assertIsNone(self.service.delivery_handler)
         self.assertFalse(bridge.started)

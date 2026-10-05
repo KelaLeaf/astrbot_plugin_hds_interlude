@@ -45,7 +45,7 @@ UPSTREAM_SECTION_ORDER = [
     "storyDefaults", "model", "onebot", "sharedStory", "runtime", "urge",
     "schedulePreplan", "timelineDirector", "agency",
     "chatActions", "stickers", "memory", "alterSystem", "browser",
-    "worldSeeder", "qzone", "blindMode", "logging", "chatRhythm",
+    "worldSeeder", "longHorizon", "qzone", "blindMode", "logging", "chatRhythm",
 ]
 
 #: 上游 1.0.1-rc23 / rc28 新增的两个扩展分组；本移植版都已转正
@@ -70,6 +70,7 @@ SECTION_MAP = [
     ("alterSystem", "alter_system"),
     ("browser", "browser"),
     ("worldSeeder", "world_seeder"),
+    ("longHorizon", "long_horizon"),
     ("qzone", "qzone"),
     ("blindMode", "blind_mode"),
     ("logging", "logging"),
@@ -89,6 +90,11 @@ UPSTREAM_FIELDS = {
     "qzone": [
         "enabled", "dailyPostCap", "dailyCommentCap", "dailyLikeCap",
         "minIntervalMinutes", "feedWindowMinutes",
+    ],
+    # 上游 1.0.1-rc28【扩展 16】长线叙事催化器（本轮 §89）。两个权重键是**兼容位**：
+    # 读得出来但不生效（`resolve_long_horizon_config` 恒取 1.0 / 0.5，上游 `long-arc.ts:48`）。
+    "long_horizon": [
+        "enabled", "triggerScore", "reviewIncrement", "privateWeight", "groupWeight", "intensity",
     ],
     "forward_message": ["enabled", "maxNodes", "maxCharacters", "maxDepth"],
     "story_defaults": [
@@ -383,6 +389,9 @@ CAMEL_TO_SNAKE = {
     "dailyLikeCap": "daily_like_cap", "minIntervalMinutes": "min_interval_minutes",
     "feedWindowMinutes": "feed_window_minutes",
     "maxNodes": "max_nodes", "maxCharacters": "max_characters", "maxDepth": "max_depth",
+    # 上游 rc28 `longHorizon`：两个门槛 + 两个**只读兼容**的权重键。
+    "triggerScore": "trigger_score", "reviewIncrement": "review_increment",
+    "privateWeight": "private_weight", "groupWeight": "group_weight",
     "characterName": "character_name", "characterProfile": "character_profile",
     "userProfile": "user_profile", "supportingCast": "supporting_cast",
     "maxImageDimension": "max_image_dimension", "outFormat": "out_format",
@@ -1966,6 +1975,36 @@ class ConfigurationSchemaTest(unittest.TestCase):
             with self.subTest(sentence=sentence):
                 self.assertIn(sentence, config_map, "CONFIG_MAP.md 缺那句逐字 hint")
 
+    # -- 群聊视频理解：群里现在也有视觉通道（v1.9.9 收口）----------------------
+
+    def test_the_group_video_hint_states_the_current_channel_facts(self) -> None:
+        """`model_center.video.group_enabled.hint` 必须与**现在**的通道口径一致。
+
+        改前那句「群回合没有视觉通道」已经不成立：侧端识图（`mode = sidecar`）与原生
+        多模态都是通道，群里的画面走「每回合图片数上限」。过期文案是**用户可见的谎**，
+        所以这里逐字钉住（hint 是用户唯一会读到的规格）。
+        """
+        video = self.section("model_center")["video"]["items"]
+        self.assertEqual(
+            video["group_enabled"]["hint"],
+            "群里沿用上面同一套设置；群里的视频画面与图片一起走「每回合图片数上限」，"
+            "没识别会说明一次。",
+        )
+        self.assertNotIn("没有视觉通道", video["group_enabled"]["hint"])
+
+    def test_config_map_quotes_the_group_video_hint_verbatim(self) -> None:
+        """三处同改：`_conf_schema.json` / 本文件 / `docs/CONFIG_MAP.md` 逐字一致。"""
+        path = os.path.join(REPO_ROOT, "docs", "CONFIG_MAP.md")
+        if not os.path.exists(path):
+            self.skipTest("发布仓布局没有 docs/CONFIG_MAP.md")
+        with open(path, encoding="utf-8") as handle:
+            config_map = handle.read()
+        self.assertIn(
+            "群里的视频画面与图片一起走「每回合图片数上限」", config_map,
+            "CONFIG_MAP.md 缺那句逐字 hint",
+        )
+        self.assertNotIn("群回合没有视觉通道", config_map)
+
 
 class ImageBudgetConfigTests(unittest.TestCase):
     """v1.9.4：每回合图片预算的**解析**（双拼写 / 脏值 / 夹取），判据只住在 core 一处。"""
@@ -2527,6 +2566,134 @@ class ReleaseConsistencyTest(unittest.TestCase):
     def test_config_map_has_the_required_columns(self):
         config_map = read(os.path.join(REPO_ROOT, "docs", "CONFIG_MAP.md"))
         self.assertIn("| 上游键 | 本插件键 | 类型 | 默认值 | 说明 |", config_map)
+
+
+class LongHorizonConfigTests(unittest.TestCase):
+    """【扩展 16】`long_horizon`（上游 `longHorizon`，本轮 §89）：默认值 / 无上界 / 0 语义。
+
+    项目硬纪律是**不许我们拍上界**，并且"该键 0 无其他语义时"才给 `0 = 不限制`。
+    这一组六个键里没有一个满足那个条件：两个是**门槛**（0 会被上游夹到最低档）、
+    两个是**只读兼容的固定权重**、一个是**枚举**、一个是**总开关**——所以本组刻意
+    不写任何"0 = 不限制"；下面那条用例就是钉住这个判断的，谁顺手加一句空承诺就红。
+    """
+
+    GROUP = "long_horizon"
+
+    #: 上游 `DEFAULT_LONG_HORIZON_CONFIG`（`upstream/src/long-arc.ts:28`）逐字，默认取省成本那侧。
+    UPSTREAM_DEFAULTS = {
+        "enabled": False,
+        "trigger_score": 25,
+        "review_increment": 40,
+        "private_weight": 1.0,
+        "group_weight": 0.5,
+        "intensity": "subtle",
+    }
+
+    def setUp(self) -> None:
+        self.schema = load_schema()
+
+    def section(self) -> dict:
+        return self.schema[self.GROUP]["items"]
+
+    def test_defaults_are_upstream_and_take_the_cheap_side(self):
+        items = self.section()
+        # 键集合也要精确相等：多一个"我们顺手加的"键本身就是纪律问题。
+        self.assertEqual(set(items), set(self.UPSTREAM_DEFAULTS))
+        for key, expected in self.UPSTREAM_DEFAULTS.items():
+            with self.subTest(key=key):
+                self.assertEqual(items[key]["default"], expected)
+
+    def test_core_defaults_are_the_same_single_source(self):
+        """判据一处：`plugin/core/long_arc.DEFAULT_LONG_HORIZON_CONFIG`。
+
+        反向：把任一侧改成"我们拍的数"→ 本用例红（`test_long_arc` 里还有一条同值对账）。
+        """
+        from plugin.core.long_arc import DEFAULT_LONG_HORIZON_CONFIG  # noqa: PLC0415
+
+        for key, expected in self.UPSTREAM_DEFAULTS.items():
+            with self.subTest(key=key):
+                self.assertEqual(DEFAULT_LONG_HORIZON_CONFIG[key], expected)
+                self.assertEqual(self.section()[key]["default"], expected,
+                                 f"schema 与 core 的 {key} 默认值必须同值")
+
+    def test_intensity_is_the_upstream_enum(self):
+        field = self.section()["intensity"]
+        self.assertEqual(field["type"], "string")
+        self.assertEqual(field["options"], ["subtle", "moderate", "strong"])
+
+    def test_no_invented_upper_bound_and_no_numeric_range_in_hints(self):
+        """两个门槛键不写上界，hint 里也不写数字区间。
+
+        上游那套 `Math.max(10, Math.min(500, …))` 留在 `resolve_long_horizon_config` 里
+        （那是**上游自己的契约**，移植用例钉着它），但**不许**把它拍到用户可见的界面上：
+        没有 `min` / `max` / `slider` 节点，hint 里也没有"10~500"这种区间。
+        """
+        for key in ("trigger_score", "review_increment"):
+            field = self.section()[key]
+            with self.subTest(key=key):
+                for banned in ("min", "max", "slider"):
+                    self.assertNotIn(banned, field, f"{key} 不许有 {banned}（我们不拍界）")
+                hint = field.get("hint", "")
+                self.assertIsNone(re.search(r"\d+\s*[~～\-–至]\s*\d+", hint),
+                                  f"{key} 的 hint 里出现了数字区间：{hint!r}")
+
+    def test_no_zero_means_unlimited_promise(self):
+        """本组没有"0 = 不限制"的键（判断见类注释）：谁加一句空承诺这里红。"""
+        for key, field in self.section().items():
+            text = "%s%s" % (field.get("description", ""), field.get("hint", ""))
+            with self.subTest(key=key):
+                self.assertNotIn("不限制", text)
+
+    def test_zero_semantics_are_the_upstream_clamp(self):
+        """0 的**真实**语义：上游 `Math.max(10, …)` —— 填 0 得到 10（最低门槛），不是不限制。"""
+        from plugin.core.long_arc import resolve_long_horizon_config  # noqa: PLC0415
+
+        resolved = resolve_long_horizon_config({"triggerScore": 0, "reviewIncrement": 0})
+        self.assertEqual(resolved["trigger_score"], 10)
+        self.assertEqual(resolved["review_increment"], 10)
+
+    def test_the_two_weights_are_read_only_compat_keys(self):
+        """上游 `long-arc.ts:48`：`privateWeight` / `groupWeight` 读得出来但**不生效**。
+
+        文案必须写明，否则用户改完没反应（"文案即规格"）。
+        """
+        for key, fixed in (("private_weight", "固定 1.0"), ("group_weight", "固定 0.5")):
+            field = self.section()[key]
+            with self.subTest(key=key):
+                self.assertIn(fixed, field["description"])
+                self.assertIn("不改变权重", field.get("hint", ""))
+
+    def test_config_map_quotes_the_same_hints_verbatim(self):
+        """三处同改：`_conf_schema.json` / 本文件 / `docs/CONFIG_MAP.md` 逐字一致。"""
+        path = os.path.join(REPO_ROOT, "docs", "CONFIG_MAP.md")
+        if not os.path.exists(path):
+            self.skipTest("发布仓布局没有 docs/CONFIG_MAP.md")
+        with open(path, encoding="utf-8") as handle:
+            config_map = handle.read()
+        for hint in (
+            "攒够叙事证据时后台会多一次模型调用",
+            "私聊条目全额计入、群聊减半；攒够本项才给她一个长期方向",
+            "上次审视之后再多攒这么多分，复查一次长期方向；每次复查都是一次模型调用",
+            "私聊条目始终全额计入；本项填什么都不改变权重",
+            "群聊条目始终减半计入；本项填什么都不改变权重",
+            "subtle = 只允许最小、可撤回的表达；调高后模型请求的更强档位才生效",
+        ):
+            with self.subTest(hint=hint):
+                self.assertIn(hint, config_map, "CONFIG_MAP.md 缺那句逐字 hint")
+
+    def test_group_numbering_follows_upstreams_insertion(self):
+        """上游把 `longHorizon` 插在 `worldSeeder` 与 `qzone` 之间，`qzone` 因此顶到【扩展 17】。
+
+        依据 `upstream/src/index.ts:545` 与 `upstream/test/configuration.test.ts:10`
+        （见 `docs/UPSTREAM_SYNC.md` 的长线叙事指导那一节）。
+        """
+        keys = list(self.schema)
+        self.assertLess(keys.index("world_seeder"), keys.index("long_horizon"))
+        self.assertLess(keys.index("long_horizon"), keys.index("qzone"))
+        self.assertTrue(self.schema["long_horizon"]["description"].startswith("【扩展 16】"),
+                        self.schema["long_horizon"]["description"])
+        self.assertTrue(self.schema["qzone"]["description"].startswith("【扩展 17】"),
+                        self.schema["qzone"]["description"])
 
 
 if __name__ == "__main__":

@@ -582,7 +582,7 @@ class FfmpegStatusTests(unittest.TestCase):
                     self.assertEqual(video.apply_ffmpeg_status_hint(schema), '⚠️ 未发现 FFmpeg')
 
     # ------------------------------------------------------------------ #
-    # v1.9.8：状态词**只许出现在「识别模式」一处**（用户真机验收原话：
+    # v1.9.9：状态词**只许出现在「识别模式」一处**（用户真机验收原话：
     # "怎么到处都是 `✅ FFmpeg 已识别` 的文字，只需要「视频识别模式」那里显示就可以了"）
     # ------------------------------------------------------------------ #
 
@@ -776,7 +776,7 @@ class FfmpegHintUniquenessTests(unittest.TestCase):
         with mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'):
             video.apply_ffmpeg_status_hint(schema)
         items = schema['model_center']['items']['video']['items']
-        # 反向 ①：v1.9.8 那处「启用视频理解」总开关。
+        # 反向 ①：v1.9.9 那处「启用视频理解」总开关。
         items['enabled']['hint'] = '✅ FFmpeg 已识别。' + items['enabled']['hint']
         self.assertEqual(
             sorted(_status_bearing_paths(schema)),
@@ -1989,9 +1989,13 @@ class _TimeoutRecordingFfmpeg(FakeFfmpeg):
 class GroupVideoParityTests(VideoTestCase):
     """群回合沿用**同一份设置**：抽帧模式 / 帧数 / 音轨格式 / 音轨时长 / 超时逐项同款。
 
-    用户口径（`group_enabled` 的 hint）："群里沿用上面同一套设置；群回合没有视觉通道，
-    画面进不去会说明一次。" 所以这里断言的**不是"差不多"**，而是两条 ffmpeg 命令行
-    逐字相同（只有临时目录不同），外加"画面进不去"那条说明同一原因只说一次。
+    用户口径（`group_enabled` 的 hint）："群里沿用上面同一套设置"。所以这里断言的
+    **不是"差不多"**，而是两条 ffmpeg 命令行逐字相同（只有临时目录不同），
+    外加"没人识别"那条说明同一原因只说一次。
+
+    v1.9.9 起群与私聊的差别只剩两处：帧的**去处**（群回合由
+    `chunk1.flush_group_turn` 喂进群聊图片通道）与"这条视频没有人识别要说出来"
+    （`explain_skips=True`，私聊默认一个字的说明都不加）。
 
     变异保护：在群路径上给任何一项写死（例如群里恒用 `sequence` / 恒抽默认 3 帧 /
     恒按 60 秒截音轨 / 恒用 20 秒超时），`test_every_item_reaches_the_group_unchanged`
@@ -2061,30 +2065,102 @@ class GroupVideoParityTests(VideoTestCase):
         self.assertEqual(audio[audio.index('-f') + 1], 'ogg')
         self.assertTrue(audio[-1].endswith('audio.ogg'), audio[-1])
 
-        # ③ 唯一的差别：画面帧丢弃、音轨照常交出去。
+        # ③ 帧与音轨**两边都交出去**（v1.9.9：群回合的帧由调用方喂进群聊图片通道，
+        #    所以这里与私聊同形；"帧真的进了模型"由 chunk1 那侧端到端钉着）。
         self.assertTrue(private.image_sources, '私聊照常交帧')
-        self.assertEqual(group.image_sources, [], '群回合没有视觉通道 → 帧不进任何通道')
+        self.assertEqual(
+            [source.rsplit('/', 1)[-1] for source in group.image_sources],
+            [source.rsplit('/', 1)[-1] for source in private.image_sources],
+            '群回合交的帧与私聊同款（同一条判据抽出来的）',
+        )
         self.assertTrue(group.audio_sources, '音轨走既有语音通道')
 
-        # ④ 正文事实写实：说清"帧没进去"，不谎称"抽了 N 帧画面"。
-        self.assertIn(video.GROUP_NO_VISION_REASON, group.note)
+        # ④ 正文事实写实：帧交出去了，就不许再写"帧没进去"。
+        self.assertIn('帧画面', group.note)
         self.assertIn('已单独抽出整段音轨', group.note)
-        self.assertNotIn('帧画面', group.note)
+        self.assertNotIn(video.GROUP_FRAMES_NO_CHANNEL_REASON, group.note)
+        self.assertEqual(group_host.warns(), [], '抽到帧、交出去了 → 没有降级 warn')
 
-    async def test_the_frames_are_lost_exactly_once_per_reason(self) -> None:
-        """**说明一次**：同故事同原因 10 分钟内只说一条 warn（节流口 `note_access_skip`）。"""
-        config = self._config(group_enabled=True)
+    async def test_the_group_skip_is_explained_exactly_once_per_reason(self) -> None:
+        """群里"这条视频没有人识别"**说明一次**（同故事同原因 10 分钟一条 warn）。
+
+        正文事实照旧每回合都写（她每回合都该知道"这里有一条视频，我没看"），
+        但日志里同一原因不许刷屏。
+        """
+        config = self._config(group_enabled=False)
         host = Host(config=config)
-        await self._run(
+        first = await self._run(
             host, video_session(is_direct=False), _TimeoutRecordingFfmpeg(), group=True,
         )
+        self.assertIn(video.GROUP_DISABLED_REASON, first.note, '只有视频未识别')
         self.assertEqual(len(host.warns()), 1)
-        self.assertIn('群回合没有视觉通道', host.warns()[0])
+        self.assertIn('群聊视频理解', host.warns()[0])
         # 同一分钟内的第二条视频：正文事实照旧，但不再刷同一条说明。
-        await self._run(
+        second = await self._run(
             host, video_session(is_direct=False), _TimeoutRecordingFfmpeg(), group=True,
         )
+        self.assertIn(video.GROUP_DISABLED_REASON, second.note)
         self.assertEqual(len(host.warns()), 1, '同原因只明说一次')
+
+    async def test_the_group_skip_speaks_only_when_there_is_a_video(self) -> None:
+        """**反向**：群里**没有**视频时一个字的说明都不加（零影响）。"""
+        host = Host(config=self._config(group_enabled=False))
+        plain = SessionView(
+            platform='onebot', self_id='1', user_id='2', is_direct=False,
+            content='大家好', elements=[], media=[],
+        )
+        result = await self._run(host, plain, _TimeoutRecordingFfmpeg(), group=True)
+        self.assertEqual((result.image_sources, result.audio_sources, result.note), ([], [], ''))
+        self.assertEqual(result.reason, '')
+        self.assertEqual(host.warns(), [], '没有视频 = 零影响')
+
+    async def test_the_master_switch_off_in_a_group_also_says_the_video_was_not_recognized(
+        self,
+    ) -> None:
+        """总开关关着（群开关开着）：同一个"只有视频未识别"，但出路是**总开关**。"""
+        host = Host(config=self._config(enabled=False, group_enabled=True))
+        result = await self._run(
+            host, video_session(is_direct=False), _TimeoutRecordingFfmpeg(), group=True,
+        )
+        self.assertEqual((result.image_sources, result.audio_sources), ([], []))
+        self.assertIn(video.VIDEO_DISABLED_REASON, result.note)
+        self.assertEqual(len(host.warns()), 1)
+        self.assertIn('打开总开关', host.warns()[0])
+
+    async def test_private_chats_stay_silent_when_the_chain_is_off(self) -> None:
+        """**反向（私聊逐字不变）**：总开关关着时，私聊一个字的说明都不加、也不 warn。
+
+        变异保护：把 `explain_skips` 的默认值写成 `True`，这一条立刻红——那是**用户可见**
+        的行为变化（每回合多一句"只有视频未识别"）。
+        """
+        host = Host(config=self._config(enabled=False))
+        result = await self._run(
+            host, video_session(is_direct=True), _TimeoutRecordingFfmpeg(), group=False,
+        )
+        self.assertEqual(
+            (result.image_sources, result.audio_sources, result.note, result.reason),
+            ([], [], '', ''),
+            '私聊关着时不许留任何说明',
+        )
+        self.assertEqual(host.warns(), [], '私聊关着时也不许 warn')
+
+    async def test_the_group_switch_never_touches_a_private_chat(self) -> None:
+        """**反向**：群聊开关关着（默认）对私聊**一个字节**都不影响——不挡、也不写说明。"""
+        host = Host(config=self._config(group_enabled=False))
+        result = await self._run(
+            host, video_session(is_direct=True), _TimeoutRecordingFfmpeg(), group=False,
+        )
+        self.assertTrue(result.image_sources, '私聊只受总开关管')
+        self.assertNotIn(video.GROUP_DISABLED_REASON, result.note)
+        self.assertNotIn(video.VIDEO_DISABLED_REASON, result.note)
+        self.assertEqual(host.warns(), [])
+
+    def test_the_private_flush_never_goes_through_the_group_wrapper(self) -> None:
+        """私聊那条路自己调 `collect_video_sources`，一个字的群语义都不碰（判据一处）。"""
+        source = _read('core/service/chunk3.py')
+        self.assertIn('collect_video_sources(self, snapshot[\'story\'], latest_session)', source)
+        self.assertNotIn('collect_group_video_media', source)
+        self.assertNotIn('explain_skips', source)
 
     def test_the_group_judgement_lives_in_exactly_one_place(self) -> None:
         """判据一处：模块里只有 `group_enabled` 那一道闸读会话是不是群聊。

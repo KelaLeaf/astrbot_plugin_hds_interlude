@@ -5,7 +5,9 @@
 适配层实现一处」，加一个动作要动四个文件、漏一处就是静默失效。这里把每个动作声明成
 一条 `PlatformAction`，由它**驱动**四件事：
 
-1. **提示词注入**：`describe_actions()` 只列**当前启用**的动作（按类别分组、带参数），
+1. **提示词注入**（v1.9.9 起是**两段式**，见 `describe_action_shortlist` / `describe_action_params`）：
+   每回合只注入"屏幕上有哪些按钮"（`id` + 一句短标签，**不含参数**）；她选定某条动作之后，
+   才把**那一条**的参数表交给她去填（最多一次额外调用）。两段都只列**当前启用**的动作，
    模型看到的就是它真能调的；
 2. **校验**：`validate_action()` 按参数声明检查类型/范围/枚举，越界一律拒绝并给出理由；
 3. **权限**：`resolve_permission()` 把「配置开关」与「独立权限表」合成生效档位；
@@ -40,6 +42,7 @@ schema 里当隐藏兼容位（读配置时照旧认它里面的键），细节�
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -62,8 +65,11 @@ __all__ = [
     'RISK_LEVELS',
     'RISK_WARNING',
     'PlatformAction',
+    'action_param_example',
     'action_risks',
     'actions_by_category',
+    'describe_action_params',
+    'describe_action_shortlist',
     'describe_actions',
     'effective_permission',
     'is_action_enabled',
@@ -1220,4 +1226,90 @@ def describe_actions(
             params = '，'.join(param.describe() for param in item.params)
             suffix = ('（%s）' % params) if params else ''
             lines.append('- %s：%s%s' % (item.id, item.summary, suffix))
+    return '\n'.join(lines)
+
+
+def describe_action_shortlist(available: Iterable[str]) -> str:
+    """**第一段**（每回合都注入）：只列"屏幕上有哪些按钮"。
+
+    形状：`类别：` + 每行 `- <id> <短标签>`。**不含任何参数说明和参数枚举**——
+    参数是第二段的事（`describe_action_params`）。用户点名的两段式就是这一句：
+    "先让她知道屏幕上有哪些按钮，她选定某个按钮之后，再告诉她这个界面怎么填"。
+
+    `available` **必填**（空集合 → 空串）：可用集是"配置开关 ⊗ 权限表 ⊗ 会话身份"的
+    合成结果，判据在 `chunk12.available_platform_actions()` **一处**；这里只做渲染，
+    绝不再判一次权限（两处判据必然分叉）。传 `None`（"不限制"）**刻意不认**——
+    全量参数目录回归正是这一层要防的（token 回归）。
+    """
+    allowed = {str(item) for item in (available or ())}
+    if not allowed:
+        return ''
+    lines: list[str] = []
+    for category, items in actions_by_category().items():
+        chosen = [item for item in items if item.id in allowed]
+        if not chosen:
+            continue
+        lines.append('%s：' % ACTION_CATEGORIES.get(category, category))
+        for item in chosen:
+            lines.append('- %s %s' % (item.id, item.label))
+    return '\n'.join(lines)
+
+
+def action_param_example(action: 'PlatformAction') -> dict[str, Any]:
+    """这条动作的一个**示例参数对象**（第二段的示教用）。
+
+    只补必填参数：拿模型自己填得出来的值当示例才有意义，把可选项也塞满反而教它
+    "每个参数都要写"。枚举取第一项（那是目录里声明的合法值）。
+    """
+    params: dict[str, Any] = {}
+    for param in action.params:
+        if not param.required:
+            continue
+        if param.choices:
+            params[param.name] = param.choices[0]
+        elif param.type == 'int':
+            params[param.name] = int(param.minimum) if param.minimum is not None else 1
+        elif param.type == 'bool':
+            params[param.name] = True
+        elif param.type == 'list':
+            params[param.name] = []
+        elif param.type == 'object':
+            params[param.name] = {}
+        else:
+            params[param.name] = '<%s>' % param.name
+    return params
+
+
+def describe_action_params(available: Iterable[str]) -> str:
+    """**第二段**（只有她选定某个动作时才给）：这些动作"这个界面怎么填"。
+
+    每条给：一句话说明 + 参数表（`name:type [范围] (枚举) 必填` + 标签/说明）+
+    一个**可照抄的示例**。复杂动作（发图文说说这类）最吃这一段。
+
+    与第一段同一条纪律：`available` 就是这一回合的可用集（判据仍只有一处），
+    这里只按它筛选 + 渲染，**不新增可调动作、也不放宽任何参数约束**——
+    模型照第二段填出来的参数仍要过 `validate_action()`（那是唯一的校验口）。
+    """
+    allowed = {str(item) for item in (available or ())}
+    if not allowed:
+        return ''
+    lines: list[str] = []
+    for item in _ACTION_LIST:
+        if item.id not in allowed:
+            continue
+        lines.append('%s（%s）：%s' % (item.id, item.label, item.summary))
+        if item.params:
+            for param in item.params:
+                detail = param.describe()
+                if param.label and param.label != param.name:
+                    detail += ' %s' % param.label
+                if param.note:
+                    detail += '（%s）' % param.note
+                lines.append('- %s' % detail)
+        else:
+            lines.append('- 无参数')
+        example = action_param_example(item)
+        lines.append('- 示例：{"action":"%s","params":%s}' % (
+            item.id, json.dumps(example, ensure_ascii=False),
+        ))
     return '\n'.join(lines)

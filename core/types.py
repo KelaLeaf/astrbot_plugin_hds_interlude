@@ -1377,6 +1377,12 @@ class OverlayCompactionDecision(TypedDict, total=False):
     major_events: list[str]
 
 
+#: 长线叙事指导的模型输入（上游 `types.ts:1127`：`Record<string, unknown>`）。
+#: 形状由 `core/long_arc.build_long_horizon_input` **唯一**产出（wire camelCase），
+#: 服务层原样交给提供者，不做二次组装。
+LongArcGuidanceRequest = dict[str, Any]
+
+
 class NarrativeCompactor(Protocol):
     """叙事压缩器协议。"""
 
@@ -1398,6 +1404,13 @@ class NarrativeCompactor(Protocol):
     # 缺少计划意味着宿主必须推迟写入，而不是让自由散文推进现实。
     async def plan_timeline(self, request: TimelinePlanRequest) -> TimelinePlan | None:
         """为自动窗口排布时间线计划。"""
+        ...
+
+    # 可选方法（上游 `planLongArcGuidance?`，`types.ts:1139`）：长线指导**刻意独立于**
+    # 场景压缩——一次冗长的场景摘要不该把这条低强度的长期走向挤掉。缺席 = 宿主没有
+    # 这条入口（`chunk15.long_horizon_generate` 打可见 warn 并零写入，不静默）。
+    async def plan_long_arc_guidance(self, request: LongArcGuidanceRequest) -> Any | None:
+        """设计一个「潜在张力 + 一次最小、可撤回的首次表达许可」。"""
         ...
 
 

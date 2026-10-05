@@ -25,7 +25,6 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from plugin.core.endpoints import (  # noqa: E402
-    ENDPOINT_DELIVERABLE_TTL_MS,
     channel_context_metadata,
     channel_context_payload,
     channel_kind_for_account,
@@ -35,8 +34,6 @@ from plugin.core.endpoints import (  # noqa: E402
     endpoint_account_key,
     endpoint_unique_key,
     fresh_endpoint_state,
-    is_endpoint_deliverable,
-    is_endpoint_initiate_allowed,
     normalize_endpoint_row,
     normalize_story_alias_row,
     resolve_inbound_endpoint,
@@ -168,25 +165,49 @@ class ChannelContextTests(unittest.TestCase):
 
 
 class EndpointStateTests(unittest.TestCase):
-    def test_state_is_conservative_and_refreshed_by_evidence(self):
-        fresh = fresh_endpoint_state('ep1', 1_000)
-        self.assertFalse(is_endpoint_deliverable(fresh, 1_000), '重启未知按不可投递处理')
-        self.assertFalse(is_endpoint_initiate_allowed(fresh, 1_000), '没有 initiate 记录时不允许主动发起')
+    """`EndpointState` 三维状态机（v3 §四）：过期即保守、重启归零。
 
+    v1.9.9 起这里**只**断言状态转移本身（`fresh` / `after_connection` /
+    `after_inbound` / `after_outbound`）——原先那两个消费它们的门控函数
+    （`is_endpoint_deliverable` / `is_endpoint_initiate_allowed`）全仓零调用方，
+    属于"有定义、有测试、没行为"的死代码，已连测试一起删除。判据本身是**状态字段**：
+    重启后 `online=False`、入站把 `deliverable.allowed` 立起来、失败落冷却。
+    """
+
+    def test_fresh_state_is_conservative(self):
+        fresh = fresh_endpoint_state('ep1', 1_000)
+        self.assertEqual(fresh['endpoint_id'], 'ep1')
+        self.assertEqual(fresh['connection'], {'online': False, 'observed_at': 1_000})
+        self.assertEqual(fresh['deliverable'], {
+            'allowed': False, 'checked_at': 1_000, 'note': 'fresh-start',
+        })
+
+    def test_state_is_refreshed_by_evidence(self):
+        fresh = fresh_endpoint_state('ep1', 1_000)
         online = state_after_connection(fresh, True, 2_000)
-        self.assertFalse(is_endpoint_deliverable(online, 2_000), '只上线还不算可投递')
+        self.assertEqual(online['connection'], {'online': True, 'observed_at': 2_000})
+        self.assertIs(online['deliverable']['allowed'], False, '只上线还不算可投递')
+
         inbound = state_after_inbound(online, 3_000)
-        self.assertTrue(is_endpoint_deliverable(inbound, 3_000), '入站即证明可投递')
+        self.assertIs(inbound['connection']['online'], True)
+        self.assertEqual(inbound['deliverable'], {'allowed': True, 'checked_at': 3_000},
+                         '入站即证明可投递')
 
         failed = state_after_outbound(inbound, False, 'send-failed', 60_000, 4_000)
-        self.assertFalse(is_endpoint_deliverable(failed, 4_000), '冷却期内保守不可投递')
-        self.assertTrue(is_endpoint_deliverable(failed, 4_000 + 60_000), '冷却结束允许重试探测')
-        # `allowed` 超过 TTL 视为过期。
-        self.assertFalse(is_endpoint_deliverable(inbound, 3_000 + ENDPOINT_DELIVERABLE_TTL_MS + 1))
+        self.assertIs(failed['deliverable']['allowed'], False)
+        self.assertEqual(failed['deliverable']['cooldown_until'], 64_000, '失败落冷却')
+        self.assertEqual(failed['deliverable']['note'], 'send-failed')
 
-        initiate = {'initiate': {'allowed': True, 'observed_at': 1, 'expiresAt': 5_000}}
-        self.assertTrue(is_endpoint_initiate_allowed(initiate, 4_000))
-        self.assertFalse(is_endpoint_initiate_allowed(initiate, 5_000), 'token 过期即不允许')
+        recovered = state_after_outbound(failed, True, 'delivered', 60_000, 5_000)
+        self.assertEqual(recovered['deliverable'], {'allowed': True, 'checked_at': 5_000},
+                         '成功即刷新（冷却不再留着）')
+
+    def test_inbound_also_refreshes_initiate_when_a_token_exists(self):
+        """**反向**：没有 `initiate` 记录时不许凭空造一个出来。"""
+        state = {'initiate': {'allowed': False, 'observed_at': 1}}
+        refreshed = state_after_inbound(state, 3_000)
+        self.assertEqual(refreshed['initiate'], {'allowed': True, 'observed_at': 3_000})
+        self.assertNotIn('initiate', state_after_inbound({'connection': {}}, 3_000))
 
 
 class ChannelKindTests(unittest.TestCase):

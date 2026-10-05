@@ -200,6 +200,10 @@ STICKER_GUESS_WINDOW_MS = 60 * 1000
 #: （连接自己的 `timeout` 之外再加一道硬上限）。
 STICKER_GUESS_TIMEOUT_SECONDS = 60.0
 
+#: 「模型点了原生表情、但这个端点没有这条能力」的可见说明节流间隔（毫秒）。
+#: 与 `STICKER_COLLECT_WARN_INTERVAL_MS` 同档：能力缺失必须看得见，但不能每回合刷一条。
+_NATIVE_FACE_WARN_INTERVAL_MS = 10 * 60 * 1000
+
 
 def _local_sticker_path(value: Any) -> str:
     """把适配器给的本地图片引用归一成文件系统路径（`file:///x` → `/x`）。
@@ -914,6 +918,33 @@ class ServiceChunk2(ServiceBase):
             _config_value(config, 'expressionThreshold', 'expression_threshold'),
         )
 
+    def _note_native_face_unavailable(self, semantic: str) -> bool:
+        """原生表情**能力缺失**的可见说明（节流；宿主没给节流口也照样说话）。
+
+        上游 rc33 把贴纸 / 原生表情的投递代理给宿主 worker（`src/desktop-bridge.ts:191,222`
+        → `src/service.ts:2645,2710` 的 `desktopOnebotActionHandler` + `onebotTargetId`），
+        因为 typ-0 worker 里**没有 `ctx.bots`**。本移植版与宿主同进程，出站直接走
+        `Transport.send_native_face`，那条代理**不需要**；但"这个端点压根没有原生表情
+        能力"这件事在上游会由代理回一个失败帧，这里则必须在**选表情那一刻**就说出来
+        ——否则模型明明白白点了一个表情、日志里却什么都没发生（坑 25：能力缺失必须 warn）。
+
+        与 `_note_qzone_feed_media` 同一条纪律：宿主 / 替身没给节流口时**照样要说话**
+        （退化成一条裸 warn），绝不因为"节流口不在"就把缺失吞成静默。
+        """
+        message = (
+            '模型选了原生表情「%s」，但当前端点没有可用的原生表情能力'
+            '（平台 / 适配器没声明 face 支持）：这条表情不会发出，回合其余内容照常。'
+            '下一步：确认该平台实例支持 OneBot 的 face 段（NapCat / aiocqhttp 均支持）；'
+            '不支持的通道只能改用本地表情包或文字。'
+        )
+        note = getattr(self, 'note_access_skip', None)
+        if callable(note):
+            return bool(note(
+                'native-face-unavailable', _NATIVE_FACE_WARN_INTERVAL_MS, message, semantic,
+            ))
+        self.report_standalone('warn', message % (semantic,))
+        return True
+
     def resolve_native_face(
         self, decision: dict[str, Any], capabilities: Any,
     ) -> Optional[str]:
@@ -922,11 +953,18 @@ class ServiceChunk2(ServiceBase):
         只认**显式声明**的原生表情草稿：语义必须在允许表里，且校准后的意愿
         达到阈值。旧的方括号标签由兼容层解析，但没有声明意愿，因此永远不能
         绕过表达阈值。
+
+        v1.9.9（rc33 的宿主代理那条的落地形态）：**模型点了表情、而这条通道没有
+        原生表情能力**时走可见降级（`_note_native_face_unavailable`）——
+        没点表情（`semantic` 为空）不算丢东西，仍然安静返回 `None`。
         """
         allowed = set(pick(capabilities, 'nativeFaces', 'native_faces') or [])
-        if not allowed:
-            return None
         draft = pick(decision, 'nativeFace', 'native_face')
+        declared = draft.get('semantic') if isinstance(draft, dict) else None
+        if not allowed:
+            if isinstance(declared, str) and declared.strip():
+                self._note_native_face_unavailable(declared)
+            return None
         group_reply = pick(decision, 'groupReply', 'group_reply')
         interaction = pick(decision, 'interaction')
         # 上游用 `??`：空字符串**不**继续回落，只有 null/undefined 才回落。
@@ -963,6 +1001,12 @@ class ServiceChunk2(ServiceBase):
 
         路径解析与越界检查逐字照搬：素材文件必须真的落在表情库目录里。
         出站走 `Transport.send_sticker`（分解契约 §7）。
+
+        v1.9.9（rc33「贴纸 / 原生表情宿主代理」那条的落地形态）：上游在 typ-0 worker 里
+        没有 `ctx.bots`，贴纸要经宿主动作代理（`src/desktop-bridge.ts:191,222` →
+        `src/service.ts:2645`）；本移植版与宿主同进程，直接用 `Transport`，**不需要代理**。
+        真正要守的是**降级可见**：素材不在库内（被移走 / 记录过时）与"宿主没有这条出站
+        能力"都必须留下一条能照着做的 warn，绝不静默丢。
         """
         root = self.sticker_library_root()
         file_path = os.path.abspath(os.path.join(root, str(pick(asset, 'filePath', 'file_path') or '')))
@@ -973,6 +1017,14 @@ class ServiceChunk2(ServiceBase):
             or relative_path.startswith('..' + os.sep)
             or ':' in relative_path
         ):
+            # 旧实现只记一条 `cancelled` 账本就返回——用户侧完全无感（"她怎么没发表情"）。
+            # 能力 / 素材缺失必须可见（坑 25），而且要写清下一步。
+            self.report(
+                'warn', story, 'user-message',
+                '本地表情包素材不在表情库目录里，这条不会发出 素材=%s 解析路径=%s 表情库=%s'
+                '（下一步：在「幕间控制台 → 表情库」重新扫描，或删掉这条指向库外的记录）',
+                pick(asset, 'assetId', 'asset_id'), file_path, root,
+            )
             if reference:
                 await self.record_platform_delivery_outcome(
                     story.get('id'), reference, 'cancelled', 'invalid-sticker-path',
@@ -982,7 +1034,12 @@ class ServiceChunk2(ServiceBase):
         try:
             send = getattr(self.transport, 'send_sticker', None)
             if not callable(send):
-                raise RuntimeError('transport-unavailable')
+                # 宿主没有这条出站能力（平台适配器没实现 send_sticker）：与上游代理
+                # 回失败帧等价，只是这里当场说清是哪一层缺。
+                raise RuntimeError(
+                    'transport-unavailable（宿主没有本地表情包出站能力 '
+                    'Transport.send_sticker）'
+                )
             result = await send(channel_id, file_path, is_group=bool(group_id))
             if not isinstance(result, dict) or result.get('ok') is not True:
                 reason = pick(result, 'error') if isinstance(result, dict) else None
@@ -1039,7 +1096,9 @@ class ServiceChunk2(ServiceBase):
                 return True
             self.report(
                 'warn', story, 'user-message',
-                '聊天动作失败 类型=本地表情包 素材=%s 错误=%s',
+                '聊天动作失败 类型=本地表情包 素材=%s 错误=%s'
+                '（下一步：确认该平台适配器支持发表情包（Transport.send_sticker）；'
+                '不支持就只能发文字或图片）',
                 pick(asset, 'assetId', 'asset_id'), clip(str(error), 200),
             )
             return False
@@ -1058,6 +1117,10 @@ class ServiceChunk2(ServiceBase):
         上游注释：OneBot 11 规范 `face.id` 是 int32，字符串 id 会被严格校验的
         实现直接拒绝；本移植版的 `Transport.send_native_face` 收 face id 字符串，
         由适配器负责转成平台要求的数字（`helpers.QQ_NATIVE_FACE_IDS`）。
+
+        v1.9.9（rc33 的宿主代理那条）：能力选表情那一侧在 `resolve_native_face` 里
+        已经可见降级；这里守的是**出站**那一侧——"这个适配器没有原生表情能力"必须
+        留一条能照着做的 warn，不能只留一个 `transport-unavailable`。
         """
         platform_delivered = False
         try:
@@ -1065,7 +1128,10 @@ class ServiceChunk2(ServiceBase):
 
             send = getattr(self.transport, 'send_native_face', None)
             if not callable(send):
-                raise RuntimeError('transport-unavailable')
+                raise RuntimeError(
+                    'transport-unavailable（宿主没有原生表情出站能力 '
+                    'Transport.send_native_face）'
+                )
             result = await send(channel_id, str(QQ_NATIVE_FACE_IDS.get(semantic, '')), is_group=bool(group_id))
             if not isinstance(result, dict) or result.get('ok') is not True:
                 reason = pick(result, 'error') if isinstance(result, dict) else None
@@ -1114,7 +1180,10 @@ class ServiceChunk2(ServiceBase):
                 return True
             self.report(
                 'warn', story, 'user-message',
-                '聊天动作失败 类型=原生表情 语义=%s 错误=%s', semantic, clip(str(error), 200),
+                '聊天动作失败 类型=原生表情 语义=%s 错误=%s'
+                '（下一步：确认该平台适配器支持原生表情（Transport.send_native_face）；'
+                '不支持就只能改用本地表情包或文字）',
+                semantic, clip(str(error), 200),
             )
             return False
 

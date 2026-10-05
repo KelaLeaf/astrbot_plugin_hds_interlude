@@ -49,7 +49,11 @@ JS `undefined` vs `null`
 
 from __future__ import annotations
 
-from .platform_actions import describe_actions
+from .platform_actions import (
+    ACTIONS,
+    action_param_example,
+    describe_action_shortlist,
+)
 
 import importlib
 import json
@@ -98,9 +102,12 @@ __all__ = [
     'participant_prompt_payload',
     'perspective_instruction',
     'phase_instruction',
+    'platform_action_params_instruction',
+    'platform_action_shortlist_instruction',
     'prompt_visible_message_content',
     'quoted_message_instruction',
     'recent_script_ownership',
+    'long_arc_guidance_prompt',
     'schedule_preplan_prompt',
     'script_first_transport_instruction',
     'sticker_instruction',
@@ -418,35 +425,113 @@ def work_instruction(request: Any) -> str:
 
 
 def platform_action_instruction(request: Any) -> str:
-    """本移植版新增：把**当前可用**的平台动作目录渲染进系统提示词。
+    """**第一段**：本移植版新增，每回合注入的"屏幕上有哪些按钮"。
 
-    与上游的 `chatActionInstruction(capabilities)` 是同一层东西（都告诉模型"你现在能做什么、
-    怎么写"），区别是这里列的是本移植版扩展出来的平台动作（戳一戳/点赞/撤回/定时/群管理/
-    空间/资料/联系人…）。目录**只列启用项**：模型看不到它其实调不动的动作，就不会去幻觉调用。
+    与上游的 `chatActionInstruction(capabilities)` 是同一层东西（都告诉模型"你现在能做什么"），
+    区别是这里列的是本移植版扩展出来的平台动作（戳一戳/点赞/撤回/定时/群管理/空间/资料/联系人…）。
+
+    形状：**只有 id + 一句短标签**，按类别分组。**不含参数说明、不含参数枚举**——那一段
+    只有她选定某个动作时才给（`platform_action_params_instruction`）。用户点名的两段式：
+    "先让她知道屏幕上有哪些按钮，她选定某个按钮之后，再告诉她这个界面怎么填"。
+
+    为什么值得拆：旧写法每回合把 62 条动作的参数表整份灌进去（含枚举与范围），
+    绝大多数字符她这一回合根本用不上；拆开后第一段只有一行一条，
+    参数表只在真的要用某一条时出现一次（最多一次额外调用）。
 
     读的是请求里的 `platformActions` / `platform_actions`（跨 chunk 双拼写），内容由
-    `ServiceChunk12.available_platform_actions()` 算好——权限、开关、会话身份都在那边判完。
+    `ServiceChunk12.available_platform_actions()` 算好——权限、开关、会话身份都在那边判完，
+    **这里是渲染，不是判据**。
+    """
+    available = _platform_action_shortlist(request)
+    if not available:
+        return ''
+    catalog = describe_action_shortlist(available)
+    if not catalog:
+        return ''
+    return _PLATFORM_ACTION_INSTRUCTION % (MAX_PLATFORM_ACTIONS_PER_TURN, catalog)
+
+
+def platform_action_shortlist_instruction(catalog: Any) -> str:
+    """把**已经渲染好的**第一段短清单（`describe_action_shortlist` 的产物）包成提示词段。
+
+    与 `platform_action_instruction(request)` 是同一段文本的两个入口：那边从请求里取
+    可用集（注入路径），这边直接收渲染结果（服务层要在同一回合里复用同一份清单时用）。
+    空清单 → 空串。**这里只加标题句**，清单本身由 `describe_action_shortlist` 一处渲染。
+    """
+    text = str(catalog or '').strip()
+    if not text:
+        return ''
+    return _PLATFORM_ACTION_INSTRUCTION % (MAX_PLATFORM_ACTIONS_PER_TURN, text)
+
+
+def _platform_action_shortlist(request: Any) -> list[str]:
+    """请求里这一回合的可用动作 id（跨 chunk 双拼写，缺省空表）。
+
+    **唯一判据仍是 `ServiceChunk12.available_platform_actions()`**：这里只做读取，
+    不接受 `None`（"不限制"）——那会让全量目录重新回到每条提示词里。
     """
     if not isinstance(request, dict):
-        return ''
+        return []
     available = request.get('platformActions')
     if available is None:
         available = request.get('platform_actions')
-    if not isinstance(available, (list, tuple)) or not available:
+    if not isinstance(available, (list, tuple)):
+        return []
+    return [str(item) for item in available]
+
+
+#: 第一段的固定标题句（两个入口共用**同一份**文本，别各写一遍——两处文案必然分叉）。
+#: v1.9.9 收短：每回合都注入的文本只留**可执行的约束**，解释性的话删掉（省 token）。
+_PLATFORM_ACTION_INSTRUCTION = (
+    'PLATFORM ACTIONS AVAILABLE NOW: besides speaking, the protagonist may act on the chat platform '
+    'itself. Return them in the top-level "platformActions" array, each item '
+    '{"action":"<id>","params":{...}}, executed after the reply is delivered, in the given order; '
+    'at most %d per turn, and omit the field entirely when nothing is needed. These are real side '
+    'effects on a live account: use them only when the story calls for it, never to imitate a reply. '
+    'A failed action is reported to you on the next turn as a script entry; do not retry blindly.\n'
+    'Action parameters are not listed here: write the id with whatever params you are sure of, and '
+    'the parameter form of the action you pick will be shown to you before it is executed. When a '
+    'form is shown, fill in that one action\'s "params" and keep its id unchanged.\n'
+    'Available actions:\n%s'
+)
+
+
+def platform_action_params_instruction(
+    action_id: str,
+    instruction: str = '',
+    spec: str = '',
+) -> str:
+    """**第二段**：只有她选定某个动作时才给——"这个界面怎么填"。
+
+    * `instruction`：该动作的一句话说明（`PlatformAction.summary`）；
+    * `spec`：该动作的参数表（由 `platform_actions.describe_action_params(['<id>'])` 渲染，
+      含每条参数的**书面值**——枚举、范围、必填标记与说明）。
+
+    **第一段文本是最终有效的**：这一段只填 `params` 槽，不许改动作 id、不许改用另一条动作；
+    回执里多写的动作一律不接受（`ServiceChunk12.apply_platform_action_params()` 按这条收）。
+    """
+    name = str(action_id or '').strip()
+    action = ACTIONS.get(name)
+    if action is None or not str(spec or '').strip():
         return ''
-    catalog = describe_actions([str(item) for item in available])
-    if not catalog:
-        return ''
+    label = action.label
+    summary = ' '.join(str(instruction or '').split()) or action.summary
+    example = action_param_example(action)
+    action_text = '%s（%s）' % (name, label)
+    if summary:
+        action_text = '%s —— %s' % (action_text, summary)
     return (
-        'PLATFORM ACTIONS AVAILABLE NOW: the protagonist may additionally act on the chat platform '
-        'itself (not just speak). Return them in the top-level "platformActions" array, each item '
-        '{"action":"<id>","params":{...}}, executed **after** the reply is delivered and in the order '
-        'given; at most %d per turn, and omit the field entirely when nothing is needed. These are real '
-        'side effects on a live account: only use them when the story itself calls for it, never as a '
-        'demonstration, and never to imitate a reply (the reply is still interaction.reply / groupReply). '
-        'A failed action is reported to you on the next turn as a script entry, so do not retry blindly.\n'
-        'Available actions:\n%s'
-    ) % (MAX_PLATFORM_ACTIONS_PER_TURN, catalog)
+        'PLATFORM ACTION PARAMETERS: the protagonist already chose the action below in '
+        '"platformActions". Fill in that one action\'s "params" now, for this live turn only, and '
+        'keep its id exactly as given — do not switch to another action. The form lists every '
+        'parameter this action accepts with its allowed values and ranges; 必填 means required. '
+        'Use this action only when the story genuinely calls for it: when even the required '
+        'parameters cannot be filled truthfully, omit the action entirely instead of guessing. '
+        'Return JSON only: {"action":"<id>","params":{...}}.\n'
+        'Action: %s\n'
+        'Parameter form:\n%s\n'
+        'Example: {"action":"<id>","params":%s}'
+    ) % (action_text, spec, json.dumps(example, ensure_ascii=False))
 
 
 def quoted_message_instruction(enabled: bool) -> str:
@@ -549,7 +634,7 @@ def sticker_selection_instruction(threshold: float = 0.7) -> str:
 # ======================================================================================
 
 
-def system_prompt(phase: str, main_prompt: Optional[str], format_prompt: Optional[str], fixed_prompt: str, base_style_prompt: str, story_style_prompt: str, refresh_continuity: bool = False, alter_enabled: bool = False, agency_enabled: bool = False, perspective_enabled: bool = False, output_recovery: bool = False, chat_capabilities: Optional[dict[str, Any]] = None, has_quoted_message: bool = False, sticker_catalog: Optional[list[dict[str, Any]]] = None, schedule_preplan_enabled: bool = False, streaming_reply_first: bool = False, cache_first_payload: bool = False, group_turn: bool = False, writing_options: Optional[dict[str, Any]] = None, specialty: Optional[dict[str, Any]] = None, channel_selection_enabled: bool = False, sticker_groups: Optional[list[dict[str, Any]]] = None) -> str:
+def system_prompt(phase: str, main_prompt: Optional[str], format_prompt: Optional[str], fixed_prompt: str, base_style_prompt: str, story_style_prompt: str, refresh_continuity: bool = False, alter_enabled: bool = False, agency_enabled: bool = False, perspective_enabled: bool = False, output_recovery: bool = False, chat_capabilities: Optional[dict[str, Any]] = None, has_quoted_message: bool = False, sticker_catalog: Optional[list[dict[str, Any]]] = None, schedule_preplan_enabled: bool = False, streaming_reply_first: bool = False, cache_first_payload: bool = False, group_turn: bool = False, writing_options: Optional[dict[str, Any]] = None, specialty: Optional[dict[str, Any]] = None, channel_selection_enabled: bool = False, sticker_groups: Optional[list[dict[str, Any]]] = None, long_horizon_guidance: Optional[str] = None) -> str:
     """上游 `systemPrompt(...)`：参数顺序、默认值、返回文本逐字一致。
 
     格式/现实性合约与可编辑文风明确分段，避免文风提示无意间削弱时间和 JSON 约束。
@@ -581,6 +666,9 @@ def system_prompt(phase: str, main_prompt: Optional[str], format_prompt: Optiona
             blocks.append(affordances)
         if overrides.get('extra_after_phase'):
             blocks.append(overrides['extra_after_phase'])
+        # 长线指导（v1.9.9）：上游 lite 数组里就在 `CHANNELS` **之前**那一条。
+        if long_horizon_guidance:
+            blocks.append(long_horizon_guidance)
         if channel_selection_enabled:
             blocks.append(MULTI_PLATFORM_TRANSPORT_SELECTION)
         # 上游 lite 分支末尾仍是用户可配置的四块：自定义输出格式、主叙事指令、附加固定
@@ -679,6 +767,14 @@ def system_prompt(phase: str, main_prompt: Optional[str], format_prompt: Optiona
         'The base setting is canon and describes the starting point. Stable overlay is the accumulated present condition after repeated evidence and takes precedence when it clearly conflicts with an old baseline. Recent relationship notes and continuity salient items describe current tendencies or temporary effects; they influence behavior without rewriting personality. A single mood, reply, or unusual event does not change canon or stable overlay.',
         'Completed visible communication stays aligned across prose and its phase-specific transport mirror. Platform actions use advertised structured capabilities; considerations and future possibilities stay in the life script until an actual action occurs.',
         writing_affordances(writing_options),
+        # 长线指导（v1.9.9）：软许可，不是剧本。
+        # **受控偏离**：上游 `systemPrompt(...)` 只在 lite 分支消费 `longHorizonGuidance`
+        # （`narrator.ts:1634`），full 分支的数组**根本没用这个参数** —— 也就是说上游
+        # full 档永远拿不到这条指导。我们是绝大多数用户跑 full 档，照抄等于这个功能
+        # 在生产上是死的，所以这里也在 `CHANNELS` 之前注入（`or ''` 与上游
+        # `...(cond ? [x] : [])` 等价：末尾 `'\n'.join(part for part in parts if part)`
+        # 会把空串滤掉）。落地记见 `docs/PORTING_NOTES.md` §90。
+        long_horizon_guidance or '',
         # 常设块（上游 full 数组里的四块）与家族新增行 / 多平台选择块。
         ADMIN_NOTES_FULL,
         WORLD_EVENTS_FULL,
@@ -904,17 +1000,27 @@ def to_prompt_payload(request: dict[str, Any], options: Optional[dict[str, Any]]
         current_event: Any = {'type': 'none'}
     elif group_context:
         # 上游 `narrator.ts:1885`：群回合的当前事件同样声明**内容条数与媒体证据**
-        # （`content` / `imageCount` / `audioCount`），只是不带私聊那套观察字段。
-        # 少了 `audioCount`，模型就不知道群里那条语音是真的音频证据（上游
-        # `anthropic.test.ts` 第 1 条钉的正是"群回合也要声明原生音频"）。
+        # （`content` / `imageCount` / `audioCount`）。少了 `audioCount`，模型就不知道
+        # 群里那条语音是真的音频证据（上游 `anthropic.test.ts` 第 1 条钉的正是
+        # "群回合也要声明原生音频"）。
+        #
+        # v1.9.9（§85.9 那一跳的接线）：群分支与**私聊分支读同一套视觉证据字段** ——
+        # 侧端识图（`model_center.vision.mode = sidecar`）下 `visualObservations` 就是
+        # 这一回合的图片证据（`imageCount` 为 0）。不读它，群里发来的图 / 视频帧的
+        # 观察结果就永远到不了模型（实测：群 `incomingEvent.event` 里根本没有该键）。
         group_images = _pick(request, 'images') or []
         group_audio = _pick(request, 'audio') or []
+        visual_observations = _pick(request, 'visualObservations', 'visual_observations') or []
         current_event = {
             'type': 'group-message-batch',
             'content': user_message if user_message is not None else '',
             'imageCount': len(group_images) if isinstance(group_images, list) else 0,
             'audioCount': len(group_audio) if isinstance(group_audio, list) else 0,
+            'visualEvidenceMode': 'native-images' if group_images else (
+                'sidecar-observations' if visual_observations else 'none'),
         }
+        if isinstance(visual_observations, list) and visual_observations:
+            current_event['visualObservations'] = visual_observations
         # 1.0.1-rc31：历史群聊图片是**旧证据**，与当前回合的图分开计数
         # （上游 `narrator.ts:1923-1931`）。少了它，模型分不清"他刚发的图"和
         # "更早发过、这次又附给我的图"；来源元数据只用来让她认出**谁在什么时候**
@@ -1561,6 +1667,35 @@ def compaction_prompt(fixed_prompt: str, compaction_main_prompt: str = '', compa
         'ADDITIONAL FIXED INSTRUCTIONS:', (fixed_prompt or '').strip() or 'None.',
         'COMPACTION-SPECIFIC FIXED INSTRUCTIONS:', (compaction_fixed_prompt or '').strip() or 'None.',
         'COMPACTION WRITING STYLE (applies only to summaries, not to the main script):', (compaction_style_prompt or '').strip() or 'Concise, factual, chronological, and concrete.',
+    ])
+
+
+def long_arc_guidance_prompt(specialty: Optional[dict[str, Any]] = None) -> str:
+    """上游 `longArcGuidancePrompt(specialty?)`（`narrator.ts:2343-2364`）**逐字**。
+
+    刻意窄的契约：这是长线指导那一次调用**唯一**的职责，与场景压缩 / 事实压缩分开，
+    免得小模型写完成篇摘要之后把深层嵌套的催化字段悄悄省掉（上游同一条理由）。
+    末行按 `specialty.tier == 'lite'` 二选一：lite 档要求每个字段都短。
+    """
+    return '\n'.join([
+        'You are the long-horizon dramaturgical catalyst for HDS Interlude.',
+        'Analyze the supplied story setting, relationship context, durable facts, recent script, weighted evidence, and any current catalyst.',
+        'Your job is not only to detect changes that already happened. You may design one small, character-consistent first expression of a latent development that has not happened yet, when the accumulated relationship and role structure make it plausible.',
+        'Do not optimize for drama. Do not force conflict, confession, awakening, personality rewrites, user actions, or major plot turns. Dramatic development must begin as the smallest natural, reversible choice that could reveal an unresolved tension.',
+        'Think in this order: (1) what is already established, (2) what unresolved tension exists between role, relationship, desire, boundary, or self-understanding, (3) what the smallest first expression could be, (4) what would happen if the user accepts, declines, or questions it.',
+        'A dormant result is valid only when no grounded developmental affordance is worth introducing, or when an existing catalyst should be left alone to receive feedback. Do not return dormant merely because the first expression has not already occurred.',
+        'Use decision="prime" when a new direction should receive one low-intensity first-expression opportunity. Use decision="activate" when an earlier expression has already been met by a meaningful response and the direction may become a recurring tendency. Use decision="dormant" when no new write is justified.',
+        'The first expression must be concrete enough for the main narrative author to realize, but never a mandatory line. It must include natural triggers, a maximum number of attempts, and reversible response branches.',
+        'For a role-based character, distinguish duty from desire without declaring self-awareness. For example, a character may be permitted to gently ask to continue a meaningful conversation before she can understand why she wants that.',
+        'Return exactly one JSON object and no Markdown with this shape:',
+        '{"decision":"dormant|prime|activate","reason":"why this decision is appropriate","title":"short title","premise":"grounded premise","latentTension":"unresolved tension, not canon","direction":"long developmental direction","emotionalCore":"latent emotional tension","firstExpression":{"action":"one small possible first action","example":"illustrative wording","trigger":["natural condition"],"intensity":"minimal","maxAttempts":1,"reversibility":"high"},"responseBranches":{"accepted":"how the possibility gains weight","declined":"how the character respects the boundary","questioned":"how the character responds without overclaiming"},"currentStage":{"id":"stage-1","name":"...","purpose":"..."},"stages":[{"id":"stage-1","name":"...","objective":"...","allowedSignals":["..."],"activationConditions":["..."],"completionEvidence":["..."]}],"subtleSignals":["..."],"preferredSituations":["..."],"avoidForcing":["..."],"intensity":"subtle","horizon":"long","confidence":0.0,"evidenceEntryIds":[1]}',
+        'For decision="dormant", reason and evidenceEntryIds are sufficient; do not fabricate an arc. For prime/activate, title, premise, direction, emotionalCore, firstExpression, responseBranches, stages, and evidenceEntryIds are required.',
+        'Use only evidenceEntryIds supplied in keyEvidence. Keep stages bounded (2-6), signals concrete and small, firstExpression.maxAttempts between 1 and 3, and confidence between 0 and 1.',
+        'The first expression may be inferred as a plausible opportunity from the role and relationship structure; it does not need to have already appeared in the evidence. However, it must remain compatible with established facts and user boundaries.',
+        'Never write that the character already has a new trait. Describe a possibility that the main author can allow once. Do not invent past events. Do not repeat the same first expression mechanically.',
+        'Keep every field concise. Prefer one precise first expression over elaborate arc prose.'
+        if _pick(specialty, 'tier') == 'lite' else
+        'Write with specific, psychologically plausible, non-deterministic guidance. A quiet, non-dramatic direction is preferable to an artificial twist.',
     ])
 
 

@@ -217,6 +217,33 @@ def delivery_reference(
     }
 
 
+def delivery_intent_key(reference: Any) -> str:
+    """**业务幂等键** `eventId:bubbleIndex`（上游 `src/service.ts:811,6356`）。
+
+    上游把这段契约交给**宿主 outbox**（`src/desktop-bridge.ts:93` 的 `intentKey`
+    注释逐字写着"宿主 outbox 跨 deliveryId 去重，防止『上游已收、回执迟到』时重试
+    造成重复投递"）。AstrBot 没有 outbox 那一层，所以本移植版**自己在桥接侧记账**
+    （见 `service/desktop.py::_background_delivery`）——键的**形状**与上游逐字一致，
+    宿主将来若补上 outbox，这个键可以直接交出去。
+
+    拿不到合法 `eventId`（或 `bubbleIndex` 不是安全整数）时返回空串 = **这条没有
+    幂等身份**，调用方不得据此去重（宁可让它照旧重试，也不能拿一个编出来的键把
+    两条不同的话当成同一条）。
+
+    键名双读：内部结构是 `event_id` / `bubble_index`（`core/delivery.py` 的写法），
+    模型/旧数据可能给 `eventId` / `bubbleIndex`。
+    """
+    event_id = _get(reference, 'event_id', 'eventId')
+    if not isinstance(event_id, str) or not event_id:
+        return ''
+    index = _get(reference, 'bubble_index', 'bubbleIndex')
+    if index is None:
+        index = _get(reference, 'segment_index', 'segmentIndex')
+    if not _is_safe_integer(index):
+        index = 0
+    return '%s:%d' % (event_id, int(index))
+
+
 def platform_action_reference(
     commit: Optional[dict[str, Any]],
     script_entry_id: Optional[int],

@@ -87,6 +87,9 @@ EXPECTED_TABLES = [
     'interlude_scheduled_command',
     # 上游 rc28 的共同作品表（P3 解禁后补上）。
     'interlude_work',
+    # 上游 rc28 的长线叙事指导：版本化 guidance 行 + 每剧本一行的累计器（本轮 §89）。
+    'interlude_long_arc_guidance',
+    'interlude_long_arc_progress',
 ]
 
 #: `(表, 主键, 是否自增)` —— 直接抄自 database.ts 的 `primary` / `autoInc`。
@@ -113,6 +116,9 @@ EXPECTED_PRIMARY = {
     'interlude_qzone_post': ('id', True),
     'interlude_scheduled_command': ('id', True),
     'interlude_work': ('id', False),
+    # guidance 自增版本行；progress 是每剧本一行（主键 `storyId`，非自增）。
+    'interlude_long_arc_guidance': ('id', True),
+    'interlude_long_arc_progress': ('storyId', False),
 }
 
 #: `indexes` / `unique` 选项 → 期望存在的索引列（顺序照抄 database.ts）。
@@ -227,13 +233,23 @@ EXPECTED_COLUMNS = {
     ],
     'interlude_qzone_post': [
         'id', 'storyId', 'kind', 'tid', 'targetUin', 'content', 'ugcRight', 'endpointId',
-        'status', 'error', 'createdAt', 'postedAt',
+        'status', 'error', 'createdAt', 'postedAt', 'commentNum', 'likeNum',
     ],
     'interlude_scheduled_command': [
         'id', 'storyId', 'command', 'params', 'cron', 'enabled', 'nextRunAt', 'lastRunAt',
         'lastStatus', 'lastError', 'runCount', 'createdAt', 'updatedAt',
     ],
     'interlude_work': ['id', 'storyId', 'participantId', 'generation', 'state'],
+    'interlude_long_arc_guidance': [
+        'id', 'storyId', 'version', 'status', 'title', 'premise', 'direction', 'payload',
+        'currentStage', 'intensity', 'confidence', 'triggerEntryId', 'evidenceEntryIds',
+        'supersedesId', 'createdAt', 'updatedAt', 'completedAt', 'expiresAt',
+    ],
+    'interlude_long_arc_progress': [
+        'storyId', 'lastCountedEntryId', 'totalScore', 'privateCount', 'privateScore',
+        'groupCount', 'groupScore', 'unknownCount', 'lastGenerationScore',
+        'lastGenerationEntryId', 'updatedAt',
+    ],
 }
 
 #: sqlite3 类型映射断言（`unsigned`/`double`/`boolean`/`json`/`timestamp`）。
@@ -342,9 +358,10 @@ class RegisterTablesTests(_DatabaseTestCase):
         created = self.db.register_tables()
         self.assertEqual(sorted(created), sorted(EXPECTED_TABLES))
         self.assertEqual(sorted(self._table_names()), sorted(EXPECTED_TABLES))
-        # `TABLES` 注册表本身是 21 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表
-        # + Token 账本 + QQ 空间账本 + 定时命令表 + 本移植版的共同作品表与表情库分组表）。
-        self.assertEqual(len(TABLES), 21)
+        # `TABLES` 注册表本身是 23 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表
+        # + Token 账本 + QQ 空间账本 + 定时命令表 + 本移植版的共同作品表与表情库分组表
+        # + rc28 长线叙事指导的两张表）。
+        self.assertEqual(len(TABLES), 23)
         self.assertEqual(db_mod.table_names(), EXPECTED_TABLES)
 
     def test_columns_match_upstream_declaration(self):

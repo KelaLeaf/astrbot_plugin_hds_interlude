@@ -93,6 +93,7 @@ from .helpers import (
     normalize_group_chat_actions,
     normalize_group_visible_reply,
     normalize_participant_state,
+    visible_reply_text,
 )
 # 群音频的批次预算（上游 2197-2215）住在 chunk3：那里有 `audioConfig` 的解析与
 # `load_native_audio`。chunk3 **不** import chunk1，所以这条模块级依赖不成环。
@@ -101,19 +102,39 @@ from .helpers import (
 # `_extract_session_image_sources` 同源：群聊图片来源与私聊视觉走**同一处判据**（§46.7），
 # 不另造一套"群聊专用图片解析"（1.0.1-rc31 的历史图片证据靠它）。
 from .chunk3 import (
-    _extract_session_image_sources, _extract_session_media, _load_group_batch_audio,
-    _member, _unique, _vision_config,
+    _extract_session_image_sources, _extract_session_media, _image_budget,
+    _load_group_batch_audio, _member, _unique, _vision_config,
     audio_turn_budget_note, audio_turn_slice, note_audio_budget_skip,
 )
-# 视频理解（v1.9.1）：群回合**只有音轨有通道**的那条接线（判据在
-# `video_understanding.collect_group_video_media`，本文件只做群回合这一跳）。
-from ..video_understanding import collect_group_video_media
+# 视频理解（v1.9.1 起接进群回合；v1.9.9 起**画面帧也进模型**）：群回合这一跳的接线
+# （判据在 `video_understanding.collect_group_video_media`，它复用私聊那条链的
+# `collect_video_sources`），本文件只负责"帧喂进群聊图片通道、音轨并进群音频批次"。
+from ..video_understanding import (
+    VideoMedia,
+    audio_clip_seconds,
+    collect_group_video_media,
+    note_group_frames_without_channel,
+    video_config,
+    video_fact_note,
+)
+# 每回合图片预算（v1.9.4）：默认值 / 解析 / 截断线索只住在 `core/vision_budget.py`；
+# 有效值的解析走 `chunk3._image_budget`（与私聊那条路**同一个**函数，判据只有一处）。
+from ..vision_budget import image_budget_note, note_image_budget_skip
 
 __all__ = ['ServiceChunk1', 'resolve_script_context_budget']
 
 #: JS `Time.hour` / `Time.second`（Koishi `Time` 的单位毫秒）。
 _HOUR_MS = 3_600_000
 _SECOND_MS = 1_000
+
+#: 侧端识图没给出观察结果、而这段视频已经抽出了帧时，那句**诚实**的视频事实的降级原因
+#: （v1.9.9）。与 `video_understanding.GROUP_FRAMES_NO_CHANNEL_REASON` 同一条尺子
+#: （抽了帧没人看不许静默，也不许把"没看到"写成"看到了"），但原因不同：那条是"没有
+#: 原生视觉通道"，这条是"侧端识图这一跳没成"——两条不许混用同一个原因串（节流 warn 的
+#: 键就是原因本身，混用等于把两种故障报成一种）。
+_SIDECAR_FRAMES_WITHOUT_OBSERVATION = (
+    '这是群里发来的一段视频，但侧端识图没有给出观察结果，抽到的画面帧没有交给模型'
+)
 
 #: 上游 `clearDatabase` 里按顺序清空的表（`src/service.ts:1493-1496`）。
 _CLEAR_DATABASE_TABLES = (
@@ -370,30 +391,35 @@ def _chat_capabilities_wire(capabilities: Any) -> Any:
     return wire
 
 
-async def _group_video_audio(
+async def _group_video_media(
     service: Any, story: Any, session: Any, group_id: Any = '', offset: int = 0,
-) -> tuple[list[Any], str]:
-    """群回合的视频：帧没有视觉通道，音轨并进群音频批次。
+) -> tuple[list[Any], str, VideoMedia]:
+    """群回合的视频：音轨并进群音频批次，帧留给调用方喂进**群聊图片通道**。
 
     判据**只有一处**：`video_understanding.collect_group_video_media`（它自己复用
     `collect_video_sources`），这里只做群回合特有的三件事——把音轨交给**同一条**
-    `load_native_audio`（与群里语音、私聊语音完全同一条通道）、临时目录收尾、
-    以及"附加能力失败不许带崩回合、也绝不静默"的兜底（坑 25）。
+    `load_native_audio`（与群里语音、私聊语音完全同一条通道）、正文事实、以及
+    "附加能力失败不许带崩回合、也绝不静默"的兜底（坑 25）。
 
-    返回 `(音轨附件, 要并进正文的视频事实)`；群开关关着 / 没有视频 / 总开关关着时
-    两个都是空的，**一个 ffmpeg 都不调**。
+    返回 `(音轨附件, 要并进正文的视频事实, 这次视频理解的产物)`。**第三项里的
+    `image_sources` 是帧**：调用方读完帧字节（`load_native_images`）之前**不许**
+    调 `cleanup()`——临时目录一删，帧就永远取不回来了。
+
+    群里没有视频 / 总开关关着 / 群开关关着时：音轨与帧都是空的（**一个 ffmpeg 都不调**），
+    但"群里发来一条视频却没人识别"会由第三项带着一句事实（`explain_skips`）。
     """
+    empty = VideoMedia()
     try:
         media = await collect_group_video_media(service, story, session)
     except Exception as error:  # noqa: BLE001 - 视频理解绝不许带崩群回合
         service.report_standalone(
             'warn', '群聊视频理解失败，本回合按"没有视频"继续 群=%s 错误=%s', group_id, error,
         )
-        return [], ''
+        return [], '', empty
     try:
         note = media.note
         if not media.audio_sources:
-            return [], note
+            return [], note, media
         # 音轨截断**可数**（v1.9.5）：多段视频的音轨走同一条语音通道、被同一个
         # 「每个事件音频数上限」切片；线索与 warn 与私聊那条路共用同一处实现。
         audio_to_take, audio_available, audio_granted = audio_turn_slice(
@@ -410,15 +436,45 @@ async def _group_video_audio(
                 for index, item in enumerate(loaded)
             ],
             note,
+            media,
         )
     except Exception as error:  # noqa: BLE001 - 音轨取不到不该吞掉那条视频事实
         service.report_standalone(
             'warn', '群聊视频音轨读取失败，本回合只保留视频事实 群=%s 错误=%s', group_id, error,
         )
-        return [], media.note
-    finally:
-        # 音轨是 `data:` URI，不依赖临时目录；帧也没进任何通道 → 现在就能删。
-        media.cleanup()
+        return [], media.note, media
+
+
+def _sidecar_frames_without_observation_note(service: Any, media: VideoMedia) -> str:
+    """群聊抽出了帧、而侧端识图这一跳没给出观察结果：**重写**那句视频事实（v1.9.9）。
+
+    与 `video_understanding.note_group_frames_without_channel()` 同一条尺子、同一个
+    **造句子**（`video_fact_note`），只有两处不同：
+
+    * 原因串是自己的（`_SIDECAR_FRAMES_WITHOUT_OBSERVATION`）——"侧端识图没成"与
+      "没有原生的视觉通道"是两种故障，混用同一个原因串会让节流 warn 把两件事报成一件；
+    * **不再打一条 warn**：这一跳的可见 warn 由 `describe_current_images(visible=True)`
+      那一处发出（它知道真正的失败原因：没连接 / 报错或超时 / 没返回内容），
+      两处都发等于同一次故障刷两条日志。
+
+    为什么是"重写"而不是"再加一句"：`collect_video_sources` 那句会声称"抽了 N 帧画面"，
+    在"帧没交给任何模型"时它就是假话（会让模型以为她看见了画面）——用同一个
+    `video_fact_note` 造一句诚实的：帧数照报（可数），降级原因顶在最前面。
+    """
+    frames = len(media.image_sources)
+    settings = video_config(service)
+    return video_fact_note(
+        degrade_reason='%s（抽到的 %d 帧没有交给模型）' % (
+            _SIDECAR_FRAMES_WITHOUT_OBSERVATION, frames,
+        ),
+        has_audio=bool(media.audio_sources),
+        # 音轨那半句由 `has_audio` 决定（有降级原因时 `audio_attempted` 不参与造句）。
+        audio_seconds=audio_clip_seconds(settings),
+        frame_mode=settings['frame_mode'],
+        interval_seconds=settings['frame_interval_seconds'],
+        average_frames=settings['frame_average_count'],
+        timeout_seconds=settings['timeout_seconds'],
+    )
 
 
 # =========================================================================== #
@@ -1792,25 +1848,26 @@ class ServiceChunk1(ServiceBase):
             group_audio = await _load_group_batch_audio(
                 self, snapshot['story'], batch, turn.get('latest_session'),
             )
-            # 视频理解（v1.9.1）：群聊的**视频帧**没有去处（抽帧结果不进下面的图片通道：
-            # rc31 接的是"群消息里真正发过的图片"，不是视频帧；帧要与直发图抢同一个每回合
-            # 预算，那是 v1.9.1 §53 的既有口径），但**音频通道是通的**——`group_audio`
-            # 就是它。所以复用同一个判据 `collect_group_video_media`：抽出的帧没有去处
-            # 时**节流明说一次**，音轨并进这批音频，**至少让声音进去**。
-            # 这是"群聊开关打开后到底发生什么"的答案——不许开着却静默什么都不做（坑 25）。
-            video_audio, video_note = await _group_video_audio(
+            # 视频理解（v1.9.1 起接进群回合；v1.9.9 起**画面帧也进模型**）：群里有人发视频
+            # 时，按既有能力判断（视频理解总开关 + 群聊开关 + 抽帧模式 / 帧数 / 间隔 / 超时），
+            # **帧**并进下面的群聊图片通道（1.0.1-rc31 那条：与群图共用「每回合图片数上限」），
+            # **音轨**并进这批群音频。群里没有视频 = 零影响；没人识别 = 一句事实 + 一条
+            # 可行动 warn（`explain_skips`，绝不静默，见 `video_understanding`）。
+            video_audio, video_note, video_media = await _group_video_media(
                 self, snapshot['story'], turn.get('latest_session'),
                 group_id, len(group_audio),
             )
             group_audio = list(group_audio) + list(video_audio)
-            if video_note:
-                # 视频事实进**当前事件**（与私聊 `chunk3.flush_buffered_narrative` 同一处）。
-                user_message = '%s\n%s' % (user_message, video_note)
             # 群聊视觉通道（1.0.1-rc31）：本批消息带过的图片是**当前回合的图**，
             # 历史条目落的 `groupImageRefs` 是**可回流的旧证据**。两者都只在本回合存在，
             # 按上游口径：当前图 `images`、历史图 `historicalGroupImages`，去重后一起交给
             # 主叙事；历史图由选择器按"同群、新到旧、最近 N 张"取（`historicalImageLimit`，
             # 0 = 关闭）。视觉关着时 `load_native_images` 与选择器各自早退，一个字节都不取。
+            #
+            # **本回合视频抽出的帧排在这两者之间（v1.9.9）**：当前图 → 当前视频帧 → 历史图
+            # ——帧与当前图同属"这一回合她眼前的东西"（一起抢「每回合图片数上限」，
+            # 与私聊那条路**同一个** `_image_budget()`，见 `core/vision_budget.py`）；
+            # 历史图是**旧证据**，走它自己的 `historicalImageLimit`，不占这份预算。
             image_session = next(
                 (item.get('imageSession') for item in batch
                  if isinstance(item, dict) and item.get('imageSession') is not None),
@@ -1821,9 +1878,44 @@ class ServiceChunk1(ServiceBase):
                 for source in (_turn_get(item, 'imageSources', 'image_sources') or [])
                 if str(source or '').strip()
             ])
-            current_images = await self.load_native_images(
-                snapshot['story'], current_image_sources, image_session,
-            )
+            # 这个回合她有没有**视觉通道**——判据就是下面给 `try_decide` 的那两处
+            # （原生图片附件 `images` / 侧端识图的观察结果 `visualObservations`），
+            # 所以"帧有没有去处"也在这里判、不另读一遍配置。
+            #
+            # v1.9.9：**侧端识图（`mode = sidecar`）也是通道**。群里有人发图 / 发视频，
+            # 她应当能看到内容（用户第一原则：按真人用 QQ 的直觉），而侧端模式此前只在
+            # 私聊接了 —— 群回合的 `visualObservations` 恒为 `None`，群图与本回合视频帧
+            # 于是**没有任何去处**。判据一处：通道 = 图片理解总开关 ⊗ 识图方式
+            # （`native` 原生 / `sidecar` 侧端）；侧端那一跳复用私聊**同一个**
+            # `describe_current_images()`，预算也复用同一个 `_image_budget()`
+            # （见 `core/vision_budget.py`）——不新造开关、不新造预算。
+            vision_section = _vision_config(self)
+            vision_enabled = bool(_config_value(vision_section, 'enabled', False))
+            vision_mode = _config_value(vision_section, 'mode', 'native') or 'native'
+            native_vision = bool(vision_enabled and vision_mode == 'native')
+            sidecar_vision = bool(vision_enabled and vision_mode == 'sidecar')
+            frame_sources = list(video_media.image_sources)
+            if frame_sources and not (native_vision or sidecar_vision):
+                # 帧抽出来了、却**一条视觉通道都没有**（图片理解关着 / 识图方式认不出来）：
+                # 丢掉，但**用一句诚实的事实换掉原来那句"抽了 N 帧画面"** + 一条可行动 warn
+                # （坑 25：丢内容必须让人看见，而且不许把"没看到"写成"看到了"）。
+                #
+                # 事实行的顺序（与文档 §85 一致）：视频事实 → 图片预算线索；两句都在下面
+                # **知道侧端识图通没通**之后才拼进正文（见 `for line in (video_note,
+                # image_note)`），否则侧端那一跳失败时正文里会留着"抽了 N 帧画面"这句假话。
+                video_note = note_group_frames_without_channel(self, snapshot['story'], video_media)
+                frame_sources = []
+            image_budget = _image_budget(self)
+            available_image_sources = _unique(list(current_image_sources) + frame_sources)
+            granted_image_sources = available_image_sources[:image_budget]
+            try:
+                current_images = await self.load_native_images(
+                    snapshot['story'], granted_image_sources, image_session,
+                )
+            finally:
+                # 帧字节已经在 `load_native_images` 里读进内存（音轨是 `data:` URI，
+                # 也不依赖它）→ 临时目录现在就能删。放 finally：那一跳抛异常也不留垃圾。
+                video_media.cleanup()
             historical_group_images = await self.load_historical_group_images(
                 snapshot['story'],
                 snapshot['imageRefs'],
@@ -1832,15 +1924,71 @@ class ServiceChunk1(ServiceBase):
                     DEFAULT_HISTORICAL_IMAGE_LIMIT,
                 ),
                 image_session,
-                current_image_sources,
+                available_image_sources,
             )
-            vision_mode = _config_value(_vision_config(self), 'mode', 'native') or 'native'
-            images = current_images if vision_mode == 'native' else []
-            historical_images = historical_group_images if vision_mode == 'native' else []
+            # 每回合图片预算的截断线索（v1.9.4）：与私聊同一条判据、同一句话、同一条 warn
+            # ——**候选总数只有这里知道**（当前群图 + 本回合视频帧，侧端模式下还包括
+            # 历史群图，见下面），所以线索也在这里写。
+            # 两道前置（照 `chunk3.flush_buffered_narrative`）：只在真的截了时说话；
+            # 视觉关着时一个字都不说（那时一张都不取，说"取了前 N 张"是假话）。
+            # 线索文本本身在下面与视频事实**一起**拼进正文（顺序：视频事实 → 预算线索）。
+            images = current_images if native_vision else []
+            historical_images = historical_group_images if native_vision else []
+            # 侧端识图（v1.9.9）：群回合也走**私聊那一条**链 —— 同一个
+            # `describe_current_images()`（→ 同一个 `vision_describer`、同一个
+            # `vision.detail`、同一份"最近识过的图不重复识"台账），吃的是**同一份**预算内的
+            # 候选：当前群图 → 本回合视频帧 → **历史群图**（旧证据）。
+            # 观察结果按**与私聊逐字相同的形状**交给 `try_decide` 的
+            # `visualObservations`（`list[str]`），群回合因此与私聊同一套语义、同一个字段。
+            #
+            # v1.9.9 补上 §85.13 第 1 条：历史群图在侧端模式下**不再静默丢** ——
+            # 它走同一条识图链、同一份去重台账、同一套失败可见 warn，并且吃同一份
+            # 「每回合图片数上限」（当前图与帧先占，剩下的额度才轮到历史图）；
+            # 被预算挡在外面的那些由正文里的可数线索 + 节流 warn 点名闸门（坑 25：
+            # 丢内容必须看得见，不许静默）。
+            sidecar_images: list[Any] = []
+            historical_granted: list[Any] = []
+            if sidecar_vision:
+                room = max(0, image_budget - len(current_images))
+                historical_granted = list(historical_group_images)[:room]
+                sidecar_images = list(current_images) + historical_granted
+            # `visible=True`：失败 / 超时 / 没返回内容在群里必须**看得见**（坑 25）——
+            # 丢的是画面内容，用户只会在剧本里看到她"没反应"。私聊那条路不传它，
+            # 日志逐字不变（反向用例钉着）。
+            visual_observations: Optional[list[str]] = None
+            if sidecar_vision:
+                visual_observations = await self.describe_current_images(
+                    snapshot['story'], sidecar_images, user_message, visible=True,
+                )
+                if not visual_observations and frame_sources:
+                    # 帧抽出来了、侧端识图却没给出观察结果：正文里那句"抽了 N 帧画面"
+                    # 在群里**是假话**（帧没交给任何模型）→ 换成诚实的同一句形态
+                    # （帧数照报、降级原因顶在最前）。与没有原生通道那一档同一条尺子，
+                    # 但原因串不同：那一条是"没有通道"，这一条是"侧端这一跳没成"。
+                    video_note = _sidecar_frames_without_observation_note(self, video_media)
+            budget_candidates = len(available_image_sources)
+            budget_granted = len(granted_image_sources)
+            if sidecar_vision:
+                # 侧端这条链的候选里还有历史群图（它自己也进了同一条识图调用），
+                # 线索照实报这条链的候选数与实际交给模型的张数。
+                budget_candidates += len(historical_group_images)
+                budget_granted += len(historical_granted)
+            image_note = ''
+            if vision_enabled:
+                image_note = image_budget_note(budget_candidates, budget_granted)
+            if image_note:
+                note_image_budget_skip(
+                    self, image_session, budget_candidates, budget_granted, image_budget,
+                )
+            # 视频事实 → 图片预算线索（文档 §85 的顺序）：两句都在**知道侧端识图通没通**
+            # 之后才拼进正文，所以上面那句诚实替换真的生效。
+            for line in (video_note, image_note):
+                if line:
+                    user_message = '%s\n%s' % (user_message, line)
             decision_result = await self.try_decide(
                 snapshot['story'], None, 'user-message', snapshot['from'], snapshot['now'],
                 user_message, [], [], group_context, images, group_audio, chat_capabilities, [],
-                sticker_catalog, turn_query_embedding, None, None, None, sticker_groups,
+                sticker_catalog, turn_query_embedding, visual_observations, None, None, sticker_groups,
                 historical_images,
             )
             decision = pick(decision_result, 'decision') or {}
@@ -1940,6 +2088,16 @@ class ServiceChunk1(ServiceBase):
                 )
             dispatcher = getattr(self, 'dispatch_platform_actions', None)
             if callable(dispatcher) and turn.get('latest_session'):
+                # 动作教学两段式的**第二段**（§86.4）：她只写了动作 id（或整条没写 `params`）时，
+                # 补问一次"这条动作怎么填"并把参数回填进决策——**第一段文本仍是最终有效的**。
+                # 每回合一个**新的**空预算 = 最多一次额外调用；失败 / 超时 / 回执不可用
+                # 都由 chunk12 留可见 warn，本回合照跑（判据与回填都在 chunk12 一处，
+                # 这里只负责那一跳——照 `dispatch_platform_actions` 的跨 chunk 调用形状）。
+                action_params = getattr(self, 'resolve_platform_action_params', None)
+                if callable(action_params):
+                    await action_params(
+                        decision, follow_up_budget={}, message=visible_reply_text(decision),
+                    )
                 await dispatcher(
                     snapshot['story'], decision,
                     session=turn.get('latest_session'), channel_id=str(turn.get('channel_id') or ''),

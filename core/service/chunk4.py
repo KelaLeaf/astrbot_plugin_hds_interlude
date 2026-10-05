@@ -361,6 +361,33 @@ def _resolved(value: Any) -> Any:
     return _value()
 
 
+async def _report_completion(
+    service: Any,
+    story_id: str,
+    reference: Any,
+    status: str,
+    reason: Any,
+    now: Any,
+    kind: str = 'due-intent',
+) -> str:
+    """把一次到期投递的结局接进**统一回报通道**（v1.9.9，见 §87）。
+
+    受控偏离：上游在这一跳之后只等下一次 sweep。回报本身炸了绝不影响已经算好的
+    投递结果（只留一条 warn），宿主缺 `report_ledger_completion`（只装了 Chunk4 的
+    测试宿主）时安静跳过——生产服务永远具备这个成员。
+    """
+    reporter = getattr(service, 'report_ledger_completion', None)
+    if not callable(reporter):
+        return 'unavailable'
+    try:
+        return await reporter(story_id, reference, status, reason, now, kind=kind)
+    except Exception as error:  # noqa: BLE001 - 回报是观察性的第二跳
+        service.report_standalone(
+            'warn', '异步动作完成回报失败 故事=%s 错误=%s', story_id, error,
+        )
+        return 'failed'
+
+
 # =========================================================================== #
 # helpers.py 尚未落地的模块级函数（本文件内置等价实现）
 # =========================================================================== #
@@ -922,6 +949,12 @@ class ServiceChunk4(ServiceBase):
                     await self.update_script_delivery_outcome(
                         story['id'], reference, 'cancelled', now, 'delivery-target-unavailable',
                     )
+                    # v1.9.9（§87）：定时的分段气泡被取消 = 一条"没发出去"的事实，
+                    # 立刻回报（否则她会一直以为那条已经发出去了）。
+                    await _report_completion(
+                        self, story['id'], reference, 'cancelled', 'delivery-target-unavailable',
+                        now, kind='due-intent',
+                    )
                 continue
             message: dict[str, Any] = {
                 'participant_id': participant['id'],
@@ -940,6 +973,22 @@ class ServiceChunk4(ServiceBase):
             if not delivered:
                 if participant['id'] in self.interrupted_typing_participants:
                     continue
+                if message.get('delivery_ambiguous') is True:
+                    # v1.9.9（与 `chunk6.deliver_due_split_segments` 同一条判据）：
+                    # 结果不可知**绝不排 30 秒重试**（请求已经写出去了，重投就是真重复）。
+                    # 意图结清成终态，投递现实留在 `pending`（三态里的"结果不确定"）。
+                    if message.get('script_event'):
+                        await self.update_script_delivery_outcome(
+                            story['id'], message['script_event'], 'pending', now,
+                            'delivery-ambiguous-no-retry',
+                        )
+                    await self.db_set('interlude_intent', {'id': intent['id']}, {'status': 'completed', 'updatedAt': now})
+                    if message.get('script_event'):
+                        await _report_completion(
+                            self, story['id'], message['script_event'], 'pending',
+                            'delivery-ambiguous-no-retry', now, kind='due-intent',
+                        )
+                    continue
                 if message.get('script_event'):
                     await self.update_script_delivery_outcome(
                         story['id'], message['script_event'], 'pending', now, 'delivery-unconfirmed-retry-scheduled',
@@ -947,6 +996,13 @@ class ServiceChunk4(ServiceBase):
                 retry_at = parse_dt(dt_ms(now) + 30 * SECOND_MS)
                 await self.db_set('interlude_intent', {'id': intent['id']}, {'notBefore': retry_at, 'updatedAt': now})
                 self.schedule_due_intent_wake(story['id'], retry_at)
+                # v1.9.9（§87）：这条定时的分段气泡**没有回执**（重试已排期）——
+                # 不可知也要当场说一声"不确定"，不能让她停在"还在转"。
+                if message.get('script_event'):
+                    await _report_completion(
+                        self, story['id'], message['script_event'], 'pending',
+                        'delivery-unconfirmed-retry-scheduled', now, kind='due-intent',
+                    )
                 continue
             await self.append_entry(story['id'], {
                 'kind': 'character-message',
@@ -1221,6 +1277,15 @@ class ServiceChunk4(ServiceBase):
         format**：顶层与嵌套键全部保持上游 camelCase（见模块 docstring 第 3 条）。
         """
         started = time.perf_counter()
+        # 长线指导（v1.9.9，上游 `decide` 的第一句）：每个 story 每进程只从库里加载
+        # 一次 active 指导，后面 `long_horizon_prompt_projection` 才是同步的。
+        # 关着时 `long_horizon_enabled()` 直接早退（零查库、零成本）。
+        # `getattr` 探（与同一块里 `dispatcher` / `work_saver` 同一套写法）：只装了
+        # Chunk4 的替身宿主没有这个口（生产里 chunk15 一定混在 `InterludeService` 里）。
+        _horizon_enabled = getattr(self, 'long_horizon_enabled', None)
+        _horizon_load = getattr(self, 'ensure_long_horizon_guidance_loaded', None)
+        if callable(_horizon_enabled) and callable(_horizon_load) and _horizon_enabled():
+            await _horizon_load(story['id'])
         superseded_intents = superseded_intents or []
         images = images or []
         audio = audio or []
@@ -1456,12 +1521,18 @@ class ServiceChunk4(ServiceBase):
         platform_actions = self.available_platform_actions(
             self.resolve_action_session_role(participant), action_scopes,
         )
+        # 长线指导（v1.9.9，上游 `service.ts:4357`）：软许可，不是剧本——关着或没有
+        # active 时是 None，`**{…}` 展开让这个键**完全消失**（不注入空块、零成本）。
+        # `getattr` 探：只装了 Chunk4 的替身宿主没有这个口（生产里 chunk15 一定在）。
+        _projection = getattr(self, 'long_horizon_prompt_projection', None)
+        long_horizon_guidance = _projection(story['id']) if callable(_projection) else None
         # 发给模型的请求：键名逐字保持上游 camelCase。
         request: dict[str, Any] = {
             'urgeEnabled': _cfg(self.urge_config, 'enabled', False) and not any(
                 intent.get('type') == 'narrative-retry' for intent in due_intents
             ),
             'phase': phase,
+            **({'longHorizonGuidance': long_horizon_guidance} if long_horizon_guidance else {}),
             'refreshContinuity': refresh_continuity,
             'outputRecovery': output_recovery,
             'story': story,
@@ -2669,5 +2740,9 @@ class ServiceChunk4(ServiceBase):
             except Exception as error:
                 # 可选的调度投影绝不能吞掉已经落库的发言。
                 self.report_standalone('warn', 'Urge 调度交接保存失败，保留既有剧本与投递 错误=%s', error)
+        # 长线指导（v1.9.9，上游 `service.ts:5218` 的 `void this.longHorizonSweep(story, now).catch(...)`）：
+        # 剧本提交成功后**异步**扫描，不阻塞主回合。异常在
+        # `schedule_long_horizon_sweep` 里就地吸收并打可见 warn（关着时它一步都不走）。
+        self.schedule_long_horizon_sweep(story, now)
         return {'messages': prepared, 'commit': commit, 'scriptEntry': script_entry, 'script_entry': script_entry}
 

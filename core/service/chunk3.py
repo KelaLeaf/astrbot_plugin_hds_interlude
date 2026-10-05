@@ -111,6 +111,7 @@ from .helpers import (
     narrative_cursor,
     normalize_participant_state,
     should_downscale_image,
+    visible_reply_text,
     wire_media_kind,
 )
 
@@ -1361,11 +1362,21 @@ class ServiceChunk3(ServiceBase):
 
     async def describe_current_images(
         self, story: Any, images: list[Any], user_message: Optional[str],
+        visible: bool = False,
     ) -> Optional[list[str]]:
         """上游 `describeCurrentImages(story, images, userMessage)`（`src/service.ts:2749`）。
 
         侧端识图与原生图片获取镜像对称，但只把它的**事实性结果**塞进文本叙事器的
         当前事件。
+
+        `visible`（v1.9.9，本移植版末位可选参数，**只有群回合传**）：三条失败路径
+        （没有可用的侧端连接 / 识图失败或超时 / 没返回内容）原本走
+        `report_operation('diagnostic', ...)` —— 按本项目的口径那等于"没有报告"（坑 25），
+        而这里丢的是**画面内容**：群里有人发了图 / 视频帧，她一个字都没看到，用户只能
+        从剧本里猜。置真时改走**可见 warn**（`report('warn', ...)`）并在句子里点名去哪调。
+
+        **判据一处**：这个参数只决定"报告走哪个频道"，不参与任何判断（有没有连接 /
+        有没有图 / 预算几张全部照旧）。私聊那条路不传它 → 日志逐字不变（反向用例钉着）。
         """
         if not images:
             return None
@@ -1388,10 +1399,19 @@ class ServiceChunk3(ServiceBase):
         describer = self.vision_describer
         available = getattr(describer, 'available', None)
         if describer is None or not callable(available) or not available():
-            self.report_operation(
-                'diagnostic', 'warn', story, 'user-message',
-                '侧端识图跳过：没有配置 useForVision 的视觉模型',
-            )
+            if visible:
+                # 可见 + 可行动：能力缺失必须让人看见（坑 25），并点名去哪调。
+                self.report(
+                    'warn', story, 'user-message',
+                    '侧端识图没有可用的视觉连接，这一回合的画面没有进模型（正文照常写作）。'
+                    '请在「模型中心 → 模型连接」给某条模型连接勾选「用于侧端识图」，'
+                    '或把「图片理解」的识图方式改回「原生多模态」。',
+                )
+            else:
+                self.report_operation(
+                    'diagnostic', 'warn', story, 'user-message',
+                    '侧端识图跳过：没有配置 useForVision 的视觉模型',
+                )
             return None
         try:
             observations = await describer.describe_images(
@@ -1410,16 +1430,32 @@ class ServiceChunk3(ServiceBase):
                     '侧端识图完成 图片=%d 观察=%d', len(images), len(observations),
                 )
             else:
-                self.report_operation(
-                    'diagnostic', 'warn', story, 'user-message',
-                    '侧端识图未返回内容，已继续处理文字消息',
-                )
+                if visible:
+                    self.report(
+                        'warn', story, 'user-message',
+                        '侧端识图没有返回观察结果，这一回合的画面没有进模型（正文照常写作）。'
+                        '请检查「模型中心 → 模型连接」里勾了「用于侧端识图」的那条连接'
+                        '（模型是否可用、是否支持图片输入）。',
+                    )
+                else:
+                    self.report_operation(
+                        'diagnostic', 'warn', story, 'user-message',
+                        '侧端识图未返回内容，已继续处理文字消息',
+                    )
             return observations
         except Exception as error:
-            self.report_operation(
-                'diagnostic', 'warn', story, 'user-message',
-                '侧端识图失败，已继续处理文字消息 错误=%s', error,
-            )
+            if visible:
+                # 超时 / 网关报错 / 模型不可用都落到这里：错误原文留着，正文照常写作。
+                self.report(
+                    'warn', story, 'user-message',
+                    '侧端识图失败，这一回合的画面没有进模型（正文照常写作）。'
+                    '请检查「模型中心 → 模型连接」里勾了「用于侧端识图」的那条连接 错误=%s', error,
+                )
+            else:
+                self.report_operation(
+                    'diagnostic', 'warn', story, 'user-message',
+                    '侧端识图失败，已继续处理文字消息 错误=%s', error,
+                )
             return None
 
     async def fetch_native_image(
@@ -2065,6 +2101,15 @@ class ServiceChunk3(ServiceBase):
                 # 只调 chunk12 的方法，**不在本文件新增成员**——Chunk3 有「上游行段铁律」。
                 dispatcher = getattr(self, 'dispatch_platform_actions', None)
                 if callable(dispatcher):
+                    # 动作教学两段式的**第二段**（§86.4）：她选定了动作但参数没写全时补问一次，
+                    # 把参数回填进决策——**第一段文本仍是最终有效的**（第二段只填参数槽）。
+                    # 每回合一个**新的**空预算 = 最多一次额外调用；失败 / 超时 / 回执不可用
+                    # 都由 chunk12 留可见 warn，本回合照跑。判据与回填都在 chunk12 一处。
+                    action_params = getattr(self, 'resolve_platform_action_params', None)
+                    if callable(action_params):
+                        await action_params(
+                            decision, follow_up_budget={}, message=visible_reply_text(decision),
+                        )
                     await dispatcher(
                         snapshot['story'], decision,
                         session=snapshot.get('participant'), channel_id=str(channel_id or ''),

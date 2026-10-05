@@ -72,17 +72,30 @@ Provider 的是**视频直链文本（URL）**，不是字节：宿主出站部�
 
 * **群聊**独立开关（`group_enabled`，默认关=省成本）：群聊里视频刷屏最贵，默认不动它；
   关着时连 `ffmpeg` 都不调（与总开关关着同一条路径）。私聊只看总开关。
-  **打开后的真实语义（写实，别读成"群里能看见画面"）**：群回合会为这段视频跑一次
-  ffmpeg——**音轨**并进群音频批次（`chunk1.flush_group_turn` 的 `group_audio`，那条
-  通道是通的），**帧没有视觉通道可去**（群回合给 `try_decide` 的图片位恒为 `[]`）→
-  丢弃，并按 `GROUP_NO_VISION_REASON` 打一条**节流**的可见说明。
+  **打开后的真实语义（v1.9.9 起：群里发的视频画面真的能看见）**：群回合会为这段视频跑
+  一次 ffmpeg——**帧**走 1.0.1-rc31 接上的**群聊图片通道**（`chunk1.flush_group_turn`
+  把帧并进当前回合的图片来源表，与群图共用「每回合图片数上限」
+  `model_center.vision.max_per_turn`，见 `core/vision_budget.py`），**音轨**并进群音频
+  批次（同一条 `load_native_audio`）。**合并顺序**：当前群图 → 本回合视频帧 → 历史群图
+  （历史图是**旧证据**，走它自己的 `historicalImageLimit`，不占每回合图片预算）。
   接线见 `collect_group_video_media()`。
+  帧抽出来了却**一条视觉通道都没有**（图片理解总开关关着 / 识图方式认不出来；`原生多模态`
+  与 `独立视觉连接` 都算通道，v1.9.9）时，
+  `note_group_frames_without_channel()` 留一句进正文的事实 + 一条**节流**的可行动 warn
+  （`GROUP_FRAMES_NO_CHANNEL_REASON`）——抽了帧没人看不许静默。
+* **群里的视频没有人识别时，一个字都不许省**（v1.9.9）：群回合把 `explain_skips=True`
+  交给 `collect_video_sources()` —— 「总开关关」「群聊开关关」这两条**连 ffmpeg 都不调**
+  的路径，在群里要留一句「只有视频未识别」的事实 + 一条点名去哪开开关的 warn
+  （`VIDEO_DISABLED_REASON` / `GROUP_DISABLED_REASON`）。私聊走默认
+  `explain_skips=False`：**一个字的说明都不加**（与 v1.9.1 逐字一致）。群里**没有**视频
+  时同样一个字节都不加（`extract_session_video_sources()` 空即返回）。
   **群回合沿用上面同一套设置**：`frame_mode` / `frame_average_count` /
   `frame_interval_seconds` / `out_format` / `audio_duration(_seconds)` /
   `timeout_seconds` 一项都不特判（都从同一个 `video_config()` 来、走同一个
-  `extract_video(...)` 调用点），所以群与私聊的 ffmpeg 命令行**逐字相同**；唯一的差别是
-  帧的去处。群里另来一套更省的就等于多一个真相（配置页说什么都不再可信），
-  用例 `test_video_understanding.GroupVideoParityTests` 钉着这一点。
+  `extract_video(...)` 调用点），所以群与私聊的 ffmpeg 命令行**逐字相同**；差别只有两处：
+  帧的**去处**（群聊图片通道 vs 私聊那一路）与"没识别要说出来"。群里另来一套更省的
+  就等于多一个真相（配置页说什么都不再可信），用例
+  `test_video_understanding.GroupVideoParityTests` 钉着这一点。
 * **合并转发里的视频**由 `forward_message.max_videos`（单条转发最多读取的视频数，
   默认 **1**；配 0 才是一段都不读）在 `core/forward_message.py` 那一侧截断，读出来的坐标经
   `SessionView.media`（`kind='video'`）流到这里——**判据只有一处**：本模块的
@@ -93,7 +106,7 @@ Provider 的是**视频直链文本（URL）**，不是字节：宿主出站部�
   每回合视觉预算）经 `collect_video_sources(..., limit=…)` 交给这里，**不读本键**。
 * **群聊开关只认会话**：`group_enabled` 只管群会话（`_is_group_session()` 读事件的
   `is_direct`）——私聊里**转发**来的视频与它无关，只看总开关。它只管"群里的视频要不要花
-  一次 ffmpeg 把声音取出来"，抽出的帧与图片共用**同一个**每回合图片预算。
+  一次 ffmpeg"，抽出的帧与图片共用**同一个**每回合图片预算。
 
 不 import astrbot（`plugin/core/` 的硬约束）。
 """
@@ -126,7 +139,8 @@ __all__ = [
     'FFMPEG_MISSING_REASON', 'NATIVE_UNSUPPORTED_REASON', 'EXTERNAL_NO_MODEL_REASON',
     'EXTERNAL_MISSING_MODEL_REASON', 'EXTERNAL_NO_URL_REASON', 'VIDEO_TRUNCATED_REASON',
     'VIDEO_TOO_LARGE_REASON', 'VIDEO_BUSY_REASON', 'VIDEO_FRAME_TIMEOUT_PREFIX',
-    'VIDEO_FRAME_PARTIAL_PREFIX', 'GROUP_NO_VISION_REASON',
+    'VIDEO_FRAME_PARTIAL_PREFIX', 'GROUP_DISABLED_REASON', 'VIDEO_DISABLED_REASON',
+    'GROUP_FRAMES_NO_CHANNEL_REASON', 'note_group_frames_without_channel',
     'FFMPEG_FOUND_LABEL', 'FFMPEG_MISSING_LABEL', 'FFMPEG_STATUS_LABELS',
     'FFMPEG_HINT_TARGETS', 'ffmpeg_hint_field_path', 'ffmpeg_status_hint_targets',
     'clip', 'VideoExtraction', 'VideoMedia', 'resolve_video_config', 'video_config',
@@ -187,8 +201,9 @@ VIDEO_AUDIO_DURATIONS = ('custom', 'unlimited')
 VIDEO_DEFAULT_AUDIO_DURATION = 'custom'
 #: 群聊视频理解默认开关。**省成本那侧 = 关**：群聊里视频刷屏最费 ffmpeg 与模型调用，
 #: 而私聊一条视频是"她真的在看"的强信号。要开就明确去开。
-#: 打开后**只让音轨进去**（群回合没有视觉通道，见 `GROUP_NO_VISION_REASON`）——
-#: 这个开关的真实语义是"群里的视频要不要花一次 ffmpeg 把声音取出来"。
+#: 打开后**整条链都通**（v1.9.9）：帧进群聊图片通道、音轨进群音频批次；
+#: 关着时群回合会留一句「只有视频未识别」的事实 + 一条可行动 warn（`GROUP_DISABLED_REASON`）
+#: —— 群里发来的视频**不许静默**。
 VIDEO_DEFAULT_GROUP_ENABLED = False
 
 #: `model_center.video` 的默认值（与 schema 默认逐字一致；`CONFIG_DEFAULTS` 也照抄它）。
@@ -455,8 +470,8 @@ VIDEO_MODE_HINT = '需要启用语音原生理解与启用图片理解后抽帧�
 
 #: 状态提示要贴的 schema 节点 —— **只有一处**：「识别模式」。
 #:
-#: v1.9.8 起收窄（用户真机验收原话："怎么到处都是 `✅ FFmpeg 已识别` 的文字，
-#: 只需要「视频识别模式」那里显示就可以了"）：v1.9.8 曾同时贴「识别模式」+「启用视频理解」
+#: v1.9.9 起收窄（用户真机验收原话："怎么到处都是 `✅ FFmpeg 已识别` 的文字，
+#: 只需要「视频识别模式」那里显示就可以了"）：v1.9.9 曾同时贴「识别模式」+「启用视频理解」
 #: 总开关、并在控制台分组标题上加徽章，三处重复＝噪声。状态词现在只出现在它真正管的那一项
 #: 旁边。放宽这张表 = 用户可见的重复，由 `tests/test_video_understanding.py` 的
 #: `FfmpegHintUniquenessTests` **全量扫描**看着（全 schema 的 hint / description 里只许
@@ -1028,7 +1043,10 @@ def video_fact_note(
     elif audio_attempted and not degrade_reason:
         parts.append('没有音轨')
     body = '，'.join(parts) if parts else '没取到内容'
-    return '%s：%s；画面与声音以本轮原生输入为准，没提供的内容保持未知。]' % (VIDEO_FACT_PREFIX, body)
+    # v1.9.9：末句说的是"这一轮**实际交出去**的内容"，不再写死「原生输入」——
+    # 侧端识图（`mode = sidecar`）下画面是经**观察结果**进去的，不是原生附件，
+    # 旧措辞在那种回合里不贴切（帧没交出去时由 `degrade_reason` 顶在最前面说清）。
+    return '%s：%s；画面与声音以本轮实际提供的内容为准，没提供的内容保持未知。]' % (VIDEO_FACT_PREFIX, body)
 
 
 #: 抽帧识别缺 FFmpeg 时的**可行动**说明（用户原话：装了 ffmpeg 才会有抽帧识别）。
@@ -1138,20 +1156,47 @@ def frame_partial_reason(frame_count: int) -> str:
     return '%s：只拿到 %d 帧，已照常提交' % (VIDEO_FRAME_PARTIAL_PREFIX, int(frame_count))
 
 
-#: **群聊回合没有视觉通道**：`chunk1.flush_group_turn` 给 `try_decide` 的图片位恒为 `[]`
-#: （群消息也不带 `imageSources`），所以帧抽出来也无处可去。这是**唯一**一句要用户看见的
-#: 说明——它既是正文事实的降级前缀，也是 `note_access_skip` 的节流键（同故事同原因 10 分钟
-#: 一条）。别把它改成只有内部人才懂的名词：用户就是靠这句话知道"为什么开了开关也看不见画面"。
-GROUP_NO_VISION_REASON = '这段视频来自群聊，而群回合没有视觉通道，抽出的画面帧没有提交给模型'
+#: **群里发来一段视频，而「视频理解」总开关关着**：这条视频没有被识别。
+#: 群里与私聊走**同一个**总开关（不新造第二套），但群回合**必须说出来**
+#: （`collect_video_sources(..., explain_skips=True)`）：她至少要知道"这里有一条视频，
+#: 我没看"，用户也才知道去哪儿打开。这句既是正文事实的降级前缀，也是
+#: `note_access_skip` 的节流键（同故事同原因 10 分钟一条）。
+VIDEO_DISABLED_REASON = '这是群里发来的一段视频，而「视频理解」总开关关着，只有视频未识别'
+#: 同上，卡在**群聊开关**那一道（默认关=省成本）。两句分开是因为**去哪里开**不同：
+#: 总开关在「视频理解」组顶部，群聊开关是同一个组里的独立一项。
+GROUP_DISABLED_REASON = (
+    '这是群里发来的一段视频，而「群聊视频理解」开关关着，只有视频未识别'
+)
+#: **帧抽出来了、却一条视觉通道都没有**（图片理解总开关关着 / 识图方式认不出来）：
+#: 群聊图片通道就是帧的去处，通道不在时帧只能丢——但**丢内容必须说出来**
+#: （与 QQ 空间动态那条 `[图片×N，未识别]` 同一条尺子）。句子本身由
+#: `note_group_frames_without_channel()` 带上帧数。
+#: v1.9.9：`原生多模态` 与 `独立视觉连接`（侧端识图）**都算通道**，这一档只剩
+#: 「总开关关着」与「识图方式认不出来」两种情形（见 §85.8.1）。
+GROUP_FRAMES_NO_CHANNEL_REASON = (
+    '这是群里发来的一段视频，抽出了画面帧，但「图片理解」没有可用的原生视觉通道，'
+    '帧没有交给模型'
+)
 
 
 #: 降级原因 → 一条**可行动**的 warn（`service.note_access_skip` 的 message）。
 #: 只放"能力 / 配置"层面的原因：单条视频的偶然失败（比如这段没有音轨）不该刷 warn。
 _ACTIONABLE_REASONS: dict[str, str] = {
-    GROUP_NO_VISION_REASON: (
-        '视频理解：这条视频来自群聊，而群回合没有视觉通道（群里发的图片同样进不去），'
-        '抽出的画面帧没有提交给模型。音轨走的是「语音 / 音频理解」那条通道，'
-        '那条总开关关着时声音也不会进去。想让她看见视频画面，请在私聊里发。'
+    VIDEO_DISABLED_REASON: (
+        '视频理解：群里发来一段视频，而「视频理解」总开关关着，这条视频没有被识别'
+        '（正文里记的是"只有视频未识别"）。想让她看见群里视频的画面，'
+        '请在「模型中心 → 视频理解」打开总开关。'
+    ),
+    GROUP_DISABLED_REASON: (
+        '视频理解：群里发来一段视频，而「群聊视频理解」开关关着（默认关，省成本），'
+        '这条视频没有被识别（正文里记的是"只有视频未识别"）。想让她看见群里视频的画面，'
+        '请在「模型中心 → 视频理解」打开「群聊视频理解」。'
+    ),
+    GROUP_FRAMES_NO_CHANNEL_REASON: (
+        '视频理解：群里的这段视频抽出了画面帧，但「图片理解」没有可用的原生视觉通道'
+        '（总开关关着，或识图方式认不出来），帧没有交给模型。'
+        '想让她看见画面，请在「模型中心 → 图片理解」打开总开关，'
+        '并把识图方式设为「原生多模态」（或「独立视觉连接」并给一条模型连接勾上「用于侧端识图」）。'
     ),
     FFMPEG_MISSING_REASON: (
         '视频理解降级：本机没检查到 FFmpeg，抽帧识别不可用；'
@@ -1442,8 +1487,20 @@ async def _collect_external(
     return '', clip(observation, 800)
 
 
+def _note_skip(service: Any, story: Any, result: VideoMedia, reason: str) -> None:
+    """群里"这条视频没有人识别"的一句事实 + 一条可行动 warn（判据一处：只在这里造句）。
+
+    只管第 2、3 道闸（开关关着，连 ffmpeg 都没调）——"抽帧失败 / 超时 / 没通道"
+    那些是**另一类**原因，各有各的句子与 warn，别在这里混成一锅。
+    """
+    result.reason = reason
+    result.note = video_fact_note(degrade_reason=reason)
+    _warn(service, story, reason)
+
+
 async def collect_video_sources(
     service: Any, story: Any, session: Any, *, limit: Any = None,
+    explain_skips: bool = False,
 ) -> VideoMedia:
     """抽帧识别（主路）：拿到帧与音轨的**来源坐标**，交给现有那两条通道去取。
 
@@ -1453,14 +1510,21 @@ async def collect_video_sources(
 
     四道闸的顺序（都在任何 ffmpeg / 模型调用之前）：
 
-    1. `enabled=False` → 直接回空（一个 ffmpeg 都不调、一个模型都不调）；
-    2. 这条会话没有视频坐标 → 回空；
+    1. 这条会话没有视频坐标 → 回空（连开关都不看：**没有视频就是零影响**）；
+    2. `enabled=False` → 直接回空（一个 ffmpeg 都不调、一个模型都不调）；
     3. **群聊且 `group_enabled=False`** → 回空（群聊独立开关，默认关=省成本）。
        ⚠️ 这条只看**会话是不是群聊**（`is_direct`）：私聊里转发来的视频与群聊开关无关
        （私聊只看总开关）；
     4. 一回合真正读取的视频段数：缺省 = `forward_message.max_videos`（v1.9.4，
        `video_read_budget()`），第 N 段之后的坐标在这里截断，**线索与 warn 都可见**
        —— 早先写死 `sources[0]`，于是"配了 3 段也只读第 1 段"。
+
+    `explain_skips`（关键字，v1.9.9）管的是**第 2、3 道闸静默回空**这件事：群里发来的
+    视频**不许静默**（她至少要知道"这里有一条视频，我没看"，用户也才知道去哪儿开），
+    所以群回合（`collect_group_video_media`）传 `True`：这两条路径各留一句进正文的事实
+    （`VIDEO_DISABLED_REASON` / `GROUP_DISABLED_REASON`）+ 一条**可行动**的节流 warn。
+    私聊走默认 `False`：与 v1.9.1 逐字一致，一个字的说明都不加。第 1 道闸（没有视频）
+    两种取值下都不留任何东西——"群里没有视频"就是零影响。
 
     `limit`（关键字，可省）是**调用方自带的那道闸**：QQ 空间动态那条路的上限由
     `qzone.feed_video_cap` × 每回合视觉预算决定（`chunk13._qzone_feed_video_lines`），
@@ -1473,13 +1537,18 @@ async def collect_video_sources(
     result = VideoMedia(mode=VIDEO_DEFAULT_MODE)
     config = video_config(service)
     result.mode = config['mode']
-    if not config['enabled']:
-        return result
+    # 坐标先取：没有视频 = 零影响（一个开关都不看、一个字都不加）。
     sources = extract_session_video_sources(session)
     if not sources:
         return result
+    if not config['enabled']:
+        if explain_skips:
+            _note_skip(service, story, result, VIDEO_DISABLED_REASON)
+        return result
     if _is_group_session(session) and not config['group_enabled']:
         # 群聊开关关着：与总开关关着同一条路径（连坐标都不再看一眼）。
+        if explain_skips:
+            _note_skip(service, story, result, GROUP_DISABLED_REASON)
         return result
 
     if config['mode'] == 'native':
@@ -1671,38 +1740,55 @@ async def _collect_one_video(
 
 
 async def collect_group_video_media(service: Any, story: Any, session: Any) -> VideoMedia:
-    """**群聊回合**的视频接线：帧没有通道可去，音轨有（判据仍然只有 `collect_video_sources`）。
+    """**群聊回合**的视频接线：帧走群聊图片通道（rc31 那条），音轨走群音频批次。
 
-    与私聊的差别只有一处：群回合给 `try_decide` 的图片位恒为 `[]`
-    （`chunk1.flush_group_turn`；群消息也不带 `imageSources`，§46 的既有设计），
-    所以帧抽出来也没处可去——"开着开关却什么都不发生"正是用户最恼的那类误导，
-    所以这里**必须**留下一条看得见的说明：
+    与私聊的差别只有一处，而且是**纪律**上的：群回合必须把"这条视频没有人识别"
+    说出来（`explain_skips=True`）——群里发视频是"她应该看得见"的强信号，
+    静默等于骗她（用户口径：决不许把"没看到"写成"看到了"）。
 
-    * **帧**：丢掉，并按原因打一条**节流**的 warn（`GROUP_NO_VISION_REASON`，
-      同故事同原因 10 分钟一条）。绝不静默。
-    * **音轨**：`audio_sources` 原样交给调用方并进群音频批次——那条通道是**通的**
-      （`chunk1` 的 `group_audio` 就是它），所以开关打开时**至少让声音进去**。
-    * **正文事实**：`note` 按"帧没进去"**重写**。`collect_video_sources` 那句会声称
-      "抽了 N 帧画面"，在群聊那是假的——模型不该以为她看见了画面。
+    其余全部来自 `collect_video_sources` 那**一处判据**，这里一份都不重算：
+    总开关 / 群聊开关 / 抽帧模式 / 帧数 / 间隔 / 超时 / 音轨格式 / 音轨时长 /
+    一回合读取几段视频。返回的 `image_sources` 就是**这一回合的帧**，由
+    `chunk1.flush_group_turn` 并进当前回合的图片来源表（当前群图 → 本回合视频帧 →
+    历史群图），与群图共用「每回合图片数上限」；`audio_sources` 并进群音频批次。
 
-    开关链路与私聊共用：总开关关 / 群开关关 / 没有视频坐标时，这里一个 ffmpeg 都不调
-    （提前 return，连 `image_sources` 都是空）。
+    帧抽出来了、却**一条视觉通道都没有**（图片理解总开关关着 / 识图方式认不出来）时，
+    调用方用 `note_group_frames_without_channel()` 留事实 + warn——那个判据在
+    调用方手上（它就是给 `try_decide` 决定 `images` 是不是空的那一处），这里不猜。
     """
-    media = await collect_video_sources(service, story, session)
-    if not media.image_sources:
-        return media
+    return await collect_video_sources(service, story, session, explain_skips=True)
+
+
+def note_group_frames_without_channel(service: Any, story: Any, media: VideoMedia) -> str:
+    """群聊抽出了帧、而原生视觉通道不可用：**重写**那句视频事实，并打一条可行动 warn。
+
+    调用方（`chunk1.flush_group_turn`）**只在真的没有通道时**调它——它就是那个判据的
+    持有者（`model.vision.enabled` + `mode == 'native'`，也就是决定 `images` 是不是
+    空的那一处），所以这里不再把配置读第二遍来判"有没有通道"（读第二遍就会漂）；
+    读配置只为**造句**（帧数 / 音轨那几项与 `collect_group_video_sources` 同一份）。
+
+    为什么是"重写"而不是"再加一句"：`collect_video_sources` 那句会声称"抽了 N 帧画面"，
+    在群聊这里它**是假的**（帧没有交给任何模型）。两句叠在一起既互相矛盾，又会让模型
+    以为她看见了画面——所以**用同一个 `video_fact_note` 造一句诚实的**：帧数照报
+    （可数），但降级原因顶在最前面说清"帧没进去"。
+
+    与 QQ 空间动态那条路同一条尺子（`chunk13` 的 `[图片×N，未识别]`）：抽帧花了钱
+    却没人看，不许静默（坑 25）。
+    """
     frames = len(media.image_sources)
-    media.image_sources = []
     config = video_config(service)
-    # 用**同一个** `video_fact_note` 造句，只把"抽了 N 帧"那句换成"帧没进去"。
-    #
-    # `audio_attempted` 也要**读配置**（`model.audio.enabled`）而不是写死 True：
-    # 语音通道关着时 `collect_video_sources` 连音轨那条命令都不发，句子就不该说"试过取音轨"。
-    # 群里的配置项**一项都不许特判**（用户口径："群里沿用上面同一套设置"），这条和
-    # `frame_mode` / `out_format` / `audio_duration` 一样，只是它落在句子而不是命令行上。
-    media.note = video_fact_note(
-        degrade_reason='%s（抽到的 %d 帧已丢弃）' % (GROUP_NO_VISION_REASON, frames),
+    _warn(
+        service, story, GROUP_FRAMES_NO_CHANNEL_REASON,
+        '视频理解：群里的这段视频抽出了 %d 帧画面，但「图片理解」没有可用的原生视觉通道'
+        '（总开关关着，或识图方式认不出来），帧没有交给模型。'
+        '想让她看见画面，请在「模型中心 → 图片理解」打开总开关，'
+        '并把识图方式设为「原生多模态」（或「独立视觉连接」并给一条模型连接勾上「用于侧端识图」）。' % frames,
+    )
+    return video_fact_note(
+        degrade_reason='%s（抽到的 %d 帧已丢弃）' % (GROUP_FRAMES_NO_CHANNEL_REASON, frames),
         has_audio=bool(media.audio_sources),
+        # 语音通道关着时 `collect_video_sources` 连音轨那条命令都不发，
+        # 句子就不该说"试过取音轨"（与旧版群接线同一条尺子）。
         audio_attempted=bool(_audio_channel_enabled(service)),
         audio_seconds=audio_clip_seconds(config),
         frame_mode=config['frame_mode'],
@@ -1710,8 +1796,6 @@ async def collect_group_video_media(service: Any, story: Any, session: Any) -> V
         average_frames=config['frame_average_count'],
         timeout_seconds=config['timeout_seconds'],
     )
-    _warn(service, story, GROUP_NO_VISION_REASON)
-    return media
 
 
 def _audio_channel_enabled(service: Any) -> bool:

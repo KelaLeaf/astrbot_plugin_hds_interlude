@@ -21,7 +21,6 @@ from .time import parse_dt
 
 __all__ = [
     'ENDPOINT_CHANNEL_KINDS',
-    'ENDPOINT_DELIVERABLE_TTL_MS',
     'ENDPOINT_OWNER_KINDS',
     'channel_context_metadata',
     'channel_context_payload',
@@ -32,8 +31,6 @@ __all__ = [
     'endpoint_account_key',
     'endpoint_unique_key',
     'fresh_endpoint_state',
-    'is_endpoint_deliverable',
-    'is_endpoint_initiate_allowed',
     'normalize_endpoint_row',
     'normalize_group_id',
     'normalize_story_alias_row',
@@ -46,10 +43,6 @@ __all__ = [
 
 ENDPOINT_CHANNEL_KINDS = ('qq', 'wechat')
 ENDPOINT_OWNER_KINDS = ('story-role', 'participant-user', 'group')
-
-#: 上游 `ENDPOINT_DELIVERABLE_TTL_MS`：`deliverable` 确认的保质期（24 小时）。
-#: 超过 TTL 的 `allowed` 按未知保守处理——陈旧的"可投递"不是事实。
-ENDPOINT_DELIVERABLE_TTL_MS = 24 * 3_600_000
 
 #: 上游 `isOneBotFamilyPlatform` 的镜像副本（`endpoints.ts` 不得反向 import service，
 #: 两处保持同步）。我方 service 侧的 `is_one_bot_platform` 是同一语义。
@@ -351,35 +344,6 @@ def state_after_outbound(
             deliverable['cooldown_until'] = stamp + int(cooldown_ms)
         deliverable['note'] = str(note)
     return {**state, 'deliverable': deliverable}
-
-
-def is_endpoint_deliverable(state: Optional[Mapping[str, Any]], now: Any = None) -> bool:
-    """上游 `isEndpointDeliverable`：冷却期内保守视为不可投递；`allowed` 超过 TTL 视为过期。"""
-    if not isinstance(state, Mapping):
-        return False
-    if _get(_get(state, 'connection') or {}, 'online') is False:
-        return False
-    deliverable = _get(state, 'deliverable') or {}
-    if _get(deliverable, 'allowed'):
-        checked_at = _get(deliverable, 'checkedAt', 'checked_at') or 0
-        return _now_ms(now) - int(checked_at) <= ENDPOINT_DELIVERABLE_TTL_MS
-    cooldown_until = _get(deliverable, 'cooldownUntil', 'cooldown_until')
-    if cooldown_until and _now_ms(now) >= int(cooldown_until):
-        return bool(_get(_get(state, 'connection') or {}, 'online'))
-    return False
-
-
-def is_endpoint_initiate_allowed(state: Optional[Mapping[str, Any]], now: Any = None) -> bool:
-    """上游 `isEndpointInitiateAllowed`：token 过期按不允许保守处理。"""
-    if not isinstance(state, Mapping):
-        return False
-    initiate = _get(state, 'initiate')
-    if not isinstance(initiate, Mapping):
-        return False
-    expires_at = _get(initiate, 'expiresAt', 'expires_at')
-    if expires_at is not None and _now_ms(now) >= int(expires_at):
-        return False
-    return bool(_get(initiate, 'allowed'))
 
 
 # --------------------------------------------------------------------------- #

@@ -571,6 +571,68 @@ class _FlushHost(FakeService):
 
 class TestFlushBufferedNarrativePipeline(unittest.IsolatedAsyncioTestCase):
 
+    async def test_private_sidecar_failure_stays_on_the_diagnostic_channel(self) -> None:
+        """**反向（私聊逐字不变）**：私聊 + 侧端识图失败 → 观察结果为空、**没有**可见 warn。
+
+        v1.9.9 给 `describe_current_images` 加了 `visible`（群回合用），私聊那条路
+        （本用例走的就是它）不传它 → 报告仍走 `report_operation('diagnostic', ...)`；
+        私聊日志因此与 v1.9.9 逐字相同（"没有报告"是既有口径，本批只给**群**补可见性）。
+        """
+        import os  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        host = _FlushHost(config={
+            'model': {'vision': {'enabled': True, 'mode': 'sidecar'}},
+            'runtime': {'message_separator': '<sep/>'},
+        })
+
+        class Describer:
+            def __init__(self) -> None:
+                self.called = 0
+
+            def available(self) -> bool:
+                return True
+
+            async def describe_images(self, images: Any, user_text: str = '',
+                                      detail: str = 'auto', kinds: Any = None) -> Any:
+                self.called += 1
+                raise RuntimeError('provider down')
+
+        describer = Describer()
+        host.vision_describer = describer
+        directory = tempfile.mkdtemp(prefix='hdsi-private-sidecar-')
+        self.addCleanup(__import__('shutil').rmtree, directory, True)
+        path = os.path.join(directory, '私聊的图.png')
+        with open(path, 'wb') as handle:
+            handle.write(_png_bytes())
+
+        turn = {
+            'storyId': 's', 'participantId': 'p',
+            'messages': [{'content': '看这个', 'occurredAt': NOW,
+                          'imageSources': ['onebot-file:%s' % path], 'audioSources': []}],
+            'latestSession': SessionView(platform='onebot', self_id='bot', user_id='u',
+                                         content='看这个'),
+            'timer': None, 'nextRevision': 3,
+            'inFlightRequestId': None, 'obsoleteRequestIds': set(),
+        }
+        host.buffered_narrative_turns = {'k': turn}
+
+        await ServiceChunk3.flush_buffered_narrative(host, 'k', 3)
+
+        # ① 失败 → 观察结果为空（绝不拿一段编的话顶上）。
+        self.assertEqual(describer.called, 1, '侧端识图真的被调过一次（否则本用例是空转）')
+        self.assertIsNone(host.calls['try_decide'][15])
+        # ② 私聊**没有**可见 warn：`report` 通道一条侧端识图的记录都不许有。
+        self.assertEqual(
+            [entry for entry in host.logs if entry[0] == 'report' and '侧端识图' in str(entry)],
+            [], host.logs,
+        )
+        # ③ 旧的那条 diagnostic 报告照旧在（与 v1.9.9 逐字同一条）。
+        self.assertTrue(
+            any(entry[0] == 'operation' and '侧端识图失败' in str(entry) for entry in host.logs),
+            host.logs,
+        )
+
     async def test_full_turn_assembles_request_persists_decision_and_delivers(self) -> None:
         host = _FlushHost()
         turn = {
@@ -1956,6 +2018,92 @@ class TestVisionHelpers(unittest.IsolatedAsyncioTestCase):
         host.vision_describer = Describer()
         self.assertIsNone(await ServiceChunk3.describe_current_images(host, {'id': 's'}, [{'id': 'i'}], None))
         self.assertTrue(any('侧端识图失败' in str(entry) for entry in host.logs))
+
+    # ---- `visible`（v1.9.9）：群回合要看得见，私聊一个字都不变 ----
+
+    @staticmethod
+    def _failure_host(error: Any = None) -> Any:
+        """一个识图失败的 host（`error=None` = 没有可用的侧端连接）。"""
+        host = _MediaHost(config={})
+
+        if error is None:
+            class Describer:
+                def available(self) -> bool:
+                    return False
+        else:
+            class Describer:
+                def available(self) -> bool:
+                    return True
+
+                async def describe_images(self, images: Any, user_text: str = '',
+                                          detail: str = 'auto', kinds: Any = None) -> Any:
+                    raise error
+        host.vision_describer = Describer()
+        return host
+
+    async def test_describe_current_images_keeps_the_diagnostic_channel_by_default(self) -> None:
+        """**反向（私聊不变）**：不传 `visible` 时报告走 `report_operation('diagnostic')`。
+
+        私聊那条路（`chunk3.flush_buffered_narrative`）不传它，所以日志与
+        v1.9.9 逐字一致；本用例把"没有可见 warn"钉住，`visible` 一旦漏进私聊这条红。
+        """
+        for error in (None, RuntimeError('provider down')):
+            with self.subTest(error=error):
+                host = self._failure_host(error)
+                await ServiceChunk3.describe_current_images(host, {'id': 's'}, [{'id': 'i'}], '看看')
+                self.assertEqual(
+                    [entry for entry in host.logs if entry[0] == 'report'], [],
+                    '默认（私聊）不许走可见 warn 频道',
+                )
+                self.assertTrue(
+                    any(entry[0] == 'operation' and entry[1] == 'diagnostic'
+                        for entry in host.logs),
+                    host.logs,
+                )
+
+    async def test_describe_current_images_reports_visibly_when_the_group_asks(self) -> None:
+        """`visible=True`（群回合）：三条失败路径都变成**可见 + 可行动**的 warn。"""
+        cases = (
+            (None, '侧端识图没有可用的视觉连接'),
+            (RuntimeError('provider down'), '侧端识图失败'),
+        )
+        for error, expected in cases:
+            with self.subTest(error=error):
+                host = self._failure_host(error)
+                await ServiceChunk3.describe_current_images(
+                    host, {'id': 's'}, [{'id': 'i'}], '看看', True,
+                )
+                visible = [entry for entry in host.logs if entry[0] == 'report']
+                self.assertEqual(len(visible), 1, host.logs)
+                self.assertEqual(visible[0][1], 'warn')
+                self.assertIn(expected, visible[0][3])
+                # 可行动：点名去哪调。
+                self.assertIn('模型中心 → 模型连接', visible[0][3])
+                self.assertIn('用于侧端识图', visible[0][3])
+                if error is not None:
+                    self.assertIn('provider down', visible[0][3], '错误原文要留着')
+
+    async def test_describe_current_images_reports_visibly_when_nothing_comes_back(self) -> None:
+        """`visible=True` + 识图返回空 → 同样是可见、可行动的 warn（不是静默）。"""
+        host = _MediaHost(config={})
+
+        class Describer:
+            def available(self) -> bool:
+                return True
+
+            async def describe_images(self, images: Any, user_text: str = '',
+                                      detail: str = 'auto', kinds: Any = None) -> Any:
+                return []
+
+        host.vision_describer = Describer()
+        result = await ServiceChunk3.describe_current_images(
+            host, {'id': 's'}, [{'id': 'i'}], '看看', True,
+        )
+        self.assertFalse(result)
+        visible = [entry for entry in host.logs if entry[0] == 'report']
+        self.assertEqual(len(visible), 1)
+        self.assertIn('侧端识图没有返回观察结果', visible[0][3])
+        self.assertIn('模型中心 → 模型连接', visible[0][3])
 
     async def test_downscale_is_skipped_without_a_configured_dimension(self) -> None:
         host = _MediaHost(config={'model': {'vision': {'max_image_dimension': 0}}})

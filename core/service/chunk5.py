@@ -85,6 +85,11 @@ from ..alter import (
 )
 from ..alter import emotional_offset_for_prompt as _alter_offset_for_prompt
 from ..narrator_prompts import prompt_visible_message_content, recent_script_ownership
+from ..script.completion_report import (
+    completion_state,
+    completion_summary,
+    platform_action_state,
+)
 from ..script.episode_index import grounded_episode_tags
 from ..script.knowledge_evidence import (
     contact_evidence_threads,
@@ -134,12 +139,34 @@ _DEFAULT_BROWSER_MAX_TEXT_CHARACTERS = 12_000
 _DEFAULT_BROWSER_MAX_EXCERPT_CHARACTERS = 3_000
 _DEFAULT_BROWSER_SEARCH_URL_TEMPLATE = 'https://html.duckduckgo.com/html/?q={query}'
 
+#: 完成回报的最短延迟（与浏览意图同一口径：不早于"最后一拍"，但也别让她等到下一次
+#: 常规 sweep）。见 `docs/PORTING_NOTES.md` §87。
+_COMPLETION_REPORT_DELAY_MS = _SECOND_MS
+#: 同因同会话的回报节流窗口：窗口内同一 `cause` 只回报一次（失败不许刷爆她的回合）。
+_COMPLETION_REPORT_THROTTLE_MS = 5 * _MINUTE_MS
+#: 完成回报意图的 `type`（跨模块的唯一标识，也是节流查表的键）。
+COMPLETION_REPORT_INTENT_TYPE = 'completion-report'
+#: 唤醒收尾时值得补排的类型（见 `_rearm_pending_intent_wake`）：这些排期**只有**一次
+#: 唤醒机会，被更早的那次挤掉就没人再排。`follow-up-commitment` / `active-consequence` /
+#: 模型提的普通 `follow-up` 刻意不在里面（各有各的结算路径，唤醒只会多出回合）。
+_WAKE_WORTHY_INTENT_TYPES = frozenset({
+    'split-message', 'browser-research', 'narrative-retry', 'delayed-reply',
+    COMPLETION_REPORT_INTENT_TYPE,
+})
+
 #: 上游 `normalizeIntentUpdates` 的 `status` 白名单。
 _INTENT_UPDATE_STATUSES = ('completed', 'cancelled')
 
 #: 上游 `upcomingNarrativeIntents` 里的内部意图类型（不展示给主叙事）。
+#:
+#: v1.9.9：`completion-report` 也在这里——它是**已经发生的事**的回报（由
+#: `report_async_completion` 写、并立刻唤醒），不是"她打算做什么"的未来计划，
+#: 混进 `upcomingPlans` 会让模型把它当成还没做的计划再演一遍。注意它**不**在
+#: `script/intent_lifecycle.py` 的 `_SELF_EXECUTED_INTENT_TYPES` 里：到期那一回合
+#: 必须真的把它交给叙事器（那正是"注入"）。
 _INTERNAL_INTENT_TYPES = frozenset({
     'split-message', 'browser-research', 'narrative-retry', 'proactive-check', 'active-consequence',
+    COMPLETION_REPORT_INTENT_TYPE,
 })
 
 _CAMEL_BOUNDARY = re.compile(r'(?<!^)(?=[A-Z])')
@@ -813,6 +840,17 @@ class ServiceChunk5(ServiceBase):
             if isinstance(embedding, list) and embedding:
                 cached['vector'] = embedding
             recall_cache[_row(row, 'id')] = cached
+        # v1.9.9（§87）：平台动作的完成事实由执行侧（chunk12/chunk13）写进**这一条**
+        # 剧本条目（`metadata.platform_actions`）。它在落库那一刻就进统一回报通道：
+        # 失败的戳一戳/加好友/空间操作必须当场让她知道，而不是等下一次有人说话。
+        # 只有带这份标记的条目会多走一跳，其余条目（绝大多数）零开销。
+        entry_metadata = _row(row, 'metadata')
+        if isinstance(entry_metadata, dict):
+            outcomes = _row(entry_metadata, 'platform_actions')
+            if isinstance(outcomes, list) and outcomes:
+                await self._report_platform_action_completion(
+                    story_id, row, outcomes, now, participant_id,
+                )
         return row
 
     async def append_memory(
@@ -1382,6 +1420,10 @@ class ServiceChunk5(ServiceBase):
 
         到期的浏览意图只执行一次，无论成败都标记完成：浏览器失败本身也是一件事
         （主角打不开那个页面），但它绝不阻塞之后的对话或生活推进。
+
+        v1.9.9（§87）：观察**一落地**就进统一回报通道——浏览是她在等的延迟工作，
+        所以连成功也要回报（`awaited=True`）：结果本身就是答案，不能等到下一次
+        有人说话才被看见。
         """
         payload = browser_intent_from_payload(_row(intent, 'payload'))
         observation = await self.collect_web_observation(
@@ -1391,7 +1433,172 @@ class ServiceChunk5(ServiceBase):
         await self.db_set('interlude_intent', {'id': _row(intent, 'id')}, {
             'status': 'completed', 'updatedAt': self.now(),
         })
+        await self._report_browse_completion(story, intent, observation, now)
         return observation
+
+    # ------------------------------------------------------------------ #
+    # 异步 "完成即回报"（v1.9.9 受控偏离，见 `docs/PORTING_NOTES.md` §87）
+    # ------------------------------------------------------------------ #
+
+    async def report_async_completion(
+        self,
+        story_id: str,
+        *,
+        kind: str,
+        state: Any,
+        facts: Any = (),
+        now: Any = None,
+        participant_id: str = '',
+        cause: str = '',
+        reason: str = '',
+        awaited: bool = False,
+        user_initiated: bool = False,
+        source_entry_id: Any = None,
+    ) -> str:
+        """**唯一**的异步完成回报通道：三态 + 事实 →（节流）→ 待回报事实 → 立即唤醒。
+
+        用户点名的类比是"调用子代理干活，干完立刻回报"：异步动作（媒体投递、平台动作、
+        浏览、定时/到期意图）的结果一落地，就必须立刻把她唤醒并把事实注入她的下一回合，
+        而不是等她下一次开口时顺带捎一句。这里沿用的是给浏览意图补的那套机制
+        （`append_intent` + `schedule_due_intent_wake`），**没有第二套唤醒机制**。
+
+        三态与事实由 `script/completion_report.py` 从投递账本派生（判据一处）；
+        `state == 'delivered'` 且 `awaited=False` 时**不产生任何即时回合**：她自己说过
+        的话、做过的动作确认送达了，没有新事实需要她处理（§87 ④，不刷噪音）。
+
+        返回值即这次回报的结局：``'delivered'``（无需回报）/ ``'throttled'``（被节流）/
+        ``'reported'``（已写待回报事实并唤醒）/ ``'unavailable'``（宿主缺能力）。
+        """
+        moment = to_date(now) or self.now()
+        normalized = completion_state([state if state else 'unknown'])
+        if normalized == 'delivered' and not awaited:
+            self.report_standalone_operation(
+                'diagnostic', 'debug', '异步动作全部成功，无需回报 类型=%s 参与者=%s',
+                kind, participant_id or '全局',
+            )
+            return 'delivered'
+        cause_key = cause or '%s|%s|%s' % (kind, normalized, reason or '')
+        reported_before, last_at = await self._completion_report_throttle(
+            story_id, cause_key, moment,
+        )
+        if reported_before:
+            # 节流必须**说得出原因**（用户点名）：被压掉的那几次去哪儿了、因为什么被压。
+            self.report_standalone(
+                'info',
+                '完成回报被节流：因为 %s 已回报过（同因同会话 %d 秒内只回报一次，'
+                '本窗口已回报 %d 次，上次回报=%s）',
+                cause_key, _COMPLETION_REPORT_THROTTLE_MS // _SECOND_MS, reported_before,
+                format_log_time(last_at, 'Asia/Shanghai') if last_at else '未知',
+            )
+            return 'throttled'
+        summary = completion_summary(normalized, facts)
+        not_before = parse_dt(dt_ms(moment) + _COMPLETION_REPORT_DELAY_MS)
+        await self.append_intent(story_id, {
+            'type': COMPLETION_REPORT_INTENT_TYPE,
+            # 模型读到的就是这一行（`dueIntents[].summary`）：状态词 + 原文。
+            'summary': summary,
+            'notBefore': iso(not_before),
+            'payload': {
+                'kind': kind,
+                'state': normalized,
+                'cause': cause_key,
+                'facts': [item for item in (facts or []) if isinstance(item, str)],
+                'reason': reason or '',
+                'sourceEntryId': source_entry_id if source_entry_id is not None else None,
+                # 这一条是"已经发生的事"而不是"她打算做的事"：到期回合按它决定能不能开口
+                # （`permit_messages` 读 `userInitiated`），所以她刚经历过的那次动作失败
+                # 才有机会当场说出来，而不是烂在剧本里。
+                'userInitiated': bool(user_initiated),
+            },
+        }, moment, participant_id)
+        # 到点就唤醒——与浏览意图、拆分气泡、其它到期意图**同一条通道**。
+        self.schedule_due_intent_wake(story_id, not_before)
+        self.report_standalone(
+            'info', '异步动作完成回报 类型=%s 状态=%s 事实=%s', kind, normalized, summary,
+        )
+        return 'reported'
+
+    async def _completion_report_throttle(
+        self, story_id: str, cause: str, now: Any,
+    ) -> tuple[int, Any]:
+        """同因同会话的节流查表：``(本窗口已回报次数, 上次回报时刻)``。
+
+        节流状态**写在待回报事实里**（`interlude_intent` 的 `payload.cause`），不另建
+        一张表、也不靠进程内内存：重启后照旧生效，控制台/剧本里也看得见"这条为什么
+        只报了一次"。
+        """
+        rows = await self.db_get('interlude_intent', {
+            'storyId': story_id, 'type': COMPLETION_REPORT_INTENT_TYPE,
+        }, {'sort': {'createdAt': 'desc'}, 'limit': 50})
+        now_ms = dt_ms(now)
+        suppressed = 0
+        last_at = None
+        for row in rows:
+            payload = _row(row, 'payload')
+            if not isinstance(payload, dict) or _row(payload, 'cause') != cause:
+                continue
+            created = to_date(_row(row, 'createdAt', 'created_at'))
+            if created is None or now_ms - dt_ms(created) > _COMPLETION_REPORT_THROTTLE_MS:
+                continue
+            suppressed += 1
+            if last_at is None or dt_ms(created) > dt_ms(last_at):
+                last_at = created
+        return suppressed, last_at
+
+    async def _report_browse_completion(
+        self, story: Any, intent: Any, observation: Any, now: Any,
+    ) -> str:
+        """浏览观察 → 统一回报通道（§87 的浏览一类）。
+
+        状态词来自观察自己的 `status`（`success` / `failed` / `blocked`），事实用观察
+        的 `summary`（生产写入方写下的那一句），不另写措辞。
+        """
+        if not isinstance(observation, dict):
+            return 'unavailable'
+        story_id = _row(story, 'id')
+        if not story_id:
+            return 'unavailable'
+        status = _row(observation, 'status')
+        return await self.report_async_completion(
+            story_id,
+            kind='browse',
+            state=status or 'unknown',
+            facts=[_row(observation, 'summary') or ''],
+            now=now,
+            participant_id=_row(intent, 'participantId', 'participant_id') or '',
+            # 同一次浏览（同一意图）成功只报一次；不同意图各有各的答案。
+            cause='browse|%s|%s' % (_row(intent, 'id'), status or 'unknown'),
+            awaited=True,
+            user_initiated=True,
+            source_entry_id=_row(observation, 'id'),
+        )
+
+    async def _report_platform_action_completion(
+        self, story_id: str, row: Any, outcomes: Any, now: Any, participant_id: str,
+    ) -> str:
+        """平台动作结果 → 统一回报通道（§87 的平台动作一类）。
+
+        执行侧（chunk12/chunk13）一个字没动：它照旧把自己的结果写进剧本条目
+        （`[平台动作] …` + `metadata.platform_actions`），这里只在**剧本条目落库那一刻**
+        把那份事实接进通道。事实就是执行侧写下的那一句正文。
+        """
+        state = platform_action_state(outcomes)
+        if state == 'delivered':
+            return 'delivered'
+        actions = sorted({
+            str(item.get('action') or '') for item in (outcomes or []) if isinstance(item, dict)
+        })
+        content = _row(row, 'content')
+        return await self.report_async_completion(
+            story_id,
+            kind='platform-action',
+            state=state,
+            facts=[content if isinstance(content, str) and content.strip() else '平台动作未完成'],
+            now=now,
+            participant_id=participant_id,
+            cause='platform-action|%s|%s' % ('|'.join(actions), state),
+            source_entry_id=_row(row, 'id'),
+        )
 
     async def collect_web_observation(
         self,
@@ -1787,6 +1994,15 @@ class ServiceChunk5(ServiceBase):
                     self.report_standalone_operation(
                         'diagnostic', 'debug', '到期消息唤醒失败 错误=%s', error,
                     )
+                finally:
+                    # v1.9.9（§87）：本次唤醒用掉了"最早的那次"排期，而更晚的排期
+                    # （分段重试 / 延迟回复 / 其它到期意图）不会自己再排一次——补上。
+                    try:
+                        await self._rearm_pending_intent_wake(story_id)
+                    except Exception as error:  # pragma: no cover - 补排失败不影响本轮
+                        self.report_standalone_operation(
+                            'diagnostic', 'debug', '补排下一次到期唤醒失败 错误=%s', error,
+                        )
 
             asyncio.ensure_future(run())
 
@@ -1804,3 +2020,32 @@ class ServiceChunk5(ServiceBase):
         }, {'sort': {'notBefore': 'asc'}, 'limit': 1})
         if pending:
             self.schedule_due_intent_wake(story_id, _row(pending[0], 'notBefore', 'not_before'))
+
+    async def _rearm_pending_intent_wake(self, story_id: str) -> None:
+        """唤醒收尾：把"下一个到期意图"的唤醒补上（v1.9.9 受控偏离，见 §87）。
+
+        上游口径是"只保留最早的那次"：一次唤醒消费掉自己的句柄之后，**更晚**的排期
+        （分段重试、延迟回复、到期浏览…）不会自己再排一次，只能等下一次常规 sweep。
+        完成回报会在动作落地那一刻插一次**更早**的唤醒，正好会把这类排期挤掉——
+        于是"回报一次"的代价变成"重试晚五分钟"，那还是"还在转"。所以唤醒收尾时按
+        下一个真正需要唤醒的意图补排一次。
+
+        只补**未来**的（`notBefore > now`）：已经到点却还没处理完的意图不再排，否则
+        会在"处理不完"时变成立即重排的自旋。只补**需要唤醒的**类型：`follow-up-commitment`
+        由投递回执结算、`active-consequence` 由常规 sweep 的过期清理管、模型提的普通
+        `follow-up` 是给实时回合消费的——给它们排唤醒只会平白多出叙事回合。
+        """
+        if story_id in self.due_intent_wake_timers:
+            return
+        now_ms = float(self.now_ms())
+        rows = await self.db_get('interlude_intent', {
+            'storyId': story_id, 'status': 'pending',
+        }, {'sort': {'notBefore': 'asc'}, 'limit': 20})
+        for row in rows:
+            if _row(row, 'type') not in _WAKE_WORTHY_INTENT_TYPES:
+                continue
+            not_before = _row(row, 'notBefore', 'not_before')
+            if _ms(not_before) <= now_ms:
+                continue
+            self.schedule_due_intent_wake(story_id, not_before)
+            return

@@ -74,6 +74,7 @@ __all__ = [
     'qzone_media_limit_note',
     'qzone_media_limit_warning',
     'qzone_intent_from_payload',
+    'qzone_reaction_deltas',
     'qzone_records_for_endpoint',
     'qzone_visibility_label',
     'qzone_visible_value',
@@ -561,17 +562,54 @@ def normalize_qzone_msg_entry(raw: Any) -> Optional[dict[str, Any]]:
     moment = _from_ms(seconds * 1000)
     if moment is None:
         moment = datetime.fromtimestamp(0, tz=timezone.utc)
-    comment = raw['comment_num'] if 'comment_num' in raw else raw.get('commentNum')
+    # 评论数的三种拼写：SnowLuma 的 `comment_num` / 扁平回执的 `commentNum` /
+    # **原始 CGI 的 `cmtnum`**（`parse_mood` 的产出——v1.9.9 起被本模块读到：
+    # 被评论感知这条链正是拿它当基线的；不认它就永远是 0，那等于每轮都报一次
+    # "从 0 涨到 N"的幽灵评论）。
+    comment = _pick(raw, 'comment_num', 'commentNum', 'cmtnum')
     return {
         'tid': tid,
         'content': _nullish_string(raw.get('content')),
         'time': moment,
         'comment_num': _js_int_or(comment),
+        # 点赞数（本移植版新增，rc33 的「被点赞感知」）：**拿不到就是 `None`**，
+        # 不是 0——`0` 是"确实没人赞"，`None` 是"这条通道的回执里没有这个字段"。
+        # 两者混在一起会让增量比对凭空造出"从 0 涨到 N"的幽灵点赞（见
+        # `qzone_reaction_deltas` 的 `like_num` 口径）。
+        'like_num': _qzone_msg_like_count(raw),
         'is_private': _pick(raw, 'is_private', 'isPrivate') is True,
         'images': _qzone_msg_image_refs(raw),
         'videos': _qzone_msg_video_refs(raw),
         'forward': _qzone_msg_forward(raw),
     }
+
+
+def _qzone_msg_like_count(raw: Mapping[str, Any]) -> Optional[int]:
+    """条目里的**点赞数**：`None` = 这条回执没有这个字段（不是 0）。
+
+    上游 `normalizeQzoneMsgEntry` 只认 `comment_num`，并在注释里写明
+    「赞数上游（SnowLuma mapMsgList / RawEmotion）尚未暴露字段……上游补 like_num
+    后在 QzoneMsgEntry 加字段并入本函数即可」（`upstream/src/qzone.ts:200`）。
+    本移植版的读通道是**原始 QZone CGI**（`emotion_cgi_msglist_v6` → `parse_mood`），
+    字段形状由腾讯决定，所以这里**多种拼写都认**（与 `pic`/`images` 同一条纪律）：
+
+    * CGI 回执的 `likecount`（`parse_mood` 保下来的那个键）；
+    * SnowLuma 的 `like_num` / `likeNum`；
+    * 扁平回执可能给的 `likenum` / `like`。
+
+    一个都没有 → `None`（能力未知，调用方必须**可见地**说明"点赞增量不可知"，
+    绝不静默当成 0 去比增量）。
+    """
+    for key in ('likecount', 'like_num', 'likeNum', 'likenum', 'like'):
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        number = _js_number(value)
+        if _finite(number):
+            return int(number)
+    return None
 
 
 def normalize_qzone_feed_entry(raw: Any, now: Any = None) -> Optional[dict[str, Any]]:
@@ -611,6 +649,103 @@ def fresh_qzone_feeds(feeds: Sequence[Any], config: Any, now: Any = None) -> lis
         if at_ms is not None and at_ms >= min_time:
             kept.append(feed)
     return kept
+
+
+# --------------------------------------------------------------------------- #
+# 被评论 / 被点赞感知（纯函数，rc29 + rc33 的被评论感知）
+# --------------------------------------------------------------------------- #
+
+
+def qzone_reaction_deltas(
+    posts: Sequence[Any],
+    entries: Sequence[Any],
+) -> dict[str, Any]:
+    """上游 `qzoneReactionDeltas`（`upstream/src/qzone.ts:203`）：她的说说互动增量比对。
+
+    上游语义逐条照抄（语料见 `upstream/test/qzone.test.ts:256`）：
+
+    * **首次观测只立基线不报增量** —— 刚发布的帖子自带几条评论/赞是常态，不是新事件；
+    * 增量 > 0 才产出感知；计数**回落**（删评 / 取消赞）静默下修基线，杜绝幽灵增量；
+    * 帖子不在当前拉取列表里（超出深度）→ 基线保持不动、不产出、也不写 baselines；
+    * 空 `tid` 不参与。
+
+    **本移植版的扩展（rc33「被评论/被点赞」）**：点赞数一并比对。判据只有一条——
+    `like_num` 为 `None`（这条回执没有该字段，见 `normalize_qzone_msg_entry`）时
+    **不产出点赞增量**，也不拿 `None` 当 0 去比。通道到底有没有给这个数，由调用方
+    按 `baselines` 里的 `like_num` 是否全为 `None` 判定，并走可见降级说明。
+
+    返回键名按本仓库的 Python 内部结构约定用 snake_case（上游是 `contentExcerpt` /
+    `commentNum`，映射见 `docs/PORTING_NOTES.md` §1 的键名法）；`previous` / `current`
+    两个数值键与上游逐字同名，方便逐条对账。
+
+    `deltas` 的一条 = 一条说说本轮**新增**的互动（评论、点赞各自可缺）：
+
+    ``{'tid', 'content_excerpt', 'previous', 'current', 'like_previous', 'like_current'}``
+
+    `previous` / `current` 是评论数（上游口径的 `null` = 首次观测，本移植版用 `None`）；
+    `like_previous` / `like_current` 是点赞数（`None` = 该轮没有可比的点赞增量）。
+    """
+    by_tid: dict[str, Any] = {}
+    for entry in entries:
+        if not _is_mapping(entry):
+            continue
+        tid = _nullish_string(_pick(entry, 'tid')).strip()
+        if tid and tid not in by_tid:
+            by_tid[tid] = entry
+    deltas: list[dict[str, Any]] = []
+    baselines: list[dict[str, Any]] = []
+    for post in posts:
+        if not _is_mapping(post):
+            continue
+        tid = _nullish_string(_pick(post, 'tid')).strip()
+        entry = by_tid.get(tid)
+        if not tid or entry is None:
+            continue
+        comment = _js_int_or(_pick(entry, 'comment_num', 'commentNum'))
+        like = _like_count_of(entry)
+        baselines.append({'tid': tid, 'comment_num': comment, 'like_num': like})
+        delta: dict[str, Any] = {
+            'tid': tid,
+            'content_excerpt': _nullish_string(_pick(entry, 'content')),
+            'previous': None, 'current': None,
+            'like_previous': None, 'like_current': None,
+        }
+        produced = False
+        previous = _pick(post, 'commentNum', 'comment_num')
+        if previous is not None and not isinstance(previous, bool):
+            previous_number = _js_number(previous)
+            if _finite(previous_number) and comment > int(previous_number):
+                delta['previous'] = int(previous_number)
+                delta['current'] = comment
+                produced = True
+        previous_like = _pick(post, 'likeNum', 'like_num')
+        if (
+            like is not None
+            and previous_like is not None
+            and not isinstance(previous_like, bool)
+        ):
+            previous_like_number = _js_number(previous_like)
+            if _finite(previous_like_number) and like > int(previous_like_number):
+                delta['like_previous'] = int(previous_like_number)
+                delta['like_current'] = like
+                produced = True
+        if produced:
+            deltas.append(delta)
+    return {'deltas': deltas, 'baselines': baselines}
+
+
+def _like_count_of(entry: Any) -> Optional[int]:
+    """已归一化条目里的点赞数；`None` = 该轮拿不到（与原始回执同一条判据）。"""
+    if not _is_mapping(entry):
+        return None
+    if 'like_num' in entry:
+        value = entry.get('like_num')
+    else:
+        value = _qzone_msg_like_count(entry)
+    if value is None or isinstance(value, bool):
+        return None
+    number = _js_number(value)
+    return int(number) if _finite(number) else None
 
 
 # --------------------------------------------------------------------------- #

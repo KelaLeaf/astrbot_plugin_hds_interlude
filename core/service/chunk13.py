@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from urllib.parse import urlsplit
@@ -65,6 +66,7 @@ from ..qzone import (
     qzone_intent_from_payload,
     qzone_media_limit_note,
     qzone_media_limit_warning,
+    qzone_reaction_deltas,
     qzone_records_for_endpoint,
     qzone_visible_value,
     qzone_visibility_label,
@@ -122,6 +124,22 @@ QZONE_FEED_CONTENT_NOTE_INTERVAL_MS = 30 * 60 * 1000
 #: 动态媒体（图片 / 视频）识别相关说明的节流间隔（毫秒）。与 `VISION_IMAGE_BUDGET_WARN_INTERVAL_MS`
 #: / `VIDEO_WARN_INTERVAL_MS` 同档：能力缺失与截断都必须让人看见，但不能刷屏。
 QZONE_FEED_MEDIA_NOTE_INTERVAL_MS = 10 * 60 * 1000
+
+# --------------------------------------------------------------------------- #
+# 被评论 / 被点赞感知（rc29 + rc33）
+# --------------------------------------------------------------------------- #
+
+#: 只看最近多少天她自己发出去的说说（上游 `7 * 24 * Time.hour`）。
+QZONE_REACTION_WINDOW_DAYS = 7
+#: 一次拉取她自己的说说列表取几条（上游 `num: 10`）。
+QZONE_REACTION_MSG_NUM = 10
+#: **单轮入账预算**（上游 `reactionBudget = 3`）：一轮最多为 3 条说说写感知条目，
+#: 其余增量**不推进基线**、留给下一轮重新发现——这是上游防"第 4 条起永久丢失"的判据，
+#: 顺序（先写基线、再写条目）也是它的一部分，别只搬纯函数不搬这段。
+QZONE_REACTION_BUDGET = 3
+#: 「这条读通道拿不到点赞数」这条降级说明的节流间隔（毫秒）。
+QZONE_REACTION_LIKE_NOTE_INTERVAL_MS = 60 * 60 * 1000
+
 
 _MILLISECONDS_PER_MINUTE = 60_000
 
@@ -207,6 +225,51 @@ def _row_ms(row: Any) -> Optional[int]:
     return None if parsed is None else dt_ms(parsed)
 
 
+def _same_reaction_baseline(row: Any, patch: Mapping[str, Any]) -> bool:
+    """要写的基线与行上现有值完全一致 → 不必写库（上游 `(row.commentNum ?? null) !== baseline.commentNum`）。
+
+    只在**已知字段**上比：`patch` 里没有点赞数（这条回执没给）时不做比较，
+    免得把"不可知"写成 0 再自我确认。
+    """
+    for key, value in patch.items():
+        current = pick(row, key)
+        if current is None and value is None:
+            continue
+        if current is None or value is None:
+            return False
+        if isinstance(current, bool) or isinstance(value, bool):
+            if current != value:
+                return False
+            continue
+        try:
+            if int(current) != int(value):
+                return False
+        except (TypeError, ValueError):
+            if current != value:
+                return False
+    return True
+
+
+class _QzoneTargetAccountNotQq(RuntimeError):
+    """多通道账号标识校验（rc33）：这条动态的账号**不是数字 QQ 号**。
+
+    QQ 空间读通道（`emotion_cgi_msglist_v6`）只能按数字 QQ 号定位某个人的说说列表；
+    `wxid_*` / `@chatroom` 这类字符串账号读不到。旧实现会把 `targetUin` 这个键**省掉**
+    ——CGI 于是按"我自己"返回，那就是**认错账号**（拿别人的动态去比对她的说说）。
+    这里改成显式失败，让上层写一条能照着做的 warn。异常只在本模块内部流转。
+    """
+
+    def __init__(self, value: Any, reason: str) -> None:
+        super().__init__(
+            '账号 %s %s（空间读通道只按数字 QQ 号定位，省掉 targetUin 会查成"我自己"）'
+            % (
+                '(空)' if value in (None, '') else value,
+                '不是数字 QQ 号' if reason == 'non-qq' else '没有账号标识',
+            )
+        )
+        self.target_reason = reason
+
+
 def _kind_label(kind: Any) -> str:
     """上游那串 `kind === 'post' ? '发帖' : …` 的中文档位名。"""
     if kind == 'post':
@@ -220,26 +283,54 @@ def _kind_label(kind: Any) -> str:
     return '点赞'
 
 
+def onebot_target_id(value: Any) -> Any:
+    """上游 `onebotTargetId`（`upstream/src/service.ts:9719`）：通道目标 ID 的类型规则。
+
+    * 先剥掉 `private:` / `group:` 前缀（上游 `/^(?:private:|group:)/`）；
+    * **纯数字串转 `int`**（QQ 的 `user_id` / `group_id` 规范类型）；
+    * 其余（`wxid_xxx` / `@chatroom` 等**字符串账号**）**原样返回**。
+
+    上游注释点名的 bug：早先 `Number()` 一刀切会把非数字 ID 变成 `NaN` 直发上游，
+    多通道（QQ / 微信 / 其它 OneBot 实现）下就会**认错账号**。返回类型不同
+    （`int` vs `str`）本身就是这条判据的可见结果，调用方必须分开处理。
+    """
+    if isinstance(value, bool) or value is None:
+        return ''
+    if isinstance(value, (int, float)):
+        return int(value) if float(value).is_integer() else str(value)
+    raw = re.sub(r'^(?:private:|group:)', '', str(value).strip(), flags=re.IGNORECASE)
+    return int(raw) if re.fullmatch(r'\d+', raw) else raw
+
+
+def _qzone_target_uin(value: Any) -> tuple[Optional[int], str]:
+    """QQ 空间读通道的 `targetUin` + **认不出账号时的原因**（判据一处）。
+
+    QQ 空间的 CGI（`emotion_cgi_msglist_v6`）只能按**数字 QQ 号**定位某人的说说列表；
+    `onebot_target_id()` 认出来的字符串账号（`wxid_*` / `@chatroom`）在这里**没法查**。
+    旧实现把它当 `Number(NaN)` 直接**省掉这个键**——于是 CGI 会按"我自己"去查，
+    这正是 rc33 那条「多通道下别认错账号」在空间链路上的现场。
+
+    返回 `(target, reason)`：`reason` 为空 = 可以用；`'missing'` = 这条动态没带账号；
+    `'non-qq'` = 账号不是数字 QQ 号（调用方必须**可见地**跳过并说明下一步，
+    绝不能省掉键去查自己的列表）。
+    """
+    target = onebot_target_id(value)
+    if isinstance(target, int):
+        return target, ''
+    if not target:
+        return None, 'missing'
+    return None, 'non-qq'
+
+
 def _target_uin_param(value: Any) -> Any:
     """`target_uin` 参数：上游 `Number(targetUin)`；非数字则**不带这个键**。
 
     JS 的 `Number('abc')` 是 NaN、序列化成 JSON 会变 `null`；本移植版直接省略，
-    免得把 `null` 当"归属 0"发给平台。
+    免得把 `null` 当"归属 0"发给平台。判据复用 `onebot_target_id()`（一处），
+    所以 `private:10002` 这类带前缀的写法同样认得出来（rc33 的账号标识规则）。
     """
-    if value is None or value == '':
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-    else:
-        try:
-            number = float(str(value).strip())
-        except (TypeError, ValueError):
-            return None
-    if not math.isfinite(number) or number != int(number):
-        return None
-    return int(number)
+    target = onebot_target_id(value)
+    return target if isinstance(target, int) else None
 
 
 def _note_qzone_feed_media(service: Any, key: str, message: str, *args: Any) -> bool:
@@ -1145,6 +1236,190 @@ class ServiceChunk13(ServiceBase):
         await finish('ok' if result.get('ok') else 'failed:%s' % clip(result.get('error') or '', 80))
 
     # ------------------------------------------------------------------ #
+    # 被评论 / 被点赞感知（rc29 + rc33）
+    # ------------------------------------------------------------------ #
+
+    def _qzone_reaction_line(self, delta: Any) -> str:
+        """一条增量 → `[空间动态]` 正文（措辞判据只在这里一处）。"""
+        excerpt = str(pick(delta, 'content_excerpt', 'contentExcerpt') or '')
+        head = '[空间动态] 她的说说%s' % ('「%s」' % excerpt if excerpt else '')
+        parts: list[str] = []
+        current = pick(delta, 'current')
+        previous = pick(delta, 'previous')
+        if current is not None and previous is not None:
+            parts.append('收到了 %d 条新评论（累计 %d 条）' % (int(current) - int(previous), int(current)))
+        like_current = pick(delta, 'like_current', 'likeCurrent')
+        like_previous = pick(delta, 'like_previous', 'likePrevious')
+        if like_current is not None and like_previous is not None:
+            parts.append('收到了 %d 个新赞（累计 %d 个）' % (
+                int(like_current) - int(like_previous), int(like_current),
+            ))
+        return '%s%s' % (head, '、'.join(parts))
+
+    def _note_qzone_like_unavailable(self, story: Any) -> None:
+        """**可见降级**：这条读通道的说说回执里没有点赞数。
+
+        上游 `qzoneReactionDeltas` 的注释逐字写着「赞数上游（SnowLuma mapMsgList /
+        RawEmotion）尚未暴露字段……此处只算评论」；本移植版读的是原始 QZone CGI
+        （`emotion_cgi_msglist_v6`），字段由腾讯决定，同样可能没有。拿不到就是
+        **能力不可知**——绝不按 0 处理（那会凭空造出"从 0 涨到 N"的幽灵点赞），
+        也不能静默（用户会以为"被赞了她就会知道"）。节流一条，写清下一步。
+        """
+        self.note_access_skip(
+            'qzone-like-count-unavailable', QZONE_REACTION_LIKE_NOTE_INTERVAL_MS,
+            'QQ 空间的说说回执里没有「点赞数」（%s）：这条通道**只能感知评论增量**，'
+            '点赞增量不可知，不会写进剧本（上游同样未暴露该字段，不是这台机器的问题）。'
+            '下一步：确认 QZone 读通道（emotion_cgi_msglist_v6）的回执里是否带 '
+            'likecount / like_num；有就照常感知，没有就继续保持"不可知"，**不要**'
+            '把缺失当 0。',
+            pick(story, 'id') or '',
+        )
+
+    async def qzone_reaction_sweep(
+        self, story: Any, call: Any, address: Any, now: Any,
+    ) -> None:
+        """被评论 / 被点赞感知（上游 `qzoneReactionSweep`，`src/service.ts:7432`）。
+
+        **感知零动作配额**：只读 `get_qzone_msg_list`，不占 `daily_*_cap`、不进
+        `interlude_qzone_post` 的动作行计数；产出的条目是 `[空间动态]`（SOCIAL SURFACE
+        规则现成，零提示词改动），由下一次推进（自动或对话）自然携带——**轮询本身
+        绝不调度推进**（被赞不立即开 advance）。
+
+        三条上游语义逐条照抄（`src/service.ts:7456-7496`）：
+
+        1. **无增量的帖子照常推进基线**（含 `commentNum` 为 `None` 的首次观测初始化）
+           ——跳过会让这条说说的增量感知**永久失效**；
+        2. **单轮预算 3 条**，之外的增量**不推进基线**（下轮重新发现），杜绝
+           "第 4 条起永久丢失"；
+        3. **先推进该帖基线、再写感知条目**；基线回写失败则**本轮中止**（不写条目），
+           杜绝"旧基线重算出相同增量"的重复入账。条目写入失败时基线**不回滚**
+           （该增量让位，避免重复入账），只留 warn。
+
+        只读拉取失败 → 基线不动、下轮重试，但**必须可见**（此前零日志）。
+        """
+        story_id = str(pick(story, 'id') or '')
+        rows = await self.db_get('interlude_qzone_post', {
+            'storyId': story_id, 'kind': 'post', 'status': 'confirmed',
+        })
+        cutoff = dt_ms(now) - QZONE_REACTION_WINDOW_DAYS * 24 * 60 * 60 * 1000
+        tracked = [
+            row for row in _rows(rows)
+            if str(pick(row, 'tid') or '').strip()
+            and (_row_ms(row) is None or _row_ms(row) >= cutoff)
+        ]
+        if not tracked:
+            return
+        self_id = pick(address, 'selfId', 'self_id')
+        target_uin, reason = _qzone_target_uin(self_id)
+        if target_uin is None:
+            # 多通道账号标识校验（rc33）：认不出数字 QQ 号就**不查**——省掉 target_uin
+            # 会让 CGI 按"我自己"返回列表，那就是认错账号（拿她的帖子去比对别人的评论）。
+            self.note_access_skip(
+                'qzone-reaction-account-not-qq', QZONE_REACTION_LIKE_NOTE_INTERVAL_MS,
+                'QQ 空间被评论感知跳过：当前轮询账号（%s）%s——空间读通道只能按数字 QQ 号'
+                '定位，拿不到就会去查"我自己"的列表（认错账号）。下一步：给这条通道'
+                '配上该故事的数字 QQ 角色账号（端点注册表里的 selfId），或关掉 QQ 空间。',
+                self_id if self_id not in (None, '') else '(空)',
+                '不是数字 QQ 号' if reason == 'non-qq' else '没有账号标识',
+            )
+            return
+        try:
+            raw = _mapping(await self._qzone_run_action(call, 'get_qzone_msg_list', {
+                'targetUin': target_uin,
+                'count': QZONE_REACTION_MSG_NUM,
+            }, 'moods'))
+        except Exception as error:  # noqa: BLE001 - 拉取失败：基线不动、下轮重试，但必须可见
+            self.report('warn', story, 'advance', '被评论列表拉取失败，本轮感知跳过 错误=%s', error)
+            return
+        entries = [
+            entry for entry in (
+                normalize_qzone_msg_entry(item)
+                for item in _rows(pick(raw, 'msglist', 'posts'))
+            ) if entry
+        ]
+        result = qzone_reaction_deltas(tracked, entries)
+        deltas = _rows(result.get('deltas'))
+        baselines = _rows(result.get('baselines'))
+        if baselines and all(
+            pick(item, 'like_num', 'likeNum') is None for item in baselines
+        ):
+            # 通道没给点赞数 = 能力缺失：可见降级，绝不静默、也不按 0 比增量。
+            self._note_qzone_like_unavailable(story)
+        # ① 无增量的帖子照常推进基线（含首次观测初始化）；有增量的留给下面逐条提交。
+        delta_tids = {str(pick(item, 'tid') or '') for item in deltas}
+        for baseline in baselines:
+            tid = str(pick(baseline, 'tid') or '')
+            if tid in delta_tids:
+                continue
+            row = next((item for item in tracked if str(pick(item, 'tid') or '') == tid), None)
+            row_id = pick(row, 'id') if row is not None else None
+            patch: dict[str, Any] = {'commentNum': pick(baseline, 'comment_num', 'commentNum')}
+            if pick(baseline, 'like_num', 'likeNum') is not None:
+                patch['likeNum'] = pick(baseline, 'like_num', 'likeNum')
+            if row_id is None or _same_reaction_baseline(row, patch):
+                continue
+            try:
+                await self.db_set('interlude_qzone_post', {'id': row_id}, patch)
+            except Exception as error:  # noqa: BLE001 - 基线初始化失败不影响本轮感知
+                self.report(
+                    'warn', story, 'advance',
+                    '被评论基线初始化失败（不影响本轮感知） tid=%s 错误=%s', tid, error,
+                )
+        # ② 逐条提交：先推进该帖基线再写条目；预算 3；基线回写失败则本轮中止。
+        accounted = 0
+        accounted_new = 0
+        for delta in deltas:
+            if accounted >= QZONE_REACTION_BUDGET:
+                break
+            tid = str(pick(delta, 'tid') or '')
+            baseline = next((item for item in baselines if str(pick(item, 'tid') or '') == tid), None)
+            row = next((item for item in tracked if str(pick(item, 'tid') or '') == tid), None)
+            row_id = pick(row, 'id') if row is not None else None
+            if baseline is None or row_id is None:
+                continue
+            patch = {'commentNum': pick(baseline, 'comment_num', 'commentNum')}
+            if pick(baseline, 'like_num', 'likeNum') is not None:
+                patch['likeNum'] = pick(baseline, 'like_num', 'likeNum')
+            try:
+                await self.db_set('interlude_qzone_post', {'id': row_id}, patch)
+            except Exception as error:  # noqa: BLE001 - 基线写不进去：本轮中止，别重复入账
+                self.report(
+                    'warn', story, 'advance',
+                    '被评论基线回写失败，本轮感知中止（下轮重算） tid=%s 错误=%s', tid, error,
+                )
+                break
+            metadata: dict[str, Any] = {
+                'qzone_tid': tid,
+                'qzone_reactions': {
+                    'previous': pick(delta, 'previous'),
+                    'current': pick(delta, 'current'),
+                    'like_previous': pick(delta, 'like_previous'),
+                    'like_current': pick(delta, 'like_current'),
+                },
+            }
+            try:
+                await self.append_entry(story_id, {
+                    'kind': 'friend-feed', 'actor': 'system',
+                    'content': self._qzone_reaction_line(delta),
+                    # `occurredAt` = **她这轮知道的时刻**（与好友动态入账同一条判据，§55）。
+                    'occurredAt': iso(now),
+                    'metadata': metadata,
+                }, now)
+                accounted += 1
+                accounted_new += max(0, int(pick(delta, 'current') or 0) - int(pick(delta, 'previous') or 0))
+            except Exception as error:  # noqa: BLE001 - 基线已推进：该增量让位，只留日志
+                self.report(
+                    'warn', story, 'advance',
+                    '被评论感知条目写入失败，该增量让位 tid=%s 错误=%s', tid, error,
+                )
+        if deltas:
+            self.report_operation(
+                'diagnostic', 'debug', story, 'advance',
+                '被评论感知已入账 新评论=%d 入账帖数=%d/%d（预算 %d）',
+                accounted_new, accounted, len(deltas), QZONE_REACTION_BUDGET,
+            )
+
+    # ------------------------------------------------------------------ #
     # 好友动态轮询
     # ------------------------------------------------------------------ #
 
@@ -1275,8 +1550,8 @@ class ServiceChunk13(ServiceBase):
                 )
             elif frames:
                 # 抽帧白抽了：视频理解开着、图片理解关着，帧**没有通道可去**
-                # （与群回合那条 `GROUP_NO_VISION_REASON` 同一条尺子：帧丢掉要说出来，
-                # 不能让模型以为她看见了画面）。帧照旧丢掉，但留事实 + 一条可行动 warn。
+                # （与群回合那条 `GROUP_FRAMES_NO_CHANNEL_REASON` 同一条尺子：帧丢掉要
+                # 说出来，不能让模型以为她看见了画面）。帧照旧丢掉，但留事实 + 一条可行动 warn。
                 _note_qzone_feed_media(
                     self, 'qzone-feed-video-frames-no-vision',
                     '好友动态的视频抽好了 %d 帧，但%s，这次没有识别：帧没有交给任何模型'
@@ -1305,9 +1580,14 @@ class ServiceChunk13(ServiceBase):
 
         单飞锁 + 失败只 warn，**绝不上抛**；feeds 接口间歇失败就静默跳过，下轮再试。
 
-        `qzone.auto_feed`（本移植版新增）没打开时**不轮询**——这个开关就是
+        `qzone.auto_feed`（本移植版新增）没打开时**不轮询好友动态**——这个开关就是
         「允许她浏览好友动态」；这时按小时节流打一条可见说明，不然用户会以为
         "QQ 空间开了却什么都不发生"。
+
+        ⚠️ **被评论 / 被点赞感知（`qzone_reaction_sweep`）不受 `auto_feed` 约束**：
+        它读的是**她自己发出去的说说**上的互动，不是"浏览别人动态"。关掉自动浏览
+        不代表"别人评论她、她不该知道"，所以那一段在这道闸**之前**跑（仍在同一个
+        单飞锁与"通道可用"判据内）。
         """
         runtime = self.qzone_runtime()
         if (
@@ -1316,14 +1596,6 @@ class ServiceChunk13(ServiceBase):
             or not runtime.get('enabled')
             or getattr(self, '_qzone_feed_sweep_running', False)
         ):
-            return
-        if not runtime.get('auto_feed'):
-            self.note_access_skip(
-                'qzone-auto-feed-off', QZONE_AUTO_FEED_NOTE_INTERVAL_MS,
-                'QQ 空间通道已启用，但「自动浏览好友动态」是关的：本轮及以后都不会'
-                '轮询好友动态（在「幕间控制台 → 配置 → QQ 空间」里打开'
-                '「自动浏览好友动态」即可；手动/意图触发的发说说、评论、点赞不受影响）',
-            )
             return
         self._qzone_feed_sweep_running = True
         try:
@@ -1342,6 +1614,16 @@ class ServiceChunk13(ServiceBase):
             if call is None:
                 return
             now = self.now()
+            # 她自己帖子上的评论 / 点赞：与 auto_feed 无关（见方法说明）。
+            await self.qzone_reaction_sweep(story, call, address, now)
+            if not runtime.get('auto_feed'):
+                self.note_access_skip(
+                    'qzone-auto-feed-off', QZONE_AUTO_FEED_NOTE_INTERVAL_MS,
+                    'QQ 空间通道已启用，但「自动浏览好友动态」是关的：本轮及以后都不会'
+                    '轮询好友动态（在「幕间控制台 → 配置 → QQ 空间」里打开'
+                    '「自动浏览好友动态」即可；手动/意图触发的发说说、评论、点赞不受影响）',
+                )
+                return
             try:
                 # **只读动作一律走 `_qzone_run_action`**：NapCat WS 方案（get_cookies +
                 # QZone CGI）；拿不到 cookie 就明确失败，不再回落平台动作。
@@ -1393,7 +1675,11 @@ class ServiceChunk13(ServiceBase):
                     # 同一条口径：正文对齐也走 CGI 优先的读通道（NapCat 没有
                     # `get_qzone_msg_list` 这条原生动作）。参数名两个通道各取所需：
                     # CGI 认 `targetUin` + `count`。
-                    target_uin = _target_uin_param(pick(feed, 'uin'))
+                    # 账号标识校验（rc33）：**认不出数字 QQ 号就不查**——省掉
+                    # `targetUin` 会让 CGI 返回"我自己"的说说列表（认错账号）。
+                    target_uin, target_reason = _qzone_target_uin(pick(feed, 'uin'))
+                    if target_uin is None:
+                        raise _QzoneTargetAccountNotQq(pick(feed, 'uin'), target_reason)
                     list_raw = _mapping(await self._qzone_run_action(call, 'get_qzone_msg_list', {
                         'targetUin': target_uin,
                         'count': QZONE_FEED_MSG_NUM,
@@ -1477,8 +1763,16 @@ class ServiceChunk13(ServiceBase):
                         # 列表里有几条，必须写进 warn——否则用户无从判断该去修哪一头。
                         if content_error is not None:
                             reason = str(content_error)
-                            next_step = ('确认 NapCat 登录态与 QZone 读通道'
-                                         '（emotion_cgi_msglist_v6）能返回该好友的说说列表')
+                            if isinstance(content_error, _QzoneTargetAccountNotQq):
+                                # 多通道账号标识校验（rc33）：不是数字 QQ 号 = 这条读通道
+                                # 定位不了那个人的说说列表，下一步要说清该去配什么。
+                                next_step = ('确认这条动态带的 uin 是数字 QQ 号——空间读通道'
+                                             '（emotion_cgi_msglist_v6）只按数字 QQ 号定位；'
+                                             'wxid_* / @chatroom 这类多通道账号本通道读不到，'
+                                             '这时只留"她刷到过"，正文不猜')
+                            else:
+                                next_step = ('确认 NapCat 登录态与 QZone 读通道'
+                                             '（emotion_cgi_msglist_v6）能返回该好友的说说列表')
                         else:
                             reason = '查的 tid=%s，该好友最近 %d 条说说里没有它' % (
                                 feed_key, len(entries),

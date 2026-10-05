@@ -5,7 +5,9 @@
 本文件是执行侧，负责四件事：
 
 1. **可用集**：把「配置开关」⊗「独立权限表」⊗「会话身份」合成"这一回合她实际能调的动作"，
-   交给提示词注入（模型只该看到它真能调的）；
+   交给提示词注入（模型只该看到它真能调的）。v1.9.9 起注入是**两段式**：
+   每回合只给"有哪些按钮"（短清单，无参数），她选定某条之后才给那一条的参数表
+   （`resolve_platform_action_params()`，每回合最多一次额外调用）；
 2. **校验**：模型写的 `platformActions` 过 `validate_actions`，越界/未知/超限一律拒绝并留证；
 3. **执行**：平台类动作走 `transport.platform_action`；**本机类动作**（定时消息/定时命令）
    留在 core 里办（它们不碰平台，只写表）；
@@ -21,19 +23,23 @@ import asyncio
 import functools
 import json
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from ..platform_actions import (
     ACTIONS,
     PLATFORM_ACTION_FIELD,
     VOICE_ACTION_IDS,
     action_config_group,
+    describe_action_params,
+    describe_action_shortlist,
     describe_actions,
     effective_permission,
     normalize_permissions,
     resolve_permission,
+    validate_action,
     validate_actions,
 )
+from ..narrator_prompts import platform_action_shortlist_instruction
 from ..scheduled_command import (
     DEFAULT_COMMAND_CATALOG,
     cron_next_run,
@@ -54,6 +60,116 @@ ACTION_PERMISSIONS_FILE = 'action_permissions.json'
 
 #: 一次回合最多执行几个动作（与 `validate_actions` 的上限同源，防止模型刷屏）。
 MAX_ACTIONS_PER_TURN = 8
+
+#: 一次回合最多**补问**几次参数（两段式的铁律，与贴纸两段式同一个数：一次）。
+#: 第二段是"照贴纸两段式的先例"来的：第一段文本是最终有效的，第二段只填参数槽；
+#: 回执里再想改动作 id / 再点一条动作，都不接着问。
+PLATFORM_ACTION_FOLLOW_UP_MAX_PER_TURN = 1
+
+#: 动作参数补问的超时（秒）。与贴纸追问同一量级（一个短 JSON 回执）。
+PLATFORM_ACTION_FOLLOW_UP_TIMEOUT_SECONDS = 20.0
+
+#: 第二段回执里唯二认的两个键（跨 chunk 的既有双拼写纪律：camelCase 与 snake_case 都认）。
+_PARAM_ACTION_KEYS = ('action', 'actionId', 'id')
+_PARAM_VALUE_KEYS = ('params', 'parameters', 'args')
+
+
+def _plain(value: Any) -> str:
+    """把"正文/说明"压成纯文本（补问 payload 用）。
+
+    只认字符串：其它类型一律回空串，**绝不做 `str(dict)`** —— 那会把一整块结构化数据
+    塞进补问 payload，既没用又容易被误读成指令。
+    """
+    if isinstance(value, str):
+        return value
+    return ''
+
+
+def close_awaitable(value: Any) -> bool:
+    """把一个没打算 await 的协程 **关掉**，避免 `coroutine ... was never awaited`。
+
+    判据与 `core/service/chunk2._spawn_sticker_task` 同源（`asyncio.iscoroutine`）：
+    兼容口上"宿主给了异步实现"这件事本身要修，但**警告不该由核心侧制造**——
+    警告是给"忘了 await"的代码看的，我们这里是**刻意不 await**（同步上下文）。
+    返回是否真的关掉了一个协程（调用方据此决定要不要额外说明）。
+    """
+    if not asyncio.iscoroutine(value):
+        return False
+    try:
+        value.close()
+    except Exception:  # noqa: BLE001 - 关不掉也不能影响判定
+        return False
+    return True
+
+
+def super_admin_ids_from_host(host: Any) -> tuple[str, ...]:
+    """从宿主对象取**同步**的超级管理员名单，归一化成 `tuple[str, ...]`。
+
+    两种形状都认，都必须是同步的：
+
+    * **属性** → 直接读（`known_super_admin_ids = ('123',)`）；
+    * **方法** → `known_super_admin_ids()`。
+
+    归一化宁可从严：拿到的不是 list/tuple/set（字符串、数字、协程…）一律当"没有名单"，
+    返回空元组。**绝不把字符串当成 id 序列**——那会把 `'12345'` 拆成五个单字符 id，
+    反而可能碰巧放行一个单字符用户号。拿不到就是空名单（= 没有权限，安全侧）。
+
+    注意调用方要**先判可调用**再走方法分支（本模块 `resolve_action_session_role` 有例）：
+    一个属性天然不可调用，别把合法的属性形状误判成接线错误。
+    """
+    if host is None:
+        return ()
+    raw = getattr(host, 'known_super_admin_ids', None)
+    if raw is None:
+        return ()
+    value = raw() if callable(raw) else raw
+    if asyncio.iscoroutine(value):
+        # 异步实现 = 接线错误：关掉协程（不留警告），按"没有名单"回空元组。
+        close_awaitable(value)
+        return ()
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return ()
+    return tuple(str(item) for item in value if item not in (None, ''))
+
+
+def session_group_id(session: Any) -> str:
+    """会话里的**群 id**——动作坐标的 `group_id` 判据（只此一处）。
+
+    生产上群回合拿到的是 `SessionView`：适配层把群 id 存在 `guild_id` / `channel_id`
+    （`astrbot_bridge.session_view`：`channel_id=guild_id=group_id`，`is_direct=False`），
+    而它**没有** `groupId` 键（`SESSION_VIEW_KEYS` 里有 `guildId` 没有 `groupId`）。
+    只读 `pick(session, 'groupId', 'group_id')` 会让**群回合的坐标看起来像私聊**：
+
+    * `dispatch_platform_actions` 的作用域被收成 `('private',)` → 群里能做的动作
+      （群公告 / 踢人 / 禁言…29 条）在投递后全被"当前会话不允许"拒掉，
+      而提示词组装那一侧（`chunk4`）按 `groupContext` 判定，**刚刚才把它们教给模型**；
+    * 同一条坐标还会让「正在输入」漏到群聊（`typing_target_is_group` 也读它）。
+
+    取法（从严到宽）：
+
+    1. 显式 `groupId` / `group_id`（dict 形状的参与者与测试夹具）——非空就用它；
+    2. `isDirect` 为真 → **空**（私聊的 `channel_id` 存的是对方 user_id，不是群）；
+    3. 会话自己的 `session_group_id()`（`SessionView` 的规范口：`guildId || channelId`
+       ——与 `core/service/session.py:142` 同一个判据，不另造一份）。
+
+    `'0'`（OneBot 私聊把 `group_id` 填成 `0` 的那个形状，用户贴过日志）按**私聊**处理，
+    与 `typing_target_is_group()` 同一个口径（判据一处）。坐标推导**绝不抛**：
+    拿不到就是空串（= 不是群），安全侧。
+    """
+    if pick(session, 'isDirect', 'is_direct') is True:
+        return ''
+    explicit = pick(session, 'groupId', 'group_id')
+    if explicit not in (None, ''):
+        candidate = str(explicit).strip()
+    else:
+        accessor = getattr(session, 'session_group_id', None)
+        if not callable(accessor):
+            return ''
+        try:
+            candidate = str(accessor() or '').strip()
+        except Exception:  # noqa: BLE001 - 坐标推导失败只当"不是群"
+            return ''
+    return '' if candidate in ('', '0') else candidate
 
 #: **由 core 自己办**的动作（不碰平台）：定时消息走既有的 intent 表，定时命令走
 #: `interlude_scheduled_command`。其余动作一律走传输层。
@@ -240,8 +356,221 @@ class ServiceChunk12(ServiceBase):
         return available
 
     def platform_action_instruction(self, available: Optional[list[str]] = None) -> str:
-        """渲染进提示词的动作目录（只列可调项）。"""
+        """渲染进提示词的动作目录（只列可调项）。
+
+        ⚠️ 这是**全量参数目录**（`describe_actions`），v1.9.9 起注入路径**不再用它**——
+        每回合注入的是第一段短清单（`platform_action_shortlist_instruction`），参数表只在
+        她选定某条动作时出现一次（第二段）。留着它是因为控制台预览与
+        `plugin/tests/test_platform_actions.py::DescribeActionsTests` 仍按它钉全量目录的形状
+        （**不是**注入路径，别把它接回提示词——那正是 token 回归）。
+        """
         return describe_actions(available)
+
+    # ------------------------------------------------------------------ #
+    # 两段式教学（v1.9.9，用户点名）：第一段"有哪些按钮"，第二段"这个界面怎么填"
+    # ------------------------------------------------------------------ #
+
+    def platform_action_shortlist(self, available: Optional[list[str]] = None) -> str:
+        """**第一段**：可用动作的短清单（`id` + 一句短标签，无参数）。
+
+        `available` 缺省 = 现算这一回合的可用集（判据仍是 `available_platform_actions()`
+        **一处**：配置开关 ⊗ 权限表 ⊗ 会话身份都在那边判完）。显式传空列表 = 什么都不给。
+        """
+        ids = self.available_platform_actions() if available is None else list(available)
+        return describe_action_shortlist(ids)
+
+    def platform_action_shortlist_instruction(self, available: Optional[list[str]] = None) -> str:
+        """**第一段**的完整提示词标题句 + 短清单（每回合注入用这一段）。"""
+        return platform_action_shortlist_instruction(self.platform_action_shortlist(available))
+
+    @staticmethod
+    def _platform_action_drafts(decision: Any) -> list[Any]:
+        """决策里的 `platformActions` 原样列表（双拼写），拿不到就回空列表。"""
+        if not isinstance(decision, Mapping):
+            return []
+        raw = decision.get(PLATFORM_ACTION_FIELD)
+        if raw is None:
+            raw = decision.get('platform_actions')
+        return list(raw) if isinstance(raw, (list, tuple)) else []
+
+    def _platform_action_current_params(self, decision: Any, action_id: str) -> dict[str, Any]:
+        """草稿里这条动作**已经写了的**参数（补问 payload 带上它，模型只需补缺的）。
+
+        只回 dict；写成字符串/别的东西一律当"没有参数"。
+        """
+        for item in self._platform_action_drafts(decision):
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get('action', item.get('actionId', item.get('id'))) or '').strip()
+            if name != action_id:
+                continue
+            for key in _PARAM_VALUE_KEYS:
+                value = item.get(key)
+                if isinstance(value, Mapping):
+                    return {str(k): v for k, v in value.items()}
+            return {}
+        return {}
+
+    def platform_action_missing_params(self, decision: Any) -> Optional[str]:
+        """决策里"选了动作但参数没给全"的那一条 → 它的 id（没有就回 `None`）。
+
+        **触发第二段的唯一判据就在这里**（与 `available_platform_actions` 一样只有一处）：
+
+        * `platformActions: ["send_qzone_post"]`（只写 id 字符串）→ 需要补参数；
+        * `platformActions: [{"action": "send_qzone_post"}]`（对象里没有 `params` 键）→ 需要补；
+        * `params: {}` **不算**需要补——空对象是模型明确的"没有参数"，再补一次是白烧一次调用；
+        * 一次决策里有多条需要补参数的动作 → 只认**第一条**（一次回合最多补问一次，
+          其余交给普通的 `validate_actions` 拒绝并留痕，不额外烧调用）。
+        """
+        items = self._platform_action_drafts(decision)
+        for item in items:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, Mapping):
+                name = str(item.get('action', item.get('actionId', item.get('id'))) or '').strip()
+                if any(key in item for key in _PARAM_VALUE_KEYS):
+                    continue  # 已经写了 params（哪怕空对象）= 模型表过态，不再补问
+            else:
+                continue
+            action = ACTIONS.get(name)
+            if action is None or name not in self.available_platform_actions():
+                continue
+            return name
+        return None
+
+    async def resolve_platform_action_params(
+        self,
+        decision: Any,
+        *,
+        follow_up_budget: Optional[dict[str, Any]] = None,
+        message: str = '',
+    ) -> Optional[str]:
+        """**第二段**：她选定了某条动作，把这条动作的参数表交给她 → 回填决策里的参数槽。
+
+        两段式的分工（照贴纸两段式的先例，§48 甲）：
+
+        * **第一段文本是最终有效的**：动作 id 在这里已经定了，第二段**只填参数槽**；
+        * **每回合最多一次额外调用**（`follow_up_budget` 是这一回合的计数，调用方每回合
+          给一个新的空 dict，与贴纸的同一个形状）；超了就不问了，交给普通校验拦；
+        * 任何失败（没有这个能力 / 超时 / 抛错 / 回执解析不了 / 参数仍然不全 / 模型想换
+          动作）都**不抛**，按"这一次没补上"继续 —— 但每一步都留一条可见记录
+          （warn / 剧本条目），不会变成"她以为点了、其实没点"的悬案；
+        * 宿主侧的调用口是可选方法 `narrator.select_platform_action_params(...)`——
+          拿不到就记一条 warn 并返回 `None`（能力缺失要**可见且可行动**）。
+        """
+        action_id = self.platform_action_missing_params(decision)
+        if not action_id:
+            return None
+        budget = follow_up_budget if isinstance(follow_up_budget, dict) else {}
+        asked = budget.get('count')
+        asked = int(asked) if isinstance(asked, (int, float)) and not isinstance(asked, bool) else 0
+        if asked >= PLATFORM_ACTION_FOLLOW_UP_MAX_PER_TURN:
+            self.report_standalone(
+                'warn', '动作参数补问已用完本回合额度，不再补问 动作=%s', action_id,
+            )
+            return None
+        action = ACTIONS.get(action_id)
+        select = getattr(self.narrator, 'select_platform_action_params', None)
+        if action is None or not callable(select):
+            self.report_standalone(
+                'warn',
+                '动作参数补问不可用（当前连接不支持这次追问），动作按参数不足处理 动作=%s',
+                action_id,
+            )
+            return None
+        spec = describe_action_params([action_id])
+        if not spec:
+            return None
+        budget['count'] = asked + 1
+        current = self._platform_action_current_params(decision, action_id)
+        try:
+            receipt = await asyncio.wait_for(
+                select(action_id, action.label, action.summary, spec, _plain(message), current),
+                PLATFORM_ACTION_FOLLOW_UP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self.report_standalone('warn', '动作参数补问超时，动作按参数不足处理 动作=%s', action_id)
+            return None
+        except Exception as error:  # noqa: BLE001 - 追问失败只是没补上参数
+            self.report_standalone(
+                'warn', '动作参数补问失败，动作按参数不足处理 动作=%s 错误=%s', action_id, error,
+            )
+            return None
+        parsed = self.parse_platform_action_params(receipt, action_id, current)
+        if parsed is None:
+            self.report_standalone(
+                'warn',
+                '动作参数补问回执不可用（缺少参数、动作被换掉或不可解析），动作按参数不足处理 动作=%s',
+                action_id,
+            )
+            return None
+        return self.apply_platform_action_params(decision, parsed)
+
+    def parse_platform_action_params(
+        self, receipt: Any, action_id: str, fallback_params: Any = None,
+    ) -> Optional[dict[str, Any]]:
+        """第二段回执 → **已校验**的单个动作（`{'action','params'}`）；不可用回 `None`。
+
+        收得比第一段**更严**（第二段是补参数，不是重开决策）：
+
+        * 动作 id 只能**逐字等于**第一段定下的那一条——换了就整条不要（第一段是最终有效的）；
+        * 参数先并入 `fallback_params`（她第一段**已经写出来**的那些，别因为补问就丢掉），
+          再走 `validate_action()`（唯一的校验口）：必填缺失 / 越界 / 枚举不认一律回 `None`；
+        * `available` 也照常传（不因为"她自己选的"就放宽可用集）。
+        """
+        if not isinstance(receipt, Mapping):
+            return None
+        name = ''
+        for key in _PARAM_ACTION_KEYS:
+            value = receipt.get(key)
+            if value:
+                name = str(value).strip()
+                break
+        if name != str(action_id or '').strip():
+            return None
+        merged: dict[str, Any] = dict(fallback_params) if isinstance(fallback_params, Mapping) else {}
+        written = False
+        for key in _PARAM_VALUE_KEYS:
+            if key in receipt:
+                value = receipt.get(key)
+                if isinstance(value, Mapping):
+                    merged.update({str(k): item for k, item in value.items()})
+                    written = True
+                break
+        if not written:
+            return None
+        normalized, _reason = validate_action(name, merged, self.available_platform_actions())
+        return normalized
+
+    def apply_platform_action_params(self, decision: Any, action: dict[str, Any]) -> Optional[str]:
+        """把第二段的结果**写回模型那份草稿**（参数槽），返回动作 id。
+
+        写回是必须的：落库与执行读的都是决策里那一份 `platformActions`
+        （与贴纸把选中的 `assetId` 写回 `localMedia` 同一条理由）。
+        两种拼写指回**同一个**对象（跨 chunk 双读的老规矩，坑 41/46）。
+        按位置对齐：草稿里第 N 条就是补问的那一条。
+        """
+        if not isinstance(decision, Mapping):
+            return None
+        name = str(action.get('action') or '')
+        if not name:
+            return None
+        raw = decision.get(PLATFORM_ACTION_FIELD)
+        if raw is None:
+            raw = decision.get('platform_actions')
+        if not isinstance(raw, list):
+            return None
+        for index, item in enumerate(raw):
+            if isinstance(item, str):
+                if item.strip() == name:
+                    raw[index] = dict(action)
+                    return name
+            elif isinstance(item, Mapping):
+                current = str(item.get('action', item.get('actionId', item.get('id'))) or '').strip()
+                if current == name and not any(key in item for key in _PARAM_VALUE_KEYS):
+                    raw[index] = dict(action)
+                    return name
+        return None
 
     def risky_actions_in_use(self, table: Optional[dict[str, str]] = None) -> list[str]:
         """当前**已启用**的危险动作（控制台与启动自检用它显示警告）。"""
@@ -279,16 +608,43 @@ class ServiceChunk12(ServiceBase):
         available = self.available_platform_actions(session_role, scopes)
         return validate_actions(raw, available, limit=MAX_ACTIONS_PER_TURN)
 
+    def super_admin_user_ids(self) -> tuple[str, ...]:
+        """宿主管理员名单（**同步**取值），`admin` 档的判据来源。
+
+        v1.9.9 修（§86）：`admin` 档的判定发生在**同步**上下文里（`resolve_action_session_role()`
+        是 `def`，`chunk4` 的提示词组装也同步调它），而历史写法直接 `probe(user_id)` 探
+        `transport.is_super_admin` —— 那是个 `async def`，同步调用什么都不 await：
+
+        * 判定**恒假**（协程对象永远为真，但没人把它当结果读）→ 超管判定永远不成立；
+        * 每次调用留一条 `RuntimeWarning: coroutine ... was never awaited`（全量日志 41 处）。
+
+        现在只读**同步**的 `transport.known_super_admin_ids()`（`core/service/transport.py`
+        的协议口）：它是属性 / 同步方法的形状，同步上下文能直接拿到真值。
+        宿主没实现 → 空元组 → `admin` 档一律不放行（安全侧，绝不反过来）。
+
+        兼容口：名单如果给的是**协程 / awaitable**（旧写法：`async def known_super_admin_ids`），
+        `super_admin_ids_from_host()` 会把它**关掉**并返回空元组 —— 判定不放行，但
+        "协程从未被 await" 的警告也不会污染日志（`asyncio.iscoroutine` 判据与
+        `core/service/chunk2._spawn_sticker_task` 同源）。这种情况仍是一条**要修**的
+        接线错误，所以由调用方（`resolve_action_session_role`）记一条 warn。
+        """
+        return super_admin_ids_from_host(getattr(self, 'transport', None))
+
     def resolve_action_session_role(self, session: Any = None) -> str:
         """判定"发言者在这个动作体系里是什么身份"，供 `admin` / `groupadmin` 档位使用。
 
         三级来源（从严到宽）：
         1. 会话/参与者的显式角色字段（适配层从群事件里取的 `sender.role`：owner/admin/member）；
-        2. 传输层的超管查询（`transport.is_super_admin(user_id)`，宿主管理员名单）；
+        2. 传输层的**同步**超管名单（`transport.known_super_admin_ids()`，宿主管理员名单）；
         3. 都没有 → 空串（**不放行**需要身份的档位）。
 
         刻意"取不到就当没有身份"：这个参数是多条 `dangerous` 动作的唯一闸门，
         宁可让用户去配权限，也不能因为读不到字段就把踢人权限当成已授予。
+
+        v1.9.9 修（§86）：第 2 条原来探的是 `transport.is_super_admin`（`async def`）并**同步**
+        调用它 → 判定恒假 + 每次一条 `coroutine ... was never awaited`。现在读同步名单，
+        判定真的能成立；宿主塞了个异步实现时记一条 warn（可见 + 可行动）并按"没身份"继续，
+        绝不把异常冒泡出去。
         """
         for key in ('role', 'groupRole', 'group_role', 'senderRole', 'sender_role'):
             value = pick(session, key) if session is not None else None
@@ -298,22 +654,58 @@ class ServiceChunk12(ServiceBase):
         user_id = str(
             pick(session, 'userId', 'user_id') or pick(session, 'senderId', 'sender_id') or '',
         )
-        probe = getattr(getattr(self, 'transport', None), 'is_super_admin', None)
-        if user_id and callable(probe):
+        if not user_id:
+            return ''
+        transport = getattr(self, 'transport', None)
+        probe = getattr(transport, 'known_super_admin_ids', None)
+        if probe is not None and not callable(probe):
+            # **属性形状**也认（`known_super_admin_ids = ('123',)`）；但一个**标量**属性
+            # （字符串/数字）不是名单，是接线错误——可见地拒绝，别静默恒假。
+            ids = super_admin_ids_from_host(transport)
+            if ids:
+                return 'admin' if user_id in ids else ''
+            if not isinstance(probe, (list, tuple, set, frozenset)):
+                self.report_standalone(
+                    'warn',
+                    '超级管理员名单接口不是可调用的、也不是名单'
+                    '（known_super_admin_ids=%s），同步权限判定读不到；'
+                    '请把它实现成同步方法或返回 id 元组的属性' % type(probe).__name__,
+                )
+            return ''
+        if callable(probe):
             try:
-                if probe(user_id):
-                    return 'admin'
-            except Exception:  # noqa: BLE001 - 身份探测失败只当没有身份
+                ids = super_admin_ids_from_host(transport)
+            except Exception as error:  # noqa: BLE001 - 身份探测失败只当没有身份
+                self.report_standalone('warn', '超级管理员名单读取失败，按"无身份"继续 错误=%s', error)
                 return ''
+            if ids:
+                return 'admin' if user_id in ids else ''
+            return ''
+        # 兼容口：宿主只给了历史那个异步方法（`is_super_admin`）。同步上下文里**不能** await，
+        # 所以判定只能是"没有身份"——但这件事必须**可见**（warn 带下一步），
+        # 绝不允许静默恒假（历史 bug 就是这么潜伏下来的）。
+        legacy = getattr(transport, 'is_super_admin', None)
+        if callable(legacy):
+            close_awaitable(legacy(user_id))
+            self.report_standalone(
+                'warn',
+                '超级管理员名单只有异步接口（is_super_admin），同步权限判定读不到；'
+                '请实现同步的 known_super_admin_ids()，否则「仅管理员」档动作一律不可用',
+            )
         return ''
 
     def action_target_from_participant(self, session: Any = None, channel_id: str = '') -> dict[str, Any]:
-        """参与者的坐标 → 动作参数里"留空=本回合对话对象"的补全值。"""
+        """参与者的坐标 → 动作参数里"留空=本回合对话对象"的补全值。
+
+        群 id 走 `session_group_id()`（**唯一**判据）：生产上的 `SessionView` 把群 id
+        存在 `guild_id`/`channel_id`，只读 `groupId` 会把群回合当成私聊
+        （后果见 `session_group_id()` 的文档串）。
+        """
         if session is None:
             return {}
         target: dict[str, Any] = {
             'user_id': str(pick(session, 'userId', 'user_id') or ''),
-            'group_id': str(pick(session, 'groupId', 'group_id') or ''),
+            'group_id': session_group_id(session),
             'channel_id': str(channel_id or pick(session, 'channelId', 'channel_id') or ''),
             'platform': str(pick(session, 'platform') or ''),
             'self_id': str(pick(session, 'selfId', 'self_id') or ''),

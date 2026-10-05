@@ -467,7 +467,7 @@ class HDSInterludePlugin(Star):
         #: 视频抽帧识别的 FFmpeg 状态（v1.9.0）：写进**内存里的** schema，
         #: 只贴「视频识别模式」（`model_center.video.mode`）这一项的 hint——
         #: 用户真机验收："只需要「视频识别模式」那里显示就可以了"
-        #: （v1.9.8 曾同时贴总开关 + 控制台分组徽章，都是重复，已撤）。
+        #: （v1.9.9 曾同时贴总开关 + 控制台分组徽章，都是重复，已撤）。
         #: 文本标记：宿主的 hint 是纯文本渲染，着不了色，依据见那个模块的注释。
         #: 宿主每打开一次配置页都现取 `config.schema` 这个活对象
         #: （`astrbot/dashboard/services/config_service.py:853-872` 的

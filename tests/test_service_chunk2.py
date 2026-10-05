@@ -146,6 +146,18 @@ def _host(**overrides: Any) -> Any:
     return service
 
 
+def _report_texts(host: Any) -> list[str]:
+    """`host.reports` 里所有**长字符串**（`_host` 的替身只记原始实参，不做格式化）。
+
+    日志正文一定比格式实参长，所以按长度挑出正文段；断言里查"下一步 / 哪一层缺"时
+    不必关心调用点用的是 `report`（3 个前导实参）还是 `report_standalone`（1 个）。
+    """
+    return [
+        part for entry in host.reports for part in entry
+        if isinstance(part, str) and len(part) > 12
+    ]
+
+
 def _cache_entry(
     entry_id: int,
     content: str,
@@ -1082,6 +1094,85 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(sent)
         self.assertEqual(recorded, [('s', reference, 'cancelled', 'invalid-sticker-path')])
+
+    async def test_sticker_face_outside_the_library_is_a_visible_warn_with_a_next_step(self):
+        """rc33「宿主代理」那条的落地形态①：素材不在库内 → **可见** warn + 可行动下一步。
+
+        旧实现只记一条 `cancelled` 账本（用户侧完全无感）。上游走宿主动作代理时
+        代理会回失败帧；我们的等价物是当场说清"哪条素材、解析到哪儿、去做什么"。
+        """
+        host = _host(config={'stickers': {'enabled': True, 'directory': 'data/stickers'}})
+        host.ctx = InterludeContext(base_dir='/base')
+        host.record_platform_delivery_outcome = _noop_async
+        sent = await host.send_sticker(
+            {'id': 's'}, {'platform': 'onebot'}, 'chan',
+            {'assetId': 'a', 'filePath': '../evil.png'}, None, None,
+        )
+        self.assertFalse(sent)
+        warned = [text for text in _report_texts(host) if '表情包素材不在表情库目录里' in text]
+        self.assertTrue(warned, '素材缺失必须留一条可见 warn：%s' % (host.reports,))
+        self.assertIn('下一步', warned[0])
+        self.assertEqual([part for entry in host.reports for part in entry if part == 'a'], ['a'])
+
+    async def test_a_host_without_the_sticker_channel_degrades_visibly(self):
+        """rc33「宿主代理」的落地形态②：宿主没有 `send_sticker` → 失败且**说清缺哪一层**。"""
+        recorded: list[tuple[Any, ...]] = []
+
+        async def record(story_id: Any, reference: Any, status: str, reason: Any = None) -> None:
+            recorded.append((story_id, reference, status, reason))
+
+        host = _host(config={'stickers': {'enabled': True, 'directory': 'data/stickers'}},
+                     transport=_BareTransport())
+        host.ctx = InterludeContext(base_dir='/base')
+        host.record_platform_delivery_outcome = record
+        reference = {'commit_id': 'c', 'event_id': 'e', 'script_entry_id': 1, 'segment_index': 0}
+        sent = await host.send_sticker(
+            {'id': 's'}, {'platform': 'onebot'}, 'chan',
+            {'assetId': 'a', 'filePath': 'ok.png'}, None, reference,
+        )
+        self.assertFalse(sent)
+        self.assertEqual(recorded[0][2], 'failed')
+        warned = _report_texts(host)
+        self.assertTrue(any('transport-unavailable' in text for text in warned), warned)
+        self.assertTrue(any('下一步' in text for text in warned), warned)
+
+    async def test_a_host_without_the_native_face_channel_degrades_visibly(self):
+        """同上，原生表情那一侧。"""
+        recorded: list[tuple[Any, ...]] = []
+
+        async def record(story_id: Any, reference: Any, status: str, reason: Any = None) -> None:
+            recorded.append((story_id, reference, status, reason))
+
+        host = _host(transport=_BareTransport())
+        host.record_platform_delivery_outcome = record
+        reference = {'commit_id': 'c', 'event_id': 'e', 'script_entry_id': 1, 'segment_index': 0}
+        sent = await host.send_native_face(
+            {'id': 's'}, {'platform': 'onebot'}, 'chan', 'smile', None, reference,
+        )
+        self.assertFalse(sent)
+        self.assertEqual(recorded[0][2], 'failed')
+        warned = _report_texts(host)
+        self.assertTrue(any('transport-unavailable' in text for text in warned), warned)
+        self.assertTrue(any('原生表情' in text and '下一步' in text for text in warned), warned)
+
+    def test_a_declared_native_face_on_a_channel_without_faces_is_visibly_degraded(self):
+        """**反向**：模型点了原生表情、端点没有这条能力 → 可见 warn + `None`。
+
+        没点表情（没有 `nativeFace` 草稿）时**不刷** warn——没丢东西就没有说明。
+        """
+        host = _host(config={'chatActions': {'expressionThreshold': 0.7}})
+        self.assertIsNone(host.resolve_native_face(
+            {'group_reply': {'content': '好耶'}, 'native_face': {'semantic': 'smile', 'willingness': 1.0}},
+            None,
+        ))
+        warned = _report_texts(host)
+        self.assertTrue(any('原生表情' in text and 'smile' in text for text in warned),
+                        '能力缺失必须可见：%s' % warned)
+        self.assertTrue(any('下一步' in text for text in warned), warned)
+
+        quiet = _host(config={'chatActions': {'expressionThreshold': 0.7}})
+        self.assertIsNone(quiet.resolve_native_face({'group_reply': {'content': '好耶'}}, None))
+        self.assertEqual(quiet.reports, [], '没点表情就不算丢东西，不许刷 warn')
 
     async def test_send_native_face_records_a_delivered_platform_action(self):
         """`sendNativeFace()`（本范围成员，`:2107`）。"""

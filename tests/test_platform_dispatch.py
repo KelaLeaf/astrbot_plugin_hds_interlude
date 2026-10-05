@@ -25,6 +25,7 @@ from plugin.core.scheduled_command import (  # noqa: E402
     parse_iso_datetime,
 )
 from plugin.core.service.chunk12 import ServiceChunk12  # noqa: E402
+from plugin.core.service.session import SessionView  # noqa: E402
 
 ANCHOR = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
 
@@ -993,6 +994,77 @@ class CronTests(unittest.TestCase):
         self.assertIsNotNone(parse_iso_datetime(1_759_200_000_000))
         self.assertIsNone(parse_iso_datetime('下周三'))
         self.assertIsNone(parse_iso_datetime(''))
+
+
+class ActionTargetSessionShapeTests(unittest.TestCase):
+    """坐标推导：会话形状 → `group_id` / `is_group`（v1.9.9 修的"群回合认不出群"）。
+
+    生产上群回合拿到的是 `SessionView`（适配层把群 id 同时放进 `channel_id` 与
+    `guild_id`，**没有** `groupId` 键）。只读 `pick(session, 'groupId', 'group_id')`
+    会把群回合当私聊：`dispatch_platform_actions` 的作用域被收成 `('private',)`，
+    提示词那侧刚教给模型的仅群聊动作（群公告 / 踢人 / 禁言…29 条）全被
+    "动作未启用或当前会话不允许"拒掉；同一条坐标还会让「正在输入」漏到群聊。
+    """
+
+    def _host(self):
+        return _Host(config={})
+
+    def test_a_group_session_view_is_recognised_as_a_group(self):
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='2',
+            channel_id='9', guild_id='9', is_direct=False,
+        )
+        target = self._host().action_target_from_participant(session, '9')
+        self.assertEqual(target['group_id'], '9')
+        self.assertIs(target['is_group'], True)
+        self.assertEqual(target['channel_id'], '9')
+
+    def test_a_private_session_view_never_looks_like_a_group(self):
+        """私聊的 `channel_id` 存的是**对方 user_id**——绝不能被当成群号。"""
+        session = SessionView(
+            platform='onebot', self_id='1', user_id='2',
+            channel_id='2', guild_id='', is_direct=True,
+        )
+        target = self._host().action_target_from_participant(session, '2')
+        self.assertNotIn('group_id', target)
+        self.assertIs(target.get('is_group', False), False)
+
+    def test_the_onebot_group_id_zero_private_shape_stays_private(self):
+        """OneBot 私聊把 `group_id` 填成 `0` / `'0'`（用户贴过日志）——那是私聊。"""
+        for raw in (0, '0', '', None):
+            with self.subTest(group_id=raw):
+                target = self._host().action_target_from_participant(
+                    {'userId': '2', 'groupId': raw, 'channelId': '2'}, '2',
+                )
+                self.assertNotIn('group_id', target)
+                self.assertIs(target.get('is_group', False), False)
+
+    def test_explicit_group_ids_in_dicts_keep_working(self):
+        session = {'userId': '2', 'groupId': '7788', 'channelId': '7788'}
+        target = self._host().action_target_from_participant(session, '7788')
+        self.assertEqual(target['group_id'], '7788')
+        self.assertIs(target['is_group'], True)
+
+    def test_the_judgement_lives_in_exactly_one_place(self):
+        """群 id 判据只有 `session_group_id()` 一处（`action_target_from_participant` 调它）。"""
+        import inspect
+
+        from plugin.core.service import chunk12 as module
+
+        source = inspect.getsource(module.ServiceChunk12.action_target_from_participant)
+        self.assertIn('session_group_id(session)', source)
+        self.assertNotIn("pick(session, 'groupId'", source, '别在调用点再写一份判据')
+
+    def test_a_broken_session_never_breaks_the_coordinates(self):
+        class _Exploding:
+            is_direct = False
+
+            def session_group_id(self):
+                raise RuntimeError('bad session')
+
+        target = self._host().action_target_from_participant(_Exploding(), 'x')
+        self.assertEqual(target.get('group_id', ''), '')
+        self.assertIs(target.get('is_group', False), False)
 
 
 if __name__ == '__main__':

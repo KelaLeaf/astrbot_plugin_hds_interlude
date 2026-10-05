@@ -1262,7 +1262,8 @@ class MoodParsingTests(unittest.TestCase):
         mood = parse_mood(MOOD_RAW)
         self.assertEqual(tuple(mood), (
             "tid", "content", "created_time", "createTime", "cmtnum", "fwdnum",
-            "name", "uin", "lbs", "pic", "video", "rt_tid", "rt_uin", "rt_content",
+            "likecount", "name", "uin", "lbs", "pic", "video", "rt_tid", "rt_uin",
+            "rt_content",
         ))
         self.assertEqual(mood["tid"], "TID1")
         self.assertEqual(mood["content"], "今天很好")
@@ -1270,10 +1271,27 @@ class MoodParsingTests(unittest.TestCase):
         self.assertEqual(mood["createTime"], "2023-11-15 06:13:20")
         self.assertEqual(mood["cmtnum"], 3)
         self.assertEqual(mood["fwdnum"], 1)
+        self.assertIsNone(mood["likecount"], '这份回执没说点赞数 → None（不是 0）')
         self.assertEqual(mood["name"], "小明")
         self.assertEqual(mood["uin"], 123456789)
         self.assertEqual(mood["lbs"], {"name": "北京市", "pos_x": "1.0"})
         self.assertEqual(mood["video"], [], "没有 video 字段时是空列表（不是缺失）")
+
+    def test_parse_mood_keeps_the_like_count_when_the_receipt_has_one(self):
+        """rc33「被点赞感知」：回执里**本来就有**的赞数要留下来（多种拼写都认）。
+
+        参考实现只取 `cmtnum` / `fwdnum`，腾讯在说说列表里的赞数字段名没有保证，
+        所以三种常见拼写都收；一个都没有才留 `None`（"这条回执没说"）。
+        `None` 与 `0` 在下游增量比对里语义相反，绝不能混。
+        """
+        for key in ("likecount", "like_num", "likenum"):
+            with self.subTest(key=key):
+                mood = parse_mood({"tid": "t", key: "7"})
+                self.assertEqual(mood["likecount"], 7, key)
+        self.assertIsNone(parse_mood({"tid": "t", "likecount": None})["likecount"])
+        self.assertIsNone(parse_mood({"tid": "t", "likecount": "坏值"})["likecount"])
+        self.assertEqual(parse_mood({"tid": "t", "likecount": 0})["likecount"], 0,
+                         '确实没人赞 = 0，与"回执没说"（None）不是一回事')
 
     def test_parse_mood_video_maps_the_reference_fields(self):
         """`video` 六个字段逐字照抄参考实现 `html_parser.py::parse_feed_data`。

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import tempfile
 import unittest
 import zlib
@@ -3300,22 +3301,23 @@ class FlushGroupTurnTests(ServiceHarness):
 
 
 # =========================================================================== #
-# 群聊视频理解（v1.9.1）：群回合没有视觉通道，音轨那条通道是通的
+# 群聊视频理解（v1.9.9）：群里有人发视频 → **画面帧真的进模型**
 # =========================================================================== #
 
 class GroupVideoUnderstandingTests(ServiceHarness):
-    """群开关打开时的**真实**后果（用户裁决 ②：不许"开着却什么都不发生"）。
+    """群里发来视频时到底发生什么（用户第一原则：某人发视频，画面就该能看到）。
 
-    事实（源码依据，别当猜测）：
+    判据**只有一处**（`core/video_understanding.py`）：总开关 / 群聊开关 / 抽帧模式 /
+    帧数 / 间隔 / 超时 / 音轨格式 / 一回合读几段，全部来自那一条链。本文件钉的是**接线**：
 
-    * 群回合**有**音频通道——`chunk1.flush_group_turn` 把 `_load_group_batch_audio`
-      的产物按位置传给 `try_decide(..., audio=...)`（本文件 `FlushGroupTurnTests` 的
-      `test_the_group_audio_batch_reaches_the_model_with_the_budget` 钉着）；
-    * 群回合**没有**视觉通道——同一个调用点的图片位是字面量 `[]`，群消息也不带
-      `imageSources`（§46 的既有设计）。
+    * 帧走 1.0.1-rc31 接上的**群聊图片通道**（`load_native_images`），与当前群图共用
+      「每回合图片数上限」（`core/vision_budget.py`，与私聊同一个 `_image_budget()`）；
+    * 音轨走群音频批次（`group_audio`）——既有通道，v1.9.1 起就这么接；
+    * 合并顺序：**当前群图 → 本回合视频帧 → 历史群图**；
+    * 没人识别（开关关 / 没有原生视觉通道）与**超预算**都必须看得见，群里不许静默。
 
-    所以开关打开后：音轨进模型（真的进），画面帧丢弃并**节流明说一次**。反向：门关着
-    时一个 ffmpeg 都不许发。
+    反向（变异）：把"帧并进图片来源表"那一跳去掉 → ① 必红；把预算那一刀去掉 →
+    ③ 必红（可数线索与那条点名闸门的 warn 都会消失）。
     """
 
     def _video_session(self, url: str = 'https://cdn.example.com/v.mp4') -> SessionView:
@@ -3323,12 +3325,25 @@ class GroupVideoUnderstandingTests(ServiceHarness):
             {'type': 'video', 'attrs': {'url': url}, 'children': []},
         ])
 
-    def _prepare(self, service: Any, session: SessionView, content: str = '看这个') -> None:
+    def _png_file(self, name: str = 'a.png') -> str:
+        """一个**真的存在**的本地图片来源（`onebot-file:` = 适配器直给的那条路）。"""
+        from plugin.tests.test_video_understanding import _png_bytes  # noqa: PLC0415
+
+        directory = tempfile.mkdtemp(prefix='hdsi-group-video-case-')
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, name)
+        with open(path, 'wb') as handle:
+            handle.write(_png_bytes())
+        return 'onebot-file:%s' % path
+
+    def _prepare(
+        self, service: Any, session: Any, messages: Optional[list[Any]] = None,
+    ) -> None:
         service.buffered_group_turns['key'] = {
             'story_id': PRIVATE_STORY_ID, 'group_id': '9',
             'rule': group_rule_stub(debounceSeconds=0),
             'channel_id': '9', 'latest_session': session,
-            'messages': [{'content': content}],
+            'messages': list(messages if messages is not None else [{'content': '看这个'}]),
             'revision': 3, 'mentioned_bot': True, 'quoted_bot': False,
         }
 
@@ -3354,6 +3369,18 @@ class GroupVideoUnderstandingTests(ServiceHarness):
         service.schedule_compaction = _noop
         service.schedule_conversation_follow_ups_after_turn = _noop
 
+    def _spy_images(self, service: Any) -> dict[str, Any]:
+        """记下 `load_native_images` **实际收到**的来源表（帧进没进这条通道就看它）。"""
+        recorded: dict[str, Any] = {}
+        original = service.load_native_images
+
+        async def spy(story: Any, sources: Any, session: Any = None, media: Any = None) -> Any:
+            recorded['sources'] = list(sources)
+            return await original(story, sources, session, media)
+
+        service.load_native_images = spy
+        return recorded
+
     def _patch_ffmpeg(self) -> Any:
         """真的去调 `_run_ffmpeg` 的替身（见 `test_video_understanding.FakeFfmpeg`）。"""
         from unittest import mock  # noqa: PLC0415 - 只在需要时引入
@@ -3365,90 +3392,67 @@ class GroupVideoUnderstandingTests(ServiceHarness):
             mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg)
 
     @needs('flush_group_turn', 'group_cooldown_active')
-    async def test_the_group_switch_on_feeds_the_audio_track_and_says_the_frames_are_lost(self) -> None:
-        """群开关开 + 群里有视频 → **音轨真的进去**，画面帧**明说一次**（节流）。
+    async def test_the_frames_of_a_group_video_reach_the_model(self) -> None:
+        """① 群里有视频 + 三件套都开着 → **帧真的进模型**（具体帧数 / 具体来源）。
 
-        变异保护：把那条 warn 去掉、或把音轨那一跳拿掉，本用例都会红。
+        变异保护：把"帧并进图片来源表"那一跳去掉 → 本用例红。
         """
         from plugin.core import video_understanding as video  # noqa: PLC0415
 
         service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'native'},
             'audio': {'enabled': True, 'maxPerMessage': 1},
             'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
         }))
         self.make_story()
         seen: dict[str, Any] = {}
         self._stub_turn(service, seen)
+        recorded = self._spy_images(service)
         ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
         with ffmpeg_path, ffmpeg_run:
             self._prepare(service, self._video_session())
             await service.flush_group_turn('key', 3)
 
-        # ① 真的抽了（帧与音轨各一条 ffmpeg 命令）。
+        # ① 真的抽了（抽帧 + 音轨各一条命令）。
         self.assertEqual(len(ffmpeg.argvs('frames')), 1)
         self.assertEqual(len(ffmpeg.argvs('audio')), 1)
 
-        # ② 音轨走**既有**语音通道（`load_native_audio` 真的把 data URI 转成了附件）。
+        # ② 交给图片通道的是**那几帧本身**（不是"调用了一次"）。
+        frame_sources = recorded['sources']
+        self.assertEqual(len(frame_sources), video.VIDEO_MAX_FRAMES)
+        for source in frame_sources:
+            self.assertTrue(source.startswith('onebot-file:'), source)
+            self.assertTrue(source.endswith('.jpg'), source)
+
+        # ③ 模型真的拿到那几帧（原生视觉附件，一个字节都不少）。
+        images = seen['args'][9]
+        self.assertEqual(len(images), video.VIDEO_MAX_FRAMES, '帧必须真的进模型')
+        for image in images:
+            self.assertEqual(image['mime_type'], 'image/png')
+            self.assertTrue(image['data_uri'].startswith('data:image/png;base64,'))
+            self.assertTrue(image['data_uri'].endswith('==') or len(image['data_uri']) > 40)
+
+        # ④ 音轨走既有语音通道（同一批群音频的编号）。
         audio = seen['args'][10]
-        self.assertEqual(len(audio), 1, '群开关打开时至少要让声音进去')
+        self.assertEqual(len(audio), 1)
         self.assertEqual(audio[0]['format'], video.VIDEO_DEFAULT_AUDIO_FORMAT)
         self.assertTrue(audio[0]['base64'], '音轨是字节，不是空壳')
-        self.assertEqual(audio[0]['id'], 'group-audio-1', '与群语音批次同一套附件编号')
+        self.assertEqual(audio[0]['id'], 'group-audio-1')
 
-        # ③ 画面帧没有去处：图片位仍然是空的（群聊没有视觉通道）。
-        self.assertEqual(seen['args'][9], [])
-
-        # ④ 正文事实写实：说清"帧没进去"，不谎称"抽了 N 帧画面"。
+        # ⑤ 正文事实写实：帧交出去了，不许再写"帧没进去 / 只有视频未识别"。
         user_message = seen['args'][5]
-        self.assertIn(video.VIDEO_FACT_PREFIX, user_message)
-        self.assertIn(video.GROUP_NO_VISION_REASON, user_message)
-        self.assertNotIn('帧画面', user_message)
-
-        # ⑤ 那条**可行动**的 warn 真的打了（节流口 = `note_access_skip`）。
-        self.assertIn('群回合没有视觉通道', self.sink.text())
-        self.assertIn('请在私聊里发', self.sink.text())
+        self.assertIn('帧画面', user_message)
+        self.assertNotIn(video.GROUP_FRAMES_NO_CHANNEL_REASON, user_message)
+        self.assertNotIn(video.GROUP_DISABLED_REASON, user_message)
+        self.assertEqual(self.sink.text().count('视频理解'), 0, '一切正常时没有降级 warn')
 
     @needs('flush_group_turn', 'group_cooldown_active')
-    async def test_three_video_tracks_are_sliced_with_a_countable_clue(self) -> None:
-        """v1.9.5：多段视频的音轨被「每个事件音频数上限」切开时**必须说清几段**。
+    async def test_the_group_switch_off_says_only_video_unrecognized(self) -> None:
+        """②（群开关）群开关关着 → 不调用 + 一条可行动 warn + 事实行"只有视频未识别"。"""
+        from plugin.core import video_understanding as video  # noqa: PLC0415
 
-        三段时间轨走同一条语音通道，`maxPerMessage = 1` 只放行第一段；以前第二段起被
-        **静默**丢掉。现在正文里留 `[音轨×3，本回合仅取前 1 段]`、日志留一条节流 warn。
-        反向：把线索那一句删掉（或把总开关那档也硬报截断）→ 本用例红。
-        """
-        service = self.make_service(make_config(
-            model={
-                'audio': {'enabled': True, 'maxPerMessage': 1},
-                'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
-            },
-            forward_message={'max_videos': 3},
-        ))
-        self.make_story()
-        seen: dict[str, Any] = {}
-        self._stub_turn(service, seen)
-        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
-        session = group_session(elements=[
-            {'type': 'video', 'attrs': {'url': 'https://cdn.example.com/%d.mp4' % index},
-             'children': []}
-            for index in range(1, 4)
-        ])
-        with ffmpeg_path, ffmpeg_run:
-            self._prepare(service, session)
-            await service.flush_group_turn('key', 3)
-
-        self.assertEqual(len(ffmpeg.argvs('audio')), 3, '三段视频各抽一次音轨')
-        audio = seen['args'][10]
-        self.assertEqual(len(audio), 1, '上限 1：只把第一段交给模型')
-        user_message = seen['args'][5]
-        self.assertIn('[音轨×3，本回合仅取前 1 段]', user_message,
-                      '可数线索必须给模型：一共几段、给了几段')
-        self.assertIn('本回合收到 3 段音轨', self.sink.text())
-        self.assertIn('每个事件音频数上限', self.sink.text())
-
-    @needs('flush_group_turn', 'group_cooldown_active')
-    async def test_the_group_switch_off_means_zero_ffmpeg_calls(self) -> None:
-        """**反向**：群开关关着（默认）→ 一个 ffmpeg 都不发、一条说明都没有。"""
         service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'native'},
             'audio': {'enabled': True, 'maxPerMessage': 1},
             'video': {'enabled': True, 'mode': 'frames', 'group_enabled': False},
         }))
@@ -3460,24 +3464,26 @@ class GroupVideoUnderstandingTests(ServiceHarness):
             self._prepare(service, self._video_session())
             await service.flush_group_turn('key', 3)
 
-        self.assertEqual(ffmpeg.calls, [], '群开关关着时连 ffmpeg 都不调')
-        self.assertEqual(seen['args'][10], [])
+        self.assertEqual(ffmpeg.calls, [], '开关关着时连 ffmpeg 都不调')
         self.assertEqual(seen['args'][9], [])
-        self.assertNotIn('[视频', seen['args'][5])
-        self.assertNotIn('群回合没有视觉通道', self.sink.text())
+        self.assertEqual(seen['args'][10], [])
+        user_message = seen['args'][5]
+        self.assertIn(video.GROUP_DISABLED_REASON, user_message, '事实行必须如实')
+        self.assertIn('只有视频未识别', user_message)
+        self.assertNotIn('帧画面', user_message, '没抽帧就不许说抽了帧')
+        # 可行动：点名去哪开。
+        self.assertIn('打开「群聊视频理解」', self.sink.text())
+        self.assertIn('模型中心 → 视频理解', self.sink.text())
 
     @needs('flush_group_turn', 'group_cooldown_active')
-    async def test_the_audio_channel_being_off_still_says_the_frames_are_lost(self) -> None:
-        """音轨通道关着（`audio.enabled=false`）：画面对声音都没有去处，**但绝不静默**。
-
-        这是"开着开关却什么都不发生"最容易被放过的一格：帧被丢、音轨根本没抽，
-        所以必须留下那条说明（它同时点出"音轨要靠语音总开关"这条出路）。
-        """
+    async def test_the_master_switch_off_also_says_only_video_unrecognized(self) -> None:
+        """②（总开关）视频理解总开关关着 → 同一个"只有视频未识别"，出路是总开关。"""
         from plugin.core import video_understanding as video  # noqa: PLC0415
 
         service = self.make_service(make_config(model={
-            'audio': {'enabled': False},
-            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+            'vision': {'enabled': True, 'mode': 'native'},
+            'audio': {'enabled': True, 'maxPerMessage': 1},
+            'video': {'enabled': False, 'mode': 'frames', 'group_enabled': True},
         }))
         self.make_story()
         seen: dict[str, Any] = {}
@@ -3487,11 +3493,682 @@ class GroupVideoUnderstandingTests(ServiceHarness):
             self._prepare(service, self._video_session())
             await service.flush_group_turn('key', 3)
 
+        self.assertEqual(ffmpeg.calls, [], '总开关关着时也不许调 ffmpeg')
+        self.assertIn(video.VIDEO_DISABLED_REASON, seen['args'][5])
+        self.assertIn('打开总开关', self.sink.text())
+
+    async def _frames_without_a_channel_case(self, vision: dict[str, Any]) -> None:
+        """一个"帧**一条**视觉通道都没有"的回合（图片理解整个关着）。"""
+        from plugin.core import video_understanding as video  # noqa: PLC0415
+
+        service = self.make_service(make_config(model={
+            'vision': dict(vision),
+            'audio': {'enabled': True, 'maxPerMessage': 1},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        recorded = self._spy_images(service)
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, self._video_session())
+            await service.flush_group_turn('key', 3)
+
         self.assertEqual(len(ffmpeg.argvs('frames')), 1, '帧照抽（抽了才知道有没有内容）')
-        self.assertEqual(ffmpeg.argvs('audio'), [], '语音总开关关着时连音轨都不抽（省一次 ffmpeg）')
-        self.assertEqual(seen['args'][10], [])
-        self.assertIn(video.GROUP_NO_VISION_REASON, seen['args'][5])
-        self.assertIn('那条总开关关着时声音也不会进去', self.sink.text())
+        self.assertEqual(seen['args'][9], [], '没有视觉通道 → 帧进不去')
+        self.assertEqual(recorded.get('sources', []), [], '一个帧来源都不许交给图片通道')
+        user_message = seen['args'][5]
+        self.assertIn(video.GROUP_FRAMES_NO_CHANNEL_REASON, user_message)
+        self.assertIn('抽到的 3 帧已丢弃', user_message, '可数：丢了几帧')
+        self.assertNotIn('已按每 4 秒 1 帧抽了 3 帧画面', user_message,
+                         '不许留着那句"抽了 N 帧画面"的假话（帧并没有交出去）')
+        self.assertEqual(user_message.count('[视频'), 1, '同一段视频只留一句事实')
+        self.assertIn('没有可用的原生视觉通道', self.sink.text())
+        self.assertIn('模型中心 → 图片理解', self.sink.text())
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_frames_without_a_vision_switch_are_reported(self) -> None:
+        """③（能力缺失）图片理解关着 → 帧抽出来也没有去处：可见 warn + 可数事实。"""
+        await self._frames_without_a_channel_case({'enabled': False, 'mode': 'native'})
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_an_unrecognised_vision_mode_is_still_reported(self) -> None:
+        """③（能力缺失）识图方式是个认不出来的值 → 两条通道都不成立，照旧说清楚。
+
+        反向：`native` / `sidecar` **都**是通道（侧端那条见
+        `GroupSidecarVisionTests`），只有认不出来的模式才落回这一档。
+        """
+        await self._frames_without_a_channel_case({'enabled': True, 'mode': 'garbage'})
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_an_over_budget_group_turn_gets_a_countable_clue(self) -> None:
+        """④（超预算）当前群图 + 视频帧超过「每回合图片数上限」→ 可数线索 + 点名那道闸。
+
+        变异保护：把预算那一刀去掉（不截断、也不写线索）→ 本用例红。
+        """
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'native', 'maxPerTurn': 3},
+            'audio': {'enabled': True, 'maxPerMessage': 1},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        recorded = self._spy_images(service)
+        session = self._video_session()
+        image = self._png_file('发来的图.png')
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, session, messages=[
+                {'content': '看这个', 'imageSources': [image], 'imageSession': session},
+            ])
+            await service.flush_group_turn('key', 3)
+
+        # 候选 = 当前群图 1 张 + 本回合视频帧 3 帧 = 4；预算 3 → 只给前 3（图在前、帧在后）。
+        self.assertEqual(len(recorded['sources']), 3, '交给图片通道的就是预算内的那 3 个坐标')
+        self.assertEqual(recorded['sources'][0], image, '当前群图排在最前')
+        self.assertTrue(
+            all(source.endswith('.jpg') for source in recorded['sources'][1:]),
+            recorded['sources'],
+        )
+        self.assertEqual(len(seen['args'][9]), 3, '预算 3：多出来的一张进不去')
+        user_message = seen['args'][5]
+        self.assertIn('[图片×4，本回合仅取前 3 张]', user_message, '可数线索必须给模型')
+        self.assertIn('本回合收到 4 张图片', self.sink.text())
+        self.assertIn('每回合图片数上限', self.sink.text(), '点名是哪道闸')
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_group_images_frames_and_history_keep_the_documented_order(self) -> None:
+        """⑤ 同一回合既有图又有视频：两者都进，顺序 = 当前图 → 视频帧 → 历史图。
+
+        历史图是**旧证据**，走它自己的 `historicalImageLimit`、不占每回合图片预算，
+        所以它落在 `try_decide` 最后一个位置（`historicalGroupImages`）而不是挤进
+        `images`。这里把两个位置与"交给选择器去重的来源表"一并钉住。
+        """
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'native', 'maxPerTurn': 8},
+            'audio': {'enabled': True, 'maxPerMessage': 1},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        recorded = self._spy_images(service)
+        history_image = {
+            'id': 'group-history-image-1', 'mime_type': 'image/png',
+            'data_uri': 'data:image/png;base64,QUJD',
+        }
+        history_calls: dict[str, Any] = {}
+
+        async def fake_history(
+            story: Any, refs: Any, limit: Any, session: Any = None, current_sources: Any = None,
+        ) -> list[Any]:
+            history_calls['current_sources'] = list(current_sources or [])
+            return [dict(history_image)]
+
+        service.load_historical_group_images = fake_history
+        session = self._video_session()
+        image = self._png_file('群里的图.png')
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, session, messages=[
+                {'content': '看这个', 'imageSources': [image], 'imageSession': session},
+            ])
+            await service.flush_group_turn('key', 3)
+
+        sources = recorded['sources']
+        self.assertEqual(sources[0], image, '当前群图排在最前')
+        self.assertEqual(len(sources), 4, '当前图 1 + 视频帧 3（预算 8，一个都不截）')
+        for source in sources[1:]:
+            self.assertTrue(source.startswith('onebot-file:'), source)
+            self.assertTrue(source.endswith('.jpg'), source)
+        self.assertEqual(seen['args'][9][0]['mime_type'], 'image/png')
+        self.assertEqual(len(seen['args'][9]), 4, '图与帧都进了同一份原生视觉输入')
+        self.assertEqual(seen['args'][19], [history_image], '历史图排最后（独立通道）')
+        self.assertEqual(history_calls['current_sources'], sources, '历史图与当前来源去重')
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_a_group_without_any_video_is_untouched(self) -> None:
+        """**反向**：群里没有视频 → 图片通道照旧、没有视频事实、没有视频 warn。"""
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'native'},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        session = group_session(elements=[])
+        image = self._png_file('只有图.png')
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, session, messages=[
+                {'content': '看这个', 'imageSources': [image], 'imageSession': session},
+            ])
+            await service.flush_group_turn('key', 3)
+
+        self.assertEqual(ffmpeg.calls, [], '没有视频就一个 ffmpeg 都不调')
+        self.assertEqual(len(seen['args'][9]), 1, '群图照旧进模型')
+        self.assertNotIn('[视频', seen['args'][5])
+        self.assertNotIn('视频理解', self.sink.text())
+
+
+# =========================================================================== #
+# 群聊侧端识图（v1.9.9）：群里发来的图 / 视频帧也交给**配置的视觉模型**看
+# =========================================================================== #
+
+class _SidecarDescriber:
+    """`service.vision_describer` 的替身：记下**真的收到**哪些图与什么文字。
+
+    比生产实现**更严**：只有 `available()` 为真、`describe_images` 被真的调用过，
+    `seen` 里才会有东西（"调用了一次"这种断言在这里没有立足之地）。
+    """
+
+    def __init__(self, observations: Any = None, error: Any = None) -> None:
+        self.seen: list[tuple[list[Any], str, str, list[Any]]] = []
+        self.observations = ['1. 一只橘猫趴在窗台上。'] if observations is None else observations
+        self.error = error
+
+    def available(self) -> bool:
+        return True
+
+    async def describe_images(
+        self, images: Any, user_text: str = '', detail: str = 'auto', kinds: Any = None,
+    ) -> Any:
+        self.seen.append(([dict(item) for item in images], user_text, detail, list(kinds or [])))
+        if self.error is not None:
+            raise self.error
+        return list(self.observations or [])
+
+
+class _SilentDescriber:
+    """`available()` 为假的替身（生产里的 `SilentVisionDescriber` 形状）。"""
+
+    def __init__(self) -> None:
+        self.called = 0
+
+    def available(self) -> bool:
+        return False
+
+    async def describe_images(self, *_args: Any, **_kwargs: Any) -> Any:  # pragma: no cover
+        self.called += 1
+        return ['不该被调用']
+
+
+class GroupSidecarVisionTests(ServiceHarness):
+    """`vision.mode = sidecar` 时群回合的画面到底去了哪。
+
+    用户第一原则：群里有人发图 / 发视频，**她应当能看到内容**（走已配置的能力）。
+    侧端识图此前只在私聊接了，群回合给 `try_decide` 的 `visualObservations` 恒为
+    `None` —— 群图与视频帧没有任何去处。这一批把群回合接上**同一条**链：
+
+    * 判据/预算一处：图片理解总开关 ⊗ 识图方式（`native` / `sidecar`），
+      侧端那一跳就是私聊那个 `describe_current_images()`，预算就是同一个
+      `_image_budget()`（`core/vision_budget.py`）；
+    * 观察结果的形状与私聊**逐字相同**：`try_decide` 的 `visualObservations`
+      位置参数、`list[str]`（这一档断言的是**具体文本**，不是"调用了一次"）；
+    * 失败 / 超时 / 没返回 → 本回合照常跑完 + **可见、可行动** warn；
+    * 超预算 → 与私聊同一句可数线索，且**观察结果也只在预算内**（不绕过预算）。
+
+    变异（清 `__pycache__` 后实测）：把"群回合喂观察结果"那一跳去掉
+    （`visual_observations` 恒为 `None`）→ ①②④ 红。
+    """
+
+    # ---- 夹具（与 `GroupVideoUnderstandingTests` 同一套，独立一份免得互相耦合） ----
+
+    def _png_file(self, name: str = 'a.png') -> str:
+        """一个**真的存在**的本地图片来源（`onebot-file:` = 适配器直给的那条路）。"""
+        from plugin.tests.test_video_understanding import _png_bytes  # noqa: PLC0415
+
+        directory = tempfile.mkdtemp(prefix='hdsi-group-sidecar-case-')
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, name)
+        with open(path, 'wb') as handle:
+            handle.write(_png_bytes())
+        return 'onebot-file:%s' % path
+
+    def _video_session(self, url: str = 'https://cdn.example.com/v.mp4') -> SessionView:
+        return group_session(elements=[
+            {'type': 'video', 'attrs': {'url': url}, 'children': []},
+        ])
+
+    def _prepare(
+        self, service: Any, session: Any = None, messages: Optional[list[Any]] = None,
+    ) -> None:
+        service.buffered_group_turns['key'] = {
+            'story_id': PRIVATE_STORY_ID, 'group_id': '9',
+            'rule': group_rule_stub(debounceSeconds=0),
+            'channel_id': '9', 'latest_session': session or group_session(),
+            'messages': list(messages if messages is not None else [{'content': '看这个'}]),
+            'revision': 3, 'mentioned_bot': True, 'quoted_bot': False,
+        }
+
+    def _stub_turn(self, service: Any, seen: dict[str, Any]) -> None:
+        """把与本用例无关的兄弟成员换成显式替身，并记下**落库/投递真的跑过**。"""
+        seen.setdefault('persisted', [])
+        seen.setdefault('sent', [])
+
+        async def decide(*args: Any, **_kwargs: Any) -> dict[str, Any]:
+            seen['args'] = args
+            return {'decision': {'groupReply': {'mode': 'none'}}, 'succeeded': True}
+
+        async def persist(*args: Any, **_kwargs: Any) -> dict[str, Any]:
+            seen['persisted'].append(args)
+            return {'messages': [], 'commit': None, 'scriptEntry': None, 'script_entry': None}
+
+        async def send(*args: Any, **_kwargs: Any) -> dict[str, Any]:
+            seen['sent'].append(args)
+            return {'deliveredSegments': [], 'complete': True, 'segmentOutcomes': []}
+
+        service.try_decide = decide
+        service.persist_decision = persist
+        service.send_group_message = send
+        service.semantic_turn_embedding_enabled = lambda: False
+        service.sticker_catalog_for_session = _empty_list
+        service.group_chat_capabilities = lambda _session, _messages: None
+        # `schedule_compaction` 是**同步**成员（返回 None）→ 替身也用同步的，
+        # 免得留下"协程从未被 await"的假告警（那会把真告警淹掉）。
+        service.schedule_compaction = lambda _story_id: None
+        service.schedule_conversation_follow_ups_after_turn = _noop
+
+    def _patch_ffmpeg(self) -> Any:
+        from unittest import mock  # noqa: PLC0415 - 只在需要时引入
+        from plugin.core import video_understanding as video  # noqa: PLC0415
+        from plugin.tests.test_video_understanding import FakeFfmpeg  # noqa: PLC0415
+
+        ffmpeg = FakeFfmpeg()
+        return ffmpeg, mock.patch.object(video, '_FFMPEG_PATH', '/usr/bin/ffmpeg'), \
+            mock.patch.object(video, '_run_ffmpeg', side_effect=ffmpeg)
+
+    def _sidecar_service(self, **vision: Any) -> Any:
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'sidecar', **vision},
+            'audio': {'enabled': False},
+        }))
+        self.make_story()
+        return service
+
+    def _group_image_message(self, session: Any, image: str) -> list[Any]:
+        return [{'content': '看这个', 'imageSources': [image], 'imageSession': session}]
+
+    # ---- ① 群里发图 ----
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_a_group_image_reaches_the_configured_vision_model(self) -> None:
+        """① 侧端模式 + 群里有图 → 观察结果**真的进**群回合（断言具体文本）。
+
+        变异保护：把"群回合喂观察结果"那一跳去掉 → 本用例红。
+        """
+        service = self._sidecar_service()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        describer = _SidecarDescriber(['1. 一只橘猫趴在窗台上，旁边有一只马克杯。'])
+        service.vision_describer = describer
+        session = group_session()
+        image = self._png_file('群里的猫.png')
+        self._prepare(service, session, self._group_image_message(session, image))
+
+        await service.flush_group_turn('key', 3)
+
+        # ① 侧端模型**真的看到了那张图的字节**（不是"调用了一次"）。
+        self.assertEqual(len(describer.seen), 1)
+        images, user_text, detail, kinds = describer.seen[0]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]['mime_type'], 'image/png')
+        self.assertTrue(images[0]['data_uri'].startswith('data:image/png;base64,'))
+        self.assertIn('看这个', user_text)
+        self.assertEqual(detail, 'auto')
+        self.assertEqual(kinds, ['image'])
+        # ② 观察结果按**与私聊同一个字段**（`visualObservations`）进群回合的可见上下文。
+        self.assertEqual(
+            seen['args'][15], ['1. 一只橘猫趴在窗台上，旁边有一只马克杯。'],
+            '群回合的 visualObservations 必须就是侧端模型的观察结果',
+        )
+        # ③ 侧端模式不把图交给主叙事模型（与私聊同一口径，见 `vision.mode` 语义）。
+        self.assertEqual(seen['args'][9], [], '侧端模式：主叙事拿到的原生图必须是空的')
+        self.assertEqual(len(seen['persisted']), 1, '回合照常落库')
+        self.assertEqual(
+            [text for level, text in self.sink.records if level in ('warn', 'error')
+             and '侧端识图' in text],
+            [], '一切正常时不许有侧端识图的降级 warn',
+        )
+
+    # ---- ② 群里发视频（本回合抽出的帧） ----
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_the_frames_of_a_group_video_reach_the_vision_model_in_sidecar_mode(self) -> None:
+        """② 侧端模式 + 群里视频 → **抽出的帧**交给侧端模型，观察结果进群回合。
+
+        变异保护：把"群回合喂观察结果"那一跳去掉 → 本用例红。
+        """
+        from plugin.core import video_understanding as video  # noqa: PLC0415
+
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'sidecar'},
+            'audio': {'enabled': True, 'maxPerMessage': 1},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        describer = _SidecarDescriber(['1. 一个人站在山顶，背后是云海。'])
+        service.vision_describer = describer
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, self._video_session())
+            await service.flush_group_turn('key', 3)
+
+        self.assertEqual(len(ffmpeg.argvs('frames')), 1, '帧照抽')
+        # ① 侧端模型收到的是**那几帧本身**。
+        self.assertEqual(len(describer.seen), 1)
+        images = describer.seen[0][0]
+        self.assertEqual(len(images), video.VIDEO_MAX_FRAMES, '抽到的帧要真的交给视觉模型')
+        for image in images:
+            self.assertEqual(image['mime_type'], 'image/png')
+            self.assertTrue(image['data_uri'].startswith('data:image/png;base64,'))
+        # ② 观察结果进群回合（与私聊同一个字段、同一套语义）。
+        self.assertEqual(seen['args'][15], ['1. 一个人站在山顶，背后是云海。'])
+        self.assertEqual(seen['args'][9], [], '侧端模式：帧不进主模型的图片槽')
+        # ③ 事实行写实：帧交出去了，不许写"帧没有交给模型"。
+        user_message = seen['args'][5]
+        self.assertIn(video.VIDEO_FACT_PREFIX, user_message)
+        self.assertIn('帧画面', user_message)
+        self.assertNotIn('没有交给模型', user_message)
+        self.assertNotIn(video.GROUP_FRAMES_NO_CHANNEL_REASON, user_message)
+        self.assertEqual(self.sink.text().count('视频理解'), 0, '一切正常时没有降级 warn')
+
+    # ---- ③ 失败 / 超时 / 没有连接 ----
+
+    async def _sidecar_failure_case(self, describer: Any) -> dict[str, Any]:
+        """一个"侧端识图这一跳没成"的群回合：图 + 视频帧都有。"""
+        from plugin.core import video_understanding as video  # noqa: PLC0415
+
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'sidecar'},
+            'audio': {'enabled': True, 'maxPerMessage': 1},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        service.vision_describer = describer
+        session = self._video_session()
+        image = self._png_file('也发了图.png')
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, session, self._group_image_message(session, image))
+            await service.flush_group_turn('key', 3)
+        seen['video_prefix'] = video.VIDEO_FACT_PREFIX
+        seen['ffmpeg_calls'] = ffmpeg.calls
+        return seen
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_a_sidecar_failure_keeps_the_turn_and_warns_visibly(self) -> None:
+        """③ 侧端识图失败 → 本回合照常跑完 + 可见、可行动 warn + 事实行如实。"""
+        seen = await self._sidecar_failure_case(_SidecarDescriber(error=RuntimeError('provider down')))
+
+        # ① 回合照常跑完：照常落库、没有异常穿透。
+        self.assertEqual(len(seen['persisted']), 1, '附加能力失败不许回滚回合')
+        # ② 没有观察结果 → 群回合那一格是空的（绝不把"没看到"写成"看到了"）。
+        self.assertFalse(seen['args'][15], '失败时不许伪造观察结果')
+        self.assertEqual(seen['args'][9], [], '侧端模式本来就不给主模型原生图')
+        # ③ 可见 + 可行动：点名哪一条链、去哪调、错误原文。
+        sink = self.sink.text()
+        self.assertIn('侧端识图失败', sink)
+        self.assertIn('这一回合的画面没有进模型', sink)
+        self.assertIn('模型中心 → 模型连接', sink)
+        self.assertIn('用于侧端识图', sink)
+        self.assertIn('provider down', sink, '错误原文要留在日志里')
+        # ④ 事实行如实：帧确实抽了，但**没有交给任何模型**。
+        user_message = seen['args'][5]
+        self.assertIn(seen['video_prefix'], user_message)
+        self.assertIn('侧端识图没有给出观察结果', user_message)
+        self.assertIn('抽到的 3 帧没有交给模型', user_message, '可数：丢了几帧')
+        self.assertEqual(user_message.count(seen['video_prefix']), 1, '同一段视频只留一句事实')
+        self.assertNotIn('没有可用的原生视觉通道', user_message,
+                         '这一条的原因串是"侧端没成"，不许借用"没有原生通道"那一句')
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_a_sidecar_timeout_is_reported_the_same_way(self) -> None:
+        """③（超时）识图超时走同一条可见 warn，本回合照常跑完、事实行照旧如实。"""
+        seen = await self._sidecar_failure_case(
+            _SidecarDescriber(error=asyncio.TimeoutError('timeout')),
+        )
+
+        self.assertEqual(len(seen['persisted']), 1)
+        self.assertFalse(seen['args'][15])
+        # 断的是**可见那一档**特有的句子（不是"诊断频道也有的"那句）：
+        # 默认 verbosity 下 diagnostic 报告等于没有报告（坑 25）。
+        sink = self.sink.text()
+        self.assertIn('这一回合的画面没有进模型', sink)
+        self.assertIn('模型中心 → 模型连接', sink)
+        self.assertIn('timeout', sink)
+        self.assertIn('抽到的 3 帧没有交给模型', seen['args'][5])
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_no_sidecar_connection_is_named_and_actionable(self) -> None:
+        """③（能力缺失）没有勾「用于侧端识图」的连接 → 可见 warn 指到「模型连接」。"""
+        describer = _SilentDescriber()
+        seen = await self._sidecar_failure_case(describer)
+
+        self.assertEqual(describer.called, 0, '没有可用连接时连调都不调')
+        self.assertEqual(len(seen['persisted']), 1, '回合照常跑完')
+        self.assertFalse(seen['args'][15])
+        sink = self.sink.text()
+        self.assertIn('侧端识图没有可用的视觉连接', sink)
+        self.assertIn('模型中心 → 模型连接', sink)
+        self.assertIn('用于侧端识图', sink)
+
+    # ---- ④ 超预算 ----
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_the_sidecar_observations_obey_the_same_image_budget(self) -> None:
+        """④ 超预算 → 可数线索 + 点名哪道闸；**侧端只看到预算内那几张**（不绕过预算）。
+
+        候选 = 当前群图 1 张 + 本回合视频帧 3 帧 = 4；预算 2 → 侧端只识前 2 张
+        （顺序：当前图 → 视频帧）。变异保护：把预算那一刀去掉 → 本用例红。
+        """
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'sidecar', 'maxPerTurn': 2},
+            'audio': {'enabled': True, 'maxPerMessage': 1},
+            'video': {'enabled': True, 'mode': 'frames', 'group_enabled': True},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        describer = _SidecarDescriber(['1. 一张照片，然后是一段视频的开头。'])
+        service.vision_describer = describer
+        session = self._video_session()
+        image = self._png_file('发来的图.png')
+        ffmpeg, ffmpeg_path, ffmpeg_run = self._patch_ffmpeg()
+        with ffmpeg_path, ffmpeg_run:
+            self._prepare(service, session, self._group_image_message(session, image))
+            await service.flush_group_turn('key', 3)
+
+        self.assertEqual(len(describer.seen), 1)
+        self.assertEqual(len(describer.seen[0][0]), 2, '预算 2：侧端看的就是预算内那两张')
+        self.assertEqual(seen['args'][15], ['1. 一张照片，然后是一段视频的开头。'])
+        user_message = seen['args'][5]
+        self.assertIn('[图片×4，本回合仅取前 2 张]', user_message, '可数线索必须给模型')
+        self.assertIn('本回合收到 4 张图片', self.sink.text())
+        self.assertIn('每回合图片数上限', self.sink.text(), '点名是哪道闸')
+        self.assertIn('模型中心 → 图片理解', self.sink.text(), '点名去哪调')
+
+    # ---- ⑤ 反向：原生模式 / 总开关 ----
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_native_mode_is_untouched_by_the_sidecar_wiring(self) -> None:
+        """⑤ 反向：原生模式照旧 —— 图进主模型的原生槽、`visualObservations` 仍是空。"""
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'native'},
+            'audio': {'enabled': False},
+            'video': {'enabled': False},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        describer = _SidecarDescriber()
+        service.vision_describer = describer
+        session = group_session()
+        image = self._png_file('原生模式.png')
+        self._prepare(service, session, self._group_image_message(session, image))
+
+        await service.flush_group_turn('key', 3)
+
+        self.assertEqual(len(seen['args'][9]), 1, '原生模式：图照旧进主模型')
+        self.assertIsNone(seen['args'][15], '原生模式：visualObservations 一个字都不加')
+        self.assertEqual(describer.seen, [], '原生模式根本不碰侧端识图')
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_vision_off_means_no_sidecar_call_at_all(self) -> None:
+        """⑤ 反向（闸门）：图片理解总开关关着 → 侧端一次都不调、也没有观察结果。"""
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': False, 'mode': 'sidecar'},
+            'audio': {'enabled': False},
+            'video': {'enabled': False},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        describer = _SidecarDescriber()
+        service.vision_describer = describer
+        session = group_session()
+        image = self._png_file('关着.png')
+        self._prepare(service, session, self._group_image_message(session, image))
+
+        await service.flush_group_turn('key', 3)
+
+        self.assertEqual(describer.seen, [], '总开关关着：侧端识图一步都不许走')
+        self.assertIsNone(seen['args'][15])
+        self.assertEqual(seen['args'][9], [], '原生槽也是空的')
+        self.assertNotIn('[图片×', seen['args'][5], '总开关关着时不写"仅取前 N 张"那类假线索')
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_a_text_only_group_turn_costs_nothing(self) -> None:
+        """反向（空候选）：群里只有文字 → 侧端识图一次都不调、一个 warn 都没有。"""
+        service = self._sidecar_service()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        describer = _SidecarDescriber()
+        service.vision_describer = describer
+        self._prepare(service, group_session(), [{'content': '在吗'}])
+
+        await service.flush_group_turn('key', 3)
+
+        self.assertEqual(describer.seen, [], '没有图就不许调视觉模型')
+        self.assertFalse(seen['args'][15])
+        self.assertEqual(seen['args'][9], [])
+        self.assertEqual(
+            [text for level, text in self.sink.records if level in ('warn', 'error')
+             and any(word in text for word in ('侧端识图', '图片', '视频', '帧'))],
+            [], '没有画面可看时一个字都不许说',
+        )
+
+    # ---- ⑥ 历史群图（旧证据）在侧端模式下不再静默丢（v1.9.9）----------------- #
+
+    def _historical_group_image_entry(self, image: str) -> dict[str, Any]:
+        """按**生产写入方**造一条历史群图行。
+
+        `groupImageRefs` 用真的 `group_image_refs_for_storage()`（写库那一端的判据），
+        群 id / 发送者 / messageId 照生产 metadata 的形状写；随后由**真实的**
+        `group_messages_snapshot()` + `load_historical_group_images()` 读出来
+        （不手搓 ref，免得夹具造出生产不存在的形状，坑 39/46/66）。
+        """
+        from plugin.core.service.helpers import group_image_refs_for_storage  # noqa: PLC0415
+
+        return self.make_entry(
+            PRIVATE_STORY_ID, kind='group-message', content='更早发过的图',
+            occurred_at=STORY_TIME,
+            metadata={
+                'groupId': '9', 'channelId': '9',
+                'senderId': '200', 'senderName': '成员', 'messageId': '-12345',
+                'groupImageRefs': group_image_refs_for_storage([image]),
+            },
+        )
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_historical_group_images_reach_the_vision_model_in_sidecar_mode(self) -> None:
+        """⑥ 侧端模式 + 历史群图 → 旧证据走**同一条**识图链，观察结果真的进群回合。
+
+        改前：`historical_images = ... if native_vision else []` → 侧端模式下旧证据
+        **无声消失**（连一条 warn 都没有）。变异保护：改回 `else []` → 本用例红。
+        """
+        service = self._sidecar_service()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        describer = _SidecarDescriber(['1. 一张更早发过的照片：窗台上的马克杯。'])
+        service.vision_describer = describer
+        image = self._png_file('历史群图.png')
+        self._historical_group_image_entry(image)
+        self._prepare(service, group_session(), [{'content': '现在只说文字'}])
+
+        await service.flush_group_turn('key', 3)
+
+        # ① 历史图**真的**交给了侧端视觉模型（字节级）。
+        self.assertEqual(len(describer.seen), 1, '历史群图必须走同一条侧端识图链')
+        images = describer.seen[0][0]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]['mime_type'], 'image/png')
+        self.assertTrue(images[0]['data_uri'].startswith('data:image/png;base64,'))
+        # ② 观察结果进群回合的可见上下文（断言具体文本）。
+        # 再往前那一跳（这份观察结果落进 `incomingEvent.event.visualObservations`）
+        # 由 `test_narrator_prompts.test_the_group_branch_reads_the_same_visual_evidence_fields`
+        # 钉着——两段合起来才是"旧证据真的进了模型看到的那份上下文"。
+        self.assertEqual(seen['args'][15], ['1. 一张更早发过的照片：窗台上的马克杯。'])
+        # ③ 侧端模式不把历史图交给主模型的原生槽（与当前图同一条口径）。
+        self.assertEqual(seen['args'][19], [], '侧端模式：历史图不进主模型的原生槽')
+        self.assertEqual(seen['args'][9], [])
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_an_over_budget_historical_image_gets_a_visible_clue(self) -> None:
+        """⑥（超预算）预算 1 + 当前图 1 + 历史图 1 → 只识当前那张，且**可见线索**点名闸门。"""
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'sidecar', 'maxPerTurn': 1},
+            'audio': {'enabled': False},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        describer = _SidecarDescriber(['1. 当前这张图。'])
+        service.vision_describer = describer
+        session = group_session()
+        current = self._png_file('当前.png')
+        self._historical_group_image_entry(self._png_file('历史.png'))
+        self._prepare(service, session, self._group_image_message(session, current))
+
+        await service.flush_group_turn('key', 3)
+
+        self.assertEqual(len(describer.seen[0][0]), 1, '预算 1：当前图先占，历史图排在后面')
+        self.assertEqual(seen['args'][15], ['1. 当前这张图。'])
+        user_message = seen['args'][5]
+        self.assertIn('[图片×2，本回合仅取前 1 张]', user_message, '可数线索必须给模型')
+        self.assertIn('本回合收到 2 张图片', self.sink.text())
+        self.assertIn('每回合图片数上限', self.sink.text(), '点名是哪道闸')
+        self.assertIn('模型中心 → 图片理解', self.sink.text(), '点名去哪调')
+
+    @needs('flush_group_turn', 'group_cooldown_active')
+    async def test_native_mode_still_passes_historical_images_natively(self) -> None:
+        """⑥（反向）原生模式一个字都不变：历史图照旧作为**低细节原生附件**进主模型。"""
+        service = self.make_service(make_config(model={
+            'vision': {'enabled': True, 'mode': 'native'},
+            'audio': {'enabled': False},
+            'video': {'enabled': False},
+        }))
+        self.make_story()
+        seen: dict[str, Any] = {}
+        self._stub_turn(service, seen)
+        describer = _SidecarDescriber()
+        service.vision_describer = describer
+        self._historical_group_image_entry(self._png_file('历史群图.png'))
+        self._prepare(service, group_session(), [{'content': '只看文字'}])
+
+        await service.flush_group_turn('key', 3)
+
+        self.assertEqual(describer.seen, [], '原生模式不碰侧端识图')
+        historical = seen['args'][19]
+        self.assertEqual(len(historical), 1, '原生模式下历史图照旧进主模型')
+        self.assertEqual(historical[0]['detail'], 'low', '历史图是旧证据 → 低细节')
+        self.assertIsNone(seen['args'][15])
 
 
 async def _empty_list(*_args: Any, **_kwargs: Any) -> list[Any]:
