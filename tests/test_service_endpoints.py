@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import pathlib
 import sys
 import unittest
@@ -126,6 +127,87 @@ class UnlinkParticipantEndpointTests(unittest.IsolatedAsyncioTestCase):
         role = _Host(rows=[_endpoint_row(ownerKind='story-role', ownerId=STORY_ID)])
         self.assertFalse((await role.unlink_participant_endpoint('e1'))['ok'])
         self.assertEqual(role.entries, [])
+
+
+class _StateWriteHost(ServiceChunk11):
+    """最小宿主：只实现状态快照的读 / 写（`interlude_endpoint_state` 的内存替身）。"""
+
+    def __init__(self, *, fail_on: str = '') -> None:
+        self.rows: list[dict] = []
+        self.fail_on = fail_on
+        self.warnings: list[str] = []
+        self.calls: list[str] = []
+
+    def now(self):
+        return NOW
+
+    async def db_get(self, table, query=None, options=None):
+        self.calls.append('get')
+        if self.fail_on == 'get':
+            raise RuntimeError('端点状态快照读不了')
+        return [dict(row) for row in self.rows if row.get('endpointId') == (query or {}).get('endpointId')]
+
+    async def db_set(self, table, query, patch):
+        self.calls.append('set')
+        if self.fail_on == 'set':
+            raise RuntimeError('端点状态快照写不了')
+        for row in self.rows:
+            if row.get('endpointId') == query.get('endpointId'):
+                row.update(patch)
+        return 1
+
+    async def db_create(self, table, data):
+        self.calls.append('create')
+        if self.fail_on == 'create':
+            raise RuntimeError('端点状态快照建不了')
+        self.rows.append(dict(data))
+        return dict(data)
+
+    def report_standalone(self, level, message, *args, **kwargs):
+        self.warnings.append(message % args if args else message)
+
+
+class EndpointStateSnapshotWriteTests(unittest.IsolatedAsyncioTestCase):
+    """M3（rc29）：`persistEndpointState` 的写盘链路与它的降级纪律。"""
+
+    async def test_the_first_write_creates_and_later_writes_update_one_row(self):
+        host = _StateWriteHost()
+        host.set_endpoint_state('ep1', {'endpoint_id': 'ep1', 'connection': {'online': True}})
+        await _drain(host)
+        host.set_endpoint_state('ep1', {'endpoint_id': 'ep1', 'connection': {'online': False}})
+        await _drain(host)
+        self.assertEqual(len(host.rows), 1, '每端点一行，不许每次状态变化都插一行')
+        self.assertEqual(host.rows[0]['state']['connection']['online'], False)
+        self.assertEqual(host.rows[0]['updatedAt'], NOW)
+        self.assertEqual(host.calls, ['get', 'create', 'get', 'set'])
+
+    async def test_a_write_failure_only_warns_and_never_escapes(self):
+        """**反向**：快照写失败不许影响连接 / 投递（上游 `void run.catch(...)`）。"""
+        for stage in ('create', 'set'):
+            with self.subTest(stage=stage):
+                host = _StateWriteHost(fail_on=stage)
+                if stage == 'set':
+                    # 已有行才会走 update 分支（否则「查不到 → create」）。
+                    host.rows.append({'endpointId': 'ep1', 'state': {}, 'updatedAt': NOW})
+                host.set_endpoint_state('ep1', {'endpoint_id': 'ep1'})
+                await _drain(host)  # 不抛就是通过
+                self.assertEqual(len(host.warnings), 1)
+                self.assertIn('端点状态快照写入失败', host.warnings[0])
+                self.assertIn('ep1', host.warnings[0])
+
+    async def test_a_read_failure_degrades_to_no_snapshots(self):
+        host = _StateWriteHost(fail_on='get')
+        self.assertEqual(await host._load_endpoint_state_snapshots(), {})
+        self.assertTrue(any('端点状态快照读取失败' in item for item in host.warnings))
+
+
+async def _drain(host) -> None:
+    """把 fire-and-forget 的写盘任务跑完（没有任务时立即返回）。"""
+    for _ in range(20):
+        pending = list(getattr(host, '_endpoint_state_tasks', None) or ())
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 if __name__ == '__main__':

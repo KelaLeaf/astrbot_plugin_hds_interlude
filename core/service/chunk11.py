@@ -16,6 +16,9 @@
 | `resolveInboundEndpointFor` / `touchEndpointStateInbound` | `resolve_inbound_endpoint_for` / `touch_endpoint_state_inbound` |
 | `noteEndpointConnection` / `noteEndpointOutbound` | `note_endpoint_connection` / `note_endpoint_outbound` |
 | `endpointAddressSync` / `resolveMostActiveEndpointId` / `narrativeEndpointSelection` | `endpoint_address_sync` / `resolve_most_active_endpoint_id` / `narrative_endpoint_selection` |
+| `persistEndpointState` / `setEndpointState` | `persist_endpoint_state` / `set_endpoint_state`（+ `_load_endpoint_state_snapshots` / `_write_endpoint_state`） |
+| `endpointGateReason` / `endpointInitiateGateReason` / `endpointForDelivery` | `endpoint_gate_reason` / `endpoint_initiate_gate_reason` / `endpoint_for_delivery` |
+| `desktopEndpointHealthSnapshot` | `desktop_endpoint_health_snapshot` |
 
 ⚠️ `db_get` 的范围算子（`$in` / `$ne` …）在本移植版**显式抛错**（见 PORTING_NOTES 的
 「范围算子查询退化」），所以上游那几处按状态过滤的查询在这里是「取全量 + Python 侧过滤」。
@@ -36,10 +39,16 @@ from ..endpoints import (
     endpoint_account_key,
     endpoint_unique_key,
     fresh_endpoint_state,
+    is_endpoint_deliverable,
+    is_endpoint_initiate_allowed,
     normalize_endpoint_row,
+    normalize_endpoint_state,
+    normalize_group_id,
     normalize_story_alias_row,
     resolve_inbound_endpoint,
     resolve_story_alias,
+    restore_endpoint_state,
+    session_matches_endpoint,
     state_after_connection,
     state_after_inbound,
     state_after_outbound,
@@ -149,9 +158,19 @@ class ServiceChunk11(ServiceBase):
                 len(persisted), len(drafts), len(existing) + len(persisted),
             )
         self.endpoint_rows = [*existing, *persisted]
-        states = getattr(self, 'endpoint_states', None) or {}
+        # M3：重启快照回读。**保留** `deliverable` 诊断（allowed / 冷却 / note），
+        # 但 `connection.online` 一律归零——绝不跨重启恢复在线事实（见
+        # `core/endpoints.py::restore_endpoint_state`）。没有快照的行 = `fresh-start`。
+        persisted_states = await self._load_endpoint_state_snapshots()
+        states = getattr(self, 'endpoint_states', None)
+        if not isinstance(states, dict):
+            states = {}
         for row in self.endpoint_rows:
-            states.setdefault(row['id'], fresh_endpoint_state(row['id'], dt_ms(now)))
+            endpoint_id = pick(row, 'id')
+            if endpoint_id not in states:
+                states[endpoint_id] = restore_endpoint_state(
+                    endpoint_id, persisted_states.get(endpoint_id), dt_ms(now),
+                )
         self.endpoint_states = states
 
         # M1b：剧本别名迁移（与端点同一幂等通道）——为每个故事登记"按账号推导的 ID →
@@ -181,6 +200,367 @@ class ServiceChunk11(ServiceBase):
         self.endpoint_registry_ready = True
 
     # ------------------------------------------------------------------ #
+    # 端点状态快照的读 / 写（M3，上游 `persistEndpointState` / `setEndpointState`）
+    # ------------------------------------------------------------------ #
+
+    async def _load_endpoint_state_snapshots(self) -> dict[str, dict[str, Any]]:
+        """读 `interlude_endpoint_state` 全表 → `{endpointId: 归一化状态}`。
+
+        坏行/坏 JSON **不抛**（上游「防御性读取持久快照；坏快照不会阻塞端点注册表启动」）：
+        单行解析失败就跳过它，那一行退回 `fresh-start`。
+        """
+        persisted: dict[str, dict[str, Any]] = {}
+        try:
+            rows = await self.db_get('interlude_endpoint_state', {})
+        except Exception as error:  # noqa: BLE001 - 快照读失败不得阻塞注册表
+            self._report_endpoint_state_problem(
+                '端点状态快照读取失败，本轮按无快照处理（全部 fresh-start）错误=%s', error,
+            )
+            return persisted
+        for raw in rows or []:
+            endpoint_id = str(pick(raw, 'endpointId', 'endpoint_id') or '').strip()
+            state = normalize_endpoint_state(raw)
+            if endpoint_id and state:
+                persisted[endpoint_id] = state
+        return persisted
+
+    def _report_endpoint_state_problem(self, message: str, *args: Any) -> None:
+        """快照读写失败只 warn：诊断信息写不进去不该影响连接与投递（上游同判据）。"""
+        reporter = getattr(self, 'report_standalone', None)
+        if callable(reporter):
+            reporter('warn', message, *args)
+
+    def set_endpoint_state(self, endpoint_id: str, state: dict[str, Any]) -> None:
+        """上游 `setEndpointState`：写内存 **并** 落盘快照。"""
+        states = getattr(self, 'endpoint_states', None)
+        if not isinstance(states, dict):
+            states = {}
+            self.endpoint_states = states
+        states[endpoint_id] = state
+        self.persist_endpoint_state(endpoint_id, state)
+
+    def persist_endpoint_state(self, endpoint_id: str, state: Any) -> None:
+        """上游 `persistEndpointState`：把快照写进独立表（不并入消息事务）。
+
+        上游是 promise 链上的 fire-and-forget（`void run.catch(...)`），本移植版等价做法是
+        往事件循环排一个任务；**失败只 warn**，绝不影响连接 / 投递。
+
+        没有运行中的事件循环时（同步测试桩、解释器收尾）只保留内存态：上游 Node 永远
+        有事件循环，这里多一道护栏而不是把异常抛回调用方。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._write_endpoint_state(endpoint_id, dict(state)))
+        pending = getattr(self, '_endpoint_state_tasks', None)
+        if pending is None:
+            pending = set()
+            self._endpoint_state_tasks = pending
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    async def _write_endpoint_state(self, endpoint_id: str, state: dict[str, Any]) -> None:
+        """单行 upsert（查后写；状态写队列与注册表写队列分开，互不排队）。"""
+        now = self.now()
+        query = {'endpointId': endpoint_id}
+        try:
+            async with self._endpoint_state_lock():
+                existing = await self.db_get('interlude_endpoint_state', query, {'limit': 1})
+                if existing:
+                    await self.db_set(
+                        'interlude_endpoint_state', query, {'state': state, 'updatedAt': now},
+                    )
+                else:
+                    await self.db_create('interlude_endpoint_state', {
+                        'endpointId': endpoint_id, 'state': state, 'updatedAt': now,
+                    })
+        except Exception as error:  # noqa: BLE001 - 快照写失败不影响连接/投递
+            self._report_endpoint_state_problem(
+                '端点状态快照写入失败（不影响连接/投递）端点=%s 错误=%s', endpoint_id, error,
+            )
+
+    def _endpoint_state_lock(self) -> asyncio.Lock:
+        """延迟创建状态写队列锁（与 `_endpoint_lock` 同法，且**互不阻塞**）。"""
+        lock = getattr(self, '_endpoint_state_write_lock', None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._endpoint_state_write_lock = lock
+        return lock
+
+    # ------------------------------------------------------------------ #
+    # 投递门控（M3，上游 `endpointGateReason` / `endpointForDelivery`）
+    # ------------------------------------------------------------------ #
+
+    def endpoint_gate_reason(self, endpoint_id: Any, now: Any = None) -> Optional[str]:
+        """上游 `endpointGateReason`（`service.ts:7547`）：**统一投递门控**的判据。
+
+        注册表还没就绪、或没给端点 id 时返回 `None`（= 不拦，走旧路径）；一旦注册表就绪，
+        每条理由都要能说清"哪条端点、为什么"，因为调用方要把这个字符串写进用户可见的 warn
+        与投递失败留痕。顺序即优先级（上游逐字）：找不到 → 停用 → 离线 → 冷却中 →
+        未过期/已过期 → 其它不可投递。
+        """
+        if not endpoint_id or not getattr(self, 'endpoint_registry_ready', False):
+            return None
+        rows = getattr(self, 'endpoint_rows', []) or []
+        endpoint = next((row for row in rows if pick(row, 'id') == endpoint_id), None)
+        if endpoint is None:
+            return 'endpoint-not-found'
+        if not pick(endpoint, 'enabled'):
+            return 'endpoint-disabled'
+        states = getattr(self, 'endpoint_states', None) or {}
+        state = states.get(endpoint_id)
+        connection = pick(state, 'connection') or {}
+        if not state or pick(connection, 'online') is not True:
+            return 'endpoint-offline'
+        deliverable = pick(state, 'deliverable') or {}
+        stamp = dt_ms(now if now is not None else self.now())
+        cooldown = pick(deliverable, 'cooldownUntil', 'cooldown_until')
+        if cooldown and stamp < cooldown:
+            return 'endpoint-cooldown'
+        if not is_endpoint_deliverable(state, stamp):
+            return 'endpoint-state-expired' if pick(deliverable, 'allowed') else 'endpoint-not-deliverable'
+        return None
+
+    def endpoint_initiate_gate_reason(self, endpoint_id: Any, now: Any = None) -> Optional[str]:
+        """上游 `endpointInitiateGateReason`（`service.ts:7568`）：主动联系的**可选**闸门。
+
+        先过普通投递门控；`initiate` 字段**缺失 = 不额外加闸**（QQ/OneBot 没有
+        context-token 概念，历史主动联系路径必须照旧可用），但只要这条记录存在，
+        过期或不允许就是硬拒绝、且理由显式分类。
+        """
+        delivery_reason = self.endpoint_gate_reason(endpoint_id, now)
+        if delivery_reason or not endpoint_id or not getattr(self, 'endpoint_registry_ready', False):
+            return delivery_reason
+        states = getattr(self, 'endpoint_states', None) or {}
+        state = states.get(endpoint_id)
+        initiate = pick(state, 'initiate')
+        if not initiate:
+            return None
+        stamp = dt_ms(now if now is not None else self.now())
+        expires = pick(initiate, 'expiresAt', 'expires_at')
+        if expires is not None and stamp >= expires:
+            return 'endpoint-state-expired'
+        return None if is_endpoint_initiate_allowed(state, stamp) else 'endpoint-initiate-forbidden'
+
+    def endpoint_for_delivery(
+        self, endpoint_id: Any, owner_kind: str, owner_id: str, now: Any = None,
+    ) -> dict[str, Any]:
+        """上游 `endpointForDelivery`（`service.ts:7577`）：硬路由归属校验 + 门控。
+
+        返回 `{'row': ...}` 或 `{'reason': ...}`（没给 id 时返回 `{}` = 不介入）。
+        **归属不符一律 `endpoint-not-found`**（不是 `endpoint-not-allowed`）：上游把
+        "端点不属于这个目标"与"端点不存在"归成同一类，避免把别人的端点当自己的路由用。
+        """
+        if not endpoint_id:
+            return {}
+        rows = getattr(self, 'endpoint_rows', []) or []
+        row = next((item for item in rows if pick(item, 'id') == endpoint_id), None)
+        if row is None:
+            return {'reason': 'endpoint-not-found'}
+        if pick(row, 'ownerKind', 'owner_kind') != owner_kind \
+                or pick(row, 'ownerId', 'owner_id') != owner_id:
+            return {'reason': 'endpoint-not-found'}
+        reason = self.endpoint_gate_reason(endpoint_id, now)
+        return {'reason': reason} if reason else {'row': row}
+
+    async def group_delivery_route(
+        self, story: Any, channel_id: Any, session: Any = None, endpoint_id: Any = None,
+    ) -> dict[str, Any]:
+        """群路出站的**端点解析 + 门控**（上游 `service.ts:2761-2825` 的 async 外层）。
+
+        上游这段是 `sendGroupMessage` 的开头：先 `ensureEndpointRegistry()`（失败即
+        `endpoint-registry-unavailable` 拒绝整条），再解析本次要走的端点（显式硬路由 /
+        默认路由）、用 live session 观测连接、最后过 `endpointForDelivery` 硬门。
+        本移植版把这段收在端点层（`chunk11`），`chunk2.send_group_message` 只需一问一用，
+        免得群发那侧再抄一遍门控判据（两份实现必然漂移）。
+
+        返回值（唯一判据的输出形状）：
+
+        | 形状 | 含义 |
+        | --- | --- |
+        | `{}` | 不介入（注册表未就绪 / 没有注册端点）：单平台零影响，走旧路径 |
+        | `{'reason': ...}` | **拒绝**：一条分段都不许发，理由即调用方要落进每段结局的串 |
+        | `{'row', 'owner_kind', 'owner_id', 'explicit'}` | 放行：`row` 就是本次实际走的那条端点 |
+
+        **注册表未就绪 / 没有注册端点** → `{}`（单平台零影响：走旧路径）。
+        """
+        try:
+            await self.ensure_endpoint_registry()
+        except Exception as error:  # noqa: BLE001 - 降级为显式拒绝（可见 warn + 理由）
+            self._report_endpoint_state_problem(
+                '群消息端点注册表不可用 群频道=%s 错误=%s', channel_id, error,
+            )
+            return {'reason': 'endpoint-registry-unavailable'}
+        return self.group_endpoint_route(story, channel_id, session, endpoint_id)
+
+    async def group_delivery_gate(
+        self, story: Any, channel_id: Any, session: Any = None, endpoint_id: Any = None,
+    ) -> Optional[str]:
+        """`group_delivery_route` 的**薄包装**：只回阻止原因或 `None`（老调用方的形状）。"""
+        route = await self.group_delivery_route(story, channel_id, session, endpoint_id)
+        return pick(route, 'reason')
+
+    def group_endpoint_gate_reason(
+        self, story: Any, channel_id: Any, session: Any = None, endpoint_id: Any = None,
+    ) -> Optional[str]:
+        """`group_delivery_route` 的同步薄包装（注册表已就绪时用）。"""
+        return pick(self.group_endpoint_route(story, channel_id, session, endpoint_id), 'reason')
+
+    def group_endpoint_route(
+        self, story: Any, channel_id: Any, session: Any = None, endpoint_id: Any = None,
+    ) -> dict[str, Any]:
+        """群路要走的端点：**显式 `endpointId` = 硬路由**（上游 `:2787-2801`），否则默认路由（`:2806-2825`）。
+
+        两条分支都与上游同序——**门控之前**先用 live session 观测连接（`:6297` 的群路等价物），
+        再进 `endpointForDelivery`；被拒即返回理由，**绝不**再回落到另一条路由（`:6366`：
+        "Once a caller/model has selected an endpoint … must never fall back"）。
+        """
+        explicit = endpoint_id.strip() if isinstance(endpoint_id, str) else endpoint_id
+        if explicit:
+            target_group = normalize_group_id(channel_id)
+            rows = getattr(self, 'endpoint_rows', []) or []
+            story_id = pick(story, 'id')
+            row = next((
+                item for item in rows
+                if pick(item, 'id') == explicit and (
+                    (
+                        pick(item, 'ownerKind', 'owner_kind') == 'story-role'
+                        and pick(item, 'ownerId', 'owner_id') == story_id
+                    ) or (
+                        pick(item, 'ownerKind', 'owner_kind') == 'group'
+                        and normalize_group_id(
+                            pick(item, 'groupId', 'group_id') or pick(item, 'ownerId', 'owner_id'),
+                        ) == target_group
+                    )
+                )
+            ), None)
+            if row is None:
+                # 上游 `:2792` 逐字：指定端点无效或不属于目标群 = **硬失败**。
+                # 理由串是 `endpoint-not-found`（上游 `:7581` 把旧的 `endpoint-not-allowed`
+                # 改名了）：他故事的端点与不存在的端点归成同一类，且这里**不许**回落到
+                # 默认路由——"看起来发了"比"没发"危险得多。
+                self.report(
+                    'warn', story, 'user-message',
+                    '群消息指定端点无效或不属于目标群 端点=%s 群频道=%s',
+                    explicit, target_group,
+                )
+                return {'reason': 'endpoint-not-found'}
+            self._observe_group_session_endpoint(pick(row, 'id'), channel_id, session)
+            owner_kind = (
+                'group' if pick(row, 'ownerKind', 'owner_kind') == 'group' else 'story-role'
+            )
+            owner_id = (
+                pick(row, 'ownerId', 'owner_id') if owner_kind == 'group' else story_id
+            )
+            resolved = self.endpoint_for_delivery(pick(row, 'id'), owner_kind, owner_id)
+            reason = pick(resolved, 'reason')
+            if reason:
+                return {'reason': reason}
+            return {
+                'row': pick(resolved, 'row'), 'owner_kind': owner_kind,
+                'owner_id': owner_id, 'explicit': True,
+            }
+        if not getattr(self, 'endpoint_registry_ready', False):
+            return {}
+        story_id = pick(story, 'id')
+        fallback = self.endpoint_address_sync(
+            {'platform': pick(story, 'platform'), 'selfId': pick(story, 'selfId', 'self_id')},
+            'story-role', story_id,
+        )
+        resolved_endpoint_id = pick(fallback, 'endpointId', 'endpoint_id')
+        if not resolved_endpoint_id:
+            return {}
+        self._observe_group_session_endpoint(resolved_endpoint_id, channel_id, session)
+        resolved = self.endpoint_for_delivery(resolved_endpoint_id, 'story-role', story_id)
+        reason = pick(resolved, 'reason')
+        if reason:
+            return {'reason': reason}
+        row = pick(resolved, 'row')
+        if row is None:
+            return {'reason': 'endpoint-not-deliverable'}
+        return {'row': row, 'owner_kind': 'story-role', 'owner_id': story_id, 'explicit': False}
+
+    def _observe_group_session_endpoint(
+        self, endpoint_id: str, channel_id: Any, session: Any,
+    ) -> None:
+        """群入站 session 同样是"此刻连着"的观测——必须在门控**之前**记下来。
+
+        上游用 `sessionBot && sessionMatchesEndpoint` 判定"这条会话是这个群的可用传输"；
+        本移植版的出站通道是 `transport`（构造时就固定），所以只保留"会话属于这个端点"与
+        "会话确实在目标群里"两条：私聊回合发起的跨群动作**不是**有效的群传输会话，
+        不许拿它当在线证据。
+        """
+        if session is None:
+            return
+        rows = getattr(self, 'endpoint_rows', []) or []
+        endpoint = next((row for row in rows if pick(row, 'id') == endpoint_id), None)
+        if endpoint is None or not session_matches_endpoint(session, endpoint):
+            return
+        session_group = normalize_group_id(
+            pick(session, 'guildId', 'guild_id') or pick(session, 'channelId', 'channel_id') or '',
+        )
+        if session_group and session_group != normalize_group_id(channel_id):
+            return
+        states = getattr(self, 'endpoint_states', None)
+        if not isinstance(states, dict):
+            return
+        previous = states.get(endpoint_id) or fresh_endpoint_state(endpoint_id)
+        if pick(pick(previous, 'connection') or {}, 'online') is not True:
+            self.set_endpoint_state(endpoint_id, state_after_connection(previous, True))
+
+    async def desktop_endpoint_health_snapshot(self) -> dict[str, Any]:
+        """上游 `desktopEndpointHealthSnapshot`（`service.ts:1001`）：端点健康投影。
+
+        刻意由服务层投影（而不是让桌面端自己算）：**可用性判据必须与投递本身用同一套
+        保守 TTL / 冷却规则**（上游注释逐字）。`initiateAllowed` 的门槛与上游一致——
+        先要普通投递可投递，再看可选的 `initiate`；`initiate` 缺失 = 不额外加闸。
+        """
+        await self.ensure_endpoint_registry()
+        now = self.now()
+        stamp = dt_ms(now)
+        endpoints: list[dict[str, Any]] = []
+        for row in getattr(self, 'endpoint_rows', []) or []:
+            endpoint_id = pick(row, 'id')
+            state = (getattr(self, 'endpoint_states', None) or {}).get(endpoint_id)
+            enabled = pick(row, 'enabled') is True
+            deliverable = enabled and is_endpoint_deliverable(state, stamp)
+            connection = pick(state, 'connection') or {}
+            deliverable_state = pick(state, 'deliverable') or {}
+            note = pick(deliverable_state, 'note')
+            initiate = pick(state, 'initiate')
+            observed_ms = pick(connection, 'observedAt', 'observed_at')
+            entry: dict[str, Any] = {
+                'endpointId': endpoint_id,
+                'ownerKind': pick(row, 'ownerKind', 'owner_kind'),
+                'ownerId': pick(row, 'ownerId', 'owner_id'),
+                'platform': pick(row, 'platform'),
+                'channelKind': pick(row, 'channelKind', 'channel_kind'),
+                'enabled': enabled,
+                'online': pick(connection, 'online') is True,
+                # 上游 `?? now`（不是 `||`）：观测时刻为 0 时照样按 0 报，别拿"现在"顶替。
+                'observedAt': iso(observed_ms if observed_ms is not None else stamp),
+                'deliverable': bool(deliverable),
+                'initiateAllowed': bool(
+                    enabled and deliverable
+                    and (not initiate or is_endpoint_initiate_allowed(state, stamp))
+                ),
+            }
+            cooldown = pick(deliverable_state, 'cooldownUntil', 'cooldown_until')
+            if cooldown:
+                entry['cooldownUntil'] = iso(cooldown)
+            if not deliverable and note:
+                entry['lastError'] = note
+            if note:
+                entry['note'] = note
+            endpoints.append(entry)
+        return {
+            'protocol': 1,
+            'generatedAt': iso(now),
+            'endpoints': endpoints,
+        }
+
+    # ------------------------------------------------------------------ #
     # 运行期增量登记
     # ------------------------------------------------------------------ #
 
@@ -198,7 +578,8 @@ class ServiceChunk11(ServiceBase):
                 row = {**draft, 'id': uuid.uuid4().hex[:32]}
                 await self.db_create('interlude_endpoint', row)
                 self.endpoint_rows.append(row)
-                self.endpoint_states.setdefault(row['id'], fresh_endpoint_state(row['id'], dt_ms(now)))
+                if row['id'] not in self.endpoint_states:
+                    self.set_endpoint_state(row['id'], fresh_endpoint_state(row['id'], dt_ms(now)))
                 await self.record_story_alias(
                     story_id_for_character_of(story), pick(story, 'id'), 'story-created',
                 )
@@ -225,7 +606,8 @@ class ServiceChunk11(ServiceBase):
                 row = {**draft, 'id': uuid.uuid4().hex[:32]}
                 await self.db_create('interlude_endpoint', row)
                 self.endpoint_rows.append(row)
-                self.endpoint_states.setdefault(row['id'], fresh_endpoint_state(row['id'], dt_ms(now)))
+                if row['id'] not in self.endpoint_states:
+                    self.set_endpoint_state(row['id'], fresh_endpoint_state(row['id'], dt_ms(now)))
             except Exception as error:  # noqa: BLE001
                 self.endpoint_registry_ready = False
                 self.report_standalone(
@@ -392,7 +774,8 @@ class ServiceChunk11(ServiceBase):
                 self.report_standalone('warn', '角色端点写入失败 故事=%s 账号=%s 错误=%s', pick(story, 'id'), account, error)
                 return {'ok': False, 'error': '写入失败：%s' % error}
             self.endpoint_rows.append(row)
-            self.endpoint_states.setdefault(row['id'], fresh_endpoint_state(row['id'], dt_ms(now)))
+            if row['id'] not in self.endpoint_states:
+                self.set_endpoint_state(row['id'], fresh_endpoint_state(row['id'], dt_ms(now)))
             # 第二端点的推导 ID 同步登记别名——其消息经 M1b 重定向直达本故事。
             await self.record_story_alias(
                 story_id_for_character(platform, account), pick(story, 'id'), 'endpoint-added',
@@ -477,7 +860,8 @@ class ServiceChunk11(ServiceBase):
             self.report_standalone('warn', '用户端点写入失败 参与者=%s 用户=%s 错误=%s', pick(participant, 'id'), account, error)
             return {'ok': False, 'error': '写入失败：%s' % error}
         self.endpoint_rows.append(row)
-        self.endpoint_states.setdefault(row['id'], fresh_endpoint_state(row['id'], dt_ms(now)))
+        if row['id'] not in self.endpoint_states:
+            self.set_endpoint_state(row['id'], fresh_endpoint_state(row['id'], dt_ms(now)))
         display = pick(participant, 'displayName', 'display_name') or pick(participant, 'id')
         await self._endpoint_migration_entry(
             pick(participant, 'storyId', 'story_id'),
@@ -609,15 +993,16 @@ class ServiceChunk11(ServiceBase):
                     ', '.join(duplicates),
                 )
         stamp = dt_ms(self.now())
-        states = self.endpoint_states
         for endpoint in (
             resolution.get('role_endpoint'), resolution.get('user_endpoint'),
             resolution.get('group_endpoint'),
         ):
             if not endpoint:
                 continue
-            previous = states.get(pick(endpoint, 'id')) or fresh_endpoint_state(pick(endpoint, 'id'), stamp)
-            states[pick(endpoint, 'id')] = state_after_inbound(previous, stamp)
+            endpoint_id = pick(endpoint, 'id')
+            previous = (getattr(self, 'endpoint_states', None) or {}).get(endpoint_id) \
+                or fresh_endpoint_state(endpoint_id, stamp)
+            self.set_endpoint_state(endpoint_id, state_after_inbound(previous, stamp))
 
     def note_endpoint_connection(self, account_key: str, online: bool) -> None:
         """上游 `noteEndpointConnection`：连接器在线状态回写（connection 维）。"""
@@ -628,8 +1013,9 @@ class ServiceChunk11(ServiceBase):
         for row in getattr(self, 'endpoint_rows', []):
             if pick(row, 'accountKey', 'account_key') != account_key:
                 continue
-            previous = states.get(pick(row, 'id')) or fresh_endpoint_state(pick(row, 'id'), stamp)
-            states[pick(row, 'id')] = state_after_connection(previous, online, stamp)
+            endpoint_id = pick(row, 'id')
+            previous = states.get(endpoint_id) or fresh_endpoint_state(endpoint_id, stamp)
+            self.set_endpoint_state(endpoint_id, state_after_connection(previous, online, stamp))
 
     def note_endpoint_outbound(
         self, owner_kind: str, owner_id: str, ok: bool, note: str, address: Any = None,
@@ -652,10 +1038,11 @@ class ServiceChunk11(ServiceBase):
                 or str(pick(row, 'selfId', 'self_id')) != str(pick(address, 'selfId', 'self_id'))
             ):
                 continue
-            previous = states.get(pick(row, 'id')) or fresh_endpoint_state(pick(row, 'id'), stamp)
-            states[pick(row, 'id')] = state_after_outbound(
+            endpoint_id = pick(row, 'id')
+            previous = states.get(endpoint_id) or fresh_endpoint_state(endpoint_id, stamp)
+            self.set_endpoint_state(endpoint_id, state_after_outbound(
                 previous, ok, note, 0 if ok else 5 * 60_000, stamp,
-            )
+            ))
 
     # ------------------------------------------------------------------ #
     # 出站地址同步与多通道选择

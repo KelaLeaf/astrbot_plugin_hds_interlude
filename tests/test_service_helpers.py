@@ -10,7 +10,8 @@
 * `upstream/test/agency.test.ts` 里 `groupDueIntents` 的用例；
 * `upstream/test/configuration.test.ts` 中 `normalizeGroupVisibleReply` /
   `visibleReplyMode` / `normalizeInteraction` / `hasRequiredNarrativeScript` 的用例；
-* `upstream/test/sticker-vision-helpers.test.ts`（全部 5 条）；
+* `upstream/test/sticker-vision-helpers.test.ts`（7 条中 6 条；`stickerDeliveryUrl` 那条
+  判**不适用**——Koishi HTTP 路由在 AstrBot 上换成宿主文件接口，见 `docs/UPSTREAM_SYNC.md`）；
 * `upstream/test/group-identity.test.ts` 中 `formatGroupSpeaker` /
   `normalizeGroupChatActions` / `normalizeAllowedReactions` /
   `calibratedNativeFaceWillingness` / `normalizeQuotedMessageContent` /
@@ -23,6 +24,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import unittest
 import zlib
 from datetime import datetime, timezone
@@ -541,7 +543,36 @@ class StickerVisionHelperTests(unittest.TestCase):
                          h.stable_sticker_asset_id('bq (6).png', hash_a))
         self.assertNotEqual(h.stable_sticker_asset_id('bq (6).png', hash_a),
                             h.stable_sticker_asset_id('bq [6].png', hash_b))
-        self.assertRegex(h.stable_sticker_asset_id('bq (6).png', hash_a), r'aaaaaaaaaaaaaaaa$')
+        # 后缀自 rc29 起是 sha1(路径+内容) 联合哈希的前 16 位，**不再是内容哈希**。
+        # 上游测试同款：`sticker-vision-helpers.test.ts:44` 就地算 sha1 再比。
+        expected = hashlib.sha1(('bq (6).png\n%s' % hash_a).encode('utf-8')).hexdigest()[:16]
+        self.assertTrue(
+            h.stable_sticker_asset_id('bq (6).png', hash_a).endswith(expected),
+            '后缀必须是 sha1(路径\\n内容) 的前 16 位',
+        )
+
+    def test_stable_sticker_asset_id_joint_unique_for_chinese_paths(self):
+        """`assetId` 联合唯一：中文路径同内容不碰撞（UNIQUE 扫描崩溃根因）。
+
+        上游 `sticker-vision-helpers.test.ts:60`。旧实现的后缀只取内容哈希，而中文目录名
+        会被折叠成 `-`（两个分组的 stem 都退化成 `sticker`）——同内容即同 assetId，
+        `interlude_sticker.assetId` 上又恰有唯一索引，于是每轮扫描都撞库并报
+        「表情包库扫描失败」（用户日志 8 连复现的根因）。
+        """
+        same_content = 'a' * 64
+        left = h.stable_sticker_asset_id('猫猫收藏/笑死.gif', same_content)
+        right = h.stable_sticker_asset_id('日常贴纸/笑死.gif', same_content)
+        self.assertNotEqual(left, right, '路径不同必然分叉')
+        self.assertEqual(left, h.stable_sticker_asset_id('猫猫收藏/笑死.gif', same_content), '同输入确定性')
+        self.assertNotEqual(
+            left, h.stable_sticker_asset_id('猫猫收藏/笑死.gif', 'b' * 64), '内容变化即换 id',
+        )
+        self.assertRegex(left, r'^sticker-[0-9a-f]{16}$', '中文折叠回退 stem 保持合法形态')
+        # 反向：这两个中文路径折叠后的 stem 都是 `sticker`，所以**旧口径**（后缀 = 纯内容
+        # 哈希前 16 位）给出的 id 必然是这个字面量。退回旧实现 → 本断言立刻红。
+        legacy = 'sticker-%s' % same_content[:16]
+        self.assertNotEqual(left, legacy, '后缀不再是纯内容哈希')
+        self.assertNotEqual(right, legacy, '后缀不再是纯内容哈希')
 
 
 class CollectedStickerAssetIdTests(unittest.TestCase):
@@ -1739,6 +1770,62 @@ class StickerSelectionParsingTests(unittest.TestCase):
         self.assertEqual(
             h.visible_reply_text({'groupReply': {'mode': 'immediate', 'content': '群里的'}}), '群里的',
         )
+
+
+class MaskQqIdsTests(unittest.TestCase):
+    """上游 `maskQqIds`（`service.ts:9727`，P2-5）：日志里的 QQ 号脱敏。
+
+    形状**逐字照抄上游**，不许自创：
+
+        String(value ?? '').replace(/\\d{5,12}/g,
+          digits => '•'.repeat(Math.max(1, digits.length - 4)) + digits.slice(-4))
+
+    即：只认 5–12 位的数字串，保留**尾 4 位**，前面全换成 `•`（至少一个）；
+    1–4 位的短号、非数字账号原样不动。上游 `test/` 里**没有**它的用例
+    （grep `maskQqIds` 只命中 `src/service.ts` 与构建产物），所以这里按正则逐条
+    列边界值，而不是"抄一个看起来像的"。
+    """
+
+    def test_the_upstream_shape_head_masked_tail_four_kept(self):
+        self.assertEqual(h.mask_qq_ids('1000008890'), '••••••8890')
+        self.assertEqual(h.mask_qq_ids('123456789012'), '••••••••9012')
+
+    def test_the_five_digit_lower_bound_still_masks_at_least_one_bullet(self):
+        # `Math.max(1, 5 - 4) === 1`：正好 5 位时也至少要有一个 `•`。
+        self.assertEqual(h.mask_qq_ids('12345'), '•2345')
+
+    def test_one_to_four_digit_runs_are_left_alone(self):
+        for value in ('1', '12', '123', '1234'):
+            with self.subTest(value=value):
+                self.assertEqual(h.mask_qq_ids(value), value)
+
+    def test_a_thirteen_digit_run_is_matched_twelve_then_the_rest_is_plain(self):
+        # `{5,12}` 贪婪吃掉 12 位，剩下 1 位不满足下界 → 尾巴那位原样留着（上游同形）。
+        self.assertEqual(h.mask_qq_ids('1234567890123'), '••••••••90123')
+
+    def test_prefixes_and_affixes_are_preserved(self):
+        self.assertEqual(h.mask_qq_ids('private:1000008890'), 'private:••••••8890')
+        self.assertEqual(h.mask_qq_ids('onebot:1:1000008890'), 'onebot:1:••••••8890')
+        self.assertEqual(h.mask_qq_ids('群=1234567890'), '群=••••••7890')
+
+    def test_non_digit_accounts_and_prose_are_untouched(self):
+        for value in ('wxid_abcdef', '@chatroom', 'alice', '', 'user名称'):
+            with self.subTest(value=value):
+                self.assertEqual(h.mask_qq_ids(value), value)
+
+    def test_every_run_in_the_string_is_masked_not_only_the_first(self):
+        self.assertEqual(h.mask_qq_ids('群 12345 和个人 1000008890'), '群 •2345 和个人 ••••••8890')
+
+    def test_non_string_inputs_follow_js_string_coercion(self):
+        # `String(value ?? '')`：None → ''，数字按 JS 的十进制字面量渲染。
+        self.assertEqual(h.mask_qq_ids(None), '')
+        self.assertEqual(h.mask_qq_ids(12345), '•2345')
+        self.assertEqual(h.mask_qq_ids(12345.6789), '•2345.6789')
+
+    def test_masking_is_repeatable_and_never_grows_the_id(self):
+        masked = h.mask_qq_ids('1000008890')
+        self.assertEqual(h.mask_qq_ids(masked), masked, '二次脱敏不再变化')
+        self.assertEqual(h.mask_qq_ids('12345'), '•2345', '`•` 本身不是数字，不会被再次打码')
 
 
 if __name__ == '__main__':

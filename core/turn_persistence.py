@@ -6,13 +6,17 @@
 commit 的 prose，事件、场景增量、投递账本（M6.1）与可选的时间线计划都进 metadata。
 **M6.1 只增加元数据**：不新增第二个发送者，也不改变既有投递时序。
 
+``metadata.conversation_kind``（上游 ``conversationKind``，``turn-persistence.ts:14-18``）
+是长线叙事评分的会话类型来源：群聊提交写 ``group``、私聊提交写 ``private``、跨两种会话
+的提交写 ``unknown``；**拿不到就整个键不写**（缺省不是私聊，见 `_conversation_kind()`）。
+
 命名约定（键名约定）：camelCase 字段转 snake_case；读取侧两种拼写都
 接受（兄弟模块或旧 JSON 可能仍是 camelCase），写出侧只写 snake_case。
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .script.delivery_ledger import create_script_delivery_actions
 
@@ -35,6 +39,32 @@ def _get(mapping: Any, *keys: str, default: Any = None) -> Any:
     return default
 
 
+def _conversation_kind(events: Any) -> Optional[str]:
+    """上游 `scriptEntryDraftForCommit()` 的会话类型判定（`turn-persistence.ts:14-18`）。
+
+    会话类型**只由这份提交自己的投递事件**决定：有群消息事件 = 群聊回合，有出站私聊
+    事件 = 私聊回合；两种都有（一次提交跨了两种会话）时上游写 `'unknown'`，让长线叙事
+    按"拿不准"保守处理；两种都没有时返回 `None` —— 调用方**不写这个键**，绝不缺省当成
+    私聊，否则一个拿不到会话类型的群回合会被 `core/long_arc.py` 按私聊全额（1.0）计分。
+
+    值域与读侧逐字对齐（`long_arc.resolve_conversation_kind()`：`private` / `group` /
+    `unknown`），落库键名按本仓约定用 snake_case（`conversation_kind`）。
+    """
+    has_group = any(
+        isinstance(event, Mapping) and event.get('kind') == 'group-message' for event in events
+    )
+    has_private = any(
+        isinstance(event, Mapping) and event.get('kind') == 'outgoing-message' for event in events
+    )
+    if has_group and has_private:
+        return 'unknown'
+    if has_group:
+        return 'group'
+    if has_private:
+        return 'private'
+    return None
+
+
 def script_entry_draft_for_commit(
     commit: dict[str, Any],
     interaction: Optional[dict[str, Any]],
@@ -50,7 +80,11 @@ def script_entry_draft_for_commit(
     window = _get(commit, 'window', default={}) or {}
     scene_delta = _get(commit, 'scene_delta', 'sceneDelta', default={}) or {}
     events = _get(commit, 'events', default=[]) or []
+    conversation_kind = _conversation_kind(events)
     metadata: dict[str, Any] = {
+        # 上游把 `conversationKind` 放在 metadata 首位，且**只在拿得到时**展开这个键
+        # （`turn-persistence.ts:28`：`...(conversationKind ? { conversationKind } : {})`）。
+        **(({'conversation_kind': conversation_kind}) if conversation_kind else {}),
         'phase': _get(commit, 'phase'),
         'narrative_authority': 'original-v2',
         'life_handoff': normalize_life_handoff(life_handoff, prose),
@@ -65,6 +99,10 @@ def script_entry_draft_for_commit(
             'to': _get(window, 'to'),
             'event_count': len(events),
         },
+        # 上游同名条目原样存 `scriptEvents: commit.events`：显式端点（M4）就藏在这份
+        # 事件列表里（`script_events[i].endpoint_id`，只在确实选了端点的事件上出现），
+        # 本模块**刻意不另立顶层端点字段**——一次提交里可以有多条发往不同端点的发言，
+        # 顶层标量会撒谎。落库字段名与值逐字来自 commit，不做改写。
         'script_events': events,
         'delivery_actions': create_script_delivery_actions(commit),
         'scene_delta': scene_delta,

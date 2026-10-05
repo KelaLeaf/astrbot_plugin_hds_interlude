@@ -1717,6 +1717,8 @@ def schedule_preplan_prompt(variation_level: str) -> str:
         'Use only stable, explicitly observed recurring commitments or routines from evidence: school, work, regular lessons, fixed trips, or clearly repeated habits. Do not infer a timetable from one ordinary scene. Do not invent school dates, lessons, obligations, locations, or future events.',
         'A regime is {"id":"stable-id","label":"life phase","from":"YYYY-MM-DD","to":"optional YYYY-MM-DD","weekly":{"monday":[{"id":"stable-block-id","start":"HH:mm","end":"HH:mm","label":"planned activity","kind":"fixed|routine|flexible|open","location":"optional","sourceEntryIds":[1]}]},"sourceEntryIds":[1]}. Use only weekday keys that have evidence.',
         'An exception is {"date":"YYYY-MM-DD","mode":"replace|patch","reason":"...","removeBlockIds":[],"blocks":[],"sourceEntryIds":[1]}. Keep it empty unless evidence proves a date-specific change.',
+        'A cancellation, a reschedule, or a newly confirmed one-off arrangement in committed script belongs to exceptions for its exact date. Do NOT change weekly blocks because of a single occurrence: a regime may change only when evidence shows the new time repeating on separate dates or being stated as permanent.',
+        'Exception evidence must be committed fact — the plan was actually cancelled, the time was actually moved, or the arrangement was explicitly confirmed. A wish, a suggestion, a tentative idea, or an unexecuted plan in conversation is not evidence for any exception or regime change.',
         variation,
         'The plan is a forecast of structure, never proof that an activity happened. Prefer an empty valid plan to a guessed plan.',
     ])

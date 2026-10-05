@@ -5015,6 +5015,110 @@ class AstrbotBridge:
         return []
 
     # ------------------------------------------------------------------ #
+    # 宿主平台连接状态 → 端点在线事实（上游 `src/service.ts:914-921`）
+    # ------------------------------------------------------------------ #
+
+    def host_platform_states(self) -> Optional[dict[str, bool]]:
+        """宿主**此刻**加载着的平台 → 这台实例还能不能用；看不见宿主时返回 `None`。
+
+        为什么不复用 `list_bots()`：那个方法把「看不见平台管理器」与「宿主机上一个平台
+        都没有」都塌成 `[]`，而这两种情形的**失败方向正好相反**——前者一个字都不该写
+        （把全部端点判离线等于新造一堵墙），后者是实情。所以这里保留 `None` 这一档。
+
+        平台名走 `resolve_platform_name`——与入站路径**同一个**归一化口（见坑 41），
+        因此"入站时算出的 platform"与"这里算出的 platform"必然一致，不会出现
+        "入站让她在线、这里把她判离线"的打架。
+
+        `status` 只认**显式失败**：`error` / `stopped` 算离线（适配器真的挂了），
+        `pending` / `running` / 读不到都算在线。为什么不拿 `running` 当进门条件：
+        `on_platform_loaded` 触发时 `_task_wrapper` 往往还没跑
+        （`astrbot/core/platform/manager.py:245` 才置 `RUNNING`），那样会把启动那一次
+        全判离线——正好是本任务要修的方向。
+        """
+        manager = getattr(self.context, 'platform_manager', None)
+        instances = None
+        if manager is not None:
+            instances = getattr(manager, 'platform_insts', None)
+            if instances is None:
+                instances = getattr(manager, 'platforms', None)
+        if instances is None:
+            return None
+        states: dict[str, bool] = {}
+        for instance in list(instances):
+            try:
+                meta = instance.meta()
+            except Exception:  # noqa: BLE001 - 取不到元信息的实例跳过，不拖垮整轮
+                continue
+            platform = resolve_platform_name(
+                _text(getattr(meta, 'name', '')), _text(getattr(meta, 'id', '')),
+            )
+            if not platform:
+                continue
+            raw_status = getattr(instance, 'status', None)
+            status = _text(getattr(raw_status, 'value', raw_status)).lower()
+            states[platform] = states.get(platform, False) or status not in ('error', 'stopped')
+        return states
+
+    async def sync_host_endpoint_connections(self) -> dict[str, Any]:
+        """把宿主**当前观测到**的连接状态写回端点（上游 `service.ts:916-920` 的等价物）。
+
+        ## 这是"宿主的当前观测"，不是"恢复重启前的旧事实"
+
+        与 `restore_endpoint_state` 的「绝不跨重启恢复在线」**不冲突**：那条纪律禁止把
+        **上一次进程**记下的在线当成现在的在线（见 `core/endpoints.py:436`）；这里写进去的
+        是**本次进程里宿主平台管理器此刻真的加载着的实例**——一次现探，不是回读快照。
+
+        ## 为什么必须有这一跳
+
+        M3 的投递门控（`chunk11.endpoint_gate_reason`）现在真的会拦投递，而重启会把
+        `connection.online` 归零。上游靠 `ctx.on('bot-status-updated'/'bot-removed')`
+        （`upstream/src/service.ts:916-920`）补回来；AstrBot 侧由 `main.py` 的
+        `@filter.on_platform_loaded` / `on_astrbot_loaded` 钩子调到这里（那两个是 4.28 里
+        **仅有**的平台生命周期事件）。少了这一跳，**重启后、下一次入站之前**到期的
+        分段/延迟消息会被判 `endpoint-offline` 拦住——现场只看到"没发出去"。
+
+        ## 账号键从哪来
+
+        宿主的平台实例**不给**机器人自己的账号（`Platform.client_self_id` 是个 uuid，
+        见 `astrbot/core/platform/platform.py:45`），所以账号键只能从端点注册表反查：
+        端点行自带 `platform` + `accountKey`，而 `note_endpoint_connection` 认的就是账号键。
+        注册表为空时无事可做（没有账号键 = 还没有任何剧本/参与者，也就没有投递可拦）。
+
+        返回 `{'ok', 'problem', 'online', 'offline', 'loaded'}`——`main.py` 据此打可见 warn。
+        """
+        states = self.host_platform_states()
+        if states is None:
+            return {
+                'ok': False, 'problem': 'host-platform-list-unavailable',
+                'online': [], 'offline': [], 'loaded': [],
+            }
+        # 注册表要先装好：`note_endpoint_connection` 是**按端点行**回写的，
+        # 冷启动时表还没建、`endpoint_rows` 也还不存在，直接写等于什么都没写
+        # （本任务要修的"她发不出去"会原样复现）。两步都是幂等的。
+        # 刻意**不**走 `ensure_started()`：那会把后台定时器与启动迁移一起提前到
+        # 平台加载事件里，动静超出这一跳该有的范围；事件路径照旧在首次入站时兜底。
+        self.db.register_tables()
+        ensure = getattr(self.service, 'ensure_endpoint_registry', None)
+        if callable(ensure):
+            await ensure()
+        by_key: dict[str, set[str]] = {}
+        for row in getattr(self.service, 'endpoint_rows', None) or []:
+            account_key = _text(pick(row, 'accountKey', 'account_key')).strip()
+            if not account_key:
+                continue
+            by_key.setdefault(account_key, set()).add(_text(pick(row, 'platform')).strip())
+        online: list[str] = []
+        offline: list[str] = []
+        for account_key, platforms in by_key.items():
+            is_online = any(states.get(platform) for platform in platforms)
+            self.service.note_endpoint_connection(account_key, is_online)
+            (online if is_online else offline).append(account_key)
+        return {
+            'ok': True, 'problem': '', 'online': online, 'offline': offline,
+            'loaded': sorted(states),
+        }
+
+    # ------------------------------------------------------------------ #
     # 按任务指定 AstrBot 模型（`model_center.task_models`）
     # ------------------------------------------------------------------ #
 

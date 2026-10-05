@@ -7,10 +7,10 @@
 
 本移植版没有 Koishi Console、没有 Node 子进程通道，改为**可选 HTTP 桥**：
 
-* `DesktopBridge` 把上游的 **8 条 `hdsi-desktop` 命令**逐条实现成方法
-  （`phase` / `inbound` / `replay-inbox` / `snapshot` / `timeline-range` /
-  `delivery-result` / `purge-range` / `cursor-set`），由 AstrBot 侧（HTTP 路由或
-  管理命令）按需调用；
+* `DesktopBridge` 把上游的 **9 条 `hdsi-desktop` 命令**逐条实现成方法
+  （`phase` / `inbound` / `replay-inbox` / `snapshot` / `endpoint-health` /
+  `timeline-range` / `delivery-result` / `purge-range` / `cursor-set`），
+  由 AstrBot 侧（HTTP 路由或管理命令）按需调用；
 * 事件出口是一个可注入的 `sink`（等价上游 `sendToDesktop`），HTTP 模式下
   同步返回的事件还可以用 `drain_events()` 取走；
 * 上游 `installDesktopBridge(service)` 的语义由模块级
@@ -25,6 +25,7 @@
 | `inbound` | `inbound()` | `inbound-result` | 无效 typ-0 入站事件。 |
 | `replay-inbox` | `replay_inbox()` | `replay-result` | 回放请求缺少 requestId。 |
 | `snapshot` | `snapshot()` | `snapshot-result` | 快照请求缺少 requestId。 |
+| `endpoint-health` | `endpoint_health()` | `endpoint-health-result` | 端点健康请求缺少 requestId。 |
 | `timeline-range` | `timeline_range()` | `timeline-range-result` | 无效时间线范围请求。 |
 | `delivery-result` | `settle_delivery()` | （回执，无响应事件） | — |
 | `purge-range` | `purge_range()` | `purge-range-result` | 选区删除请求缺少 requestId。／选区删除时间范围无效。 |
@@ -172,6 +173,7 @@ _COMMAND_HANDLERS = {
     'inbound': 'inbound',
     'replay-inbox': 'replay_inbox',
     'snapshot': 'snapshot',
+    'endpoint-health': 'endpoint_health',
     'timeline-range': 'timeline_range',
     'purge-range': 'purge_range',
     'cursor-set': 'cursor_set',
@@ -183,6 +185,7 @@ _RESPONSE_BY_COMMAND = {
     'inbound': 'inbound-result',
     'replay-inbox': 'replay-result',
     'snapshot': 'snapshot-result',
+    'endpoint-health': 'endpoint-health-result',
     'timeline-range': 'timeline-range-result',
     'purge-range': 'purge-range-result',
 }
@@ -191,6 +194,7 @@ _RESPONSE_BY_COMMAND = {
 _MISSING_REQUEST_ID_MESSAGE = {
     'replay-inbox': '回放请求缺少 requestId。',
     'snapshot': '快照请求缺少 requestId。',
+    'endpoint-health': '端点健康请求缺少 requestId。',
     'purge-range': '选区删除请求缺少 requestId。',
 }
 
@@ -429,7 +433,17 @@ class DesktopBridge:
     """
 
     #: 上游 `bridge-ready` 里上报的协议版本（`:283`）。
+    #: 上游 `DESKTOP_BRIDGE_PROTOCOL`（`desktop-bridge.ts:17`）。
     PROTOCOL = 4
+    #: 上游 `DESKTOP_BRIDGE_CAPABILITIES`（`desktop-bridge.ts:18-23`）：桥自己声明的命令族。
+    #: 名字逐字照抄上游；**只列真的实现了的**——上游还有 `multi-account` /
+    #: `onebot-action` 两个能力位，本移植版没有对应实现（那是 typ-0 worker 才需要的
+    #: 入站重定向与动作代理），所以不虚报（能力缺失宁可少报，也不让宿主以为能用）。
+    #: `delivery` 对应 `delivery-result` 回执通道（上游上报的能力名也是 `delivery`）。
+    CAPABILITIES = (
+        'phase', 'inbound', 'replay-inbox', 'snapshot', 'timeline-range',
+        'delivery', 'purge-range', 'cursor-set', 'endpoint-health',
+    )
     #: 上游 `requestDelivery` 的 45s 回执超时。
     DELIVERY_TIMEOUT_MS = 45_000
     #: 上游 `heartbeat` 的 10s 周期。
@@ -508,6 +522,7 @@ class DesktopBridge:
             self.emit('bridge-ready', {
                 'protocol': self.PROTOCOL,
                 'phase': self.service.get_desktop_runtime_phase(),
+                'capabilities': list(self.CAPABILITIES),
             })
         return self
 
@@ -928,6 +943,22 @@ class DesktopBridge:
             raise ValueError(_MISSING_REQUEST_ID_MESSAGE['snapshot'])
         payload = {'requestId': request_id, 'snapshot': await self.service.desktop_timeline_snapshot()}
         self.emit('snapshot-result', payload)
+        return payload
+
+    async def endpoint_health(self, value: dict[str, Any]) -> dict[str, Any]:
+        """`endpoint-health`：端点健康投影（`:255` 之后，上游 `handle` 的独立分支）。
+
+        投影由**服务层**算（`desktop_endpoint_health_snapshot`）：桌面端只读，
+        可用性判据必须与投递本身共用同一套 TTL / 冷却规则（上游注释逐字）。
+        """
+        request_id = _request_id(value)
+        if not is_request_id(request_id):
+            raise ValueError(_MISSING_REQUEST_ID_MESSAGE['endpoint-health'])
+        payload = {
+            'requestId': request_id,
+            'snapshot': await self.service.desktop_endpoint_health_snapshot(),
+        }
+        self.emit('endpoint-health-result', payload)
         return payload
 
     async def timeline_range(self, value: dict[str, Any]) -> dict[str, Any]:

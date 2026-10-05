@@ -517,7 +517,31 @@ class AsyncCompletionReportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('结果不确定', self._due(self.visible(request))[0]['summary'])
         rearmed = self.wake()
         self.assertIsNotNone(rearmed, '更晚的排期必须在唤醒收尾时补回来')
-        self.assertEqual(rearmed['due_at'], retry_at.timestamp() * 1000)
+        # 唤醒收尾补的是**下一个真正需要唤醒的意图**（§87），而这一跳本身可能又造出
+        # 一条更早的回报（她的应答当场没拿到回执）。所以要断言的不是"等于重试时刻"，
+        # 而是两件事：① 当前句柄 = **最早的**待唤醒意图；② **分段重试仍在队里、时刻
+        # 没被推后**——后者才是这道闸真正要守的（重试不许被挤到常规 sweep 的五分钟后）。
+        from plugin.core.service.chunk5 import _WAKE_WORTHY_INTENT_TYPES
+        now_ms = float(self.service.now_ms())
+        pending = [
+            dict(row) for row in self.db.all(
+                'interlude_intent', {'storyId': STORY_ID, 'status': 'pending'},
+            )
+        ]
+        worthy = [
+            row for row in pending
+            if row.get('type') in _WAKE_WORTHY_INTENT_TYPES
+            and row['notBefore'].timestamp() * 1000 > now_ms
+        ]
+        self.assertTrue(worthy, '收尾之后必须还找得到下一个待唤醒的意图')
+        self.assertEqual(
+            rearmed['due_at'],
+            min(row['notBefore'].timestamp() * 1000 for row in worthy),
+            '句柄必须指向最早的待唤醒意图',
+        )
+        still = (await self._db_get_split())[0]
+        self.assertEqual(still['status'], 'pending', '重试仍要排期')
+        self.assertEqual(still['notBefore'], retry_at, '重试时刻不许被推后')
 
     async def _db_get_split(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.db.all(

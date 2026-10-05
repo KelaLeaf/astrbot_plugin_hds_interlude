@@ -11,8 +11,9 @@
 -------------------------------
 上游 camelCase 字段转 snake_case（``script_event`` / ``later_segments`` /
 ``bubble_index`` / ``bubble_count`` / ``full_content`` / ``caused_by_event_ids``
-/ ``script_entry_id`` …）。读取侧两种拼写都接受（``contract.py`` 等兄弟模块或
-旧 JSON 可能仍是 camelCase），写出侧只写 snake_case。
+/ ``script_entry_id`` / ``endpoint_id`` …）。读取侧两种拼写都接受（``contract.py``
+等兄弟模块或旧 JSON 可能仍是 camelCase），写出侧只写 snake_case。显式端点
+（M4 ``endpointId``）走 ``endpoint_id``：**只在确实选了端点时落键**，缺省不写空串。
 """
 
 from __future__ import annotations
@@ -43,10 +44,20 @@ def _is_safe_integer(value: Any) -> bool:
 
 
 try:  # 上游 `import { messageEventReference } from './script/contract'`
-    from .script.contract import message_event_reference
+    from .script.contract import message_event_reference, read_endpoint_id
 except ImportError:  # pragma: no cover - contract.py 由并行 Agent 移植
     # 降级垫片：`contract.py` 尚未落地时，本模块退化为上游 `messageEventReference()`
     # 的等价实现（仅覆盖消息事件引用的构造）。contract.py 一旦可导入，本分支永不执行。
+    def read_endpoint_id(mapping: Any) -> str:
+        """`contract.read_endpoint_id()` 的降级实现（语义逐字一致，判据不另立）。"""
+        if not isinstance(mapping, dict):
+            return ''
+        for key in ('endpointId', 'endpoint_id'):
+            value = mapping.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return ''
+
     def _fallback_is_outgoing(event: Any) -> bool:
         if not isinstance(event, dict):
             return False
@@ -70,6 +81,9 @@ except ImportError:  # pragma: no cover - contract.py 由并行 Agent 移植
         result['event_kind'] = _get(event, 'kind')
         result['caused_by_event_ids'] = list(_get(event, 'caused_by_event_ids',
                                                   'causedByEventIds', default=[]) or [])
+        endpoint_id = read_endpoint_id(event)
+        if endpoint_id:
+            result['endpoint_id'] = endpoint_id
         result['full_content'] = event.get('content')
         result['bubble_index'] = bubble_index
         result['bubble_count'] = len(event.get('bubbles') or [])
@@ -81,11 +95,20 @@ def attach_message_event(
     event: Optional[dict[str, Any]],
     script_entry_id: Optional[int] = None,
 ) -> dict[str, Any]:
-    """上游 `attachMessageEvent()`：把剧本事件身份挂到待投递消息上。"""
+    """上游 `attachMessageEvent()`：把剧本事件身份挂到待投递消息上。
+
+    事件带了端点、而草稿自己还没有时，端点**同时**落到草稿顶层（上游
+    `...(event.endpointId && !message.endpointId ? { endpointId } : {})`）——投递层
+    因此看得见"这条要发给哪个端点"；草稿已自带端点时不覆盖它。
+    """
     script_event = message_event_reference(event, 0, script_entry_id) if event is not None else None
     if not script_event:
         return message
-    return {**message, 'script_event': script_event}
+    attached = {**message, 'script_event': script_event}
+    endpoint_id = read_endpoint_id(event)
+    if endpoint_id and not read_endpoint_id(message):
+        attached['endpoint_id'] = endpoint_id
+    return attached
 
 
 def prepare_outgoing_delivery(message: dict[str, Any], bubbles: list[Any]) -> Optional[dict[str, Any]]:
@@ -139,7 +162,12 @@ def script_event_payload(message: dict[str, Any], bubble_index: int = 0) -> dict
 
 
 def restore_message_event(value: Any, content: str) -> Optional[dict[str, Any]]:
-    """上游 `restoreMessageEvent()`：从 intent payload 还原剧本事件引用。"""
+    """上游 `restoreMessageEvent()`：从 intent payload 还原剧本事件引用。
+
+    显式 ``endpointId`` 随引用一起**带回来**（上游
+    `...(typeof event.endpointId === 'string' && event.endpointId ? { endpointId } : {})`）：
+    历史 payload（没选端点）还原出的键集合与改动前逐字一致——**不补空串**。
+    """
     if not isinstance(value, dict):
         return None
     event = _get(value, 'script_event', 'scriptEvent')
@@ -164,6 +192,9 @@ def restore_message_event(value: Any, content: str) -> Optional[dict[str, Any]]:
         restored['script_entry_id'] = script_entry_id
     restored['event_kind'] = event_kind
     restored['caused_by_event_ids'] = caused_by_event_ids
+    endpoint_id = read_endpoint_id(event)
+    if endpoint_id:
+        restored['endpoint_id'] = endpoint_id
     restored['full_content'] = full_content if isinstance(full_content, str) else content
     restored['bubble_index'] = bubble_index if _is_safe_integer(bubble_index) else 0
     restored['bubble_count'] = bubble_count if _is_safe_integer(bubble_count) else 1
@@ -172,7 +203,11 @@ def restore_message_event(value: Any, content: str) -> Optional[dict[str, Any]]:
 
 def delivery_entry_metadata(message: dict[str, Any],
                             extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """上游 `deliveryEntryMetadata()`：剧本条目的 metadata（含投递身份）。"""
+    """上游 `deliveryEntryMetadata()`：剧本条目的 metadata（含投递身份）。
+
+    ``script_event`` 整份展开进 metadata，所以显式端点（``endpoint_id``）**当且仅当
+    草稿确实带了端点时**出现在 metadata 里；没选端点的历史路径键集合逐字不变。
+    """
     metadata: dict[str, Any] = {
         'visible': True,
         'interaction': message.get('interaction'),  # 上游 `?? null`

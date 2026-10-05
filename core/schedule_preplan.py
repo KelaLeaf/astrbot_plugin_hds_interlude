@@ -36,7 +36,7 @@ import re
 from datetime import datetime, timedelta, timezone as _timezone
 from typing import Any, Literal, Optional, TypedDict
 
-from .time import calendar_day_key, local_clock_minutes, parse_dt, story_local_time_context
+from .time import calendar_day_key, dt_ms, local_clock_minutes, parse_dt, story_local_time_context
 from .types import (
     SchedulePreplanBlock,
     SchedulePreplanDay,
@@ -207,6 +207,72 @@ def schedule_preplan_needs_model(
     if not any(_regime_covers(regime, coverage_target) for regime in regimes):
         return True
     return _js_lt(_pick(record, 'validThrough', 'valid_through'), coverage_target)
+
+
+# ============================================================ 当天例外触发扫描
+
+
+#: 上游 `const DATE_CHANGE_TRIGGER`：取消 / 改期 / 新确认安排在已提交剧本中的语言痕迹。
+#: 只作「是否值得跟进审查」的廉价预筛——是否真登记例外仍由审查模型依据证据判定
+#: （愿望与未实现计划在教学行里被明确排除，见 `narrator_prompts.schedule_preplan_prompt`）。
+#:
+#: 逐字对应上游正则 `/取消|改期|改成|推迟|提前到|延到|改约|另约|延期|定在|敲定|约好|约了|确认了?(时间|地点|日子)?/`：
+#: 末尾两项的 `?` 让「确认」单独出现也算命中（`了` 与「时间/地点/日子」都是可选的）。
+_DATE_CHANGE_TRIGGER = re.compile(r'取消|改期|改成|推迟|提前到|延到|改约|另约|延期|定在|敲定|约好|约了|确认了?(时间|地点|日子)?')
+
+
+def schedule_preplan_evidence_mentions_date_change(entries: list[Any]) -> list[int]:
+    """上游 `schedulePreplanEvidenceMentionsDateChange()`：未读证据里的改约信号条目 id。
+
+    输入与 `schedule_preplan_evidence()` 同源（`kind=script` 的剧本条目）；世界事件 /
+    好友动态 / 空间条目是外部观测，不进入该管道，天然不构成她的日程改变。
+
+    只收**正整数 id**（上游 `Number.isSafeInteger(id) && id > 0`）。本移植版沿用本文件
+    `_ids()` 的口径：先过 `_js_number()` 再校验整数/安全范围/正数，因此纯数字字符串 id
+    （JSON 里常见的 `"7"`）也会被接受——这是读取侧双拼写纪律的一部分，也是唯一的宽容点。
+    去重保序、至多 20 条。文本取 `String(entry.content ?? '')`——键缺失或 `null`
+    都当空串，因此它们永远不命中。
+    """
+    matched: list[int] = []
+    for entry in entries:
+        entry_id = _js_number(_pick(entry, 'id'))
+        if entry_id is None or not entry_id.is_integer() or abs(entry_id) > _MAX_SAFE_INTEGER or entry_id <= 0:
+            continue
+        content = _pick(entry, 'content')
+        text = '' if content is _UNDEFINED or content is None else _js_string(content)
+        if _DATE_CHANGE_TRIGGER.search(text):
+            matched.append(int(entry_id))
+    return list(dict.fromkeys(matched))[:20]
+
+
+#: 上游 `SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS = 2 * 60 * 60_000`：两次带外审查之间至少隔 2 小时。
+SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS = 2 * 60 * 60_000
+
+
+def schedule_preplan_follow_up_due(
+    record: Optional[SchedulePreplanRecord],
+    unseen_evidence: list[Any],
+    now: datetime,
+    config: SchedulePreplanConfig,
+) -> bool:
+    """上游 `schedulePreplanFollowUpDue()`：当天跟进审查是否到期。
+
+    日审查已完成后（`schedule_preplan_review_due()` 为假），未读证据出现改约信号
+    且冷却（≥2h）已过 → 允许一次带外审查。此前单次改约要等到次日审查才入例外，
+    而那个改约属于「今天」（backlog：当天例外的及时收束）。
+
+    这里是这条放行判据的**唯一真源**：未启用 / 无记录 / 日审本身到期 / 冷却未过 /
+    未读证据无信号，五态一律 `False`；接线侧只负责把未读证据取来。
+    """
+    if not _pick(config, 'enabled') or not record:
+        return False
+    if schedule_preplan_review_due(record, now, _pick(record, 'timezone'), config):
+        return False
+    # 上游 `now.getTime() - record.updatedAt.getTime() < COOLDOWN`；无法解析的时间戳
+    # 折成 0（= `new Date(0).getTime()`），与 `normalize_schedule_preplan_record()` 的回落一致。
+    if dt_ms(now) - dt_ms(_pick(record, 'updatedAt', 'updated_at')) < SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS:
+        return False
+    return len(schedule_preplan_evidence_mentions_date_change(unseen_evidence)) > 0
 
 
 # ============================================================ 写入

@@ -98,8 +98,10 @@ from typing import Any, Callable, Optional
 from ..agency import active_agency_window, proactive_candidate_fingerprint
 from ..bubbles import VOICE_MARKER, runtime_bubble_segments
 from ..delivery import delivery_entry_metadata, restore_message_event, script_event_payload
+from ..endpoints import fresh_endpoint_state, session_matches_endpoint, state_after_connection
 from ..script.completion_report import ledger_completion
 from ..script.delivery_ledger import delivery_intent_key, update_script_delivery_actions
+from ..script.contract import read_endpoint_id
 from ..story_state import decode_story_state, encode_story_state
 from ..time import dt_ms, format_log_time, iso, parse_dt, utc_now
 from ..urge import (
@@ -385,6 +387,26 @@ targetable_message_id = _prefer_helper('targetable_message_id', _targetable_mess
 class ServiceChunk6(ServiceBase):
     """对应 `upstream/src/service.ts` 第 4814–5441 行的成员。"""
 
+    def _endpoint_candidate_for_delivery(
+        self, endpoint_id: Any, participant_id: Any,
+    ) -> Optional[dict[str, Any]]:
+        """上游 `endpointCandidate`（`service.ts:6263`）：这条私聊消息的候选端点行。
+
+        只认 **本人** 的 `participant-user` 端点——别人的端点不算候选（也就不会拿
+        别人的在线事实给这条消息背书）。
+        """
+        if not endpoint_id:
+            return None
+        for row in getattr(self, 'endpoint_rows', None) or []:
+            if pick(row, 'id') != endpoint_id:
+                continue
+            if pick(row, 'ownerKind', 'owner_kind') != 'participant-user':
+                return None
+            if pick(row, 'ownerId', 'owner_id') != participant_id:
+                return None
+            return row
+        return None
+
     # ------------------------------------------------------------------ #
     # deliverDueSplitSegments（上游 :4814）
     # ------------------------------------------------------------------ #
@@ -441,12 +463,19 @@ class ServiceChunk6(ServiceBase):
                             story_id, reference, 'cancelled', 'delivery-target-unavailable', now,
                         )
                 else:
+                    # 上游 `:5880`：显式端点随剧本事件引用一起恢复到出站草稿上——
+                    # `...(scriptEvent?.endpointId ? { endpointId: scriptEvent.endpointId } : {})`。
+                    # 没选端点时不建这个键（空串不算选了端点）。
+                    script_event = restore_message_event(payload, content)
                     message: dict[str, Any] = {
                         'participant_id': pick(participant, 'id'),
                         'content': content,
                         'automatic_delivery': automatic_delivery,
-                        'script_event': restore_message_event(payload, content),
+                        'script_event': script_event,
                     }
+                    endpoint_id = read_endpoint_id(script_event) if script_event else ''
+                    if endpoint_id:
+                        message['endpoint_id'] = endpoint_id
                     if payload.get('voice') is True:
                         # 这一段是正文 `<tts/>` 指定的语音（排期时写进 payload，见
                         # `confirm_outgoing_deliveries`）。
@@ -970,7 +999,10 @@ class ServiceChunk6(ServiceBase):
         ids: list[str] = []
         for message in messages:
             participant_id = pick(message, 'participantId', 'participant_id')
-            if participant_id and participant_id not in ids:
+            if (participant_id and not str(participant_id).startswith('group:')
+                    and participant_id not in ids):
+                # 上游 `service.ts:6197`：群目标不进私聊参与者查表（否则会被误报成
+                # 「参与者不存在」丢掉——她选了平台却被忽略的真实现场）。
                 ids.append(participant_id)
         by_id: dict[str, Any] = {}
         if current is not None and pick(current, 'id') in ids:
@@ -982,8 +1014,39 @@ class ServiceChunk6(ServiceBase):
                 by_id[pick(participant, 'id')] = participant
         typing_floor_applied = False
         typing_waited_ms = 0
+        # M3（上游 `service.ts:6204`）：**注册表没就绪就不要投递**。健康门控只有在
+        # 持久注册表与状态快照都可用之后才有意义，所以这里宁可整批拒绝并逐条留痕，
+        # 也不退化成"看起来发了"。极简桩没有这个方法 → 走旧路径（getattr 兜底）。
+        ensure_registry = getattr(self, 'ensure_endpoint_registry', None)
+        if callable(ensure_registry):
+            try:
+                await ensure_registry()
+            except Exception as error:  # noqa: BLE001 - 降级为显式拒绝（可见 warn + 留痕）
+                self.report_standalone(
+                    'warn', '出站端点注册表不可用，已阻止本批消息投递 错误=%s', error,
+                )
+                if record_failures:
+                    for blocked in messages:
+                        await self.record_outgoing_delivery_failure(
+                            story, pick(blocked, 'participantId', 'participant_id'),
+                            blocked, 'endpoint-registry-unavailable',
+                        )
+                return delivered
         for message in messages:
             message_participant_id = pick(message, 'participantId', 'participant_id')
+            if isinstance(message_participant_id, str) \
+                    and message_participant_id.startswith('group:'):
+                # 群目标绝不进私聊参与者查表，也不许拿「写这条动作的那个私聊回合」的
+                # session 当传输（上游 `service.ts:6223` 逐字）。跨群出站自己落账。
+                try:
+                    await self.send_cross_group_message(story, message, session)
+                except Exception as error:  # noqa: BLE001 - 上游同样只留 warn，不自动重发
+                    self.report(
+                        'warn', story, 'intent-due',
+                        '跨群投递或回执记录失败（不自动重发）目标=%s 错误=%s',
+                        message_participant_id, error,
+                    )
+                continue
             target = by_id.get(message_participant_id)
             if target is None:
                 self.report(
@@ -1053,6 +1116,91 @@ class ServiceChunk6(ServiceBase):
                 self.report_operation(
                     'standard', 'info', story, 'intent-due', '消息投递开始 参与者=%s', target_id,
                 )
+                # ── M3 统一投递门控（上游 `service.ts:6268-6320`）───────────────
+                # 顺序与上游逐条一致：先解析旧路径地址 → 区分"调用方显式指定"与
+                # "默认路由" → 用**当前 live session** 观测连接 → 过硬路由归属校验
+                # + 投递门控 → 再过可选的主动联系门控。被拒绝的消息**一步都不往外走**，
+                # 并且必须留下能点名的可见理由（哪条端点、为什么），否则真机上只会
+                # 表现为"她没回"。
+                #
+                # `getattr` 兜底：极简测试桩不实现端点层时整段跳过（单平台零影响）。
+                sync = getattr(self, 'delivery_address_for', None)
+                legacy_address = sync(story, target) if callable(sync) else target
+                delivery_target = legacy_address
+                raw_explicit = pick(message, 'endpoint_id', 'endpointId')
+                explicit_endpoint_id = (
+                    raw_explicit.strip()
+                    if isinstance(raw_explicit, str) and raw_explicit.strip() else None
+                )
+                selected_endpoint_id = explicit_endpoint_id or pick(
+                    legacy_address, 'endpointId', 'endpoint_id',
+                )
+                endpoint_row = self._endpoint_candidate_for_delivery(
+                    selected_endpoint_id, target_id,
+                )
+                # 入站 session 就是"这一刻连着"的事实——**在门控之前**记下来，
+                # 否则第一条立即回复会被判成离线（门控死锁，上游注释写过）。
+                if endpoint_row is not None and session is not None \
+                        and pick(current, 'id') == target_id \
+                        and session_matches_endpoint(session, endpoint_row):
+                    states = getattr(self, 'endpoint_states', None)
+                    record_state = getattr(self, 'set_endpoint_state', None)
+                    if isinstance(states, dict) and callable(record_state):
+                        previous = states.get(selected_endpoint_id) \
+                            or fresh_endpoint_state(selected_endpoint_id)
+                        if pick(pick(previous, 'connection') or {}, 'online') is not True:
+                            record_state(
+                                selected_endpoint_id, state_after_connection(previous, True),
+                            )
+                gate = getattr(self, 'endpoint_for_delivery', None)
+                resolved = (
+                    gate(selected_endpoint_id, 'participant-user', target_id)
+                    if callable(gate) else {}
+                )
+                gate_reason = pick(resolved, 'reason')
+                if gate_reason:
+                    self.report(
+                        'warn', story, 'intent-due',
+                        '消息被端点门控阻止 参与者=%s 端点=%s 原因=%s',
+                        target_id, selected_endpoint_id, gate_reason,
+                    )
+                    if record_failures:
+                        await self.record_outgoing_delivery_failure(
+                            story, target_id, message, gate_reason,
+                        )
+                    continue
+                endpoint = pick(resolved, 'row')
+                if endpoint is not None:
+                    # 硬路由：出站地址以注册表为准（不再回落到旧字段 / 别的账号）。
+                    delivery_target = {
+                        **legacy_address,
+                        'platform': pick(endpoint, 'platform'),
+                        'selfId': pick(endpoint, 'selfId', 'self_id'),
+                    }
+                    if not explicit_endpoint_id:
+                        # 默认路由解析出来的端点也要记回草稿（M4 的前置：分段/延迟
+                        # 投递据此恢复同一条硬路由），但不能把普通回复变成后台投递。
+                        message['endpoint_id'] = pick(endpoint, 'id')
+                if endpoint is not None \
+                        and pick(message, 'userInitiated', 'user_initiated') is not True:
+                    # 用户触发的回复不是主动联系；后台 / 延迟 / Agency 消息在通道
+                    # 提供 context-token 这类闸门时才需要再过一道。QQ/OneBot 端点没有
+                    # `initiate` 记录 → 不额外加闸（历史主动联系路径照旧）。
+                    initiate_gate = getattr(self, 'endpoint_initiate_gate_reason', None)
+                    initiate_reason = (
+                        initiate_gate(pick(endpoint, 'id')) if callable(initiate_gate) else None
+                    )
+                    if initiate_reason:
+                        self.report(
+                            'warn', story, 'intent-due',
+                            '消息被主动联系端点门控阻止 参与者=%s 端点=%s 原因=%s',
+                            target_id, pick(endpoint, 'id'), initiate_reason,
+                        )
+                        if record_failures:
+                            await self.record_outgoing_delivery_failure(
+                                story, target_id, message, initiate_reason,
+                            )
+                        continue
                 literal_quote_message_id = await self.resolve_literal_quote_message_id(
                     pick(story, 'id'), target_id, content,
                 )
@@ -1088,12 +1236,9 @@ class ServiceChunk6(ServiceBase):
                         # 上游把正文换成 `h('quote', {id}) + '\u200b'`；`send_session`
                         # 协议没有 reply_to，照原样发就只剩零宽占位，故这条降级路径
                         # 改走按参与者投递，把引用目标显式交给适配器（见模块文档串第 3 条）。
-                        # 上游 M1a：出站地址以端点注册表为准（无注册表时原样）。
-                        # `getattr` 兜底：极简测试桩不必实现端点层。
-                        sync = getattr(self, 'delivery_address_for', None)
+                        # 出站地址已由上面的 M3 门控解析（注册表优先，无注册表时原样）。
                         result = await self.transport.send_private(
-                            sync(story, target) if callable(sync) else target,
-                            _QUOTE_PLACEHOLDER, literal_quote_message_id,
+                            delivery_target, _QUOTE_PLACEHOLDER, literal_quote_message_id,
                         )
                     else:
                         result = await self.transport.send_session(
@@ -1161,8 +1306,6 @@ class ServiceChunk6(ServiceBase):
                     # 找到了 Koishi 式 bot 对象，但本移植版的出站协议只有 Transport：
                     # 记一次明确失败，绝不静默丢消息（见模块文档串第 2 条）。
                     raise RuntimeError('transport-unavailable')
-                sync = getattr(self, 'delivery_address_for', None)
-                delivery_target = sync(story, target) if callable(sync) else target
                 result = await self.transport.send_private(
                     delivery_target, outgoing_content, literal_quote_message_id,
                     **voice_kwargs(outgoing_voice),

@@ -29,6 +29,7 @@
 | 5676 | `updateParticipantState` |
 | 5683 | `migrateLegacyStory` |
 | 5736 | `migrateLegacyBranchIntoShared` |
+| 5790 | `sendCrossGroupMessage` |
 | 5840 | `ensureContinuity` |
 | 5866 | `compactionFingerprint` |
 | 5872 | `compactionIsBackedOff` |
@@ -74,14 +75,24 @@ from ..schedule_preplan import (
     next_schedule_preplan_transition,
     normalize_schedule_preplan_record,
     refresh_schedule_preplan,
+    schedule_preplan_evidence_mentions_date_change,
+    schedule_preplan_follow_up_due,
     schedule_preplan_needs_model,
     schedule_preplan_review_due,
 )
+from ..bubbles import DEFAULT_SEPARATOR, VOICE_MARKER, runtime_bubble_segments
 from ..story_state import decode_story_state, encode_story_state
 from ..time import calendar_day_key, dt_ms, format_log_time, iso, parse_dt
 from ..types import empty_participant_state, empty_story_setting
 from ..urge import resolve_urge_config
-from .base import ServiceBase, legacy_story_id_for, normalize_account_id, pick, story_id_for_character
+from .base import (
+    ServiceBase,
+    legacy_story_id_for,
+    normalize_account_id,
+    normalize_group_id,
+    pick,
+    story_id_for_character,
+)
 from .config import COMPACTION_RETRY_BACKOFF, SCHEDULE_PREPLAN_RETRY_BACKOFF
 from .session import SessionView
 from .helpers import (
@@ -1089,6 +1100,163 @@ class ServiceChunk7(ServiceBase):
         return str(pick(rows[0], 'id')) if rows else ''
 
     # ------------------------------------------------------------------ #
+    # 跨群出站（上游 `src/service.ts:5790`；rc36 同段 `:6162`）
+    # ------------------------------------------------------------------ #
+
+    async def send_cross_group_message(
+        self, story: Any, message: Any, session: Any = None,
+    ) -> dict[str, Any]:
+        """上游 `sendCrossGroupMessage(story, message, session?)`（`src/service.ts:5790`）逐条移植。
+
+        跨会话动作的目标**是群**（`participantId` 以 `group:` 开头）时走这条：她主动去
+        **另一个群**说话，而不是回她当前这条私聊。两件事上游注释写得最直白：群目标
+        绝不能进私聊参与者查表，也绝不能拿"写下这条动作的那个私聊回合"的 session
+        当传输——那都不是这个群的有效传输。
+
+        端点沿用 `chunk2.send_group_message` 的**硬路由**：`message.endpoint_id` 有值就按
+        它走，选不中（不存在 / 不属于本故事或本群 / 当前不可投递）**一条都不发**，理由串
+        仍用 M3/M4 已定的词表（`endpoint-not-found` / `endpoint-offline` /
+        `endpoint-registry-unavailable` …），**绝不回落到默认路由**。
+        群规则（`onebot.groupChats`）没列这个群 → 逐段 `group-not-allowed`（上游 `:6167`）。
+
+        出站结果**记回端点状态**（上游 `:2862` 成功写 `'group-delivered'`、`:2872` 失败带
+        错误串）：按本次**实际走的那条**端点逐段回写（`chunk2` 只在门控放行之后才把选中
+        的端点写进草稿），多端点下不会错刷兄弟端点；被拒 / 注册表不可用 / 没有端点层时
+        草稿里没有端点 id，**一个字都不写**——与上游"没进分段循环就不记账"同形。
+
+        投递结局按上游原样落账：有 `script_event` 就逐段写投递结局（含理由），有分段投
+        出去就追加一条 `character-group-message` 剧本条目；未完成时留一条可见 warn
+        （**不自动重发**：适配器接受请求之后才失败时，重发就是重复消息）。
+        """
+        participant_id = _text_value(pick(message, 'participantId', 'participant_id'))
+        raw_group = (
+            participant_id[len('group:'):]
+            if participant_id.lower().startswith('group:') else participant_id
+        )
+        group_id = normalize_group_id(raw_group)
+        content = pick(message, 'content')
+        content = content if isinstance(content, str) else ''
+        runtime = _section(self.config, 'runtime')
+        separator = _cfg(runtime, 'messageSeparator', 'message_separator')
+        separator = (
+            separator.strip()
+            if isinstance(separator, str) and separator.strip() else DEFAULT_SEPARATOR
+        )
+        # 受控偏离（见 `docs/PORTING_NOTES.md` §101）：`chunk4` 的即时动作**一律**过
+        # `prepare_outgoing_delivery`（上游 `:5201` 明确把群目标排除在外），于是群消息到
+        # 这里时可能已经是"首段 + `later_segments`"。不还原就会**静默只发第一段**，所以
+        # 按同一个分隔符拼回整条、并把语音意图用标记还原（`<tts/>` 是本移植版的出站形状）。
+        # `chunk4` 照上游补上群目标例外之后，这一段自然空转。
+        later_segments = pick(message, 'laterSegments', 'later_segments') or []
+        if later_segments:
+            later_voice = pick(message, 'laterSegmentsVoice', 'later_segments_voice') or []
+            parts = [content] + [str(item) for item in later_segments]
+            voice_flags = [pick(message, 'voice') is True] + [bool(item) for item in later_voice]
+            content = separator.join(
+                ('%s%s' % (VOICE_MARKER, part)) if voice_flags[index] else part
+                for index, part in enumerate(parts)
+            )
+        endpoint_id = pick(message, 'endpoint_id', 'endpointId')
+        endpoint_id = (
+            endpoint_id.strip()
+            if isinstance(endpoint_id, str) and endpoint_id.strip() else None
+        )
+        allowed = self.group_rule(group_id) is not None
+        # `chunk2` 在门控**放行之后、真正出站之前**才把选中的端点写进这份草稿——所以
+        # "草稿里有点 id"就是"这一条真的进了出站尝试"（被拒的分支写不进去）。
+        route_draft: dict[str, Any] = {}
+        if allowed:
+            outcome = await self.send_group_message(  # type: ignore[attr-defined]
+                story, group_id, content, None, session, endpoint_id, draft=route_draft,
+            )
+        else:
+            outcome = {
+                'delivered_segments': [],
+                'complete': False,
+                'segment_outcomes': [
+                    {'index': index, 'content': pick(segment, 'content'),
+                     'status': 'failed', 'reason': 'group-not-allowed'}
+                    for index, segment in enumerate(runtime_bubble_segments(
+                        runtime, content, bool(self.voice_reply_enabled),  # type: ignore[attr-defined]
+                    ))
+                ],
+            }
+            # 上游这里只有句末那句"未完成"；被名单挡下属于"需要用户看见的能力缺失"，
+            # 所以点名群频道与理由串（词表沿用上游的 `group-not-allowed`，不新造）。
+            self.report(
+                'warn', story, 'intent-due',
+                '跨群消息被群聊名单阻止 群频道=%s 原因=%s', group_id, 'group-not-allowed',
+            )
+        delivered_segments = pick(outcome, 'deliveredSegments', 'delivered_segments') or []
+        segment_outcomes = pick(outcome, 'segmentOutcomes', 'segment_outcomes') or []
+        used_endpoint_id = _text_value(pick(route_draft, 'endpoint_id'))
+        if used_endpoint_id:
+            message['endpoint_id'] = used_endpoint_id
+            note_outbound = getattr(self, 'note_endpoint_outbound', None)
+            rows = getattr(self, 'endpoint_rows', None) or []
+            row = next((item for item in rows if pick(item, 'id') == used_endpoint_id), None)
+            if callable(note_outbound) and row is not None:
+                owner_kind = (
+                    'group' if pick(row, 'ownerKind', 'owner_kind') == 'group' else 'story-role'
+                )
+                owner_id = (
+                    pick(row, 'ownerId', 'owner_id') if owner_kind == 'group' else pick(story, 'id')
+                )
+                address = {
+                    'platform': pick(row, 'platform'),
+                    'selfId': pick(row, 'selfId', 'self_id'),
+                }
+                for segment in segment_outcomes:
+                    if pick(segment, 'status') == 'delivered':
+                        note_outbound(owner_kind, owner_id, True, 'group-delivered', address)
+                    else:
+                        note_outbound(
+                            owner_kind, owner_id, False,
+                            _text_value(pick(segment, 'reason')) or 'group-delivery-failed',
+                            address,
+                        )
+        now = self.now()  # type: ignore[attr-defined]
+        story_id = pick(story, 'id')
+        script_event = pick(message, 'scriptEvent', 'script_event')
+        script_metadata = script_event if isinstance(script_event, dict) else {}
+
+        async def record_task() -> None:
+            if script_metadata:
+                for segment in segment_outcomes:
+                    await self.update_script_delivery_outcome(  # type: ignore[attr-defined]
+                        story_id,
+                        {**script_metadata, 'segment_index': pick(segment, 'index')},
+                        pick(segment, 'status'), now, pick(segment, 'reason'),
+                    )
+            if delivered_segments:
+                metadata: dict[str, Any] = {
+                    'groupId': group_id, 'channelId': group_id,
+                    **script_metadata,
+                    'deliverySegmentIndexes': [
+                        pick(segment, 'index') for segment in segment_outcomes
+                        if pick(segment, 'status') == 'delivered'
+                    ],
+                    'partialDelivery': not pick(outcome, 'complete'),
+                }
+                await self.append_entry(  # type: ignore[attr-defined]
+                    story_id,
+                    {
+                        'kind': 'character-group-message', 'actor': 'character',
+                        'content': DEFAULT_SEPARATOR.join(str(item) for item in delivered_segments),
+                        'occurredAt': iso(now), 'metadata': metadata,
+                    },
+                    now,
+                )
+
+        await self.serial(story_id, record_task)  # type: ignore[attr-defined]
+        if not pick(outcome, 'complete'):
+            self.report(
+                'warn', story, 'intent-due',
+                '跨群消息投递未完成（不自动重发）群频道=%s', group_id,
+            )
+        return outcome
+
+    # ------------------------------------------------------------------ #
     # 连续性（`src/service.ts:5840-5864`）
     # ------------------------------------------------------------------ #
 
@@ -1471,6 +1639,11 @@ class ServiceChunk7(ServiceBase):
     async def prepare_schedule_preplan_review(self, story: Any, now: datetime) -> Optional[dict[str, Any]]:
         """上游 `prepareSchedulePreplanReview(story, now)`（`src/service.ts:6047`）。
 
+        两条放行路径：① 日审查到期 → 照常取未读证据；② 日审查未到期但
+        「冷却已过 + 未读证据含改约/取消/新确认信号」→ 放行一次带外审查
+        （当天例外的及时收束，判据在 `schedule_preplan_follow_up_due()`）。
+        两条都不成立时返回 `None`：调用方因此**零模型调用**。
+
         返回本移植版内部的复核上下文（键名 snake_case，与 `types.py` 的
         `SchedulePreplanReviewRequest` 一致）：`current` / `evidence_entries` /
         `local_date` / `needs_model` / `request`。
@@ -1484,12 +1657,30 @@ class ServiceChunk7(ServiceBase):
             return None
         current = await self.get_schedule_preplan(story_id)
         timezone = _setting_timezone(story)
-        if not schedule_preplan_review_due(current, now, timezone, config):
-            return None
+        daily_due = schedule_preplan_review_due(current, now, timezone, config)
+        if daily_due:
+            evidence_entries = await self.schedule_preplan_evidence(
+                story_id, _number(pick(current, 'lastEvidenceEntryId', 'last_evidence_entry_id'), 0),
+            )
+        else:
+            # 当天例外的及时收束（backlog 2026-09-07，上游 `service.ts:8636-8644`）：
+            # 日审查完成后改约仍会发生，原先要等次日审查才登记——而那个例外属于「今天」。
+            # 放行判据（日审未到期 + 冷却已过 + 未读证据含确定性改约信号）**只有一处**：
+            # `schedule_preplan_follow_up_due()`；这里只负责取未读证据与留一条 debug。
+            # 判据不成立就零模型调用地返回（连未读证据都不必查时直接空列表）。
+            unseen = await self.schedule_preplan_evidence(
+                story_id, _number(pick(current, 'lastEvidenceEntryId', 'last_evidence_entry_id'), 0),
+            ) if current else []
+            if not schedule_preplan_follow_up_due(current, unseen, now, config):
+                return None
+            evidence_entries = unseen
+            triggers = schedule_preplan_evidence_mentions_date_change(unseen)
+            self.report_operation(  # type: ignore[attr-defined]
+                'diagnostic', 'debug', story, 'advance',
+                'Schedule Preplan 当天跟进审查：未读证据含改约/取消/新安排信号 条目=%s',
+                ','.join(str(item) for item in triggers[:5]),
+            )
         local_date = calendar_day_key(now, timezone)
-        evidence_entries = await self.schedule_preplan_evidence(
-            story_id, _number(pick(current, 'lastEvidenceEntryId', 'last_evidence_entry_id'), 0),
-        )
         if not current and not evidence_entries:
             empty = apply_schedule_preplan_proposal(
                 None,

@@ -79,6 +79,9 @@ EXPECTED_TABLES = [
     'interlude_seeded_event',
     # 上游 1.0.1-rc28（M1a/M1b）：端点注册表与剧本别名。
     'interlude_endpoint',
+    # 上游 1.0.1-rc29（M3）：端点**动态健康状态**的持久快照
+    # （`database.ts:214`；身份行与动态状态分表，重启只保留诊断、不恢复在线事实）。
+    'interlude_endpoint_state',
     'interlude_story_alias',
     # 本移植版新增：控制台「Token 统计」页的账本。
     'interlude_token_usage',
@@ -111,6 +114,8 @@ EXPECTED_PRIMARY = {
     'interlude_schedule_preplan': ('storyId', False),
     'interlude_seeded_event': ('id', True),
     'interlude_endpoint': ('id', False),
+    # 每端点一行，主键就是端点 id（非自增）。
+    'interlude_endpoint_state': ('endpointId', False),
     'interlude_story_alias': ('aliasStoryId', False),
     'interlude_token_usage': ('id', True),
     'interlude_qzone_post': ('id', True),
@@ -139,6 +144,7 @@ EXPECTED_INDEXES = {
     # 分组描述表：主键就是目录名，所以没有 `name` 列、也没有名字唯一索引。
     'interlude_sticker_groups': ['updatedAt'],
     'interlude_schedule_preplan': ['validThrough', 'lastReviewedLocalDate'],
+    'interlude_endpoint_state': ['updatedAt'],
 }
 
 #: 每张表应有的列（列名与顺序都照抄 database.ts）。
@@ -226,6 +232,7 @@ EXPECTED_COLUMNS = {
         'id', 'ownerKind', 'ownerId', 'channelKind', 'platform', 'accountKey', 'selfId',
         'userId', 'channelId', 'groupId', 'conversationKind', 'enabled', 'createdAt', 'updatedAt',
     ],
+    'interlude_endpoint_state': ['endpointId', 'state', 'updatedAt'],
     'interlude_story_alias': ['aliasStoryId', 'canonicalStoryId', 'reason', 'createdAt'],
     'interlude_token_usage': [
         'id', 'day', 'storyId', 'task', 'model', 'provider',
@@ -268,6 +275,8 @@ EXPECTED_TYPES = {
     'interlude_schedule_preplan': {'revision': 'INTEGER', 'validFrom': 'TEXT',
                                    'regimes': 'TEXT', 'exceptions': 'TEXT',
                                    'materializedDays': 'TEXT'},
+    # `json` → TEXT（`state` 存 JSON 文本）；`timestamp` → TEXT（ISO 串）。
+    'interlude_endpoint_state': {'endpointId': 'TEXT', 'state': 'TEXT', 'updatedAt': 'TEXT'},
 }
 
 
@@ -358,10 +367,10 @@ class RegisterTablesTests(_DatabaseTestCase):
         created = self.db.register_tables()
         self.assertEqual(sorted(created), sorted(EXPECTED_TABLES))
         self.assertEqual(sorted(self._table_names()), sorted(EXPECTED_TABLES))
-        # `TABLES` 注册表本身是 23 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表
-        # + Token 账本 + QQ 空间账本 + 定时命令表 + 本移植版的共同作品表与表情库分组表
-        # + rc28 长线叙事指导的两张表）。
-        self.assertEqual(len(TABLES), 23)
+        # `TABLES` 注册表本身是 24 项（13 张原有表 + rc23 事件表 + rc28 端点/别名表
+        # + rc29 端点状态快照表 + Token 账本 + QQ 空间账本 + 定时命令表 + 本移植版的
+        # 共同作品表与表情库分组表 + rc28 长线叙事指导的两张表）。
+        self.assertEqual(len(TABLES), 24)
         self.assertEqual(db_mod.table_names(), EXPECTED_TABLES)
 
     def test_columns_match_upstream_declaration(self):

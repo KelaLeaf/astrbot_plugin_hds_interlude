@@ -623,6 +623,20 @@ def iter_fields(node: dict, path: str = ""):
                     yield from iter_fields(sub_spec.get("items", {}), f"{here}[].{sub_key}")
 
 
+#: 上游 `CONFIGURATION_GUIDE.md:260`（6.2 分段消息）＋ 6.3 表（`contextEntryLimit` /
+#: `contextTimeWindowMinutes`）的「小模型三件套配合说明」。三条 hint 是**用户可见文案的
+#: 唯一权威原文**：`plugin/_conf_schema.json` 写这三句、`docs/CONFIG_MAP.md` 逐字引用，
+#: 三处同改（`test_the_small_model_hints_are_verbatim_in_the_schema` /
+#: `test_config_map_quotes_the_small_model_hints_verbatim`）。
+SMALL_MODEL_NEWLINE_HINT = (
+    "小模型适配开关：模型没按合约写分段标记、改用换行分条时，把换行当分段标记再发；"
+    "已含分段标记时不转换；关掉「拆分回复消息」时本项无效。"
+    "Gemma 等不遵守分句合约的小模型建议开启。"
+)
+SMALL_MODEL_ENTRY_HINT = "小模型可调小，例如 15；填小于 35 的值真实生效。"
+SMALL_MODEL_WINDOW_HINT = "设 0 = 只按条数上限。小模型收缩上下文时需与条数上限一起调小或设 0。"
+
+
 class ConfigurationSchemaTest(unittest.TestCase):
     """上游 `test/configuration.test.ts` 的等价移植。"""
 
@@ -976,6 +990,67 @@ class ConfigurationSchemaTest(unittest.TestCase):
         self.assertIn("换行", entry["description"])
         self.assertIn("不转换", entry["hint"], "已含显式分隔符时不转换是上游守卫，必须写出来")
         self.assertIn("换行", entry["hint"])
+
+    # -- 上游 CONFIGURATION_GUIDE.md:260：小模型三件套「配合说明」---------------
+
+    def test_the_small_model_hints_are_verbatim_in_the_schema(self):
+        """三处同改①：schema 的三条 hint 逐字 = 本文件的权威原文。
+
+        上游 `CONFIGURATION_GUIDE.md:260`（6.2）外加 6.3 表两行，把
+        `contextEntryLimit` / `contextTimeWindowMinutes` / `convertNewlineToSeparator`
+        当成一套「小模型适配」讲：前两个负责把上下文缩下来（条数可小到 15、
+        时间窗要与条数一起缩），第三个负责让不写分段标记的小模型用换行分条。
+        本移植版只把这套说明放进 hint（`description` 仍是一句话），三处同改。
+
+        反向（变异）：任一处 hint 改一个字 → 这条红；`docs/CONFIG_MAP.md` 改一个字
+        → `test_config_map_quotes_the_small_model_hints_verbatim` 红。
+        """
+        runtime = self.section("runtime")
+        self.assertEqual(
+            runtime["convert_newline_to_separator"]["hint"], SMALL_MODEL_NEWLINE_HINT,
+        )
+        self.assertEqual(runtime["context_entry_limit"]["hint"], SMALL_MODEL_ENTRY_HINT)
+        self.assertEqual(
+            runtime["context_time_window_minutes"]["hint"], SMALL_MODEL_WINDOW_HINT,
+        )
+
+    def test_the_small_model_hints_state_the_upstream_facts(self):
+        """文案即规格：这三条 hint 的每一句都要对得上本移植版**真实**行为。
+
+        * 「换行当分段标记」——`plugin/core/bubbles.py:117`（连续换行只算一个边界）；
+        * 「已含分段标记时不转换」——`bubbles.py:117` 的 `separator not in normalized`；
+        * 「关掉「拆分回复消息」时本项无效」——`bubbles.py:113`（`enabled=False` 提前返回）；
+        * 「填小于 35 的值真实生效」——`service/chunk1.py:498` 的 35 硬地板已整条移除；
+        * 「需与条数上限一起调小或设 0」——`chunk1.py:506` 条数与时间窗是**只加不减**的叠加。
+
+        刻意**不**照抄上游的"把每个换行自动视作一条消息的分隔"：上游自己的
+        `/\r?\n+/g` 也把换行**运行**收敛成一个边界，字面照抄就是假话。
+        """
+        runtime = self.section("runtime")
+        newline = runtime["convert_newline_to_separator"]["hint"]
+        self.assertIn("小模型适配开关", newline, "上游 CONFIGURATION_GUIDE.md:260 的原话")
+        self.assertIn("Gemma", newline, "上游点名 Gemma 才构成『部分完成』缺的那一段")
+        self.assertIn("不遵守分句合约的小模型建议开启", newline)
+        self.assertIn("关掉「拆分回复消息」时本项无效", newline, "上游前提：拆分关闭则本开关无效")
+        entry = runtime["context_entry_limit"]["hint"]
+        self.assertIn("15", entry, "上游给了小模型的具体建议值")
+        self.assertIn("小于 35", entry, "硬地板已移除，这句是用户敢调小的依据")
+        window = runtime["context_time_window_minutes"]["hint"]
+        self.assertIn("设 0 = 只按条数上限。", window, "rc35 语义不许被新句挤掉")
+        self.assertIn("一起调小", window, "上游：收缩上下文要两个值配合")
+
+    def test_config_map_quotes_the_small_model_hints_verbatim(self):
+        """三处同改②：`docs/CONFIG_MAP.md` 三行逐字含这三条 hint。"""
+        path = os.path.join(REPO_ROOT, "docs", "CONFIG_MAP.md")
+        if not os.path.exists(path):
+            self.skipTest("发布仓布局没有 docs/CONFIG_MAP.md")
+        with open(path, encoding="utf-8") as handle:
+            config_map = handle.read()
+        for hint in (SMALL_MODEL_NEWLINE_HINT, SMALL_MODEL_ENTRY_HINT, SMALL_MODEL_WINDOW_HINT):
+            with self.subTest(hint=hint):
+                self.assertIn(hint, config_map, "CONFIG_MAP.md 缺那句逐字 hint")
+        # 反向：旧文案（只有「按换行拆」、没有小模型那段）不许留在任何一处。
+        self.assertNotIn("模型用换行分条时按换行拆", config_map)
 
     # -- 上游第 16 条：separate optional perspective layer ----------------------
 

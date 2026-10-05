@@ -1230,7 +1230,7 @@
         "type": "bool",
         "description": "换行也当分条",
         "default": false,
-        "hint": "模型用换行分条时按换行拆；已含分段标记时不转换"
+        "hint": "小模型适配开关：模型没按合约写分段标记、改用换行分条时，把换行当分段标记再发；已含分段标记时不转换；关掉「拆分回复消息」时本项无效。Gemma 等不遵守分句合约的小模型建议开启。"
       },
       "typing_base_delay_seconds": {
         "type": "float",
@@ -1314,13 +1314,14 @@
       "context_entry_limit": {
         "type": "int",
         "description": "主叙事携带的最近条目数上限（默认 35，可填 1~200）。与时间窗是叠加：窗口内的条目全部并入。",
-        "default": 35
+        "default": 35,
+        "hint": "小模型可调小，例如 15；填小于 35 的值真实生效。"
       },
       "context_time_window_minutes": {
         "type": "int",
         "description": "额外保留时间窗分钟（默认 45，可填 0~1440）。与条数上限是叠加：窗口内的条目全部并入。",
         "default": 45,
-        "hint": "设 0 = 只按条数上限。"
+        "hint": "设 0 = 只按条数上限。小模型收缩上下文时需与条数上限一起调小或设 0。"
       },
       "memory_limit": {
         "type": "int",

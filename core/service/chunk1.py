@@ -89,6 +89,7 @@ from .helpers import (
     extract_session_voice_count,
     format_group_speaker,
     group_image_refs_for_storage,
+    mask_qq_ids,
     narrative_cursor,
     normalize_group_chat_actions,
     normalize_group_visible_reply,
@@ -1300,9 +1301,12 @@ class ServiceChunk1(ServiceBase):
         # 关掉的群、`mention-only` 下没 @ 的消息、找不到 / 非 active 的剧本，
         # 上面都已经 return 了 —— 那些消息既不进叙事，也不该顺手收藏别人的图。
         self._spawn_group_sticker_collect(group_media)
+        # 上游 `service.ts:2076` 逐字：summary 级关不掉，所以**只在这一行**把 QQ 号脱敏
+        # （`maskQqIds`）。入站之外的用途（出站 UMO / 名单 / 主键 / 发给模型的 payload）
+        # 一律保持原文，脱敏不许外溢。
         self.report_operation(
             'summary', 'info', story, 'user-message',
-            '收到群聊消息 群=%s 发送者=%s', group_id, sender_id,
+            '收到群聊消息 群=%s 发送者=%s', mask_qq_ids(group_id), mask_qq_ids(sender_id),
         )
         return True
 
@@ -1362,7 +1366,7 @@ class ServiceChunk1(ServiceBase):
         user_input = self.describe_user_event(story, session)
         self.report_operation(
             'summary', 'info', story, 'user-message',
-            '收到参与者私聊消息 参与者=%s', pick(participant, 'id'),
+            '收到参与者私聊消息 参与者=%s', mask_qq_ids(pick(participant, 'id')),
         )
         logging_config = _config_section(self.config, 'logging')
         if pick(logging_config, 'logMessageContent', 'log_message_content'):
@@ -2183,6 +2187,15 @@ class ServiceChunk1(ServiceBase):
                     pick(rule, 'willingness'),
                     self.now_ms(),
                 )
+            # 其他会话走与私聊回合**同一套**投递账本（上游 `src/service.ts:2306`，rc36 `:2450`）：
+            # 群回合里她写下的跨会话动作（含"去另一个群说话"）同样要出站。不接这一跳就是
+            # "她在群里决定了、却没有任何人去发"。`messages` 里只有跨会话动作（群回复走上面
+            # 的 `send_group_message`，群回合没有私聊参与者，立即回复那一支进不来），所以
+            # **没有跨群动作时 `messages` 为空、群路既有行为一个字都不变**（反向用例钉着）。
+            # 上游这里同样**不**调 `confirm_outgoing_deliveries`：群目标的回执由
+            # `send_cross_group_message` 自己落账（见 chunk7）。
+            if result['messages']:
+                await self.send_outgoing_messages(snapshot['story'], result['messages'])
             self.schedule_compaction(story_id)
         except Exception as error:
             self.report('warn', story, 'user-message', '群聊主叙事失败，保持静默 群=%s 错误=%s', group_id, error)

@@ -3,7 +3,8 @@
 本模块是 移植约定 分解契约里的 `helpers.py`：只含**模块级函数**，
 不含 `InterludeService` 的任何成员。`upstream/src/service.ts` 该范围内出现、但实际
 定义在别处的辅助函数（`isRecord` / `clip` / `clampNumber` / `toDate` / `cosineSimilarity`
-等）按上游同样归属本模块。
+等）按上游同样归属本模块。**例外**：`maskQqIds`（上游 `service.ts:9727`，P2-5 日志脱敏）
+在该范围之外，但同属"模块级纯函数"，按同一判据收在本模块末尾（见文件末节）。
 
 ## 键名约定
 
@@ -31,6 +32,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -183,6 +185,8 @@ __all__ = [
     'rank_sticker_catalog',
     'should_downscale_image',
     'detect_live_script_time_overflow',
+    # ---- 日志展示：QQ 号脱敏（上游 `maskQqIds`，service.ts:9727）----
+    'mask_qq_ids',
     # ---- 常量 ----
     'SEMANTIC_STICKER_LIMIT',
     'AUDIO_FILE_EXTENSIONS',
@@ -909,10 +913,22 @@ def calibrated_native_face_willingness(semantic: str, willingness: Any, reply_co
 
 
 def stable_sticker_asset_id(file_path: Any, hash_value: Any) -> str:
-    """上游 `stableStickerAssetId`。
+    """上游 `stableStickerAssetId`（`src/service.ts:10048`，rc29 起）。
 
     旧的「只留标点」的 id 会碰撞（例如两个文件名都归一成 `bq--6-`）。保留一段
-    可读路径前缀，再附带内容哈希片段，使每一行全局唯一、且未改动的文件保持稳定。
+    可读路径前缀，再附带**路径 + 内容**的联合哈希片段：路径或内容任一变化 id 必换，
+    同一份输入恒定。
+
+    **后缀是联合哈希（rc29 修复，别退回只取内容哈希）**：中文目录名会被上面那几行
+    正则整体折叠成 `-`，`stem` 于是退化成一个常量（`猫猫收藏/` 与 `日常贴纸/` 都变
+    `sticker`）；此时若后缀只取内容哈希，两个分组里放同一张图就是**同一个 assetId**，
+    而 `interlude_sticker.assetId` 上有唯一索引 —— 每轮扫描都在它上面撞库并报
+    「表情包库扫描失败」（用户日志 8 连复现的根因）。联合哈希让路径差异必然分叉。
+
+    旧库里已经写下的 id 由下一轮扫描按 `filePath` **就地把同一行改写**（
+    `chunk2.scan_sticker_library` 用 `by_path` 找旧行、`db_set` 到新 id），
+    不需要数据迁移脚本；文件内容没变的 `active` 行会一直保留旧 id（它仍唯一），
+    内容一变自然换新 id。
     """
     stem = _str(file_path)
     stem = stem.replace('\\', '/')
@@ -921,7 +937,11 @@ def stable_sticker_asset_id(file_path: Any, hash_value: Any) -> str:
     stem = re.sub(r'-+', '-', stem)
     stem = re.sub(r'^[-/]+|[-/]+$', '', stem)
     stem = stem[:220] or 'sticker'
-    suffix = re.sub(r'[^a-fA-F0-9]', '', _str(hash_value))[:16].lower() or 'unhashed'
+    # 进 sha1 的字节 = UTF-8(`<原样 filePath>\n<原样 hash>`)，与上游
+    # `createHash('sha1').update(`${filePath}\n${hash}`)` 逐字节相同（JS 字符串
+    # 默认按 UTF-8 编码）。取十六进制前 16 位。
+    joint = '%s\n%s' % (_str(file_path), _str(hash_value))
+    suffix = hashlib.sha1(joint.encode('utf-8')).hexdigest()[:16]
     return ('%s-%s' % (stem, suffix))[:255]
 
 
@@ -4063,3 +4083,31 @@ def normalize_major_events(value: Any, patches: list[dict[str, Any]],
         if item and item not in combined:
             combined.append(item)
     return combined[-20:]
+
+
+# =========================================================================== #
+# 日志展示：QQ 号脱敏（上游 `service.ts:9724-9729` 的 `maskQqIds`，P2-5）
+# =========================================================================== #
+
+#: 上游 `/\d{5,12}/g`。**只匹配 5–12 位**：1–4 位的小号（以及非数字账号
+#: `wxid_*` 里的数字段如果是短串）原样保留，13 位以上的长数字段上游按"先吃掉
+#: 12 位、剩下 1 位不满足下界"处理（`{5,12}` 是贪婪但**不**回溯成"更长"）。
+#: JS 的 `\d` 只认 ASCII，故这里显式写 `[0-9]`（同本模块其它正则）。
+_QQ_ID_RUN = re.compile(r'[0-9]{5,12}')
+
+
+def mask_qq_ids(value: Any) -> str:
+    """上游 `maskQqIds(value)`（`service.ts:9727`）：把字符串里每个 5–12 位数字段
+    保留**尾 4 位**（够关联排查）、前面一律换成 `•`（至少一个）。
+
+    这是**展示层**脱敏：上游只用在那两行 "summary 级入站消息" 日志上
+    （`service.ts:2076` 群聊入站 / `service.ts:2139` 私聊入站），因为 summary 级
+    `verbosity` 关不掉，完整 ID 会被无条件写进日志。**入站之外的用途一律不接**：
+    出站 UMO / 权限名单 / 数据库主键 / 发给模型的 payload 都必须保真。
+
+    非字符串按 JS `String(value ?? '')` 处理（`None` → `''`）。
+    """
+    return _QQ_ID_RUN.sub(
+        lambda matched: '•' * max(1, len(matched.group(0)) - 4) + matched.group(0)[-4:],
+        _str(value),
+    )

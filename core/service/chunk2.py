@@ -204,6 +204,15 @@ STICKER_GUESS_TIMEOUT_SECONDS = 60.0
 #: 与 `STICKER_COLLECT_WARN_INTERVAL_MS` 同档：能力缺失必须看得见，但不能每回合刷一条。
 _NATIVE_FACE_WARN_INTERVAL_MS = 10 * 60 * 1000
 
+#: 群路被端点层拦下时**已经在端点层留过 warn** 的理由（`chunk11.group_delivery_route`）：
+#: 注册表不可用带错误详情、显式端点无效带端点 id 与群频道。这两条不再由 `chunk2` 重复
+#: 刷一遍同一条事实——但**其余**理由（离线 / 冷却 / 停用 / 过期）必须在这里留可见 warn，
+#: 否则真机上只会表现为"她在群里没说话"。
+_GROUP_GATE_REASONS_REPORTED_BY_ENDPOINTS = (
+    'endpoint-registry-unavailable',
+    'endpoint-not-found',
+)
+
 
 def _local_sticker_path(value: Any) -> str:
     """把适配器给的本地图片引用归一成文件系统路径（`file:///x` → `/x`）。
@@ -505,6 +514,27 @@ def _now_ms(owner: Any) -> int:
     if callable(method):
         return int(method())
     return dt_ms(utc_now())
+
+
+def _sticker_dedupe_key(row: dict[str, Any]) -> tuple[Any, Any]:
+    """扫描去重键 `(assetId, filePath)`（上游 `dedupeKey`，`src/service.ts:2999`）。
+
+    两个字段一起看，不是只看 `filePath`：旧 assetId 折叠缺陷留下的重复行是
+    **同 id 同路径**的两行（`filePath` 单键也是它，但键的形状要与上游一致，
+    以后上游若把键扩成三列，这里跟着改一处就够）。
+    """
+    return (row.get('assetId'), row.get('filePath'))
+
+
+def _sticker_row_updated_ms(row: dict[str, Any]) -> float:
+    """行的 `updatedAt` 毫秒时间戳；取不到当**最旧**。
+
+    上游拿 `Date` 直接比大小：`item.updatedAt > prior.updatedAt`。库里 `updatedAt`
+    正常总有值，缺失是脏行——脏行不许顶掉有时间的行（`-inf` 保证这一点），
+    时间戳相等时保留先遇到的那行（严格 `>`，与上游一致）。
+    """
+    stamp = parse_dt(row.get('updatedAt'))
+    return dt_ms(stamp) if stamp is not None else float('-inf')
 
 
 def _coerce_int(value: Any) -> int:
@@ -1194,16 +1224,67 @@ class ServiceChunk2(ServiceBase):
         content: str,
         reply_to_message_id: Optional[str] = None,
         session: Any = None,
+        endpoint_id: Optional[str] = None,
+        *,
+        draft: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """上游 `sendGroupMessage(...)`（`src/service.ts:2147`）。
+        """上游 `sendGroupMessage(...)`（`src/service.ts:2751`，rc28 起就有 `endpointId?`）。
 
         上游先按 `story.selfId` / `story.platform` 找一个可用机器人账号；本移植版
         把这条能力收敛到 `Transport.send_group`，因此「没有可用账号」等价于
         「没有可用的出站通道」。逐段投递并保留每段的结局，便于投递账本记账。
+
+        `endpoint_id`（M4）：调用方/模型**显式选中**的端点。上游把它当**硬路由**——
+        选中的端点找不到、不属于这个群/这个故事、或过不了投递门控时，整条群消息
+        **硬失败、一条都不发**，且**绝不**回落到默认路由（`src/service.ts:6366`）。
+        判据的唯一实现在 `chunk11.group_delivery_route`（显式分支 + 默认分支 + 门控前
+        live session 观测），这里只一问一用，不抄第二份。
+
+        `draft`（**本移植版扩展**，关键字参数）：群路出站草稿。给了就把本次实际走的那条
+        端点**记回**草稿顶层 `endpoint_id`——与私聊出站记回 `message['endpoint_id']` 同形
+        （上游的群路草稿只存在于 `sendCrossGroupMessage`，本移植版还没有那条跨群入口，
+        所以由调用方按需传入）。不给 = 行为与上游逐字一致。
         """
         segments = runtime_bubble_segments(
             _config_section(self.config, 'runtime'), content, bool(self.voice_reply_enabled),
         )
+        # M3/M4：群路出站前的**统一投递门控 + 端点选择**（上游 `service.ts:2761-2825`）。
+        # 注册表不可用、显式端点无效/不属于目标、或选中的端点当前不可投递（离线 / 冷却 /
+        # 停用 / 过期）时**一条分段都不发**，理由写进每段的结局里——群消息被拦也必须说得出
+        # "哪条端点、为什么"，否则真机上只会表现为"她在群里没说话"。判据的唯一实现在
+        # `chunk11.group_delivery_route`（含 fresh-start / restart-awaiting-connection 例外），
+        # 这里只一问一用，不抄第二份。
+        route: dict[str, Any] = {}
+        route_fn = getattr(self, 'group_delivery_route', None)
+        if callable(route_fn):
+            route = await route_fn(story, channel_id, session, endpoint_id)
+        else:
+            group_gate = getattr(self, 'group_delivery_gate', None)
+            if callable(group_gate):
+                route = {'reason': await group_gate(story, channel_id, session, endpoint_id)}
+        blocked_reason = pick(route, 'reason')
+        if blocked_reason:
+            if blocked_reason not in _GROUP_GATE_REASONS_REPORTED_BY_ENDPOINTS:
+                # 这两条理由端点层已经**带着详情**留过一次 warn（注册表不可用带错误详情、
+                # 显式端点无效带端点与群频道），这里不重复刷同一条事实。
+                self.report(
+                    'warn', story, 'user-message',
+                    '群消息被端点门控阻止 群频道=%s 原因=%s', channel_id, blocked_reason,
+                )
+            return {
+                'delivered_segments': [],
+                'complete': False,
+                'segment_outcomes': [
+                    {'index': index, 'content': segment['content'], 'status': 'failed',
+                     'reason': blocked_reason}
+                    for index, segment in enumerate(segments)
+                ],
+            }
+        # 放行时把"实际走的那条端点"记回草稿（与私聊 outbound 同形）。缺注册表 / 没有
+        # 注册端点时 `route` 是 `{}` → 不写这个键，旧路径逐字不变。
+        selected = pick(route, 'row')
+        if draft is not None and selected is not None:
+            draft['endpoint_id'] = pick(selected, 'id')
         send = getattr(self.transport, 'send_group', None)
         if not callable(send):
             self.report(
@@ -1637,8 +1718,27 @@ class ServiceChunk2(ServiceBase):
             lister = getattr(self.transport, 'list_sticker_files', None)
             files = await lister(root) if callable(lister) else _list_sticker_files(root)
             existing = await self.db_get('interlude_sticker', {})
+            # 旧 assetId 折叠缺陷（后缀只取内容哈希）留下的重复行会让每轮扫描在
+            # `assetId` 唯一索引上崩掉：扫描前先按 `(assetId, filePath)` 去重，
+            # 每个键只留 `updatedAt` 最新的那行，其余**物理删除**——库自愈，不需要
+            # 数据迁移脚本（上游 `scanStickerLibrary` 的 `newestByKey` 段，
+            # `src/service.ts:2997-3009`）。删的是旧缺陷留下的重复行，所以不报用户可见
+            # 文案：正常库里这个键天然唯一，循环一次都不删。
+            newest_by_key: dict[tuple[Any, Any], dict[str, Any]] = {}
+            for row in existing:
+                if not isinstance(row, dict):
+                    continue
+                key = _sticker_dedupe_key(row)
+                kept = newest_by_key.get(key)
+                if kept is None or _sticker_row_updated_ms(row) > _sticker_row_updated_ms(kept):
+                    newest_by_key[key] = row
+            for row in existing:
+                if not isinstance(row, dict) or row.get('id') is None:
+                    continue
+                if newest_by_key.get(_sticker_dedupe_key(row)) is not row:
+                    await self.db_remove('interlude_sticker', {'id': row.get('id')})
             by_path = {
-                row.get('filePath'): row for row in existing if isinstance(row, dict)
+                row.get('filePath'): row for row in newest_by_key.values()
             }
             seen: set[str] = set()
             pending: list[dict[str, Any]] = []

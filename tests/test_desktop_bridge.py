@@ -84,6 +84,11 @@ class _FakeService:
         self.range_queries: list[Any] = []
         self.purge_calls: list[tuple[Any, Any]] = []
         self.phase_error: Exception | None = None
+        #: M3 `endpoint-health` 投影（形状由服务层决定，桥只中转）。
+        self.health_calls = 0
+        self.health_snapshot: dict[str, Any] = {
+            'protocol': 1, 'generatedAt': '2026-09-30T12:00:00.000Z', 'endpoints': [],
+        }
 
     # ---- 桥接面 ----
 
@@ -122,6 +127,10 @@ class _FakeService:
     async def desktop_purge_range(self, from_value: Any, to_value: Any) -> dict[str, Any]:
         self.purge_calls.append((from_value, to_value))
         return {'storyId': 'story-1'}
+
+    async def desktop_endpoint_health_snapshot(self) -> dict[str, Any]:
+        self.health_calls += 1
+        return self.health_snapshot
 
 
 def inbound_event(**overrides: Any) -> dict[str, Any]:
@@ -549,6 +558,39 @@ class DesktopBridgeCommandTests(unittest.IsolatedAsyncioTestCase):
         payload = events_of(result, 'purge-range-result')[0]['payload']
         self.assertEqual(payload['error'], '选区删除时间范围无效。')
 
+    # ---- endpoint-health（M3，上游 `desktop-bridge.ts:331-338`）----
+
+    async def test_endpoint_health_returns_the_service_projection(self) -> None:
+        """`endpoint-health` 是**只读投影**：桥不自己算可用性，只把服务层那份转回去。
+
+        形状断言到具体键（不是"有个 snapshot"）：端点是硬路由，宿主拿它给用户看
+        "哪条能投、为什么不能投"，少一个键就少一条能照着查的线索。
+        """
+        projection = {
+            'protocol': 1,
+            'generatedAt': '2026-09-30T12:00:00.000Z',
+            'endpoints': [{
+                'endpointId': 'ep-1', 'ownerKind': 'participant-user', 'ownerId': 'p1',
+                'platform': 'onebot', 'channelKind': 'qq', 'enabled': True,
+                'online': True, 'observedAt': '2026-09-30T11:59:00.000Z',
+                'deliverable': True, 'initiateAllowed': True, 'note': 'delivered',
+            }],
+        }
+        self.service.health_snapshot = projection
+        result = await self.bridge.handle(command('endpoint-health', {'requestId': REQUEST_ID}))
+        payload = events_of(result, 'endpoint-health-result')[0]['payload']
+        self.assertEqual(payload['requestId'], REQUEST_ID)
+        self.assertEqual(payload['snapshot'], projection)
+        self.assertEqual(self.service.health_calls, 1)
+
+    async def test_endpoint_health_requires_request_id(self) -> None:
+        result = await self.bridge.handle(command('endpoint-health', {}))
+        payload = events_of(result, 'endpoint-health-result')[0]['payload']
+        self.assertEqual(payload, {
+            'requestId': None, 'accepted': False, 'error': '端点健康请求缺少 requestId。',
+        })
+        self.assertEqual(self.service.health_calls, 0, '校验失败不得去问服务层')
+
     # ---- 服务异常 ----
 
     async def test_service_exception_becomes_a_failure_envelope(self) -> None:
@@ -842,9 +884,22 @@ class BridgeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         events = bridge.drain_events()
         self.assertEqual(events, [{
             'type': 'hdsi-desktop', 'event': 'bridge-ready',
-            'payload': {'protocol': 4, 'phase': 'running'},
+            'payload': {
+                'protocol': 4, 'phase': 'running',
+                'capabilities': list(DesktopBridge.CAPABILITIES),
+            },
         }])
         self.assertEqual(self.service.phase_calls, ['running'])
+
+    async def test_bridge_ready_advertises_endpoint_health(self) -> None:
+        """M3（rc29）：`endpoint-health` 是桥的**声明能力**，而且只声明做得到的。
+
+        上游 `desktop-bridge.ts:18-23` 的能力位里还有 `multi-account` / `onebot-action`，
+        本移植版没有对应实现——**不虚报**（宁可少报，也不让宿主以为能用）。
+        """
+        self.assertIn('endpoint-health', DesktopBridge.CAPABILITIES)
+        self.assertNotIn('multi-account', DesktopBridge.CAPABILITIES)
+        self.assertNotIn('onebot-action', DesktopBridge.CAPABILITIES)
 
     async def test_initial_phase_comes_from_the_environment(self) -> None:
         with mock.patch.dict(os.environ, {DESKTOP_PHASE_ENV: 'muted'}):

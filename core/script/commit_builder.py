@@ -41,6 +41,7 @@ from .contract import (
     ScriptDeliveryMode,
     ScriptEventDraft,
     is_outgoing_script_event,
+    read_endpoint_id,
 )
 
 try:  # 上游 `./authored-actions`；由并行的 `core/script/authored_actions.py` 移植任务落地。
@@ -155,6 +156,9 @@ def decision_to_script_commit(input: ScriptFirstDecisionInput) -> ScriptCommitDr
             continue
         _add_message_event(add, {
             'participant_id': action['participant_id'],
+            # 上游这里是 `endpointId: action.endpointId`：模型显式选的端点属于**这条
+            # 跨会话发言**，随事件落进剧本（缺省时 `_add_message_event` 不建该键）。
+            'endpoint_id': read_endpoint_id(action),
             'content': action['content'],
             'mode': action['mode'],
             'occurred_at': action['send_at'] if action['mode'] == 'delayed' and _js_truthy(action.get('send_at')) else now_iso,
@@ -330,19 +334,29 @@ def _add_message_event(
     add: Any,
     input: dict[str, Any],
 ) -> ScriptEventDraft:
-    """上游私有 `addMessageEvent`：算好气泡与绑定后塞进事件列表。"""
+    """上游私有 `addMessageEvent`：算好气泡与绑定后塞进事件列表。
+
+    选中的端点随事件一起落进剧本（上游 `...(input.endpointId ? { endpointId : {} )`）：
+    **只在确实选了端点时**才写 ``endpoint_id``，缺省时不建这个键。
+    """
     separator = _js_default(input.get('separator'), _DEFAULT_SEPARATOR)
     split = _js_default(input.get('split'), True)
     bubbles = _split_bubbles(input['content'], separator, split)
-    return add({
+    event: dict[str, Any] = {
         'kind': 'outgoing-message', 'actor': 'protagonist', 'occurred_at': input['occurred_at'],
         'caused_by_event_ids': input['caused_by_event_ids'], 'participant_id': input['participant_id'],
+    }
+    endpoint_id = read_endpoint_id(input)
+    if endpoint_id:
+        event['endpoint_id'] = endpoint_id
+    event.update({
         'content': _canonical_bubble_content(input['content'], bubbles, separator, split),
         'bubbles': bubbles,
         'delivery_mode': input['mode'],
         'script_binding': {'status': 'future'} if input['mode'] == 'delayed'
         else bind_immediate_message_action(input['prose'], bubbles, input.get('actions') or []),
     })
+    return add(event)
 
 
 def _canonical_bubble_content(

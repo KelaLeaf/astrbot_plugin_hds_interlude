@@ -31,6 +31,7 @@ from plugin.core.narrator_prompts import (
     compaction_prompt,
     prompt_visible_message_content,
     recent_script_ownership,
+    schedule_preplan_prompt,
     sticker_description_instruction,
     sticker_instruction,
     sticker_selection_instruction,
@@ -1067,6 +1068,44 @@ class PlatformActionInstructionTests(unittest.TestCase):
         for junk in ({}, None, 'x', {'platformActions': None}, {'platformActions': 'send_poke'}):
             with self.subTest(junk=junk):
                 self.assertEqual(platform_action_instruction(junk), '')
+
+
+class SchedulePreplanPromptTests(unittest.TestCase):
+    """`schedule_preplan_prompt()`：审查教学两行（上游 `src/narrator.ts:2374,2375`）。
+
+    上游 `test/schedule-preplan.test.ts:190` 对**源码**做正则断言（那一份在
+    `test_schedule_preplan.SchedulePreplanTeachingTests`，读 `narrator_prompts.py` 源码）；
+    这里守的是**渲染结果**：三个 variationLevel 下两行都逐字在，且不会漏进主叙事提示词。
+    """
+
+    #: 上游 `src/narrator.ts:2374` 逐字（含末尾句号）。
+    CANCELLATION_LINE = (
+        'A cancellation, a reschedule, or a newly confirmed one-off arrangement in committed script '
+        'belongs to exceptions for its exact date. Do NOT change weekly blocks because of a single '
+        'occurrence: a regime may change only when evidence shows the new time repeating on separate '
+        'dates or being stated as permanent.'
+    )
+    #: 上游 `src/narrator.ts:2375` 逐字（破折号是 U+2014）。
+    EVIDENCE_LINE = (
+        'Exception evidence must be committed fact — the plan was actually cancelled, the time was actually '
+        'moved, or the arrangement was explicitly confirmed. A wish, a suggestion, a tentative idea, or an '
+        'unexecuted plan in conversation is not evidence for any exception or regime change.'
+    )
+
+    def test_teaching_lines_are_rendered_verbatim_for_every_variation_level(self) -> None:
+        for level in ('stable', 'contextual', 'granular'):
+            with self.subTest(variation_level=level):
+                prompt = schedule_preplan_prompt(level)
+                self.assertIn(self.CANCELLATION_LINE, prompt)
+                self.assertIn(self.EVIDENCE_LINE, prompt)
+
+    def test_teaching_lines_stay_inside_the_schedule_preplan_prompt(self) -> None:
+        """反向：这两行只属于 Preplan 侧任务，主叙事提示词里一个字都不该有。"""
+        main = system_prompt(
+            'advance', '', '', '', '', '', False, False, False, False, False, None, False, None, False)
+        self.assertNotIn('Do NOT change weekly blocks', main)
+        self.assertNotIn('is not evidence for any exception or regime change', main)
+        self.assertIn('Do NOT change weekly blocks', schedule_preplan_prompt('stable'))
 
 
 if __name__ == '__main__':

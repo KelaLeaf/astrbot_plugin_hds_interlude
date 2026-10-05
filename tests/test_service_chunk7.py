@@ -1057,5 +1057,149 @@ class SchedulePreplanStoreTests(AsyncServiceTestCase):
         self.assertEqual(DEFAULT_SCHEDULE_PREPLAN_CONFIG['horizon_days'], 14)
 
 
+class SchedulePreplanFollowUpWiringTests(AsyncServiceTestCase):
+    """:8636-8644 当天例外及时收束的接线：命中放行一次、未命中零模型调用。
+
+    用例里 `NOW = 2026-09-07T04:00:00Z` = 本地（Asia/Shanghai）12:00；
+    `reviewAfterLocalHour = 3` ⇒ 当天日审已过（`lastReviewedLocalDate = '2026-09-07'`），
+    所以每条用例走的都是**跟进分支**，除非显式把上次复核日设成昨天。
+    """
+
+    #: 与 `make_config()` 的默认值无关的一份完整 schedulePreplan 段。
+    PREPLAN = {
+        'enabled': True, 'horizonDays': 14, 'reviewAfterLocalHour': 3,
+        'anchorAutoAdvance': True, 'variationLevel': 'stable',
+        'candidateActivationProbability': .25, 'candidateRevealMinutes': 120,
+    }
+
+    async def _seed(
+        self, *, updated_at: datetime, reviewed_local_date: str = '2026-09-07',
+        last_evidence_id: int = 0, contents: tuple[str, ...] = (),
+    ) -> tuple[Any, dict[str, Any]]:
+        config = make_config(schedulePreplan=dict(self.PREPLAN))
+        service = self.make_service(config)
+        service.cached_schedule_preplan_config = None
+        await self.insert_story('story', setting={**empty_story_setting(), 'timezone': 'Asia/Shanghai'})
+        story = await self.story_row('story')
+        record = apply_schedule_preplan_proposal(
+            None,
+            {
+                'outcome': 'replace', 'reason': '有稳定日程',
+                'regimes': [{
+                    'id': 'summer', 'label': '暑假', 'from': '2026-08-01', 'to': '2026-09-30',
+                    'weekly': {'monday': [
+                        {'id': 'class', 'start': '14:00', 'end': '17:00', 'label': '补课', 'kind': 'fixed'},
+                    ]},
+                }],
+                'exceptions': [],
+            },
+            [], '2026-09-07', 'Asia/Shanghai', resolve_schedule_preplan_config(dict(self.PREPLAN)), NOW,
+        )
+        assert record is not None
+        record['story_id'] = 'story'
+        record['last_reviewed_local_date'] = reviewed_local_date
+        record['last_evidence_entry_id'] = last_evidence_id
+        record['updated_at'] = updated_at
+        await service.save_schedule_preplan(record)
+        for content in contents:
+            await service.db_create('interlude_script_entry', {
+                'storyId': 'story', 'participantId': '', 'kind': 'script', 'actor': 'narrator',
+                'content': content, 'occurredAt': NOW, 'metadata': {}, 'createdAt': NOW,
+            })
+        return service, story
+
+    @staticmethod
+    async def _drain(service: Any, story_id: str = 'story', limit: int = 200) -> None:
+        """等 `schedule_compaction` 那条后台链跑完（`scheduled_compactions` 被 finally 清空）。"""
+        for _ in range(limit):
+            if story_id not in service.scheduled_compactions:
+                return
+            await asyncio.sleep(0)
+        raise AssertionError('后台整理没有在预期轮数内结束')
+
+    @staticmethod
+    def _pipeline(service: Any) -> list[Any]:
+        """桩掉场景压缩与模型调用，只观察 Schedule Preplan 那条是否真的调了模型。"""
+        calls: list[Any] = []
+
+        async def _count_request(_story: Any, request: Any) -> Any:
+            calls.append(request)
+            return None
+
+        async def _no_scene(_story: Any, _now: Any, _forced: Any) -> Any:
+            return None
+
+        service.request_schedule_preplan = _count_request  # type: ignore[assignment]
+        service.prepare_compaction = _no_scene  # type: ignore[assignment]
+        return calls
+
+    async def test_cooldown_not_elapsed_blocks_the_follow_up(self):
+        service, story = await self._seed(
+            updated_at=NOW - timedelta(hours=1), contents=('今晚的课取消了',))
+        self.assertIsNone(
+            await service.prepare_schedule_preplan_review(story, NOW),
+            '冷却未过：即使证据里有改约信号也不放行')
+
+    async def test_signal_after_cooldown_releases_exactly_one_follow_up_review(self):
+        service, story = await self._seed(
+            updated_at=NOW - timedelta(hours=3), contents=('今晚的课取消了',))
+        review = await service.prepare_schedule_preplan_review(story, NOW)
+        self.assertIsNotNone(review, '冷却已过 + 有信号：放行一次')
+        self.assertTrue(review['needs_model'])
+        self.assertIsNotNone(review['request'])
+        self.assertEqual(review['local_date'], '2026-09-07')
+        self.assertEqual(len(review['evidence_entries']), 1)
+        self.assertTrue(
+            any('当天跟进审查' in text for _level, text in self.sink.records),
+            '带外审查必须留一条诊断记录')
+
+    async def test_no_signal_means_no_follow_up_review(self):
+        service, story = await self._seed(
+            updated_at=NOW - timedelta(hours=3), contents=('她想去看那部新电影，但还没买票。',))
+        self.assertIsNone(
+            await service.prepare_schedule_preplan_review(story, NOW),
+            '愿望不是证据：未命中触发词时零模型调用')
+
+    async def test_daily_review_still_takes_the_normal_path_without_a_trigger(self):
+        """反向：日审到期时不需要触发词，走的是正常路径（跟进判据不在这里生效）。"""
+        service, story = await self._seed(
+            updated_at=NOW - timedelta(hours=3), reviewed_local_date='2026-09-06',
+            contents=('平平无奇的一天',))
+        review = await service.prepare_schedule_preplan_review(story, NOW)
+        self.assertIsNotNone(review)
+        self.assertTrue(review['needs_model'])
+
+    async def test_disabled_preplan_never_reviews(self):
+        service, story = await self._seed(
+            updated_at=NOW - timedelta(hours=3), contents=('今晚的课取消了',))
+        service.config['schedulePreplan'] = {**self.PREPLAN, 'enabled': False}
+        service.cached_schedule_preplan_config = None
+        self.assertIsNone(await service.prepare_schedule_preplan_review(story, NOW))
+
+    async def test_pipeline_makes_zero_model_calls_without_a_signal(self):
+        service, _story = await self._seed(
+            updated_at=NOW - timedelta(hours=3), contents=('她想去看那部新电影，但还没买票。',))
+        calls = self._pipeline(service)
+        service.schedule_compaction('story')
+        await self._drain(service)
+        self.assertEqual(calls, [], '未命中触发词 → 一条 Schedule Preplan 模型请求都不发')
+
+    async def test_pipeline_makes_exactly_one_model_call_with_a_signal(self):
+        service, _story = await self._seed(
+            updated_at=NOW - timedelta(hours=3), contents=('今晚的课取消了',))
+        calls = self._pipeline(service)
+        service.schedule_compaction('story')
+        await self._drain(service)
+        self.assertEqual(len(calls), 1, '命中触发词 → 恰好一次带外审查')
+        self.assertEqual(calls[0]['local_date'], '2026-09-07')
+        # 审查检查点前进（lastReviewedLocalDate 仍是今天）且冷却被重置：
+        # 紧接着再扫一遍不会再调模型（"放行一次"，不是每次都放行）。
+        stored = await service.get_schedule_preplan('story')
+        self.assertEqual(stored['last_reviewed_local_date'], '2026-09-07')
+        service.schedule_compaction('story')
+        await self._drain(service)
+        self.assertEqual(len(calls), 1, '冷却把紧接的第二次扫描挡在门外')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

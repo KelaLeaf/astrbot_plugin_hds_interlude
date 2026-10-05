@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import shutil
@@ -42,6 +43,7 @@ import tempfile
 import unittest
 import zlib
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from plugin.core import logging as interlude_logging
@@ -1290,6 +1292,28 @@ class ReceiveGroupTests(ServiceHarness):
         self.assertIn('收到群聊消息', self.sink.text())
 
     @needs('receive_group', 'append_entry', 'buffer_group_message')
+    async def test_the_group_intake_log_line_masks_both_qq_numbers(self) -> None:
+        """上游 `service.ts:2076`：群聊入站那一行 summary 关不掉，群号与发送者都走脱敏。
+
+        反向：把这一行的 `mask_qq_ids(...)` 去掉 → 本用例红（两个明文全号重新进日志）。
+        """
+        service = self.make_service(make_config(onebot={}))
+        self.make_story()
+        session = group_session(
+            channel_id='1234567890', guild_id='1234567890', user_id='1000008890',
+            content='@bot 在吗', elements=[{'type': 'at', 'attrs': {'id': '1'}}],
+        )
+        self.assertTrue(await service.receive_group(session, STORY_TIME))
+
+        lines = [text for _level, text in self.sink.records if '收到群聊消息' in text]
+        self.assertEqual(len(lines), 1, '入站日志行应当只有一条：%r' % (lines,))
+        line = lines[0]
+        self.assertIn('••••••7890', line, '群号保尾 4 位')
+        self.assertIn('••••••8890', line, '发送者保尾 4 位')
+        self.assertNotIn('1234567890', line, '完整群号不许出现在这条关不掉的日志里')
+        self.assertNotIn('1000008890', line, '完整发送者 QQ 不许出现在这条关不掉的日志里')
+
+    @needs('receive_group', 'append_entry', 'buffer_group_message')
     async def test_a_group_voice_counts_as_addressing_her_and_rides_the_buffer(self) -> None:
         """群语音（v1.7.6）：语音没法带 @，所以 `mention-only` 下它也算"叫了她"；
         语音来源随消息进缓冲（上游 `bufferGroupMessage` 的 `audioSources` / `audioSession`），
@@ -1980,6 +2004,34 @@ class ReceiveTests(ServiceHarness):
         self.assertEqual(turn['messages'][0]['content'], '你好')
         self.assertIn('收到参与者私聊消息', self.sink.text())
         self.assertIn('用户回合已入队', self.sink.text())
+
+    @needs('receive', 'append_entry', 'buffer_user_narrative', 'describe_vision_event')
+    async def test_the_private_intake_log_line_masks_the_partner_id(self) -> None:
+        """上游 `service.ts:2139`：私聊入站那一行 summary 关不掉，参与者账号走脱敏。
+
+        反向：把这一行的 `mask_qq_ids(...)` 去掉 → 本用例红（明文全号重新进日志）。
+        """
+        service = self.make_service(onebot_config(
+            onebot={'userAccounts': [{'qq': '1000008890'}]},
+            sharedStory={'autoEnrollParticipants': True},
+        ))
+        self.make_story()
+        participant = {'id': 'onebot:1:1000008890', 'status': 'active', 'personId': '1000008890'}
+        self._stub_private_dependencies(service, participant)
+        service.signal_incoming_interruption = lambda _story, _participant: None
+
+        self.assertTrue(await service.receive(
+            self._session(user_id='1000008890', channel_id='private:1000008890'), STORY_TIME,
+        ))
+
+        line = self._intake_line('收到参与者私聊消息')
+        self.assertIn('••••••8890', line, '尾 4 位必须留着（够关联排查）')
+        self.assertNotIn('1000008890', line, '完整 QQ 号不许出现在这条关不掉的日志里')
+
+    def _intake_line(self, marker: str) -> str:
+        lines = [text for _level, text in self.sink.records if marker in text]
+        self.assertEqual(len(lines), 1, '入站日志行应当只有一条：%r' % (lines,))
+        return lines[0]
 
     @needs('receive', 'append_entry', 'buffer_user_narrative', 'describe_vision_event')
     async def test_incoming_images_and_audio_are_counted_in_metadata(self) -> None:
@@ -3090,6 +3142,58 @@ class FlushGroupTurnTests(ServiceHarness):
         self.assertLess(service.group_willingness['key']['score'], 1.0)
         self.assertEqual(ctx['compacted'], [PRIVATE_STORY_ID])
         self.assertNotIn('key', service.buffered_group_turns)
+
+    async def _flush_with_cross_actions(self, messages: list[Any]) -> tuple[Any, list]:
+        """跑一次群回合，`persist_decision` 交回给定的跨会话动作；返回（服务, 出站调用）。"""
+        service, ctx = self._prepare(willingness={'enabled': False})
+        service.buffered_group_turns['key']['messages'].append({'content': 'hi'})
+        outgoing: list = []
+
+        async def decide(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'decision': {'groupReply': {'mode': 'none'}}, 'succeeded': True}
+
+        async def persist(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'messages': list(messages), 'commit': None, 'scriptEntry': None}
+
+        async def send(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {'deliveredSegments': [], 'complete': True, 'segmentOutcomes': []}
+
+        async def deliver(story: Any, pending: Any, *args: Any, **kwargs: Any) -> list:
+            outgoing.append((story['id'], list(pending)))
+            return []
+
+        service.try_decide = decide
+        service.persist_decision = persist
+        service.send_group_message = send
+        service.send_outgoing_messages = deliver
+        service.semantic_turn_embedding_enabled = lambda: False
+        service.sticker_catalog_for_session = _empty_list
+        service.group_chat_capabilities = lambda _session, _messages: None
+        service.schedule_compaction = ctx['compacted'].append
+        service.update_script_delivery_outcome = _noop
+        await service.flush_group_turn('key', 3)
+        return service, outgoing
+
+    @needs('flush_group_turn', 'group_messages', 'group_cooldown_active')
+    async def test_the_group_turn_delivers_cross_conversation_actions(self) -> None:
+        """上游 `src/service.ts:2306`：群回合的跨会话动作走**与私聊同一套**投递账本。
+
+        不接这一跳就是"她在群里决定了要去另一个群说话、却没有任何人去发"。
+        """
+        _service, outgoing = await self._flush_with_cross_actions([
+            {'participant_id': 'group:999', 'content': '另一个群见'},
+        ])
+        self.assertEqual(len(outgoing), 1, '群回合的跨会话动作必须出站（上游 `:2306`）')
+        self.assertEqual(outgoing[0][0], PRIVATE_STORY_ID)
+        self.assertEqual(
+            [item['participant_id'] for item in outgoing[0][1]], ['group:999'],
+        )
+
+    @needs('flush_group_turn', 'group_messages', 'group_cooldown_active')
+    async def test_a_group_turn_without_cross_actions_never_touches_the_outbound_ledger(self) -> None:
+        """**反向（等价）**：没有跨会话动作时群路一个字不变——出站投递**一次都不许调**。"""
+        _service, outgoing = await self._flush_with_cross_actions([])
+        self.assertEqual(outgoing, [], '没有跨会话动作时不许调用出站投递')
 
     @needs('flush_group_turn', 'group_cooldown_active')
     async def test_the_group_audio_batch_reaches_the_model_with_the_budget(self) -> None:
@@ -4343,6 +4447,108 @@ class UpstreamBehaviourPortTests(ServiceHarness):
         )
         # 群回复带上了平台回复目标（messageId 来自被引用的入站消息）。
         self.assertEqual(sent['args'][3], '-12345')
+
+
+# =========================================================================== #
+# ⑤ 脱敏接线（上游 `maskQqIds`，`service.ts:9727`）：**源码级**扫描断言
+# =========================================================================== #
+
+#: 插件根（`plugin/`）——本文件在 `plugin/tests/` 下。
+_PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+
+#: 上游唯二的两条 summary 级入站日志（`service.ts:2076` / `:2139`），逐字。
+_UPSTREAM_INBOUND_LINES = (
+    '收到群聊消息 群=%s 发送者=%s',
+    '收到参与者私聊消息 参与者=%s',
+)
+
+
+def _call_name(node: ast.Call) -> Optional[str]:
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def _is_mask_call(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _call_name(node) == 'mask_qq_ids'
+
+
+def _report_operation_calls(tree: ast.AST) -> list[ast.Call]:
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _call_name(node) == 'report_operation'
+    ]
+
+
+class MaskQqIdsCallSiteTests(unittest.TestCase):
+    """⑤ 上游每一个调用点都真的走脱敏——用 AST 扫源码，不靠"记得改"。
+
+    只用源码（不 import 服务）：并行分块没落地时这几条也必须照跑。
+    """
+
+    def _chunk1_tree(self) -> ast.AST:
+        return ast.parse((_PLUGIN_ROOT / 'core' / 'service' / 'chunk1.py').read_text(encoding='utf-8'))
+
+    def test_both_upstream_inbound_lines_exist_verbatim(self) -> None:
+        source = (_PLUGIN_ROOT / 'core' / 'service' / 'chunk1.py').read_text(encoding='utf-8')
+        for line in _UPSTREAM_INBOUND_LINES:
+            with self.subTest(line=line):
+                self.assertIn("'%s'" % line, source, '上游文案逐字保留')
+
+    def test_every_upstream_inbound_line_passes_its_arguments_through_masking(self) -> None:
+        checked = 0
+        for call in _report_operation_calls(self._chunk1_tree()):
+            literals = [arg for arg in call.args if isinstance(arg, ast.Constant) and isinstance(arg.value, str)]
+            message = next((arg for arg in literals if '%s' in arg.value), None)
+            if message is None or message.value not in _UPSTREAM_INBOUND_LINES:
+                continue
+            checked += 1
+            placeholders = message.value.count('%s')
+            # 文案之后的所有实参都必须是 `mask_qq_ids(...)`。
+            trailing = call.args[call.args.index(message) + 1:]
+            self.assertEqual(len(trailing), placeholders, '实参个数与 %%s 对不上')
+            for arg in trailing:
+                self.assertTrue(
+                    _is_mask_call(arg),
+                    '%s 的实参没有走脱敏：%s' % (message.value, ast.dump(arg)),
+                )
+        self.assertEqual(checked, len(_UPSTREAM_INBOUND_LINES), '上游两个调用点必须都在，且都接上脱敏')
+
+    def test_masking_is_used_at_exactly_the_two_inbound_lines_plugin_wide(self) -> None:
+        """**脱敏不许外溢**：全插件生产代码里 `mask_qq_ids(...)` 只在上游那两条入站日志上。
+
+        出站 UMO / 权限名单 / 数据库主键 / 发给模型的 payload 都要保真；哪条线把它们
+        接到脱敏上，本用例立刻红（并指出是哪个文件）。数目：群聊那行两个实参各一次、
+        私聊那行一次 = 3 次调用，全在 `chunk1.py`，且不成第三处调用点。
+        """
+        call_sites: list[tuple[str, int]] = []
+        for path in sorted(_PLUGIN_ROOT.rglob('*.py')):
+            if 'tests' in path.parts or '__pycache__' in path.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding='utf-8'))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and _call_name(node) == 'mask_qq_ids':
+                    call_sites.append((path.relative_to(_PLUGIN_ROOT).as_posix(), node.lineno))
+        self.assertEqual(
+            sorted({file for file, _line in call_sites}), ['core/service/chunk1.py'],
+            '脱敏只许出现在 chunk1 的两条入站日志上，实际：%r' % (call_sites,),
+        )
+        # 群聊行两个实参同一行、私聊行一个实参 → 3 次调用 / 2 行。
+        self.assertEqual(len(call_sites), 3, 'mask_qq_ids 调用次数变了：%r' % (call_sites,))
+        self.assertEqual(len({line for _file, line in call_sites}), 2, '应当正好两行')
+
+    def test_the_pure_function_lives_in_helpers_and_is_exported(self) -> None:
+        """判据一处：实现在 `service/helpers.py`（上游 `service.ts` 的模块级函数归它），
+        chunk1 只 import，不另写一份。"""
+        source = (_PLUGIN_ROOT / 'core' / 'service' / 'chunk1.py').read_text(encoding='utf-8')
+        self.assertIn('mask_qq_ids', source)
+        self.assertNotIn('def mask_qq_ids', source, 'chunk1 不得自带第二份实现')
+        helpers = (_PLUGIN_ROOT / 'core' / 'service' / 'helpers.py').read_text(encoding='utf-8')
+        self.assertIn('def mask_qq_ids(', helpers)
+        self.assertIn("'mask_qq_ids'", helpers, 'helpers 的 __all__ 要列出它')
 
 
 if __name__ == '__main__':

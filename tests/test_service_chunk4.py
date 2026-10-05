@@ -36,6 +36,7 @@ from unittest import mock
 from plugin.core import logging as interlude_logging
 from plugin.core import narrator as narrator_module
 from plugin.core.database import Database
+from plugin.core.long_arc import resolve_conversation_weight
 from plugin.core.script.authored_actions import resolve_authored_actions
 from plugin.core.script.commit_builder import decision_to_script_commit, find_outgoing_script_event
 from plugin.core.service import (
@@ -1151,6 +1152,47 @@ class PersistDecisionTests(unittest.IsolatedAsyncioTestCase):
         # 自动生活回合没有实时参与者事件，因此不产生 outgoing-message 事件。
         kinds = [event['kind'] for event in result['commit']['events']]
         self.assertNotIn('outgoing-message', kinds)
+
+    @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
+    async def test_a_group_turn_and_a_private_turn_persist_their_conversation_kind(self) -> None:
+        """① 端到端：群回合落 `group`、私聊回合落 `private`——真数据库、真 `persist_decision`。
+
+        上游落库形状照抄生产写入方（`chunk1.flush_group_turn` 调
+        `persist_decision(..., participant=None, phase='user-message')`，可见回复在
+        `groupReply` 里），别在夹具里自创 group 回合的写法（坑 39/66）。
+
+        反向：把写入侧那个键去掉 / 猜成 private → 群那条当场红。
+        """
+        story = self.story_row()
+        # 群回合：只有 groupReply → 只有 group-message 事件。
+        group_result = await self.service.persist_decision(
+            story, None,
+            {'script': '她在群里应了一声。',
+             'groupReply': {'mode': 'immediate', 'content': '群里回一句'}},
+            FROM, NOW, True, 'user-message', [], False, None,
+        )
+        # 私聊回合：参与者在、interaction 有可见回复 → outgoing-message 事件。
+        private_result = await self.service.persist_decision(
+            self.story_row(), self.participant_row(),
+            {'script': '她私下回了一句。',
+             'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'content': '私聊回一句'}}},
+            FROM, NOW, True, 'user-message', [], False, None,
+        )
+
+        group_entry = group_result['script_entry']
+        private_entry = private_result['script_entry']
+        self.assertEqual(group_entry['metadata']['conversation_kind'], 'group')
+        self.assertEqual(private_entry['metadata']['conversation_kind'], 'private')
+
+        # 落库回来的那一份（不是内存草稿）也带着它，并且长线评分直接吃这个值。
+        persisted = {
+            row['id']: row for row in rows_of(self.rows('interlude_script_entry'))
+            if row.get('kind') == 'script'
+        }
+        self.assertEqual(persisted[group_entry['id']]['metadata']['conversation_kind'], 'group')
+        self.assertEqual(persisted[private_entry['id']]['metadata']['conversation_kind'], 'private')
+        self.assertEqual(resolve_conversation_weight(persisted[group_entry['id']], None), 0.5)
+        self.assertEqual(resolve_conversation_weight(persisted[private_entry['id']], None), 1.0)
 
     @unittest.skipUnless(_INTEGRATION_READY, '落库用例需要同批任务的 Chunk5/Chunk9')
     async def test_invalid_commit_is_rejected_before_any_write(self) -> None:

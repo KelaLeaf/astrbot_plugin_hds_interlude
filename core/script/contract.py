@@ -13,6 +13,11 @@
   故 `ScriptCommitWindow` 用**函数式 TypedDict 语法**，运行期键名原样保留为 `'from'`
   （与 `plugin/core/types.py` 中的同类处理一致）。
 - 上游 `ScriptActionBinding.spans` 的内联对象被抽成 `ScriptActionSpan`。
+
+端点字段（M4）：上游 `ScriptEventDraft.endpointId` / `ScriptMessageEventReference.endpointId`
+在本移植版内部统一写 snake_case ``endpoint_id``（与 metadata / 内部 dict 的键名法一致），
+读取走 `read_endpoint_id()`——两种拼写都认、优先 camelCase，且**只在确实选了端点时**
+才落键。
 """
 
 from __future__ import annotations
@@ -68,6 +73,8 @@ class ScriptEventDraft(TypedDict, total=False):
     occurred_at: Required[str]
     caused_by_event_ids: Required[list[str]]
     participant_id: str
+    # M4：选中的投递端点属于**创作出来的事件**本身，而不只是运行期草稿。
+    endpoint_id: str
     content: str
     bubbles: list[str]
     delivery_mode: ScriptDeliveryMode
@@ -111,6 +118,7 @@ class ScriptMessageEventReference(TypedDict, total=False):
     script_entry_id: int
     event_kind: Required[Literal['outgoing-message', 'group-message']]
     caused_by_event_ids: Required[list[str]]
+    endpoint_id: str
     full_content: Required[str]
     bubble_index: Required[int]
     bubble_count: Required[int]
@@ -121,6 +129,26 @@ def _is_safe_integer(value: Any) -> bool:
     if isinstance(value, bool) or not isinstance(value, int):
         return False
     return abs(value) <= 9_007_199_254_740_991
+
+
+def read_endpoint_id(mapping: Any) -> str:
+    """双拼写读取「选中的投递端点」；**没有选端点一律返回空串**（判据只有这一处）。
+
+    键名法：上游 wire / 模型可见的 JSON 写 camelCase ``endpointId``，本移植版内部
+    dict 写 snake_case ``endpoint_id``；读取外部输入（旧 JSON、兄弟模块、模型原样
+    返回的字段）两种拼写都认，**优先 camelCase**。
+
+    取值口径与上游 ``event.endpointId ? { endpointId } : {}`` 的真值判定一致：
+    只认**非空字符串**；缺键、``None``、空串、数字等一律当「没选端点」，调用方据此
+    **不写这个键**（不是写空串）。
+    """
+    if not isinstance(mapping, dict):
+        return ''
+    for key in ('endpointId', 'endpoint_id'):
+        value = mapping.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ''
 
 
 def is_outgoing_script_event(event: ScriptEventDraft) -> bool:
@@ -145,7 +173,8 @@ def message_event_reference(
     """把一条出站剧本事件折成投递层的稳定引用；非出站事件返回 `None`。
 
     键顺序照抄上游展开运算符：`commitId, eventId, [scriptEntryId], eventKind,
-    causedByEventIds, fullContent, bubbleIndex, bubbleCount`。
+    causedByEventIds, [endpointId], fullContent, bubbleIndex, bubbleCount`——
+    `endpointId` 只在**确实选了端点**时出现（上游 `...(event.endpointId ? {...} : {})`）。
     """
     if not is_outgoing_script_event(event):
         return None
@@ -158,6 +187,11 @@ def message_event_reference(
     reference.update({
         'event_kind': event['kind'],
         'caused_by_event_ids': list(event['caused_by_event_ids']),
+    })
+    endpoint_id = read_endpoint_id(event)
+    if endpoint_id:
+        reference['endpoint_id'] = endpoint_id
+    reference.update({
         'full_content': event['content'],
         'bubble_index': bubble_index,
         'bubble_count': len(event['bubbles']),

@@ -573,6 +573,23 @@ ENDPOINT = TableSpec(
     added_later=True,
 )
 
+#: `interlude_endpoint_state` —— 端点**动态健康状态**的持久快照（M3，上游 `database.ts:214`）。
+#: 动态状态写独立表，**不污染** `interlude_endpoint` 的身份行；主键是 `endpointId`，
+#: 状态 JSON 保留未来字段（小版本扩展不必再加列）。
+#: 语义要点（`core/endpoints.py::restore_endpoint_state`）：重启后**保留**
+#: `deliverable` 诊断快照，但 `connection.online` 一律归零——绝不跨重启恢复在线事实。
+ENDPOINT_STATE = TableSpec(
+    name='interlude_endpoint_state',
+    fields={
+        'endpointId': _spec('string(63)'),
+        'state': _spec('json'),
+        'updatedAt': _spec('timestamp'),
+    },
+    primary='endpointId',
+    indexes=('updatedAt',),
+    added_later=True,
+)
+
 #: `interlude_story_alias` —— 推导 ID → 稳定剧本 ID 的重定向（M1b）。
 #: 回滚 = 删行；行自带审计（`reason` + 时间）。
 STORY_ALIAS = TableSpec(
@@ -749,8 +766,8 @@ TABLES: dict[str, TableSpec] = {
     spec.name: spec for spec in (
         STORY, PARTICIPANT, SCRIPT_ENTRY, MEMORY, INTENT, SCENE, ARC, FACT, STATE_PATCH,
         WEB_OBSERVATION, OVERLAY_SNAPSHOT, STICKER, STICKER_GROUP, SCHEDULE_PREPLAN,
-        SEEDED_EVENT, ENDPOINT, STORY_ALIAS, TOKEN_USAGE, QZONE_POST, SCHEDULED_COMMAND,
-        WORK, LONG_ARC_GUIDANCE, LONG_ARC_PROGRESS,
+        SEEDED_EVENT, ENDPOINT, ENDPOINT_STATE, STORY_ALIAS, TOKEN_USAGE, QZONE_POST,
+        SCHEDULED_COMMAND, WORK, LONG_ARC_GUIDANCE, LONG_ARC_PROGRESS,
     )
 }
 

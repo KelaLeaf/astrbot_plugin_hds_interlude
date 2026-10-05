@@ -214,6 +214,27 @@ class ConversationKindTests(unittest.TestCase):
             'conversation_kind': 'unknown', 'script_events': [{'kind': 'outgoing-message'}],
         })), 'unknown', '显式 unknown 优先')
 
+    def test_the_direct_key_is_read_in_both_spellings_with_snake_winning(self):
+        """② 落库侧写 `conversation_kind`（snake），读侧两种拼写都认、**优先 snake**。
+
+        同一份 metadata 两种拼写同时在时（旧副本 / 外部输入混进来），以我们自己的
+        snake 为准；反向：把 `_meta(metadata, 'conversation_kind', 'conversationKind')`
+        的参数顺序调过来（或只留 camel）→ 本用例当场红。
+        """
+        self.assertEqual(
+            resolve_conversation_kind(entry(metadata={'conversation_kind': 'group'})), 'group',
+        )
+        self.assertEqual(
+            resolve_conversation_kind(entry(metadata={'conversationKind': 'private'})), 'private',
+        )
+        self.assertEqual(
+            resolve_conversation_kind(entry(metadata={
+                'conversation_kind': 'group', 'conversationKind': 'private',
+            })),
+            'group',
+            '两种拼写同时在 → snake（我们自己的生产者）优先',
+        )
+
     def test_script_reads_the_event_ledger_first(self):
         """上游 `:47` `resolveConversationKind：script 优先读取 scriptEvents …`。
 

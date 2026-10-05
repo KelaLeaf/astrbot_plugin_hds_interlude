@@ -965,6 +965,72 @@ class ServiceChunk4(ServiceBase):
     """对应 `upstream/src/service.ts` 第 3217–4185 行的成员。"""
 
     # ------------------------------------------------------------------ #
+    # Agency 端点门控（M3，上游 `:5013-5030`）
+    # ------------------------------------------------------------------ #
+
+    async def agency_endpoint_gate(
+        self, decision: Any, agency_candidate: Any, story: Any, phase: str,
+    ) -> Optional[str]:
+        """主动联系前的端点门控：返回阻止原因（`None` = 放行）。
+
+        上游在 `:5013-5030` 内联这段；本移植版抽成一个方法，好让"闸门真的会拦"
+        有独立的反向用例（这一段跑的仍然是 chunk11 的真实门控实现）。
+
+        模型能显式指定端点的唯一入口是 `crossConversationActions[*].endpointId`
+        （M4 的字段，本批只**双读**、不新造）；没指定时退回历史的"最活跃端点"，
+        再让最终发送侧走一遍硬门。注册表整个不可用时**保守阻止**——宁可这次不主动
+        联系，也不拿一条来历不明的通道发出去。
+        """
+        participant_id = _record(agency_candidate).get('participant_id')
+        agency_action = next((
+            action for action in (_record(decision).get('crossConversationActions') or [])
+            if _record(action).get('participantId') == participant_id
+            and _record(action).get('mode') == 'immediate'
+        ), None)
+        chosen_endpoint_id = (
+            _record(agency_action).get('endpointId')
+            or _record(agency_action).get('endpoint_id')
+            or _record(agency_candidate).get('endpointId')
+            or _record(agency_candidate).get('endpoint_id')
+        )
+        reason: Optional[str] = None
+        try:
+            ensure_registry = getattr(self, 'ensure_endpoint_registry', None)
+            if callable(ensure_registry):
+                await ensure_registry()
+            if not chosen_endpoint_id:
+                resolve_endpoint = getattr(self, 'resolve_most_active_endpoint_id', None)
+                if callable(resolve_endpoint):
+                    chosen_endpoint_id = resolve_endpoint(participant_id)
+            if chosen_endpoint_id:
+                gate = getattr(self, 'endpoint_for_delivery', None)
+                gated = (
+                    gate(chosen_endpoint_id, 'participant-user', participant_id)
+                    if callable(gate) else {}
+                )
+                reason = _record(gated).get('reason')
+                if not reason:
+                    initiate_gate = getattr(self, 'endpoint_initiate_gate_reason', None)
+                    if callable(initiate_gate):
+                        reason = initiate_gate(chosen_endpoint_id)
+        except Exception as error:  # noqa: BLE001 - 注册表不可用即阻止（保守）
+            reason = 'endpoint-registry-unavailable'
+            self.report_operation(
+                'diagnostic', 'warn', story, phase,
+                'Agency 端点注册表不可用，阻止主动联系 参与者=%s 端点=%s 错误=%s',
+                participant_id, chosen_endpoint_id or '(legacy)', error,
+            )
+        if reason:
+            # 这是**运营层的路由失败**，不是角色决定：理由必须显式分类且可见，
+            # 免得在日志或重查推理里被误当成意愿/容量拒绝（上游注释逐字）。
+            self.report_operation(
+                'standard', 'warn', story, phase,
+                'Agency 端点门控阻止主动联系 参与者=%s 端点=%s 原因=%s',
+                participant_id, chosen_endpoint_id or '(legacy)', reason,
+            )
+        return reason
+
+    # ------------------------------------------------------------------ #
     # advanceUnlocked（上游 :3217）
     # ------------------------------------------------------------------ #
 
@@ -2589,9 +2655,17 @@ class ServiceChunk4(ServiceBase):
                         agency_candidate['participant_id'], now,
                     )
                     cap_passes = daily_cap <= 0 or daily_count < daily_cap
+                    # M3：端点策略同时属于 **Agency 决策边界**与最终投递边界（上游
+                    # `:5000-5030`）。动作是模型唯一能显式指定参与者端点的地方；缺省时
+                    # 保留历史的"最活跃端点"解析，并让最终发送侧再走一遍硬门。
+                    agency_endpoint_reason = await self.agency_endpoint_gate(
+                        decision, agency_candidate, story, phase,
+                    )
+                    agency_policy_allows = not agency_endpoint_reason
                     agency_allows_send = (
                         agency_candidate.get('outcome') == 'send-now'
                         and bool(capacity.get('allowed')) and willingness_passes and cap_passes
+                        and agency_policy_allows
                     )
                     health = getattr(self, 'health', None)
                     if health is not None:

@@ -441,6 +441,31 @@ def _iter_handlers() -> Iterable[str]:
     return (spec.handler for spec in COMMANDS)
 
 
+#: 宿主缺哪些平台生命周期钩子（老宿主 / 契约变了）：装饰器在**类定义期**求值，
+#: 拿不到就退化成空装饰器并记在这里，加载时点名 warn（不静默、不刷屏、不影响加载）。
+_MISSING_HOST_HOOKS: list[str] = []
+_MISSING_HOST_HOOKS_WARNED: set[str] = set()
+
+
+def host_lifecycle_hook(name: str) -> Any:
+    """取宿主的平台生命周期钩子装饰器（`astrbot.api.event.filter` 里的那几个）。
+
+    钩子不存在时返回**空装饰器**：`@filter.xxx` 是在类定义期求值的，那里抛异常等于
+    整个插件 import 不进来——"拿不到钩子"绝不能变成"插件加载失败"。缺哪个钩子由
+    `HDSInterludePlugin._warn_missing_host_hooks()` 在加载时点名 warn（每个钩子一条）。
+    """
+    register = getattr(filter, name, None)
+    if callable(register):
+        return register
+
+    def _missing(func: Any) -> Any:
+        return func
+
+    if name not in _MISSING_HOST_HOOKS:
+        _MISSING_HOST_HOOKS.append(name)
+    return _missing
+
+
 # =========================================================================== #
 # 插件
 # =========================================================================== #
@@ -490,6 +515,8 @@ class HDSInterludePlugin(Star):
         self.suppressed_commands: tuple[str, ...] = ()
         #: 等待 y/n 确认的回调（key = `unified_msg_origin`）。
         self._confirmations: dict[str, asyncio.Future] = {}
+        #: 平台连接状态写回端点时已经点名 warn 过的原因（同一条只说一次）。
+        self._endpoint_sync_warned: set[str] = set()
         #: 启动自检的后台任务（`initialize()` 里创建，`terminate()` 里取消）。
         self._capability_task: asyncio.Task | None = None
         # 一条节流日志（每次加载一条；视频理解真跑起来时缺 FFmpeg 会有可行动的 warn，
@@ -498,6 +525,8 @@ class HDSInterludePlugin(Star):
             'hds-interlude：视频抽帧识别 %s（%s）'
             % (self.video_ffmpeg_status, video_mode_label(self.config))
         )
+        #: 缺平台生命周期钩子 = 端点的在线事实只能靠入站刷新（可见 warn，一次）。
+        self._warn_missing_host_hooks()
         if self.blind_mode:
             self.suppressed_commands = self._suppress_management_commands()
             logger.info(
@@ -590,6 +619,89 @@ class HDSInterludePlugin(Star):
             raise
         except Exception as error:  # noqa: BLE001 - 自检失败绝不能挡住插件启动
             logger.warning('hds-interlude：模型能力自检失败：%s' % error)
+
+    # ------------------------------------------------------------------ #
+    # 平台生命周期 → 端点连接状态（上游 `src/service.ts:914-921`）
+    # ------------------------------------------------------------------ #
+    #
+    # 上游在 `startBackgroundTasks()` 里挂 `ctx.on('bot-status-updated')` /
+    # `ctx.on('bot-removed')`（`upstream/src/service.ts:916-920`）。AstrBot 4.28 能挂的
+    # 平台生命周期事件**只有**两个（`astrbot/core/star/star_handler.py:225-226` 的
+    # `EventType`）：`on_platform_loaded`（触发点 `core/platform/manager.py:229-236`）
+    # 与 `on_astrbot_loaded`（触发点 `core/core_lifecycle.py:367-375`）。
+    # 两者的回调都**不带参数**（`await handler.handler()`），平台身份由
+    # `bridge.host_platform_states()` 现探 `context.platform_manager` 得到。
+    #
+    # 宿主的 `terminate_platform()` / `reload()` 不发任何事件（`EventType` 里没有
+    # "平台卸载"这一项），所以"断开"没有即时钩子，靠下一次现探（下一次
+    # `on_platform_loaded`，或入站顺带刷新）——这是受控降级，写在 §99。
+
+    @host_lifecycle_hook('on_platform_loaded')
+    async def _on_host_platform_loaded(self) -> None:
+        """宿主装好一个平台适配器：把**当前**连接状态写回端点。"""
+        await self._sync_host_connection_state('on_platform_loaded')
+
+    @host_lifecycle_hook('on_astrbot_loaded')
+    async def _on_host_ready(self) -> None:
+        """宿主加载完成：再补一次全量现探（启动序列里最后一次对齐机会）。"""
+        await self._sync_host_connection_state('on_astrbot_loaded')
+
+    async def _sync_host_connection_state(self, trigger: str) -> None:
+        """把宿主当前的平台连接状态写回端点（失败只 warn，**绝不外抛**）。
+
+        写回本身在适配层（`bridge.sync_host_endpoint_connections`）：它会自己把
+        `interlude_endpoint` 表建好、把端点注册表从库里装载完——`note_endpoint_connection`
+        是**按端点行**回写的，冷启动时缺了这两步等于什么都没写。这里只负责
+        "什么时候写"与"写不回去要出声"。
+        """
+        try:
+            result = await self.bridge.sync_host_endpoint_connections()
+        except Exception as error:  # noqa: BLE001 - 生命周期回调不许抛错
+            logger.warning(
+                'hds-interlude：把宿主平台连接状态写回端点失败（%s）：%s' % (trigger, error)
+            )
+            return
+        if not result.get('ok'):
+            self._warn_endpoint_sync_problem(result.get('problem') or 'unknown')
+            return
+        logger.debug(
+            'hds-interlude：宿主平台连接状态已写回端点（%s）在线=%s 离线=%s'
+            % (trigger, '、'.join(result.get('online') or []) or '无',
+               '、'.join(result.get('offline') or []) or '无')
+        )
+
+    def _warn_missing_host_hooks(self) -> None:
+        """宿主缺平台生命周期钩子：**点名 warn 一次**（不静默、也不刷屏）。
+
+        缺钩子时插件照常加载，只是平台连接状态只能靠入站消息顺带刷新——那意味着
+        "重启后、下一次入站之前到期的消息"会被投递门控判离线拦住，用户只看到没发出去。
+        这条 warn 就是那个现象的线索，所以必须可见。
+        """
+        for name in _MISSING_HOST_HOOKS:
+            if name in _MISSING_HOST_HOOKS_WARNED:
+                continue
+            _MISSING_HOST_HOOKS_WARNED.add(name)
+            logger.warning(
+                'hds-interlude：当前宿主没有 %s 钩子（astrbot.api.event.filter），' % name
+                + '平台连接状态只能靠入站消息顺带刷新；'
+                + '重启后在下一次入站之前到期的分段/延迟消息可能被判离线拦下。'
+            )
+
+    def _warn_endpoint_sync_problem(self, problem: str) -> None:
+        """写不回连接状态时点名 warn **一次**（同一条原因不重复刷屏）。"""
+        if problem in self._endpoint_sync_warned:
+            return
+        self._endpoint_sync_warned.add(problem)
+        if problem == 'host-platform-list-unavailable':
+            logger.warning(
+                'hds-interlude：拿不到宿主当前的平台连接清单（平台管理器不可用），'
+                '端点的连接状态这次写不回去；重启后到期的主动消息可能被判离线拦下。'
+            )
+        else:
+            logger.warning(
+                'hds-interlude：把宿主平台连接状态写回端点未成功（%s）；'
+                '重启后到期的主动消息可能被判离线拦下。' % problem
+            )
 
     # ------------------------------------------------------------------ #
     # 配置备份页（WebUI 插件页面 `pages/config-backup/`）

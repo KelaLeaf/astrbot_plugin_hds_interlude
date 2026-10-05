@@ -610,7 +610,22 @@ class StickerVisionHelperTests(unittest.TestCase):
         hash_b = 'b' * 64
         self.assertEqual(stable_sticker_asset_id('bq (6).png', hash_a), stable_sticker_asset_id('bq (6).png', hash_a))
         self.assertNotEqual(stable_sticker_asset_id('bq (6).png', hash_a), stable_sticker_asset_id('bq [6].png', hash_b))
-        self.assertRegex(stable_sticker_asset_id('bq (6).png', hash_a), r'a{16}$')
+        # 后缀 = sha1(路径\n内容) 前 16 位（上游 rc29，`src/service.ts:10048`）。
+        expected = hashlib.sha1(('bq (6).png\n%s' % hash_a).encode('utf-8')).hexdigest()[:16]
+        self.assertTrue(stable_sticker_asset_id('bq (6).png', hash_a).endswith(expected))
+
+    def test_stable_sticker_asset_id_does_not_collapse_chinese_paths(self):
+        """中文路径 + 同内容 → id 不同（同 id 会让扫描每轮在唯一索引上撞库）。"""
+        same_content = 'a' * 64
+        left = stable_sticker_asset_id('猫猫收藏/笑死.gif', same_content)
+        right = stable_sticker_asset_id('日常贴纸/笑死.gif', same_content)
+        self.assertNotEqual(left, right)
+        self.assertEqual(left, stable_sticker_asset_id('猫猫收藏/笑死.gif', same_content))
+        self.assertNotEqual(left, stable_sticker_asset_id('猫猫收藏/笑死.gif', 'b' * 64))
+        # 反向：旧口径（后缀 = 纯内容哈希）下这两个路径折叠后 stem 都是 `sticker`，
+        # id 必然是下面这个字面量。退回旧实现 → 立刻红。
+        self.assertNotEqual(left, 'sticker-%s' % same_content[:16])
+        self.assertNotEqual(right, 'sticker-%s' % same_content[:16])
 
     def test_sticker_mime_and_sticker_path_helpers(self):
         """`stickerMime` / `targetableMessageId` / `groupMessageRef`（模块级，`:7300-7325`）。"""
@@ -1076,6 +1091,88 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item['reason'] for item in result['segment_outcomes']],
                          ['transport-unavailable', 'transport-unavailable'])
         self.assertTrue(host.reports)
+
+    # ---- M4 群路形参：默认路由**逐字等价**（清单第 89 行） ----
+    async def test_the_group_route_is_byte_identical_without_an_endpoint_layer(self):
+        """没有端点层（`group_delivery_route` 缺席）时，群路结果与旧实现**逐字节相同**。
+
+        上游 `sendGroupMessage(..., endpointId?)` 的形参是**可选**的：不给 `endpoint_id`
+        就是默认路由，今天的生产路径一个字都不能变。这里同时钉住"返回字典的键集"
+        （多一个键就说明新形参在无端点层时也会改形状）。
+        """
+        transport = _MemoryRecorderTransport()
+        host = _host(transport=transport)
+        host.split_outgoing_message = lambda content: content.split('<sep/>')
+        story = {'id': 's', 'platform': 'onebot', 'selfId': 'bot'}
+
+        result = await host.send_group_message(story, 'chan', '第一段<sep/>第二段', 'reply-9')
+
+        self.assertEqual(set(result), {'delivered_segments', 'complete', 'segment_outcomes'})
+        self.assertEqual(result, {
+            'delivered_segments': ['第一段', '第二段'],
+            'complete': True,
+            'segment_outcomes': [
+                {'index': 0, 'content': '第一段', 'status': 'delivered'},
+                {'index': 1, 'content': '第二段', 'status': 'delivered'},
+            ],
+        })
+        self.assertEqual(transport.group_calls, [
+            ('chan', '第一段', 'reply-9'), ('chan', '第二段', None),
+        ])
+
+    async def test_the_new_endpoint_parameter_defaults_to_the_old_behaviour(self):
+        """**反向（等价）**：显式传 `endpoint_id=None` 必须与不传**调用形状与结果都相同**。
+
+        变异方向：让默认值变成任何"非空"（例如把形参写成 `endpoint_id: str = ''`
+        然后在没有端点层时也走门控分支）都会让这里红。
+        """
+        transport = _MemoryRecorderTransport()
+        host = _host(transport=transport)
+        host.split_outgoing_message = lambda content: content.split('<sep/>')
+        story = {'id': 's', 'platform': 'onebot', 'selfId': 'bot'}
+
+        omitted = await host.send_group_message(story, 'chan', '甲<sep/>乙', 'reply-1')
+        explicit_none = await host.send_group_message(story, 'chan', '甲<sep/>乙', 'reply-1', None, None)
+
+        self.assertEqual(omitted, explicit_none)
+        self.assertEqual(transport.group_calls, [
+            ('chan', '甲', 'reply-1'), ('chan', '乙', None),
+            ('chan', '甲', 'reply-1'), ('chan', '乙', None),
+        ])
+
+    async def test_an_explicit_endpoint_is_ignored_when_there_is_no_endpoint_layer(self):
+        """**反向（等价）**：单平台桩没有端点层 → 显式 `endpoint_id` 不改变任何行为。
+
+        端点层缺席时不许"因为选了端点就拦下"——那会把单平台用户整条群路拦死。
+        """
+        transport = _MemoryRecorderTransport()
+        host = _host(transport=transport)
+        host.split_outgoing_message = lambda content: content.split('<sep/>')
+        story = {'id': 's', 'platform': 'onebot', 'selfId': 'bot'}
+
+        result = await host.send_group_message(story, 'chan', '甲', None, None, 'ep-ghost')
+
+        self.assertTrue(result['complete'])
+        self.assertEqual(transport.group_calls, [('chan', '甲', None)])
+
+    async def test_a_blocked_group_route_never_touches_the_transport(self):
+        """**反向**：端点层给了阻止理由 → 出站调用次数为 0，理由写进每段结局。"""
+        transport = _MemoryRecorderTransport()
+        host = _host(transport=transport)
+        host.split_outgoing_message = lambda content: content.split('<sep/>')
+
+        async def block(story, channel_id, session=None, endpoint_id=None):
+            return {'reason': 'endpoint-not-found'}
+
+        host.group_delivery_route = block
+        result = await host.send_group_message(
+            {'id': 's', 'platform': 'onebot', 'selfId': 'bot'}, 'chan', '甲<sep/>乙',
+        )
+
+        self.assertEqual(transport.group_calls, [])
+        self.assertFalse(result['complete'])
+        self.assertEqual([item['reason'] for item in result['segment_outcomes']],
+                         ['endpoint-not-found', 'endpoint-not-found'])
 
     async def test_send_sticker_refuses_paths_outside_the_library_and_records_cancellation(self):
         """`sendSticker()`（本范围成员，`:2059`）的越界检查与账本记账。"""
@@ -1551,6 +1648,89 @@ class StickerLibraryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row['assetId'] for row in host.sticker_catalog],
                              [after[active_path]['assetId']])
             self.assertIn(after[active_path]['assetId'], host.sticker_by_id)
+            database.close()
+
+    async def test_scan_sticker_library_dedupes_legacy_duplicate_rows_keeping_the_newest(self):
+        """旧 assetId 折叠缺陷留下的重复行：只留 `updatedAt` 最新那行，其余物理删除。
+
+        上游 `scanStickerLibrary` 的 `newestByKey` 段（`src/service.ts:2997-3009`）：
+        **扫描前**按 `(assetId, filePath)` 去重，库自愈（真库断言行数）。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'stickers')
+            os.makedirs(root)
+            payload = b'\x89PNG\r\n\x1a\n' + b'x' * 32
+            with open(os.path.join(root, 'a.png'), 'wb') as handle:
+                handle.write(payload)
+            database = Database(':memory:')
+            database.register_tables()
+            digest = hashlib.sha256(payload).hexdigest()
+            asset_id = stable_sticker_asset_id('a.png', digest)
+            # 现库在 `assetId` 上有唯一索引，所以同 id 的两行只可能来自"索引建起来之前"
+            # 写下的旧库（正是上游注释里那批重复行）。先摘掉索引，造出真实的两行。
+            database.conn.execute('DROP INDEX interlude_sticker_assetId')
+            old_id = database.insert('interlude_sticker', {
+                'assetId': asset_id, 'filePath': 'a.png', 'hash': digest,
+                'status': 'active', 'updatedAt': '2026-01-01T00:00:00.000Z',
+            })['id']
+            keep_id = database.insert('interlude_sticker', {
+                'assetId': asset_id, 'filePath': 'a.png', 'hash': digest,
+                'status': 'active', 'updatedAt': '2026-09-01T00:00:00.000Z',
+            })['id']
+            self.assertEqual(database.count('interlude_sticker', {}), 2, '前置：真库里确实有两行')
+
+            host = _host(
+                ctx=InterludeContext(base_dir=tmp),
+                config={'stickers': {'enabled': True, 'directory': 'stickers'}},
+                db=database,
+                transport=_BareTransport(),
+            )
+            await host.scan_sticker_library()
+
+            rows = await host.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 1, '重复行必须被删到只剩一行')
+            self.assertEqual(rows[0]['id'], keep_id, '留的是 updatedAt 最新的那行')
+            self.assertNotEqual(rows[0]['id'], old_id)
+            database.close()
+
+    async def test_rescan_migrates_a_legacy_asset_id_on_the_same_row(self):
+        """迁移口径：旧 id 行按 `filePath` **就地复用**成新 id，不重复入库。
+
+        后缀从"内容哈希"换成 sha1(路径+内容) 后不需要数据迁移脚本——下一轮扫描在
+        `by_path` 里按 `filePath` 找到旧行，`db_set` 到同一个 `id`，只是把 `assetId`
+        改写掉。断言行数与主键都不变，只有 id 换了。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'stickers')
+            os.makedirs(root)
+            payload = b'\x89PNG\r\n\x1a\n' + b'x' * 32
+            with open(os.path.join(root, 'a.png'), 'wb') as handle:
+                handle.write(payload)
+            database = Database(':memory:')
+            database.register_tables()
+            digest = hashlib.sha256(payload).hexdigest()
+            # 旧实现的 id：stem 归一化（`a.png` 去掉扩展名 → `a`）+ 后缀 = 纯内容哈希前 16 位。
+            legacy_asset_id = 'a-%s' % digest[:16]
+            row_id = database.insert('interlude_sticker', {
+                'assetId': legacy_asset_id, 'filePath': 'a.png', 'hash': digest,
+                'status': 'pending', 'description': '',
+                # 早于 `STICKER_DESCRIPTION_RETRY_COOLDOWN`，否则 pending 行会被跳过。
+                'updatedAt': '2026-01-01T00:00:00.000Z',
+            })['id']
+
+            host = _host(
+                ctx=InterludeContext(base_dir=tmp),
+                config={'stickers': {'enabled': True, 'directory': 'stickers'}},
+                db=database,
+                transport=_BareTransport(),
+            )
+            await host.scan_sticker_library()
+
+            rows = await host.db_get('interlude_sticker', {})
+            self.assertEqual(len(rows), 1, '按 filePath 复用旧行，不许新增一行')
+            self.assertEqual(rows[0]['id'], row_id, '行的主键不变')
+            self.assertEqual(rows[0]['assetId'], stable_sticker_asset_id('a.png', digest))
+            self.assertNotEqual(rows[0]['assetId'], legacy_asset_id)
             database.close()
 
     async def test_scan_sticker_library_describes_new_assets_and_indexes_them(self):

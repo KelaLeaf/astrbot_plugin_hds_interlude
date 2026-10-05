@@ -5,16 +5,21 @@
 
 对应关系
 --------
-上游 10 条用例 → 本文件 11 个方法（断言逐条保留，不加不减）：
+上游 13 条用例 → 本文件 14 个方法（断言逐条保留，不加不减）：
 
-* 10 条里 8 条只测 `src/schedule-preplan.ts` → `plugin.core.schedule_preplan`：
-  `SchedulePreplanTests`。
+* 13 条里 10 条只测 `src/schedule-preplan.ts` → `plugin.core.schedule_preplan`：
+  `SchedulePreplanTests`（8 条）+ `SchedulePreplanFollowUpTests`（`:145` 触发扫描 /
+  `:168` 当天跟进五态）。后者另加 2 条本移植版用例补上游没断的边界：
+  去重 + 至多 20 条、2 小时冷却的精确边界。
 * `main narration receives only the coming twelve hours ...` 的后半句断言
   （`systemPrompt(...)` 含 `roughly twelve hours`）与
   `prompt payload exposes Schedule Preplan ...` 断言的是 `src/narrator.ts`
   （→ `plugin.core.narrator`）；按 `docs/PORT_PLAN.md` §1「模块一一对应」，
   它们不属于本模块，故拆到 `SchedulePreplanNarratorTests`：
   **narrator 尚未落地时以 `SkipTest` 显式标记**（断言逐字保留，落地后自动生效）。
+* `:190` 审查教学三行是对**源码**做正则断言（上游读 `src/narrator.ts`）→
+  `SchedulePreplanTeachingTests`：本移植版照抄成读 `plugin/core/narrator_prompts.py`
+  的源码正则断言，防止将来那两行被删。
 * 上游用例里的时间字面量、期望值、`?? undefined` 之类的边界一律照抄；
   唯一的形式转换是键名：记录与配置用本移植版的 snake_case，
   模型提案里仍保留上游 camelCase（顺带回归「读取侧同时接受两种拼写」）。
@@ -28,13 +33,17 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from plugin.core.schedule_preplan import (
     DEFAULT_SCHEDULE_PREPLAN_CONFIG,
+    SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS,
     apply_schedule_preplan_proposal,
     materialize_schedule_preplan,
     next_schedule_preplan_transition,
+    schedule_preplan_evidence_mentions_date_change,
+    schedule_preplan_follow_up_due,
     schedule_preplan_needs_model,
     schedule_preplan_review_due,
     schedule_preplan_window,
@@ -245,6 +254,130 @@ class SchedulePreplanTests(unittest.TestCase):
             None, proposal, evidence, '2026-08-31', 'Asia/Shanghai', DEFAULT_SCHEDULE_PREPLAN_CONFIG, now, 'granular')
         self.assertIsNotNone(granular)
         self.assertEqual(granular['regimes'][0]['weekly']['monday'][0]['tentative'], True)
+
+
+class SchedulePreplanFollowUpTests(unittest.TestCase):
+    """上游 `schedule-preplan.test.ts:145,168`：当天例外触发扫描 + 跟进审查五态。"""
+
+    def test_date_change_trigger_scan_matches_reschedule_cancel_and_confirmation_but_not_wishes(self):
+        """上游：当天例外触发扫描：改约/取消/新确认命中，愿望与闲聊不命中。"""
+        hit = schedule_preplan_evidence_mentions_date_change([
+            {'id': 1, 'content': '她给对方发消息：今晚的健身取消啦，改天再约。'},
+            {'id': 2, 'content': '"那我们把见面改成八点半？"对方回复说好。'},
+            {'id': 3, 'content': '她和朋友敲定了周六上午十点的牙医。'},
+        ])
+        self.assertEqual(hit, [1, 2, 3])
+        miss = schedule_preplan_evidence_mentions_date_change([
+            {'id': 4, 'content': '她想去看那部新电影，但还没买票。'},
+            {'id': 5, 'content': '晚饭是昨天的剩面，味道一般。'},
+        ])
+        self.assertEqual(miss, [])
+        # 去重 + 非法 id 过滤
+        dupes = schedule_preplan_evidence_mentions_date_change([
+            {'id': 7, 'content': '约好了周日去爬山'}, {'id': 7, 'content': '约好了周日去爬山'},
+            {'id': 0, 'content': '取消了'},
+        ])
+        self.assertEqual(dupes, [7])
+
+    def test_trigger_scan_deduplicates_keeps_order_and_caps_at_twenty(self):
+        """本移植版补的上游边界：去重保序、至多 20 条（上游 `.slice(0, 20)`）。"""
+        entries = [{'id': index, 'content': '取消了'} for index in range(1, 26)]
+        matched = schedule_preplan_evidence_mentions_date_change(entries)
+        self.assertEqual(matched, list(range(1, 21)), '第 21 条起必须截断')
+        self.assertEqual(len(matched), 20)
+        self.assertEqual(
+            schedule_preplan_evidence_mentions_date_change([
+                {'id': 9, 'content': '取消了'}, {'id': 3, 'content': '改期了'}, {'id': 9, 'content': '改期了'},
+            ]),
+            [9, 3],
+        )
+        # id 必须是正整数：0 / 负数 / 非整数 / 缺失 / 非文本 content 一律丢弃。
+        self.assertEqual(
+            schedule_preplan_evidence_mentions_date_change([
+                {'id': 0, 'content': '取消了'}, {'id': -3, 'content': '取消了'},
+                {'id': 2.5, 'content': '取消了'}, {'id': 4}, {'id': 5, 'content': None},
+                {'content': '取消了'},
+            ]),
+            [],
+        )
+
+    def test_follow_up_review_due_needs_cooldown_elapsed_and_an_unseen_date_change_signal(self):
+        """上游：当天跟进审查到期：日审已过 + 冷却已过 + 未读含信号（五态）。"""
+        config = {**DEFAULT_SCHEDULE_PREPLAN_CONFIG, 'reviewAfterLocalHour': 3}
+        tz = 'Asia/Shanghai'
+        # 日审已于今晨完成（lastReviewedLocalDate=今天），updatedAt=昨日 19:20Z（本地 03:20）
+        reviewed = {
+            'story_id': 's', 'revision': 1, 'timezone': tz, 'valid_from': '2026-10-02', 'valid_through': '2026-10-15',
+            'last_reviewed_local_date': '2026-10-02', 'last_evidence_entry_id': 100, 'review_reason': 'r',
+            'regimes': [], 'exceptions': [], 'materialized_days': [],
+            'created_at': _dt('2026-10-01T00:00:00Z'), 'updated_at': _dt('2026-10-01T19:20:00Z'),
+        }
+        now_late = _dt('2026-10-01T22:00:00Z')  # updatedAt + 2h40m ⇒ 冷却已过
+        # 冷却未过（updatedAt+1h）
+        too_soon = reviewed['updated_at'] + timedelta(hours=1)
+        self.assertEqual(
+            schedule_preplan_follow_up_due(reviewed, [{'id': 101, 'content': '今晚的课取消了'}], too_soon, config),
+            False, '冷却未过')
+        # 冷却已过 + 信号命中
+        self.assertEqual(
+            schedule_preplan_follow_up_due(reviewed, [{'id': 101, 'content': '今晚的课取消了'}], now_late, config),
+            True, '命中放行')
+        # 冷却已过但无信号
+        self.assertEqual(
+            schedule_preplan_follow_up_due(reviewed, [{'id': 101, 'content': '平平无奇的一天'}], now_late, config),
+            False, '无信号零成本')
+        # 无记录 / 未启用 → false
+        self.assertEqual(schedule_preplan_follow_up_due(None, [{'id': 1, 'content': '取消了'}], now_late, config), False)
+        self.assertEqual(
+            schedule_preplan_follow_up_due(
+                reviewed, [{'id': 101, 'content': '取消了'}], now_late, {**config, 'enabled': False}),
+            False)
+        # 日审查本身到期时走正常路径（跟进返回 false）
+        stale = {**reviewed, 'last_reviewed_local_date': '2026-10-01'}
+        self.assertEqual(
+            schedule_preplan_follow_up_due(stale, [{'id': 101, 'content': '取消了'}], now_late, config),
+            False, '日审到期让位正常路径')
+
+    def test_follow_up_cooldown_is_exactly_two_hours(self):
+        """本移植版补的边界：冷却常量 2h，且恰好 2h 时放行、差 1ms 时拦下。"""
+        self.assertEqual(SCHEDULE_PREPLAN_FOLLOWUP_COOLDOWN_MS, 2 * 60 * 60 * 1000)
+        config = {**DEFAULT_SCHEDULE_PREPLAN_CONFIG, 'reviewAfterLocalHour': 3}
+        reviewed = {
+            'story_id': 's', 'revision': 1, 'timezone': 'Asia/Shanghai',
+            'valid_from': '2026-10-02', 'valid_through': '2026-10-15',
+            'last_reviewed_local_date': '2026-10-02', 'last_evidence_entry_id': 100, 'review_reason': 'r',
+            'regimes': [], 'exceptions': [], 'materialized_days': [],
+            'created_at': _dt('2026-10-01T19:20:00Z'), 'updated_at': _dt('2026-10-01T19:20:00Z'),
+        }
+        signal = [{'id': 101, 'content': '今晚的课取消了'}]
+        self.assertEqual(
+            schedule_preplan_follow_up_due(
+                reviewed, signal, reviewed['updated_at'] + timedelta(milliseconds=7_199_999), config),
+            False, '差 1ms 不算冷却已过')
+        self.assertEqual(
+            schedule_preplan_follow_up_due(
+                reviewed, signal, reviewed['updated_at'] + timedelta(minutes=120), config),
+            True, '恰好 2 小时放行（上游是 `< COOLDOWN`）')
+
+
+class SchedulePreplanTeachingTests(unittest.TestCase):
+    """上游 `schedule-preplan.test.ts:190`：审查教学行对源码做正则断言。"""
+
+    @staticmethod
+    def _prompts_source() -> str:
+        path = Path(__file__).resolve().parents[1] / 'core' / 'narrator_prompts.py'
+        return path.read_text(encoding='utf-8')
+
+    def test_teaching_lines_are_present_in_the_prompt_source(self):
+        """上游读 `src/narrator.ts` 源码；本移植版读 `core/narrator_prompts.py` 源码。"""
+        source = self._prompts_source()
+        self.assertRegex(
+            source,
+            r'belongs to exceptions for its exact date\. Do NOT change weekly blocks because of a single occurrence')
+        self.assertRegex(source, r'shows the new time repeating on separate dates or being stated as permanent')
+        self.assertRegex(
+            source,
+            r'A wish, a suggestion, a tentative idea, or an unexecuted plan in conversation is not evidence')
 
 
 class SchedulePreplanNarratorTests(unittest.TestCase):
