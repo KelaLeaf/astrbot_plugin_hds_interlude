@@ -185,3 +185,16 @@ class AlterCopyMatchesTheJudgementSourceTests(unittest.TestCase):
         """`DIRECTION` 的 `tone` 字段从来没被渲染过（死代码，且它自己也写反过）——已删。"""
         source = self._read('frontend/src/panels/Alter.tsx')
         self.assertNotIn("{ label: string; tone:", source)
+    def test_the_card_value_and_meter_follow_direction_too(self) -> None:
+        """整屏"同语义同色"：氛围位移**数值**与内心天气**强度条**也必须按方向给色。
+
+        原先数值用的是 `Math.abs(value) > 0.5 ? 'warn' : 'neutral'`（只看大小、不看方向）：
+        放松态（负）也显示琥珀，与徽章、两张表的"负=绿"自相矛盾；强度条则根本没传 tone
+        （默认蓝），出现"绿徽章配蓝条"。
+        """
+        source = self._read('frontend/src/panels/Alter.tsx')
+        self.assertIn('function directionTone(value: number)', source, '方向→色调必须是唯一判据')
+        self.assertIn("tone={directionTone(state?.value ?? 0)}", source, '数值必须走方向判据')
+        self.assertIn("tone={offset.direction === 'relaxed' ? 'ok' : 'warn'}", source,
+                      '强度条必须跟方向一致')
+        self.assertNotIn("Math.abs(state?.value ?? 0) > 0.5 ? 'warn'", source, '旧的只看大小的写法不许回来')

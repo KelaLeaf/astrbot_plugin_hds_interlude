@@ -40,6 +40,14 @@ function Sparkline({
 // 与提示词完全相反——用户 2026-10-05 在控制台上看出不对。
 // （守卫用例：`plugin/tests/test_alter_trigger_wiring.py::AlterCopyMatchesTheJudgementSourceTests`，
 //   它按源码断言方向标签与图例，旧的错误串一律不许再出现——所以这里不逐字复述旧文案。）
+//: **方向 → 色调的唯一判据**（面板内共用一处）：正 = 严肃/沉重 → 琥珀；负 = 放松/活跃 → 绿；
+//: 位移接近 0（没有明确方向）→ 中性灰。`+0.5` 这条阈值只用来把"几乎没动"判成中性，
+//: 不改变方向语义——同一语义在整屏（数值 / 徽章 / 强度条 / 两张表）必须是同一种颜色。
+function directionTone(value: number): 'ok' | 'warn' | 'neutral' {
+  if (Math.abs(value) < 0.5) return 'neutral'
+  return value > 0 ? 'warn' : 'ok'
+}
+
 // 只留标签：配色由**方向语义**在下面各处表达（内心天气徽章 + 两张表的数值），
 // 这里原先那个 `tone` 字段从来没被渲染过（死代码，且它自己也把两种方向写反过）。
 const DIRECTION: Record<number, { label: string }> = {
@@ -79,7 +87,7 @@ export function Alter({ storyId, refreshKey }: PanelProps) {
           label="氛围位移"
           value={(state?.value ?? 0).toFixed(2)}
           hint={`方向：${direction.label}`}
-          tone={Math.abs(state?.value ?? 0) > 0.5 ? 'warn' : 'neutral'}
+          tone={directionTone(state?.value ?? 0)}
         />
         <Stat label="累积权重" value={(state?.weight ?? 0).toFixed(2)} hint="达到阈值才触发侧端分析" />
         <Stat label="待处理桶" value={pending.length} hint={pending.length ? '按关系分开累计' : '无'} />
@@ -95,7 +103,7 @@ export function Alter({ storyId, refreshKey }: PanelProps) {
               <Badge tone={offset.direction === 'relaxed' ? 'ok' : 'warn'}>
                 {offset.direction === 'relaxed' ? '松弛' : '严肃'}
               </Badge>
-              <Meter value={offset.intensity} />
+              <Meter value={offset.intensity} tone={offset.direction === 'relaxed' ? 'ok' : 'warn'} />
               <span class="text-[11px] text-muted">{offset.generated_at}</span>
             </div>
             <p class="prose-body text-xs">{offset.description}</p>
@@ -119,6 +127,7 @@ export function Alter({ storyId, refreshKey }: PanelProps) {
               <span>单轮增量（alter）</span>
               <span>正=严肃/沉重，负=放松/活跃</span>
             </div>
+            {/* 折线本身跨正负，无法用"方向色"表达；固定色只是为了与上一张图区分（不是方向判定）。 */}
             <Sparkline values={deltas} tone="var(--app-warn)" />
           </div>
         </div>
