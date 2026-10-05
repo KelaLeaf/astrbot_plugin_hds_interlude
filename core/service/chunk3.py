@@ -2052,6 +2052,13 @@ class ServiceChunk3(ServiceBase):
                     'standard', 'info', snapshot['story'], 'user-message',
                     '已丢弃过期主模型结果 参与者=%s 请求=%d', pick(snapshot['participant'], 'id'), request_id,
                 )
+                # 丢弃旁白是对的，但旁白里"她打算去做什么"不该跟着无声消失：否则就是
+                # "她说过要去查、结果没人查，最后模型自己把页面内容编出来"（真机 2026-10-05）。
+                # 判据与文案只有 `chunk4.report_dropped_draft_actions` 一处。
+                from .chunk4 import report_dropped_draft_actions  # noqa: PLC0415
+                report_dropped_draft_actions(
+                    self, snapshot['story'], 'user-message', decision, '主模型结果因新消息作废',
+                )
                 return
             if self.can_handle_participant(snapshot['participant']):
                 delivered = await self.send_outgoing_messages(

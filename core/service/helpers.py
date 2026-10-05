@@ -36,7 +36,7 @@ import math
 import os
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import quote as _urlquote
 
 from .. import database as _database
@@ -2752,25 +2752,78 @@ def interaction_promises_follow_up(content: Any) -> bool:
     ))
 
 
+#: 承诺处置的**动作词**词表：模型写的同义词一律映射到上游那三个词。
+#: 上游只认 `outcome`（`service.ts:10598`），而真机（2026-10-05 12:30 / 12:51 / 13:31
+#: 三次「即将处理到期计划」）模型写的是 `status: "fulfilled"` —— 形状只差一个键名，
+#: 于是三次都被静默丢掉、承诺永远结不清。读外部输入两种拼写都认（AGENTS 坑 41/46/53/65）。
+_FOLLOW_UP_OUTCOME_ALIASES: dict[str, str] = {
+    'fulfilled': 'fulfilled', 'done': 'fulfilled', 'completed': 'fulfilled', 'complete': 'fulfilled',
+    'rescheduled': 'rescheduled', 'reschedule': 'rescheduled', 'delayed': 'rescheduled',
+    'cancelled': 'cancelled', 'canceled': 'cancelled', 'cancel': 'cancelled',
+}
+
+
+def read_follow_up_resolution(item: Any) -> tuple[Optional[dict[str, Any]], str]:
+    """读一条承诺处置：``(归一化处置, 丢弃原因)``；可用时原因是空串。
+
+    **判据只有这一处**：`normalize_follow_up_resolutions`（收下可用的）与
+    `follow_up_resolution_problems`（说出为什么丢）都是它的视图——两边各写一套判据
+    正是「一个判通过、另一个判不通过」的温床。
+    """
+    if not is_record(item):
+        return None, '不是对象'
+    raw_id = item.get('id')
+    intent_id: Optional[int] = None
+    if isinstance(raw_id, int) and not isinstance(raw_id, bool) and _is_integer(raw_id) and raw_id > 0:
+        intent_id = int(raw_id)
+    elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+        # 模型偶尔把 id 写成字符串（"153"）：它指的还是同一个正整数主键。
+        intent_id = int(raw_id.strip())
+    if intent_id is None:
+        return None, 'id 必须是正整数（收到 %r）' % (raw_id,)
+    outcome = ''
+    for key in ('outcome', 'status'):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            outcome = _FOLLOW_UP_OUTCOME_ALIASES.get(value.strip().lower(), '')
+            if outcome:
+                break
+    if not outcome:
+        return None, (
+            'outcome 必须是 fulfilled|rescheduled|cancelled（收到 outcome=%r status=%r）'
+            % (item.get('outcome'), item.get('status'))
+        )
+    entry: dict[str, Any] = {'id': intent_id, 'outcome': outcome}
+    if isinstance(item.get('notBefore'), str):
+        entry['notBefore'] = item['notBefore']
+    return entry, ''
+
+
 def normalize_follow_up_resolutions(value: Any) -> list[dict[str, Any]]:
-    """上游 `normalizeFollowUpResolutions`：最多两条承诺处置。"""
+    """上游 `normalizeFollowUpResolutions`：最多两条承诺处置（判据见 `read_follow_up_resolution`）。"""
     if not isinstance(value, list):
         return []
     resolutions: list[dict[str, Any]] = []
     for item in value:
-        if not is_record(item):
-            continue
-        if not isinstance(item.get('id'), int) or isinstance(item.get('id'), bool):
-            continue
-        if not _is_integer(item['id']) or item['id'] <= 0:
-            continue
-        if item.get('outcome') not in ('fulfilled', 'rescheduled', 'cancelled'):
-            continue
-        entry: dict[str, Any] = {'id': item['id'], 'outcome': item['outcome']}
-        if isinstance(item.get('notBefore'), str):
-            entry['notBefore'] = item['notBefore']
-        resolutions.append(entry)
+        entry, _problem = read_follow_up_resolution(item)
+        if entry is not None:
+            resolutions.append(entry)
     return resolutions[:2]
+
+
+def follow_up_resolution_problems(value: Any) -> list[str]:
+    """``followUpResolutions`` 里每一条**为什么被丢掉**（空列表 = 全都可用）。
+
+    调用方用它打一条可见 warn：坏形状绝不许静默（否则就是"三次没结算却查不出为什么"）。
+    """
+    if not isinstance(value, list):
+        return []
+    problems: list[str] = []
+    for index, item in enumerate(value):
+        _entry, problem = read_follow_up_resolution(item)
+        if problem:
+            problems.append('第%d条：%s' % (index + 1, problem))
+    return problems
 
 
 def automatic_delivery_from_payload(value: Any) -> dict[str, Any] | None:

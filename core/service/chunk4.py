@@ -128,6 +128,7 @@ from .helpers import (
     detect_live_script_time_overflow,
     detect_message_repetition,
     extract_user_reported_times,
+    follow_up_resolution_problems,
     group_due_intents,
     has_required_narrative_script,
     inferred_follow_up_commitment,
@@ -648,28 +649,107 @@ def _browser_intent_drafts(raw: Any) -> list[Any]:
     return []
 
 
-def _normalize_browser_intent_draft_loose(value: Any) -> Optional[dict[str, Any]]:
-    """上游 `normalizeBrowserIntentDraftLoose`（`:7881`）。"""
-    if not is_record(value) or value.get('mode') not in ('search', 'visit'):
-        return None
-    if not isinstance(value.get('purpose'), str):
-        return None
-    query = clip(value.get('query'), 500) if isinstance(value.get('query'), str) else ''
-    url = clip(value.get('url'), 2_000) if isinstance(value.get('url'), str) else ''
-    if value['mode'] == 'search' and not query:
-        return None
-    if value['mode'] == 'visit' and not url:
-        return None
-    draft: dict[str, Any] = {'mode': value['mode'], 'purpose': clip(value['purpose'], 500)}
-    if query:
-        draft['query'] = query
-    if url:
-        draft['url'] = url
+def _browser_intent_draft_read(value: Any) -> tuple[Optional[dict[str, Any]], str]:
+    """读一条浏览草稿：``(归一化草稿, 丢弃原因)``；可用时原因是空串。
+
+    **判据只有这一处**：`_normalize_browser_intent_draft_loose`（收下可用的）与
+    `browser_intent_draft_problem`（说出为什么丢）都是它的视图。
+
+    宽容两处**模型实际写过的形状**（真机 2026-10-05：`{url, timing:"deferred",
+    reason:"…"}`，mode/purpose 都没写）：
+    - `mode` 缺失时按给了什么推断 —— 有公开 url 就是 `visit`，只有 query 就是 `search`；
+    - `purpose` 缺失时接受 `reason` / `summary` 作为同一件事的别的写法。
+    真的什么都缺才判脏值（由调用方打可见 warn，绝不静默）。
+    """
+    if not is_record(value):
+        return None, '不是对象'
+    mode = str(pick(value, 'mode') or '').strip().lower()
+    query = pick(value, 'query')
+    url = pick(value, 'url')
+    has_query = isinstance(query, str) and bool(query.strip())
+    has_url = isinstance(url, str) and bool(url.strip())
+    if mode not in ('search', 'visit'):
+        if has_url:
+            mode = 'visit'
+        elif has_query:
+            mode = 'search'
+        else:
+            return None, '需要 mode=search|visit，且给出公开 url 或 query'
+    if mode == 'search' and not has_query:
+        return None, 'mode=search 需要 query'
+    if mode == 'visit' and not has_url:
+        return None, 'mode=visit 需要公开 url'
+    purpose = ''
+    for key in ('purpose', 'reason', 'summary'):
+        candidate = pick(value, key)
+        if isinstance(candidate, str) and candidate.strip():
+            purpose = candidate
+            break
+    if not purpose:
+        return None, '需要一个 purpose（或同义的 reason）字符串'
+    draft: dict[str, Any] = {'mode': mode, 'purpose': clip(purpose, 500)}
+    if has_query:
+        draft['query'] = clip(query, 500)
+    if has_url:
+        draft['url'] = clip(url, 2_000)
     draft['timing'] = 'immediate' if pick(value, 'timing') == 'immediate' else 'deferred'
     raw_participant = pick(value, 'participantId', 'participant_id')
     if isinstance(raw_participant, str):
         draft['participantId'] = raw_participant.strip()
+    return draft, ''
+
+
+def _normalize_browser_intent_draft_loose(value: Any) -> Optional[dict[str, Any]]:
+    """上游 `normalizeBrowserIntentDraftLoose`（`:7881`）：判据见 `_browser_intent_draft_read`。"""
+    draft, _problem = _browser_intent_draft_read(value)
     return draft
+
+
+def browser_intent_draft_problem(value: Any) -> str:
+    """这条浏览草稿为什么不可用（空串 = 可用）；判据与归一化同一处。"""
+    _draft, problem = _browser_intent_draft_read(value)
+    return problem
+
+
+def dropped_draft_action_kinds(raw: Any) -> list[str]:
+    """被丢弃的草稿里**属于她的行动意图**都有哪些（判据只有这一处）。
+
+    旁白被丢弃是对的（那段话从没说过），但 `browserIntents` / `followUpCommitment`
+    / `intents` 这类"她打算去做什么"不该跟着无声消失：否则就会出现"她说过要去查、
+    结果没人查，最后模型自己把页面内容编出来"（真机 2026-10-05 的现场）。
+    """
+    decision = _record(raw)
+    checks = (
+        ('浏览意图', len(_browser_intent_drafts(decision))),
+        ('承诺回访', 1 if is_record(pick(decision, 'followUpCommitment', 'follow_up_commitment')) else 0),
+        ('到期计划', _list_length(pick(decision, 'intents'))),
+        ('计划更新', _list_length(pick(decision, 'intentUpdates', 'intent_updates'))),
+        ('跨对话动作', _list_length(pick(decision, 'crossConversationActions', 'cross_conversation_actions'))),
+    )
+    return [name for name, count in checks if count > 0]
+
+
+def report_dropped_draft_actions(service: Any, story: Any, phase: str, raw: Any, reason: str) -> bool:
+    """草稿被丢弃时，把它带着的行动意图打成一条**可见 warn**（绝不静默）。
+
+    规则（2026-10-05 定）：被丢弃草稿里的意图**要么落库、要么留痕**。这里选留痕 ——
+    被丢的那一版旁白从没对用户说过，把里面的意图单独落库会凭空给她排一件她从没
+    承诺过的事；而"说一声丢了什么"既让运维能定位，也不制造幽灵动作。
+    返回是否真的打了 warn（调用方/测试用它区分"没有意图"与"有意图但被丢"）。
+    """
+    kinds = dropped_draft_action_kinds(raw)
+    if not kinds:
+        return False
+    service.report_operation(
+        'standard', 'warn', story, phase,
+        '被丢弃的草稿里带着她的行动意图，已一并丢弃（未落库、未执行）原因=%s 项目=%s',
+        reason, '、'.join(kinds),
+    )
+    return True
+
+
+def _list_length(value: Any) -> int:
+    return len(value) if isinstance(value, list) else 0
 
 
 def _normalize_browser_intent_draft(draft: Any, config: Any) -> Optional[dict[str, Any]]:
@@ -2062,6 +2142,12 @@ class ServiceChunk4(ServiceBase):
                     else '结构化可见回复缺失，已抛弃本次未落库剧本并重新写作',
                     *([initial_time_overflow] if initial_time_overflow else []),
                 )
+                # 与 chunk3 的"过期作废"同一条规则：被抛弃的草稿里若带着她的行动意图，
+                # 也必须留一条可见 warn（判据与文案只有 report_dropped_draft_actions 一处）。
+                report_dropped_draft_actions(
+                    self, story, phase, decision,
+                    '剧本越过当前时间终点' if initial_time_overflow else '结构化可见回复缺失',
+                )
                 decision = await self.decide(
                     story, participant, phase, from_, effective_now, user_message, due_intents,
                     superseded_intents, group_context, images, audio, immediate_observations, True,
@@ -2231,6 +2317,31 @@ class ServiceChunk4(ServiceBase):
             raw, from_, now, permit_messages, self.effective_urge_runtime, shared,
             participant_id or '', permitted_participant_ids, phase, self.memory_config, refresh_continuity,
         )
+        # 丢一条"她申请去查"必须留痕（真机 2026-10-05：草稿写成 `{url, timing, reason}`，
+        # 形状在 `_normalize_decision` 里被判脏值丢掉——旧实现在这里**一个字都不打**，
+        # 于是既没有意图落库、也没有任何 warn，模型只好把页面内容编出来）。
+        for browser_draft in _browser_intent_drafts(raw):
+            problem = browser_intent_draft_problem(browser_draft)
+            if not problem:
+                continue
+            self.report_operation(
+                'standard', 'warn', story, phase,
+                '网页浏览请求被忽略：草稿不可用（原因=%s）。需要 mode=search|visit 与 purpose'
+                '（或同义的 reason）；search 还需 query，visit 还需公开 url。原样=%s',
+                problem, safe_json_preview(browser_draft),
+            )
+        # 同一条纪律用在承诺结算上：形状不对就点名缺什么，绝不让它静默地"再等一次"。
+        resolution_problems = follow_up_resolution_problems(
+            _raw_decision(raw, 'followUpResolutions'),
+        )
+        if resolution_problems:
+            self.report_operation(
+                'standard', 'warn', story, phase,
+                '承诺结算被忽略：followUpResolutions 形状不可用（%s）。'
+                '需要 [{"id": <正整数>, "outcome": "fulfilled|rescheduled|cancelled"}]；'
+                '同义的 "status" 也认。',
+                '；'.join(resolution_problems),
+            )
         script = decision.get('script') or ''
         state_before = decode_story_state(story.get('state'))
         active_scene = await self.active_scene(story['id']) if script else None

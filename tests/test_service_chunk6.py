@@ -53,7 +53,7 @@ from plugin.core.service.chunk12 import ServiceChunk12
 from plugin.core.service.chunk6 import ServiceChunk6, defer_retry_milliseconds
 from plugin.core.service.chunk7 import ServiceChunk7
 from plugin.core.service.chunk9 import ServiceChunk9
-from plugin.core.service.helpers import to_date
+from plugin.core.service.helpers import follow_up_resolution_problems, normalize_follow_up_resolutions, to_date
 from plugin.core.time import iso, parse_dt
 from plugin.core.turn_persistence import script_entry_draft_for_commit
 from plugin.core.types import empty_participant_state, empty_story_setting, empty_story_state
@@ -414,9 +414,13 @@ class _SettlementStub(ServiceChunk6):
 
 
 class _SettlementHarness:
-    """上游 `settlementHarness(outcome)` 的等价物。"""
+    """上游 `settlementHarness(outcome)` 的等价物。
 
-    def __init__(self, outcome: str = 'fulfilled') -> None:
+    `key` 是模型写处置用的**键名**：上游提示词教 `outcome`，真机 2026-10-05 模型写的
+    是 `status`（三次都没结清）。两种都必须在同一处判据里被认出来。
+    """
+
+    def __init__(self, outcome: str = 'fulfilled', key: str = 'outcome') -> None:
         self.task = _intent(11, 'follow-up-commitment')
         commit = _commit_fixture()
         event = find_outgoing_script_event(commit, 'alice')
@@ -424,7 +428,7 @@ class _SettlementHarness:
             raise AssertionError('fixture 没有 alice 的 outgoing-message 事件')
         event['metadata'] = {'follow_up_resolutions': [{
             'id': 11,
-            'outcome': outcome,
+            key: outcome,
             'notBefore': iso(NOW + timedelta(minutes=1)),
         }]}
         entry: dict[str, Any] = {'id': 3, 'storyId': 's', **script_entry_draft_for_commit(commit, None)}
@@ -471,6 +475,19 @@ class FollowUpSettlementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             aggregate_delivery_status(h.stored_action()['segments']), 'delivered',
         )
+
+    async def test_a_status_spelled_resolution_settles_through_the_delivery_ledger(self) -> None:
+        """真机写法（`status` 键）也要走完整个账本链：全气泡送达 → 承诺结清。
+
+        反向：若 `update_script_delivery_outcome` 不再把处置交给判据（或判据只认
+        `outcome`），这里就会停在 pending —— 真机三次没结算的现场。
+        """
+        h = _SettlementHarness('fulfilled', key='status')
+        await h.update(0, 'delivered')
+        self.assertEqual(h.task['status'], 'pending')
+        await h.update(1, 'delivered')
+        self.assertEqual(h.task['status'], 'completed')
+        self.assertEqual(h.stub.writes, 1)
 
     async def test_interrupted_last_bubble_and_wrong_story_callbacks_leave_the_promise_pending(self) -> None:
         h = _SettlementHarness()
@@ -644,6 +661,104 @@ class FollowUpSettlementTests(unittest.IsolatedAsyncioTestCase):
         stub.fail_reads = True
         await call()  # 绝不抛出：摘要只是投影
         self.assertEqual(stub.warnings, 1)
+
+
+# =========================================================================== #
+# 2b. 真机回归（2026-10-05）：同一条承诺三次没结算
+# =========================================================================== #
+
+class FollowUpResolutionJudgeTests(unittest.IsolatedAsyncioTestCase):
+    """`followUpResolutions` 的**判据**与它在真库上的结算效果。
+
+    真机现场：12:30:00 / 12:51:50 / 13:31:50 三次「即将处理到期计划 类型=follow-up-commitment」，
+    模型每次都回了 `followUpResolutions`，账上却一直不结清，直到第三次才打出一条
+    "第 3 次没结算"。根因是判据只认 `outcome` 键，而模型写的是 `status` —— 形状只差
+    一个键名，整条处置被静默丢掉。
+
+    这里钉四件事：`status` 与 `outcome` 等价、结算后**不再出现在到期队列**、
+    没有可用处置时照旧留在队列（拆掉结算那一跳必须红）、坏形状被点名且绝不结清。
+    """
+
+    def setUp(self) -> None:
+        ServiceFixtureMixin.setUp(self)
+        self.db = Database(':memory:')
+        self.addCleanup(self.db.close)
+        self.db.register_tables()
+        ctx = InterludeContext(logger=None, database=self.db, clock=lambda: NOW)
+        self.service = _DbHarness(ctx, _make_config(), self.db, NullTransport())
+        self.db.insert('interlude_story', {
+            'id': 'story:1', 'platform': 'telegram', 'selfId': 'bot', 'userId': '',
+            'channelId': '', 'status': 'active', 'setting': empty_story_setting(),
+            'state': empty_story_state(), 'cursorAt': NOW, 'createdAt': NOW, 'updatedAt': NOW,
+        })
+        self.db.insert('interlude_participant', {
+            'id': 'p1', 'storyId': 'story:1', 'platform': 'telegram', 'selfId': 'bot',
+            'userId': 'u1', 'channelId': 'c1', 'personId': 'u1', 'displayName': 'Alice',
+            'profile': '', 'relationship': '', 'state': empty_participant_state(),
+            'status': 'active', 'createdAt': NOW, 'updatedAt': NOW,
+        })
+        self.db.insert('interlude_intent', {
+            'id': 11, 'storyId': 'story:1', 'participantId': 'p1',
+            'type': 'follow-up-commitment', 'summary': '稍后确认库存',
+            'notBefore': NOW - timedelta(seconds=1), 'status': 'pending',
+            'payload': {'kind': 'checking', 'requiresVisibleOutcome': True, 'userInitiated': True},
+            'createdAt': NOW, 'updatedAt': NOW,
+        })
+
+    def _intent(self) -> dict[str, Any]:
+        return dict(self.db.get('interlude_intent', {'id': 11}))
+
+    async def _resolve(self, resolutions: Any, content: str = '查过了，还有货') -> set:
+        return await self.service.apply_follow_up_resolutions(
+            'story:1', 'p1', resolutions,
+            {'seen': False, 'reply': {'mode': 'immediate', 'content': content}}, NOW, 'e1',
+        )
+
+    async def test_status_spelled_fulfilled_settles_and_leaves_the_due_queue(self) -> None:
+        """真机写法 `{"id": 11, "status": "fulfilled"}` 必须真的结清，且第二次不再到期。"""
+        due = await self.service.due_intents('story:1', NOW)
+        self.assertEqual([row['id'] for row in due], [11], '前提：这条承诺此刻确实到期')
+        resolutions = normalize_follow_up_resolutions([
+            {'id': 11, 'status': 'fulfilled', 'resolution': '查过了，还有货'},
+        ])
+        self.assertEqual(resolutions, [{'id': 11, 'outcome': 'fulfilled'}])
+        self.assertEqual(await self._resolve(resolutions), {11})
+        self.assertEqual(self._intent()['status'], 'completed')
+        self.assertEqual(await self.service.due_intents('story:1', NOW), [], '结清之后不许再到期')
+
+    async def test_the_canonical_outcome_spelling_is_unchanged(self) -> None:
+        """反向（口径不许改窄）：上游的 `outcome` 照旧结清。"""
+        resolutions = normalize_follow_up_resolutions([{'id': 11, 'outcome': 'cancelled'}])
+        self.assertEqual(await self._resolve(resolutions), {11})
+        self.assertEqual(self._intent()['status'], 'cancelled')
+
+    async def test_without_a_usable_resolution_it_stays_pending_and_still_due(self) -> None:
+        """反向：拆掉结算那一跳（给空列表）→ 承诺仍是 pending、仍在到期队列里。
+
+        这就是真机三次重复到期的现场；上面那条"结清"的断言因此不是恒真。
+        """
+        self.assertEqual(await self._resolve([]), set())
+        self.assertEqual(self._intent()['status'], 'pending')
+        self.assertEqual([row['id'] for row in await self.service.due_intents('story:1', NOW)], [11])
+
+    async def test_a_broken_shape_is_named_and_never_silently_settles(self) -> None:
+        """坏形状：点名缺什么，并且不许当成结清。"""
+        broken = [{'id': 0, 'outcome': 'fulfilled'}, {'id': 11, 'status': 'maybe'}]
+        problems = follow_up_resolution_problems(broken)
+        self.assertEqual(len(problems), 2)
+        self.assertIn('id 必须是正整数', problems[0])
+        self.assertIn('outcome 必须是 fulfilled|rescheduled|cancelled', problems[1])
+        self.assertIn("'maybe'", problems[1])
+        self.assertEqual(normalize_follow_up_resolutions(broken), [])
+        self.assertEqual(await self._resolve(normalize_follow_up_resolutions(broken)), set())
+        self.assertEqual(self._intent()['status'], 'pending')
+
+    async def test_a_numeric_string_id_is_still_the_same_promise(self) -> None:
+        """模型把 id 写成字符串时指的仍是同一条承诺（否则"结算了却没人结清"）。"""
+        resolutions = normalize_follow_up_resolutions([{'id': '11', 'status': 'completed'}])
+        self.assertEqual(resolutions, [{'id': 11, 'outcome': 'fulfilled'}])
+        self.assertEqual(await self._resolve(resolutions), {11})
+        self.assertEqual(self._intent()['status'], 'completed')
 
 
 # =========================================================================== #

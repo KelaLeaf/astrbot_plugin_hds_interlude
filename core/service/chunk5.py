@@ -1383,15 +1383,26 @@ class ServiceChunk5(ServiceBase):
             return
         normalized = normalize_browser_intent_draft(draft, config)
         if not normalized:
-            warn(
-                '网页浏览请求被忽略：草稿不完整（模式=%s）。需要 mode=search|visit 与 purpose；'
-                'search 还需 query，visit 还需公开 url。', mode,
-            )
+            # 形状问题与配置闸门是两件事，别用同一句话糊过去：形状问题说"缺什么"，
+            # 配置闸门说"去哪儿开"（否则用户按"形状"去改草稿，永远改不对）。
+            from .chunk4 import browser_intent_draft_problem  # noqa: PLC0415
+            problem = browser_intent_draft_problem(draft)
+            if problem:
+                warn(
+                    '网页浏览请求被忽略：草稿不完整（模式=%s）。需要 mode=search|visit 与 purpose；'
+                    'search 还需 query，visit 还需公开 url。原因=%s', mode, problem,
+                )
+            else:
+                warn(
+                    '网页浏览请求被忽略：网页观察配置不允许这种浏览（模式=%s）。'
+                    '打开「允许搜索」或「允许访问网页」后她才会真的去查。', mode,
+                )
             return
         participant_id = fallback_participant_id
         if participant_id:
             allowed = await self.get_participant(participant_id)
             if not allowed or not self.can_handle_participant(allowed):
+                warn('网页浏览请求被忽略：这条关系分支不可处理（参与者=%s）。', participant_id)
                 return
         not_before = parse_dt(dt_ms(now) + _SECOND_MS)
         await self.append_intent(story_id, {

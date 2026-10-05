@@ -877,10 +877,16 @@ class FollowUpCommitmentDraft(TypedDict, total=False):
 
 
 class FollowUpResolutionDraft(TypedDict, total=False):
-    """对既有承诺的处置（兑现/改期/取消）。"""
+    """对既有承诺的处置（兑现/改期/取消）。
+
+    `status` 是 `outcome` 的**同义拼写**（真机 2026-10-05 模型写的就是它，见
+    `docs/PORTING_NOTES.md` §91.3）：`helpers.read_follow_up_resolution` 两种都读，
+    判据只有那一处。
+    """
 
     id: Required[int]
     outcome: Required[Literal['fulfilled', 'rescheduled', 'cancelled']]
+    status: Literal['fulfilled', 'rescheduled', 'cancelled']
     not_before: str
 
 

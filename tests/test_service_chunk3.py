@@ -709,6 +709,61 @@ class TestFlushBufferedNarrativePipeline(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('persist_decision', host.calls)
         self.assertEqual(host.buffered_narrative_turns, {})
 
+    # ---- 真机 2026-10-05：被丢弃的草稿里带着她的行动意图 ---------------------- #
+
+    def _action_draft_host(self, decision_extra: dict[str, Any]) -> Any:
+        host = _FlushHost()
+
+        async def try_decide(*args: Any) -> Any:
+            host.calls['try_decide'] = args
+            return {
+                'decision': {
+                    'interaction': {'seen': True, 'reply': {'mode': 'immediate', 'content': '在的。'}},
+                    'localMedia': None, 'nativeFace': None,
+                    **decision_extra,
+                },
+                'succeeded': True,
+                'effectiveNow': NOW,
+                'immediateObservations': [],
+            }
+
+        host.try_decide = try_decide
+        # 请求 3 已经被"新消息到达"作废：真机 12:23:09 的那一行。
+        host.buffered_narrative_turns = {'k': {
+            'storyId': 's', 'participantId': 'p', 'messages': [{'content': '在吗', 'occurredAt': NOW}],
+            'latestSession': 'session', 'timer': None, 'nextRevision': 3,
+            'inFlightRequestId': None, 'obsoleteRequestIds': {3},
+        }}
+        return host
+
+    async def test_a_discarded_draft_with_her_action_intents_is_a_visible_warn(self) -> None:
+        """弃掉旁白是对的；但旁白里的浏览意图 / 承诺不该**无声**消失（真机现场）。"""
+        host = self._action_draft_host({
+            'browserIntents': [{'url': 'https://example.com/post/1', 'reason': '她想去看看'}],
+            'followUpCommitment': {
+                'kind': 'checking', 'summary': '稍后确认库存',
+                'notBefore': '2026-09-06T12:10:00+00:00',
+            },
+        })
+        await ServiceChunk3.flush_buffered_narrative(host, 'k', 3)
+        self.assertNotIn('persist_decision', host.calls, '前提：这条草稿确实被作废')
+        warns = [
+            entry for entry in host.logs
+            if entry[0] == 'operation' and entry[1] == 'standard' and entry[2] == 'warn'
+        ]
+        text = ' '.join(str(part) for entry in warns for part in entry)
+        self.assertIn('被丢弃的草稿里带着她的行动意图', text)
+        self.assertIn('浏览意图', text)
+        self.assertIn('承诺回访', text)
+        self.assertIn('主模型结果因新消息作废', text)
+
+    async def test_a_discarded_draft_without_action_intents_stays_quiet(self) -> None:
+        """反向：草稿里没有行动意图时不许凭空多一条 warn（否则这条纪律变成噪音）。"""
+        host = self._action_draft_host({})
+        await ServiceChunk3.flush_buffered_narrative(host, 'k', 3)
+        text = ' '.join(str(part) for entry in host.logs for part in entry)
+        self.assertNotIn('被丢弃的草稿里带着她的行动意图', text)
+
 
 # =========================================================================== #
 # 4.5 每回合图片预算（v1.9.4）

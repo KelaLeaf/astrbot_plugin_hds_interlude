@@ -37,7 +37,7 @@ from plugin.core import logging as interlude_logging
 from plugin.core import narrator as narrator_module
 from plugin.core.database import Database
 from plugin.core.script.authored_actions import resolve_authored_actions
-from plugin.core.script.commit_builder import decision_to_script_commit
+from plugin.core.script.commit_builder import decision_to_script_commit, find_outgoing_script_event
 from plugin.core.service import (
     InterludeContext,
     InterludeService,
@@ -1899,7 +1899,7 @@ class DeferredBrowseLoopTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
     async def test_an_incomplete_draft_is_a_visible_warn_that_says_what_is_missing(self) -> None:
-        """模型申请了浏览、草稿形状却不可用 → 同样必须说出来（v1.9.7 定稿文案）。"""
+        """模型申请了浏览、草稿形状却不可用 → 同样必须说出来（v1.9.7 定稿文案 + v1.9.10 原因）。"""
         with mock.patch.object(self.service, 'report_standalone') as reported:
             await self.service.append_browser_intent(
                 STORY_ID, {'mode': 'search'}, NOW, PARTICIPANT_ID,
@@ -1909,8 +1909,8 @@ class DeferredBrowseLoopTests(unittest.IsolatedAsyncioTestCase):
             (
                 'warn',
                 '网页浏览请求被忽略：草稿不完整（模式=%s）。需要 mode=search|visit 与 purpose；'
-                'search 还需 query，visit 还需公开 url。',
-                'search',
+                'search 还需 query，visit 还需公开 url。原因=%s',
+                'search', 'mode=search 需要 query',
             ),
             [call.args for call in reported.call_args_list],
         )
@@ -1931,6 +1931,172 @@ class DeferredBrowseLoopTests(unittest.IsolatedAsyncioTestCase):
         self.browse()
         await self.run_turn(self.decision(browserIntentDraft=dict(_DEFERRED_SEARCH)))
         self.assertEqual(self.db.all('interlude_intent', {'storyId': STORY_ID}), [])
+
+    # ---- 真机 2026-10-05：D 问题①（deferred 浏览意图从未执行）---------------- #
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_the_real_world_draft_shape_still_reaches_the_page_and_the_next_turn(self) -> None:
+        """真机草稿形状 `{url, timing, reason}`：落库 → 到期 → 真执行 → 结果进下一回合。
+
+        真机现场（2026-10-05 12:24）：模型写的是
+        `{"url": "https://api.xiaoheihe.cn/…", "timing": "deferred", "reason": "…"}` ——
+        没有 `mode`、也没有 `purpose`。旧判据要求这两个键都在，于是草稿在
+        `_normalize_decision` 里被判脏值**静默丢掉**：没有意图、没有到期、没有 warn，
+        模型只能把页面内容编出来。这里钉住宽容读法的两件事（mode 推断 + reason 当
+        purpose）以及它真的换来了观察结果。
+        """
+        transport = self.browse()
+        url = 'https://api.xiaoheihe.cn/v3/bbs/app/api/web/share?link_id=342a725062c6'
+        await self.run_turn(self.decision(browserIntents=[{
+            'url': url, 'timing': 'deferred', 'reason': '用户问她能不能看到帖子里面的内容',
+        }]))
+        intents = [dict(row) for row in self.db.all('interlude_intent', {'storyId': STORY_ID})]
+        self.assertEqual([row['type'] for row in intents], ['browser-research'])
+        # 宽容读法落进 payload：mode 由 url 推出来，purpose 用模型写的 reason。
+        self.assertEqual(intents[0]['payload']['mode'], 'visit')
+        self.assertEqual(intents[0]['payload']['url'], url)
+        self.assertEqual(intents[0]['payload']['purpose'], '用户问她能不能看到帖子里面的内容')
+        self.assertIn(STORY_ID, self.service.due_intent_wake_timers, '到点唤醒必须排上')
+        await self.drain_browser_intents(NOW + timedelta(seconds=30))
+        self.assertIn(('visit', url), transport.calls, '到期的浏览意图必须真的去抓这一页')
+        observations = [dict(row) for row in self.db.all('interlude_web_observation', {'storyId': STORY_ID})]
+        self.assertEqual([row['status'] for row in observations], ['success'])
+        web_context = await self.next_turn_web_context(NOW + timedelta(minutes=1))
+        self.assertEqual(len(web_context), 1)
+        self.assertIn(_PAGE_EXCERPT, web_context[0]['excerpt'], '取回的内容必须真的进她下一回合的上下文')
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_a_draft_with_no_usable_target_is_a_visible_warn_not_silence(self) -> None:
+        """反向：连 url / query 都没有的草稿绝不静默 —— 落库不了就必须留一条可见 warn。"""
+        self.browse()
+        await self.run_turn(self.decision(browserIntents=[
+            {'timing': 'deferred', 'reason': '她想去看看'},
+        ]))
+        self.assertEqual(self.db.all('interlude_intent', {'storyId': STORY_ID}), [])
+        warns = [text for level, text in self.sink.records if level == 'warn']
+        self.assertTrue(
+            any('网页浏览请求被忽略：草稿不可用' in text for text in warns), warns,
+        )
+        self.assertTrue(
+            any('给出公开 url 或 query' in text for text in warns), warns,
+        )
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_the_real_world_shape_still_hits_the_disabled_switch_warn(self) -> None:
+        """总开关关着时，真机形状也必须走到那条"去哪儿开"的可见 warn（不许在判据前消失）。"""
+        self.service.config = {**self.service.config, 'browser': {'enabled': False}}
+        self.service.__dict__.pop('cached_browser_config', None)
+        with mock.patch.object(self.service, 'report_standalone') as reported:
+            await self.run_turn(self.decision(browserIntents=[{
+                'url': 'https://example.com/post/1', 'timing': 'deferred', 'reason': '她想去看看',
+            }]))
+        self.assertEqual(self.db.all('interlude_intent', {'storyId': STORY_ID}), [])
+        self.assertIn(
+            (
+                'warn',
+                '网页浏览请求被忽略：网页观察未启用（模式=%s）。打开「网页观察」后她才会真的去查。',
+                'visit',
+            ),
+            [call.args for call in reported.call_args_list],
+        )
+
+
+# =========================================================================== #
+# 真机回归（2026-10-05）：承诺结算的**入口判据**（chunk4.persist_decision）
+# =========================================================================== #
+
+class FollowUpResolutionIntakeTests(unittest.IsolatedAsyncioTestCase):
+    """`followUpResolutions` 从模型 JSON 到投递账本的那一跳（真机三次没结算的现场）。
+
+    真机 12:30 / 12:51 / 13:31 三次「即将处理到期计划 类型=follow-up-commitment」，
+    模型每次都回了 `followUpResolutions`，但账上一直不结清，直到第三次才打出一条
+    "第 3 次没结算"。这里的判据是：模型写 `status` 而不是 `outcome` 时**收下**；
+    形状真的坏时**当场点名缺什么**（不许等到第三次才说、更不许静默）。
+    """
+
+    def setUp(self) -> None:
+        self.sink = _Sink()
+        interlude_logging.set_log_sink(self.sink)
+        self.addCleanup(interlude_logging.set_log_sink, interlude_logging._default_sink)
+        self.db = Database(':memory:')
+        self.addCleanup(self.db.close)
+        self.db.register_tables()
+        self.ctx = InterludeContext(logger=None, database=self.db, clock=lambda: NOW)
+        self.service = InterludeService(self.ctx, browser_service_config(), self.db, NullTransport())
+        self.db.insert('interlude_story', {
+            'id': STORY_ID, 'platform': 'test', 'selfId': '1', 'userId': '1',
+            'channelId': 'private:1', 'status': 'active',
+            'setting': make_setting(), 'state': encode_story_state(empty_story_state()),
+            'cursorAt': FROM, 'createdAt': FROM, 'updatedAt': FROM,
+        })
+        self.db.insert('interlude_participant', {
+            'id': PARTICIPANT_ID, 'storyId': STORY_ID, 'platform': 'test', 'selfId': '1',
+            'userId': '2', 'channelId': 'private:2', 'personId': 'person:2',
+            'displayName': 'Kela', 'profile': '', 'relationship': '',
+            'state': {'openThreads': [], 'relationshipNotes': []}, 'status': 'active',
+            'createdAt': FROM, 'updatedAt': FROM,
+        })
+
+    async def persist(self, **overrides: Any) -> dict[str, Any]:
+        self.service.narrator = _FakeNarrator({
+            'script': '她翻了翻手机，把查到的结果说了出来。',
+            'interaction': dict(_REAL_INTERACTION),
+            **overrides,
+        })
+        story = await self.service.get_story(STORY_ID)
+        participant = await self.service.get_participant(PARTICIPANT_ID)
+        result = await self.service.try_decide(
+            story, participant, 'user-message', FROM, NOW, '在吗', [],
+        )
+        return await self.service.persist_decision(
+            story, participant, result['decision'], FROM, NOW, True, 'user-message', [], False,
+            result.get('timelinePlan'),
+        )
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_a_status_spelled_resolution_survives_into_the_ledger_metadata(self) -> None:
+        """`status: fulfilled` 必须与 `outcome: fulfilled` 等价地进账本（真机写法）。"""
+        persisted = await self.persist(followUpResolutions=[
+            {'id': 11, 'status': 'fulfilled', 'resolution': '查过了，有货'},
+        ])
+        event = find_outgoing_script_event(persisted['commit'], PARTICIPANT_ID)
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event['metadata']['followUpResolutions'],
+            [{'id': 11, 'outcome': 'fulfilled'}],
+            '模型写的 status 必须被收下并归一成 outcome；否则结算那一跳永远走不到',
+        )
+        # 真正落库的那一份（投递账本读的就是它：条目 metadata.script_events[].metadata）。
+        entry = self.db.get('interlude_script_entry', {'id': persisted['script_entry']['id']})
+        landed = [
+            item.get('metadata') or {} for item in entry['metadata']['script_events']
+            if item.get('kind') == 'outgoing-message'
+        ]
+        self.assertEqual(landed[0]['followUpResolutions'], [{'id': 11, 'outcome': 'fulfilled'}])
+        self.assertNotIn('承诺结算被忽略', self.sink.text())
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_the_canonical_outcome_spelling_still_works(self) -> None:
+        """反向（不许把口径改窄）：上游的 `outcome` 拼写照旧必须能用。"""
+        persisted = await self.persist(followUpResolutions=[
+            {'id': 11, 'outcome': 'cancelled'},
+        ])
+        event = find_outgoing_script_event(persisted['commit'], PARTICIPANT_ID)
+        self.assertEqual(event['metadata']['followUpResolutions'], [{'id': 11, 'outcome': 'cancelled'}])
+
+    @unittest.skipUnless(FULL_SERVICE_READY, '兄弟 chunk 未全部就绪')
+    async def test_a_broken_resolution_shape_is_named_on_the_spot(self) -> None:
+        """坏形状 → 当回合一条可见 warn 点名缺什么，且**不许**当成结清。"""
+        persisted = await self.persist(followUpResolutions=[
+            {'id': 0, 'outcome': 'fulfilled'},
+            {'id': 11, 'status': 'maybe'},
+        ])
+        self.assertNotIn('followUpResolutions', persisted['commit']['events'][0].get('metadata') or {})
+        text = self.sink.text()
+        self.assertIn('承诺结算被忽略', text)
+        self.assertIn('id 必须是正整数', text)
+        self.assertIn('outcome 必须是 fulfilled|rescheduled|cancelled', text)
+        self.assertIn("'maybe'", text)
 
 
 # =========================================================================== #
