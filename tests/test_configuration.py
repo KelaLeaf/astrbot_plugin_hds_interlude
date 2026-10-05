@@ -11,8 +11,7 @@ options 枚举集合一致 / 数值范围一致」。
 「配置 schema」范畴，归各自的模块测试；`resolve_blind_mode_config` 例外——它是
 schema 默认值的直接消费者，本文件用 `skipUnless` 在它落地后自动启用。
 
-独立运行：
-    cd <仓库根目录>
+独立运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
     python3 -m unittest plugin.tests.test_configuration -v
 """
 

@@ -17,8 +17,7 @@
 `sys.modules` 里装一套**最小 AstrBot 桩**（getter 契约 + `filter` 装饰器 +
 组件类 + handler 注册表）。桩只实现被测代码真正用到的接口，不模拟宿主行为。
 
-独立运行：
-    cd <仓库根目录>
+独立运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
     python3 -m unittest plugin.tests.test_astrbot_bridge -v
 """
 

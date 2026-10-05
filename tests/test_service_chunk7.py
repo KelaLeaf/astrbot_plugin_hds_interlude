@@ -1,8 +1,8 @@
 """`plugin/core/service/chunk7.py`（`upstream/src/service.ts:5442-6082`）的单元测试。
 
-运行：
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
 
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_service_chunk7 -v
+    python3 -m unittest plugin.tests.test_service_chunk7 -v
 
 包含两类用例：
 

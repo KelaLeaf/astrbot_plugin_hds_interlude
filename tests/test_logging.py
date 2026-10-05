@@ -1,8 +1,8 @@
 """`core/logging.py` 单元测试（不依赖 AstrBot SDK）。
 
-移植自上游 `test/logging.test.ts`，逐条对照断言。运行方式：
+移植自上游 `test/logging.test.ts`，逐条对照断言。运行方式（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
 
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_logging -v
+    python3 -m unittest plugin.tests.test_logging -v
 """
 
 import contextlib

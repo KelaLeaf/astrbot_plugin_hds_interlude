@@ -15,8 +15,7 @@
 字符预算耗尽、未知段类型、`maxDepth=0`、超时、响应形状怪（坏帧 / 非字典）、
 `clamp_int` 的 JS `Number()` 语义、以及"没有合并转发时不打任何日志、也绝不发请求"。
 
-独立运行：
-    cd <仓库根目录>
+独立运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
     python3 -m unittest plugin.tests.test_forward_message -v
 """
 

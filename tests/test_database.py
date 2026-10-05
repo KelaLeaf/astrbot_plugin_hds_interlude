@@ -20,8 +20,8 @@
 数据库文件建在本测试目录下（**不放 /tmp**），每个 TestCase 用临时目录，
 `tearDown` 里整体删除。
 
-运行：
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_database -v
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
+    python3 -m unittest plugin.tests.test_database -v
 """
 
 from __future__ import annotations

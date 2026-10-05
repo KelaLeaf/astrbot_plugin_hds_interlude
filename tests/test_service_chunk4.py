@@ -22,8 +22,8 @@
 / `appendEntry` / `contactThreads` / `developmentForPrompt`（分别属于 Chunk5/Chunk8/Chunk9），
 本文件对那部分只做**守门占位**（`@unittest.skipUnless`），不假绿。
 
-运行：
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_service_chunk4 -v
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
+    python3 -m unittest plugin.tests.test_service_chunk4 -v
 """
 
 from __future__ import annotations

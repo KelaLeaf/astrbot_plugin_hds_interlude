@@ -2,8 +2,8 @@
 
 上游参照：`src/world-seeder.ts` 与 `test/world-seeder.test.ts`，版本 **1.0.1-rc28**。
 
-运行：
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_world_seeder -v
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
+    python3 -m unittest plugin.tests.test_world_seeder -v
 
 对应关系
 --------

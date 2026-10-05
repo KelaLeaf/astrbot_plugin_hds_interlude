@@ -20,8 +20,8 @@
    裁剪与边界、剧情余波生命周期、私密隔离、到期意图视图、网页观察缓存与公开性校验、
    浏览器并发闸门、重试与到期唤醒、Alter 旁路分析。
 
-运行：
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_service_chunk5 -v
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
+    python3 -m unittest plugin.tests.test_service_chunk5 -v
 
 时间约定：上游 `new Date('...Z')` → timezone-aware `datetime`；时间源用
 `InterludeContext(clock=...)` 注入，不依赖真实时钟。

@@ -31,8 +31,8 @@
 4. 累计器（`ProgressTests`）、投影（`ProjectionTests`）、模型输入与**隐私边界**
    （`InputBuilderTests`）、存储读写与版本链（`StoreWiringTests`）。
 
-运行：
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_long_arc -v
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
+    python3 -m unittest plugin.tests.test_long_arc -v
 """
 
 from __future__ import annotations

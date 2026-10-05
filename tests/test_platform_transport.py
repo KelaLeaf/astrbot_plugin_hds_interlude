@@ -24,8 +24,7 @@
 **最小 AstrBot 桩**（只实现被测代码真正用到的接口）。桩宿主 / 桩 OneBot client
 由本文件自己的 `Fake*` 类提供，不依赖别的测试文件（并行开发时互不牵连）。
 
-独立运行：
-    cd <仓库根目录>
+独立运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
     python3 -m unittest plugin.tests.test_platform_transport -v
 """
 

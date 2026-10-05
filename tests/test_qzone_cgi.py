@@ -18,8 +18,7 @@
 **字段集合与顺序**这一组是硬断言（`list(body.keys())` 与参考实现的字面量元组相等）：
 腾讯的 CGI 靠字段名认参，键顺序也是 wire 的一部分，别顺手"整理"成字母序。
 
-独立运行：
-    cd <仓库根目录>
+独立运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
     python3 -m unittest plugin.tests.test_qzone_cgi -v
 """
 

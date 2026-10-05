@@ -1,7 +1,7 @@
 """上游 `upstream/test/schedule-preplan.test.ts` 的逐条移植（stdlib `unittest`）。
 
-运行：
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_schedule_preplan -v
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
+    python3 -m unittest plugin.tests.test_schedule_preplan -v
 
 对应关系
 --------

@@ -450,13 +450,34 @@ _MISSING_HOST_HOOKS_WARNED: set[str] = set()
 def host_lifecycle_hook(name: str) -> Any:
     """取宿主的平台生命周期钩子装饰器（`astrbot.api.event.filter` 里的那几个）。
 
-    钩子不存在时返回**空装饰器**：`@filter.xxx` 是在类定义期求值的，那里抛异常等于
-    整个插件 import 不进来——"拿不到钩子"绝不能变成"插件加载失败"。缺哪个钩子由
-    `HDSInterludePlugin._warn_missing_host_hooks()` 在加载时点名 warn（每个钩子一条）。
+    ⚠️ **AstrBot 4.28 的这几个是"装饰器工厂"**（`astrbot/core/star/register/
+    star_handler.py:337/347`）：
+
+    ```python
+    def register_on_platform_loaded(**kwargs):
+        def decorator(awaitable): ...
+        return decorator
+    ```
+
+    所以**必须调用一次**拿到里面的装饰器：`@filter.on_platform_loaded()`。直接把它
+    当装饰器用（`@filter.on_platform_loaded`）会把被装饰函数当**位置参数**喂给
+    `(**kwargs)` → `TypeError: register_on_platform_loaded() takes 0 positional
+    arguments but 1 was given` → **整个插件 import 失败、被宿主摘掉**（v1.9.11 真机
+    回归，测试全绿也照样中招——测试桩当时只有"裸装饰器"形态）。
+
+    这里**兼容两种形态**：工厂（调用一次取装饰器）/ 裸装饰器（老宿主或宿主改了实现）。
+    钩子不存在时返回**空装饰器**：`@filter.xxx` 在类定义期求值，那里抛异常等于插件
+    加载失败——"拿不到钩子"绝不能变成"插件加载失败"。缺哪个由
+    `HDSInterludePlugin._warn_missing_host_hooks()` 加载时点名 warn（每钩子一条）。
     """
     register = getattr(filter, name, None)
     if callable(register):
-        return register
+        # 工厂形态：调用一次拿到真正的装饰器；万一调用本身抛（宿主签名变了），
+        # 退化成空装饰器 + 记一笔，绝不让加载失败。
+        try:
+            return register()
+        except TypeError:
+            return register
 
     def _missing(func: Any) -> Any:
         return func

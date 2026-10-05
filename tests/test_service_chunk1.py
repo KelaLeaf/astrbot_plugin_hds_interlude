@@ -29,8 +29,8 @@
 尚未移植的兄弟 chunk 成员（Chunk6/7 的 `record_incoming_message` 等）在本文件里
 用**显式测试替身**替换，并在用例 docstring 里点名。
 
-运行：
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_service_chunk1 -v
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
+    python3 -m unittest plugin.tests.test_service_chunk1 -v
 """
 
 from __future__ import annotations

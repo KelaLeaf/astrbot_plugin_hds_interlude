@@ -13,8 +13,7 @@
    （两条通道都是 `ServiceChunk3` 的真实实现，断言的是"同一份来源表"）；
 8. 变异：去掉上限 → 红；ffmpeg 缺失时假装成功 → 红；把帧绕过既有图像通道自造一套 → 红。
 
-独立运行：
-    cd <仓库根目录>
+独立运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
     python3 -m unittest plugin.tests.test_video_understanding -v
 """
 

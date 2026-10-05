@@ -421,8 +421,20 @@ class HostHookWiringTests(_HostHookTestCase):
             )
 
     def test_the_real_host_hook_is_used_when_it_exists(self) -> None:
-        """宿主有钩子时，取到的就是它本人（不是那个空装饰器）。"""
-        def fake_hook(**_kwargs):
+        """宿主有钩子时，拿到的是**工厂里面的装饰器**，不是工厂本人。
+
+        ⚠️ v1.9.11 真机回归就死在这一条上（坑 86）：AstrBot 4.28 的
+        `register_on_platform_loaded(**kwargs)`（`star_handler.py:337/347`）是
+        **装饰器工厂**，必须 `@...on_platform_loaded()`。当时这条用例断言的是
+        `assertIs(host_lifecycle_hook(...), fake_hook)` —— 把"返回工厂本身"这个
+        **错误契约**钉死了，于是测试全绿、真机 `TypeError` 插件直接加载失败。
+        现在断言的是"工厂被调用过一次，拿到里面的 decorator 并真的注册上"。
+        """
+        calls: list[dict] = []
+
+        def fake_factory(**_kwargs):          # 与真宿主同形：工厂 + 内层装饰器
+            calls.append(_kwargs)
+
             def decorator(func):
                 func._hdsi_registered = True  # type: ignore[attr-defined]
                 return func
@@ -430,9 +442,36 @@ class HostHookWiringTests(_HostHookTestCase):
             return decorator
 
         with mock.patch.object(
-            main_module.filter, 'on_platform_loaded', fake_hook, create=True,
+            main_module.filter, 'on_platform_loaded', fake_factory, create=True,
         ):
-            self.assertIs(main_module.host_lifecycle_hook('on_platform_loaded'), fake_hook)
+            hook = main_module.host_lifecycle_hook('on_platform_loaded')
+
+        self.assertEqual(calls, [{}], '工厂必须被调用一次（真实宿主形态）')
+        self.assertIsNot(hook, fake_factory, '不许把工厂本人当装饰器返回')
+
+        def handler():
+            return 'ok'
+
+        registered = hook(handler)
+        self.assertIs(registered, handler)
+        self.assertTrue(getattr(handler, '_hdsi_registered', False), '装饰器必须真的生效')
+
+    def test_a_bare_decorator_host_form_still_works(self) -> None:
+        """老宿主 / 宿主改回裸装饰器形态时，`register()` 会抛 TypeError → 退回裸形态。"""
+        def bare(func):
+            func._hdsi_registered_bare = True  # type: ignore[attr-defined]
+            return func
+
+        with mock.patch.object(
+            main_module.filter, 'on_astrbot_loaded', bare, create=True,
+        ):
+            hook = main_module.host_lifecycle_hook('on_astrbot_loaded')
+
+        def handler():
+            return 'ok'
+
+        self.assertIs(hook(handler), handler)
+        self.assertTrue(getattr(handler, '_hdsi_registered_bare', False))
 
     def test_a_missing_hook_degrades_to_a_no_op_decorator(self) -> None:
         """钩子不存在时装饰器必须原样放行（类定义期抛异常 = 插件 import 不进来）。"""

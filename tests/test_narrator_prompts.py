@@ -15,8 +15,8 @@
 - 上游用 `JSON.stringify` 做前缀比较；这里用 `stringify()`（`separators=(',', ':')`、
   `ensure_ascii=False`）对齐 JS 的输出形状。
 
-运行：
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_narrator_prompts -v
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
+    python3 -m unittest plugin.tests.test_narrator_prompts -v
 """
 
 from __future__ import annotations

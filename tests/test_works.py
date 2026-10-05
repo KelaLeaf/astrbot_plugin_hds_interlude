@@ -26,8 +26,8 @@ Python 里 `await` 一个内部没有 `await` 的协程**不让步**，两个 `p
 双双成功（假绿）。所以 `_MemoryStore` 的每个方法都 `await asyncio.sleep(0)`——
 这不是"为了让测试过"，而是复现上游测试所依赖的调度语义。
 
-运行：
-    cd <仓库根目录> && python3 -m unittest plugin.tests.test_works -v
+运行（仓库根目录；发布仓布局去掉 `plugin.` 前缀）：
+    python3 -m unittest plugin.tests.test_works -v
 """
 
 from __future__ import annotations
