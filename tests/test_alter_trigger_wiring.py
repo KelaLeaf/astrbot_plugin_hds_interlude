@@ -169,3 +169,19 @@ class AlterCopyMatchesTheJudgementSourceTests(unittest.TestCase):
         source = self._read('frontend/src/panels/Alter.tsx')
         self.assertIn('正=严肃/沉重，负=放松/活跃', source)
         self.assertNotIn('正=放松，负=紧绷', source)
+    def test_the_table_colors_follow_the_same_direction(self) -> None:
+        """数值配色必须与方向语义一致：**正（严肃/沉重）= 琥珀，负（放松/活跃）= 绿**。
+
+        原先两处表格写的是 `value >= 0 ? 'text-ok' : 'text-warn'`——正值给绿、负值给琥珀，
+        与面板自己的内心天气徽章（松弛=绿 / 严肃=琥珀）和修好后的图例**正好相反**。
+        """
+        source = self._read('frontend/src/panels/Alter.tsx')
+        self.assertIn("row.value > 0 ? 'text-warn'", source, '按来源分桶：正值必须琥珀')
+        self.assertIn("row.alter > 0 ? 'text-warn'", source, '本论增量：正值必须琥珀')
+        self.assertNotIn("row.value >= 0 ? 'text-ok'", source, '旧的写反配色不许回来')
+        self.assertNotIn("row.alter >= 0 ? 'text-ok'", source, '旧的写反配色不许回来')
+
+    def test_the_never_rendered_tone_field_is_gone(self) -> None:
+        """`DIRECTION` 的 `tone` 字段从来没被渲染过（死代码，且它自己也写反过）——已删。"""
+        source = self._read('frontend/src/panels/Alter.tsx')
+        self.assertNotIn("{ label: string; tone:", source)

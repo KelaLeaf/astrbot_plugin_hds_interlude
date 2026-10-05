@@ -40,10 +40,12 @@ function Sparkline({
 // 与提示词完全相反——用户 2026-10-05 在控制台上看出不对。
 // （守卫用例：`plugin/tests/test_alter_trigger_wiring.py::AlterCopyMatchesTheJudgementSourceTests`，
 //   它按源码断言方向标签与图例，旧的错误串一律不许再出现——所以这里不逐字复述旧文案。）
-const DIRECTION: Record<number, { label: string; tone: 'ok' | 'warn' | 'neutral' }> = {
-  1: { label: '偏严肃 / 沉重', tone: 'warn' },
-  [-1]: { label: '偏放松 / 活跃', tone: 'ok' },
-  0: { label: '无位移', tone: 'neutral' },
+// 只留标签：配色由**方向语义**在下面各处表达（内心天气徽章 + 两张表的数值），
+// 这里原先那个 `tone` 字段从来没被渲染过（死代码，且它自己也把两种方向写反过）。
+const DIRECTION: Record<number, { label: string }> = {
+  1: { label: '偏严肃 / 沉重' },
+  [-1]: { label: '偏放松 / 活跃' },
+  0: { label: '无位移' },
 }
 
 export function Alter({ storyId, refreshKey }: PanelProps) {
@@ -131,7 +133,9 @@ export function Alter({ storyId, refreshKey }: PanelProps) {
                 key: 'value',
                 title: '位移',
                 render: (row) => (
-                  <span class={row.value >= 0 ? 'text-ok' : 'text-warn'}>{row.value.toFixed(2)}</span>
+                  <span class={row.value > 0 ? 'text-warn' : row.value < 0 ? 'text-ok' : 'text-muted'}>
+                    {row.value.toFixed(2)}
+                  </span>
                 ),
               },
               { key: 'attempt', title: '上次分析', mono: true, render: (row) => row.last_attempt_at || '从未' },
@@ -164,7 +168,11 @@ export function Alter({ storyId, refreshKey }: PanelProps) {
             {
               key: 'alter',
               title: '本论增量',
-              render: (row) => <span class={row.alter >= 0 ? 'text-ok' : 'text-warn'}>{row.alter.toFixed(2)}</span>,
+              render: (row) => (
+                <span class={row.alter > 0 ? 'text-warn' : row.alter < 0 ? 'text-ok' : 'text-muted'}>
+                  {row.alter.toFixed(2)}
+                </span>
+              ),
             },
             { key: 'value', title: '累计', render: (row) => row.alter_value.toFixed(2) },
             { key: 'who', title: '来源', render: (row) => row.participant_id || '全局' },
