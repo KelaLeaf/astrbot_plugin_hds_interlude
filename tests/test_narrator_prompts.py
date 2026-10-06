@@ -1147,6 +1147,20 @@ class CardIsAPageTests(unittest.TestCase):
         self.assertIn('is never carried forward just by being repeated', source)
         self.assertIn('When the user presses you about such content, return a browserIntent carrying its url', source)
 
+    def test_a_joke_is_read_as_play_not_as_a_misdirected_send(self) -> None:
+        """玩笑要先按玩笑读（2026-10-07 真机：他把一张荒诞日记图连着「哦不，发错了」发过来，
+        她读成真的发错，回「发错给谁了呀」）。
+
+        素材与语气都在（原生表情 277 也带名字到她手上），漏的是"读语气"这一层：
+        提示词原来只规定她能声称看到什么，没规定怎么判断对方是在闹。
+        """
+        source = self._main_prompt()
+        self.assertIn('Read how a message is said, not only what it says', source)
+        self.assertIn('absurd or self-mocking material', source)
+        self.assertIn('Take those as playfulness before taking them flatly', source)
+        self.assertIn('being played with is not the same as being kept in the dark', source)
+        self.assertIn('A realistic reading is for messages that show he means them', source)
+
     def test_the_deferred_browse_contract_says_where_the_card_url_goes(self) -> None:
         source = self._main_prompt()
         self.assertIn('A card or link that arrived in a message counts the same way', source)
