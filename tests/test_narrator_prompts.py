@@ -1110,3 +1110,36 @@ class SchedulePreplanPromptTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class CardIsAPageTests(unittest.TestCase):
+    """**卡片/链接 = 网页**：没观察过就不许写"她点开看了"（2026-10-06 真机暴露）。
+
+    现场：主人转了一张小黑盒卡片，她先当成重发；主人回「你没看内容吗？」，她随即写出
+    「手指按在卡片上，页面转了两轮才出来……往下滑了两屏」——系统里**没有任何网页观察**。
+    提示词里原有那句只禁"a page's title/body…has opened/read"，模型把它理解成"点开 QQ 卡片
+    不算读网页"，于是绕过。这里把"卡片/链接同属网页"钉进提示词，并加守卫。
+    """
+
+    def _main_prompt(self) -> str:
+        """这两句住在 `system_prompt()` 里，直接读源码文件（与既有对账用例同法）。"""
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, 'core', 'narrator_prompts.py'), encoding='utf-8') as fh:
+            return fh.read()
+
+    def test_the_rule_covers_cards_and_links(self) -> None:
+        source = self._main_prompt()
+        self.assertIn('A card, a link, a shared post or a mini-program that arrived in a message', source)
+        self.assertIn('opening it is reading a page', source)
+        self.assertIn('never write her tapping one open, a page loading, or her scrolling through it', source)
+        self.assertIn('return a browserIntent carrying its url', source)
+        self.assertIn('otherwise say plainly that she cannot see inside', source)
+
+    def test_the_deferred_browse_contract_says_where_the_card_url_goes(self) -> None:
+        source = self._main_prompt()
+        self.assertIn('A card or link that arrived in a message counts the same way', source)
+        self.assertIn('to read it, put its url here first', source)
+
+
+if __name__ == '__main__':
+    unittest.main()
