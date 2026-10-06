@@ -723,6 +723,16 @@ class IncomingMediaKindTests(unittest.TestCase):
         self.assertIn('title="知名Vtuber真白花音（白菜）重新转生了"', content)
         self.assertIn('url="https://api.xiaoheihe.cn/v3/bbs/app/api/web/share?link_id=abc"', content)
 
+    def test_a_card_is_marked_as_carrying_no_content(self):
+        """卡片标签必须带 `unread="1"`：消息里只有标题与摘要，内容要靠观察才有。"""
+        card = types.SimpleNamespace(data={'app': 'com.tencent.tuwen.lua',
+                                           'meta': {'news': {'title': 't', 'jumpUrl': 'https://x/y'}}})
+        card._hdsi_kind = 'json'
+        content = self._content(self._event([{'type': 'json', 'data': card.data}], components=[card]))
+        self.assertIn('unread="1"', content)
+        # 判据那份不许被灌进常量（`media[].raw` = 观测到的原始判据）。
+        self.assertNotIn('unread', bridge_module._json_card_attrs(card))
+
     def test_a_card_without_a_link_does_not_invent_one(self):
         """反向：卡片里没有链接就**不许凭空造**一个 url 属性出来。"""
         payload = {'app': 'com.tencent.miniapp_01',

@@ -1135,6 +1135,18 @@ class CardIsAPageTests(unittest.TestCase):
         self.assertIn('return a browserIntent carrying its url', source)
         self.assertIn('otherwise say plainly that she cannot see inside', source)
 
+    def test_an_earlier_script_line_is_not_an_observation(self) -> None:
+        """她自己上一回合写的"点开看过"不许当凭据继续沿用（2026-10-06 真机二次污染）。
+
+        现场：v1.9.17 已装（22:11 重启），22:15 那回合她仍写「标题那行我**点开看过**」——
+        这句援引的是 21:38 那次同样没有观察的编造，而规则原先豁免了 "existing script"。
+        """
+        source = self._main_prompt()
+        self.assertIn('A card tag carries unread="1"', source)
+        self.assertIn('an earlier line of your own script is not an observation of it', source)
+        self.assertIn('is never carried forward just by being repeated', source)
+        self.assertIn('When the user presses you about such content, return a browserIntent carrying its url', source)
+
     def test_the_deferred_browse_contract_says_where_the_card_url_goes(self) -> None:
         source = self._main_prompt()
         self.assertIn('A card or link that arrived in a message counts the same way', source)

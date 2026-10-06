@@ -914,7 +914,12 @@ def serialize_component(
                 'summary': '',
                 'raw': dict(attrs),
             })
-        tag = ' '.join('%s="%s"' % (key, _escape_attr(value)) for key, value in attrs.items() if value != '')
+        # 卡片**本身不携带内容**：消息里给的只有标题与摘要。`unread="1"` 是给模型的**结构信号**——
+        # 2026-10-06 真机：她在没有观察的情况下写了"点开滑了两屏"，之后每回合都拿自己上一回合
+        # 那句话当凭据继续写。标记钉在消息上，比只在提示词里讲一句更难绕开。
+        # 它只进渲染，不进 `media[].raw`（那份是**观测到的判据**，塞常量等于灌噪声）。
+        visible = dict(attrs, unread='1')
+        tag = ' '.join('%s="%s"' % (key, _escape_attr(value)) for key, value in visible.items() if value != '')
         return ('<card %s/>' % tag) if tag else '<card/>', {'type': 'card', 'attrs': attrs, 'children': []}, None
 
     if kind == 'file':
