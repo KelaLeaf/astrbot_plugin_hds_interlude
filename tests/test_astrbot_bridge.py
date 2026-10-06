@@ -705,6 +705,41 @@ class IncomingMediaKindTests(unittest.TestCase):
         self.assertIn('title="QQ经典农场"', content)
         self.assertIn('app="com.tencent.miniapp_01"', content)
 
+    def test_share_card_keeps_the_page_link(self):
+        """卡片里的**页面链接**要交到她手上（2026-10-06 真机：她只拿到标题，无法去读原文）。
+
+        现场是一条 QQ 分享卡片（`app=com.tencent.tuwen.lua`，小黑盒），jumpUrl 就躺在
+        `meta.news` 里；`_json_card_attrs` 原先只取 app/prompt/title/desc，链接被丢掉。
+        """
+        payload = {
+            'app': 'com.tencent.tuwen.lua',
+            'meta': {'news': {'title': '知名Vtuber真白花音（白菜）重新转生了',
+                              'desc': '下载小黑盒查看更多精彩内容',
+                              'jumpUrl': 'https://api.xiaoheihe.cn/v3/bbs/app/api/web/share?link_id=abc'}},
+        }
+        card = types.SimpleNamespace(data=payload)
+        card._hdsi_kind = 'json'
+        content = self._content(self._event([{'type': 'json', 'data': payload}], components=[card]))
+        self.assertIn('title="知名Vtuber真白花音（白菜）重新转生了"', content)
+        self.assertIn('url="https://api.xiaoheihe.cn/v3/bbs/app/api/web/share?link_id=abc"', content)
+
+    def test_a_card_without_a_link_does_not_invent_one(self):
+        """反向：卡片里没有链接就**不许凭空造**一个 url 属性出来。"""
+        payload = {'app': 'com.tencent.miniapp_01',
+                   'meta': {'detail_1': {'title': 'QQ经典农场', 'desc': '快乐不独享'}}}
+        card = types.SimpleNamespace(data=payload)
+        card._hdsi_kind = 'json'
+        content = self._content(self._event([{'type': 'json', 'data': payload}], components=[card]))
+        self.assertNotIn('url=', content)
+        self.assertEqual(bridge_module._json_card_attrs(card).get('url'), None)
+
+    def test_the_card_link_is_bounded(self):
+        """链接要截断，别把一条超长 URL 整份灌进提示词。"""
+        long_url = 'https://example.com/' + 'x' * 900
+        card = types.SimpleNamespace(data={'meta': {'news': {'title': 't', 'jumpUrl': long_url}}})
+        attrs = bridge_module._json_card_attrs(card)
+        self.assertEqual(len(attrs['url']), 300)
+
     def test_raw_media_hints_indexes_by_file_and_url(self):
         event = self._event([{'type': 'image', 'data': {
             'file': 'a.jpg', 'url': 'https://x/a.jpg', 'sub_type': '1',

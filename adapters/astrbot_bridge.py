@@ -555,6 +555,23 @@ def _json_card_attrs(component: Any) -> dict[str, str]:
                 attrs['desc'] = desc[:80]
             if title or desc:
                 break
+    # 卡片里的**页面链接**（小黑盒/公众号那种分享）：原先只取标题与描述，链接被丢在这里，
+    # 于是"她能不能点开看一眼"这件事根本无从谈起——2026-10-06 真机：主人转了一张讲 up 主
+    # 转生的小黑盒卡片，她只能凭标题回话（想问也问不到原文）。链接是**用户自己发的**，
+    # 交给她由她决定要不要去看（观察走既有 `browserIntents`，网页内容仍是不可信材料）。
+    url = _text(payload.get('jumpUrl') or payload.get('jump_url') or payload.get('url'))
+    if not url and isinstance(detail, dict):
+        for value in detail.values():
+            if not isinstance(value, dict):
+                continue
+            url = _text(
+                value.get('jumpUrl') or value.get('jump_url')
+                or value.get('qqdocurl') or value.get('url'),
+            )
+            if url:
+                break
+    if url:
+        attrs['url'] = url[:300]
     return attrs
 
 
